@@ -224,7 +224,7 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
 
     // No -v for /blobs. mkdir would happily create it in the container layer and
     // the run would look perfect while every artifact died with --rm.
-    expect(() =>
+    const attempt = () =>
       execFileSync('docker', ['run', '--rm', '-i', '-v', `${fixture.repo}:/src:ro`, IMAGE], {
         input: JSON.stringify({
           runId: RUN_ID,
@@ -237,8 +237,21 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
           flakeRuns: 0,
         }),
         encoding: 'utf8',
-      }),
-    ).toThrow(/not a host store/);
+      });
+
+    expect(attempt).toThrow(/not a host store/);
+    // Exit 3, not 2: nothing reached the channel, so there is nothing to fold.
+    // Sharing a code with the partial-stream case would leave a caller unable to
+    // tell evidence from silence.
+    let status: number | undefined;
+    let stdout = '';
+    try {
+      attempt();
+    } catch (error) {
+      ({ status, stdout } = error as { status?: number; stdout: string });
+    }
+    expect(status).toBe(3);
+    expect(stdout).toBe('');
   }, 300_000);
 
   test('an anonymous volume is refused: it dies with --rm like the container layer', () => {

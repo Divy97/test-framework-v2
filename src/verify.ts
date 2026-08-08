@@ -483,10 +483,12 @@ async function observe(
     return hashes;
   };
 
-  // Only now is the engine working on the base commit. Everything above is
-  // setup — argument validation and tree hygiene — including the checkout and
-  // the committed-path refusal, which touch no worktree state and would
-  // otherwise report a `rev-parse` typo as a base-phase failure.
+  // Only now is the engine working on the base commit's tree in a way that could
+  // produce evidence. Everything above is setup: resolving the caller's refs and
+  // refusing a repro path that would overwrite committed code — argument
+  // validation that was otherwise reporting a typo'd `fixRef` as a base-phase
+  // failure. The base checkout sits above the line too; it mutates the worktree,
+  // but no event has been emitted yet, so nothing is left half-observed.
   progress.phase = 'base';
   await applyRepro();
   const registered = await hashRepro();

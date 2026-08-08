@@ -38,12 +38,25 @@ describe('fold', () => {
         },
       ],
       registeredRepro: {
+        attempt: 1,
         command: 'npm test -- checkout-discount',
         files: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
         applied: ['tests/checkout-discount.test.ts'],
       },
+      registrations: [
+        {
+          attempt: 1,
+          command: 'npm test -- checkout-discount',
+          files: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
+          applied: ['tests/checkout-discount.test.ts'],
+        },
+      ],
       reproduced: true,
-      fixDiff: null, // the demo run predates FIX_DIFF_OBSERVED
+      fixDiff: {
+        changed_files: ['src/checkout/discount.ts'],
+        diff_hash: 'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
+      },
+      completedAttempts: [1],
       pr: {
         repo: 'demo-org/demo-app',
         pr_number: 42,
@@ -56,8 +69,9 @@ describe('fold', () => {
         'sha256:5b7a1de2c3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0',
         'sha256:9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b',
         'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
+        'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
       ],
-      lastSeq: 7,
+      lastSeq: 8,
     });
   });
 
@@ -68,7 +82,9 @@ describe('fold', () => {
       { status: 'attempting', currentAttempt: 1, reproduced: false },
       { status: 'attempting', reproduced: false }, // repro registered — still nothing proven
       { status: 'attempting', reproduced: false }, // base failed — nothing proven yet
-      { status: 'attempting', reproduced: true }, // fix passed — red→green
+      // The fix passed, but nothing yet vouches the flake series ran to the end.
+      { status: 'attempting', reproduced: false },
+      { status: 'attempting', reproduced: true }, // diff observed — the series is complete
       { status: 'pr_opened', reproduced: true },
     ];
     expected.forEach((partial, i) => {
@@ -240,7 +256,7 @@ describe('a run that ends', () => {
   it('does not let a late PR_OPENED rewrite the outcome', () => {
     const late = fold([
       ...ended('not_reproduced'),
-      { ...demoRunEvents[6]!, seq: 3 },
+      { ...demoRunEvents[7]!, seq: 3 },
     ]);
     expect(late.status).toBe('unresolved');
     expect(late.pr).toBeNull();
@@ -284,18 +300,18 @@ describe('an attempt that could not be observed', () => {
   it('revokes a reproduction the truncated runs had already earned', () => {
     // The abort arrives AFTER the runs it truncates, so a fold that only
     // recomputed on TEST_RUN would leave the verdict standing.
-    const upToFix = fold(demoRunEvents.slice(0, 6));
-    expect(upToFix.reproduced).toBe(true);
+    const complete = fold(demoRunEvents.slice(0, 7));
+    expect(complete.reproduced).toBe(true);
 
-    const truncated = fold([...demoRunEvents.slice(0, 6), aborted('fix', 7)]);
+    const truncated = fold([...demoRunEvents.slice(0, 7), aborted('fix', 8)]);
     expect(truncated.reproduced).toBe(false);
   });
 
   it('leaves a fully observed attempt alone when a LATER attempt aborts', () => {
     const state = fold([
-      ...demoRunEvents.slice(0, 6), // attempt 1, fully observed, red -> green
-      { run_id: DEMO_RUN_ID, seq: 7, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
-      aborted('fix', 8), // attempt 2 dies
+      ...demoRunEvents.slice(0, 7), // attempt 1, fully observed, red -> green -> diff
+      { run_id: DEMO_RUN_ID, seq: 8, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      aborted('fix', 9), // attempt 2 dies
     ]);
     // Disqualification is scoped to its own attempt, or one bad attempt would
     // erase a good one — `reproduced` scans the whole history.
@@ -303,9 +319,59 @@ describe('an attempt that could not be observed', () => {
     expect(state.reproduced).toBe(true);
   });
 
+  it('will not credit a series that simply stops, with no abort to give it away', () => {
+    // The dangerous shape, and the reason the fold needs the log's own completion
+    // witness rather than the abort record. The Runner emits its events in one
+    // loop at the end and a host may append them as they arrive, so a container
+    // killed mid-stream writes exactly this: a red base, one green fix run, and
+    // nothing else. No abort. Counting passes cannot tell it from a full series.
+    const cutShort = fold(demoRunEvents.slice(0, 6));
+    expect(cutShort.testRuns.filter((r) => r.phase === 'fix')).toHaveLength(1);
+    expect(cutShort.aborts).toEqual([]);
+    expect(cutShort.completedAttempts).toEqual([]);
+    expect(cutShort.reproduced).toBe(false);
+  });
+
+  it('disqualifies on a base abort even when the runs themselves look clean', () => {
+    // Pins `base` in the truncation filter: without real runs beside it, a lone
+    // base abort is already false for want of anything to credit.
+    const events = [
+      ...demoRunEvents.slice(0, 7),
+      aborted('base', 8),
+    ];
+    expect(fold(events).reproduced).toBe(false);
+  });
+
+  it('does not disqualify on a setup abort — no observation had begun', () => {
+    // Pins the other side of the same line. A setup abort means the attempt never
+    // started looking, so it cannot have truncated anything.
+    expect(fold([...demoRunEvents.slice(0, 7), aborted('setup', 8)]).reproduced).toBe(true);
+  });
+
+  it('judges each attempt against the reproduction IT registered', () => {
+    // A second registration must not retroactively judge the first attempt's
+    // runs — that both credits runs which never executed the repro they are
+    // measured by, and erases an honestly earned verdict when a later attempt
+    // merely re-registers.
+    const other: RunEvent = {
+      run_id: DEMO_RUN_ID,
+      seq: 9,
+      ts: 'T',
+      type: 'REPRO_REGISTERED',
+      payload: { v: 1, command: 'different', files: { 'other.test.ts': 'sha256:ff' }, applied: [] },
+    };
+    const state = fold([
+      ...demoRunEvents.slice(0, 7), // attempt 1: complete, and genuinely reproduced
+      { run_id: DEMO_RUN_ID, seq: 8, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      other,
+    ]);
+    expect(state.registrations).toHaveLength(2);
+    expect(state.reproduced).toBe(true);
+  });
+
   it('does not revoke on a cleanup or diff abort — every run had finished', () => {
     for (const phase of ['diff', 'cleanup'] as const) {
-      expect(fold([...demoRunEvents.slice(0, 6), aborted(phase, 7)]).reproduced).toBe(true);
+      expect(fold([...demoRunEvents.slice(0, 7), aborted(phase, 8)]).reproduced).toBe(true);
     }
   });
 });

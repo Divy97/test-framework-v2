@@ -455,7 +455,16 @@ describe('failures to observe never become observations', () => {
   });
 
   test('a git failure is an ObservationFailed, not a bare Error', async () => {
-    await expect(observe(clean(), { baseRef: 'no-such-ref' })).rejects.toThrow(ObservationFailed);
+    const failed = await observe(clean(), { baseRef: 'no-such-ref' }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(failed).toBeInstanceOf(ObservationFailed);
+    // Resolving the caller's refs is argument validation, so it is `setup` — the
+    // boundary the phase label exists to draw. Nothing about the base commit
+    // failed, because the engine never got as far as one.
+    const abort = (failed as ObservationFailed).observed[0]!.payload as VerificationAbortedV1;
+    expect(abort.phase).toBe('setup');
   });
 
   test('a dirty working tree is refused, since the result would describe neither commit', async () => {

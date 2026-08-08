@@ -66,14 +66,37 @@ closed by this event, and the Runner flushes the blobs and emits the partial
 stream before exiting 2.
 
 It is deliberately **not** terminal for the run — an attempt can abort and the
-next one can still reach a PR — but it *is* disqualifying for its own attempt
-when it lands in `base` or `fix`. Nothing in the log says how many flake re-runs
-there should have been, so a truncated series is indistinguishable from a
-complete one to anything that merely counts passes. A repro that goes green once
-and then hangs would otherwise be credited red-then-green off a single run, and
-the flake-survival criterion would belong to the agent under judgement. **An
-incomplete observation is not a reproduction.** `diff` and `cleanup` aborts do
-not disqualify: every run had already finished by then.
+next one can still reach a PR.
+
+### An incomplete observation is not a reproduction
+
+Nothing in the log says how many flake re-runs there should have been, so
+`isReproduced`'s "every fix run passed" was really asking "did every run I can
+*see* passed" — and the runs it could not see are exactly the ones an agent
+would arrange to fail. A repro that goes green once and then hangs was credited
+red-then-green off a single run, handing the flake-survival criterion to the
+thing it exists to catch.
+
+Disqualifying the attempt on a `base`/`fix` abort was the obvious fix and was
+not enough: **a stream can be truncated with no abort at all.** The Runner writes
+its events in one loop at the end, and a host that appends them as they arrive —
+which the design explicitly anticipates — can die mid-stream. Events are
+immutable, so that truncation is permanent, and it carries nothing to give it
+away.
+
+So the fold requires the log's own witness instead: `FIX_DIFF_OBSERVED` is
+emitted after the flake loop and nowhere else, so its presence in an attempt is
+proof that attempt's fix series ran to completion. It needs no faith in event
+ordering, and it subsumes the abort case — an attempt that aborted in `base` or
+`fix` never reached the diff either. The abort check is kept beside it as
+defence in depth. `diff` and `cleanup` aborts are not disqualifying on their own,
+because by then the witness has either been emitted or it has not.
+
+The same cross-attempt bug lived in the registration: one `REPRO_REGISTERED`
+slot meant every attempt's runs were judged against whichever registration came
+last, which both credits runs that never executed the repro they are measured by
+and destroys an earlier attempt's honest verdict the moment a later attempt
+re-registers. Each attempt is now judged against its own.
 
 `RUN_ENDED`'s `reason` is the *stated cause of the process halting* — a
 control-flow fact — and the fold derives the outcome from the log rather than

@@ -130,20 +130,42 @@ export async function runJob(
   // the run write back out through it.
   // `--` so a sourcePath cannot be read as an option: `--upload-pack=…` and
   // `ext::sh -c …` are both command execution.
-  await execFileAsync('git', [
-    'clone', '--quiet', '--no-local', `--separate-git-dir=${gitDir}`, '--', job.sourcePath, repoPath,
-  ]);
+  // Standing the sandbox up is not the Runner working correctly or incorrectly —
+  // it is the difference between being able to look and not. An unreachable
+  // sourcePath or a chown that fails is exactly as much a failure to observe as a
+  // repro that times out, and reporting it as a Runner bug sends whoever reads
+  // the exit code to the wrong place entirely.
+  const setUp = async (what: string, run: Promise<unknown>) => {
+    try {
+      await run;
+    } catch (error) {
+      throw new ObservationFailed(`could not ${what}`, { cause: error });
+    }
+  };
+
+  await setUp(
+    `clone ${job.sourcePath}`,
+    execFileAsync('git', [
+      'clone', '--quiet', '--no-local', `--separate-git-dir=${gitDir}`, '--', job.sourcePath, repoPath,
+    ]),
+  );
 
   // The repro runs as this user, not as the Runner. Root in the Runner's own
   // namespace can reach the event channel through /proc/1/fd/N whatever the
   // Runner does with its own descriptors.
   const runAs = { uid: REPRO_UID, gid: REPRO_GID };
   // The worktree only. Not the blob store, and not the git dir.
-  await execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, repoPath]);
+  await setUp(
+    'hand the worktree to the repro user',
+    execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, repoPath]),
+  );
   // The Runner stays root, so git now sees a tree owned by someone else and
   // refuses it as "dubious ownership". Scoped to this path, inside a container
   // built for exactly one run.
-  await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]);
+  await setUp(
+    'mark the worktree safe for git',
+    execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]),
+  );
 
   let events: RunEvent[];
   // A run that could not be observed to the end is still a run that observed
@@ -167,9 +189,10 @@ export async function runJob(
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });
   } catch (error) {
-    // Nothing observed means nothing to report on the channel; let it out to
-    // stderr instead, where a failure to observe cannot be mistaken for a record.
-    if (!(error instanceof ObservationFailed) || error.observed.length === 0) throw error;
+    // `verify()` always attaches at least its own VERIFICATION_ABORTED, so an
+    // ObservationFailed here always carries something worth emitting. The setup
+    // failures above are thrown before this try and leave on stderr instead.
+    if (!(error instanceof ObservationFailed)) throw error;
     events = error.observed;
     exitCode = EXIT.partial;
   }
