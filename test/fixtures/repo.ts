@@ -251,6 +251,86 @@ export const HANGS_ON_FIX: ReproSpec = {
   files: { 'repro.sh': 'cat src.txt\ngrep -q right src.txt || exit 1\nwhile :; do :; done\n' },
 };
 
+/** Hangs immediately, so the run stops with nothing observed at all. Pins `phase: 'base'`. */
+export const HANGS_ON_BASE: ReproSpec = {
+  command: 'sh repro.sh',
+  files: { 'repro.sh': 'while :; do :; done\n' },
+};
+
+/**
+ * Passes the first fix run and hangs on the flake re-run — the shape that turns
+ * the abort into a way of *gaming* the gate rather than merely losing evidence.
+ *
+ * Nothing in the log says how many re-runs there should have been, so a
+ * truncated series looks exactly like a complete one to anyone counting passes.
+ * An agent authoring this repro gets red-then-green off a single green run and
+ * the flake-survival criterion never executes. The counter is untracked, so it
+ * survives the shared fix-phase worktree but is scrubbed at the phase boundary —
+ * which is why the base run never reaches it.
+ */
+export const HANGS_ON_FLAKE_RERUN: ReproSpec = {
+  command: 'sh repro.sh',
+  files: {
+    'repro.sh':
+      'cat src.txt\ngrep -q right src.txt || exit 1\n' +
+      'n=$(cat .runs 2>/dev/null || echo 0)\nn=$((n+1))\necho "$n" > .runs\n' +
+      '[ "$n" = 2 ] && while :; do :; done\nexit 0\n',
+  },
+};
+
+/**
+ * Makes the postcondition tidy-up fail, and only the tidy-up.
+ *
+ * The unremovable directory is created solely on the fix commit, so the
+ * phase-boundary scrub never meets it and the diff — which only reads committed
+ * trees — still succeeds. `git clean -dff` is then the first thing that cannot
+ * do its job, on a run where every phase completed and every fact was observed.
+ *
+ * Useless as root, which ignores the permission bits; the caller skips it there.
+ */
+export const LOCKS_THE_TREE_ON_FIX: ReproSpec = {
+  command: 'sh repro.sh',
+  files: {
+    'repro.sh':
+      'cat src.txt\ngrep -q right src.txt || exit 1\n' +
+      'mkdir -p locked && : > locked/f && chmod 500 locked\n',
+  },
+};
+
+/**
+ * Two unrelated root commits. Every phase runs, and then `git diff base...fix`
+ * fails outright for want of a merge base — the only way to reach a `diff`-phase
+ * abort without breaking git itself.
+ */
+export function unrelatedHistories(): Fixture {
+  const repo = mkdtempSync(join(tmpdir(), 'engine-fixture-'));
+  const blobRoot = mkdtempSync(join(tmpdir(), 'engine-blobs-'));
+  created.push(repo, blobRoot);
+
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo });
+  const head = () =>
+    execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+
+  git('init', '--quiet', '--initial-branch=main');
+  git('config', 'user.email', 'fixture@example.com');
+  git('config', 'user.name', 'Fixture');
+
+  writeFileSync(join(repo, 'src.txt'), 'wrong\n');
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'base: the bug');
+  const base = head();
+
+  // --orphan gives a second root with no ancestry in common.
+  git('checkout', '--quiet', '--orphan', 'other');
+  writeFileSync(join(repo, 'src.txt'), 'right\n');
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'fix: an unrelated root');
+  const fix = head();
+
+  git('checkout', '--quiet', base);
+  return { repo, base, fix, blobRoot };
+}
+
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () => makeRepo({ 'src.txt': 'right\n' }, { 'notes.md': 'nope\n' });
 

@@ -55,10 +55,21 @@ export type RunState = {
   pr: { repo: string; pr_number: number; head_sha: string } | null;
   /**
    * Every phase that stopped being observable, in order. Not terminal: an attempt
-   * can abort and the next one can still reach a PR, so these are kept for display
-   * rather than folded into the status.
+   * can abort and the next one can still reach a PR, so these are kept out of the
+   * status — but a `base` or `fix` abort does disqualify its own attempt from
+   * being credited a reproduction. See `isReproduced`.
    */
-  aborts: { phase: VerificationPhase; reason: string }[];
+  aborts: { attempt: number; phase: VerificationPhase; reason: string }[];
+  /**
+   * Event types that arrived after RUN_ENDED, recorded and NOT applied.
+   *
+   * The store enforces unique `(run_id, seq)`; nothing enforces terminality at
+   * write. A producer race can therefore append past the end, and events are
+   * immutable — so throwing here would leave the run permanently unrenderable
+   * with no repair path. A projection that refuses to render is worse than one
+   * that renders the truth plus "this log is malformed".
+   */
+  afterEnd: string[];
   /**
    * What the run said stopped it, verbatim. Recorded as a stated cause, never read
    * as a verdict — `reproduced` and `status` are derived from the facts regardless
@@ -81,6 +92,7 @@ const initialState = (runId: string): RunState => ({
   fixDiff: null,
   pr: null,
   aborts: [],
+  afterEnd: [],
   endedReason: null,
   artifactHashes: [],
   lastSeq: 0,
@@ -93,13 +105,14 @@ export function apply(state: RunState, event: RunEvent): RunState {
   if (event.seq !== state.lastSeq + 1) {
     throw new Error(`seq gap in run ${state.runId}: expected ${state.lastSeq + 1}, got ${event.seq}`);
   }
-  // RUN_ENDED means it ended. A stream that keeps going has two runs' events
-  // interleaved, or a producer that restarted against a closed log — either way
-  // the fold would be summarising something that never happened as one run.
+  // RUN_ENDED means it ended, so a stream that keeps going is malformed — two
+  // runs interleaved, or a producer restarted against a closed log. Record the
+  // anomaly and refuse to apply it, rather than throw: the seq and run_id checks
+  // above police conditions the store already prevents at write, and terminality
+  // is not one of them. Throwing would let one racing append make a run
+  // permanently unrenderable, and events are immutable.
   if (state.endedReason !== null) {
-    throw new Error(
-      `run ${state.runId} already ended (${state.endedReason}); ${event.type} at seq ${event.seq} is after the end`,
-    );
+    return { ...state, lastSeq: event.seq, afterEnd: [...state.afterEnd, event.type] };
   }
 
   const next: RunState = { ...state, lastSeq: event.seq };
@@ -144,7 +157,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
       return {
         ...next,
         testRuns,
-        reproduced: isReproduced(testRuns, state.registeredRepro),
+        reproduced: isReproduced(testRuns, state.registeredRepro, state.aborts),
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
     }
@@ -157,20 +170,38 @@ export function apply(state: RunState, event: RunEvent): RunState {
         },
         artifactHashes: [...state.artifactHashes, event.payload.diff_hash],
       };
-    case 'VERIFICATION_ABORTED':
+    case 'VERIFICATION_ABORTED': {
       // Status deliberately untouched. The run is still attempting until something
       // says it ended, and a later attempt may yet succeed.
-      return {
-        ...next,
-        aborts: [...state.aborts, { phase: event.payload.phase, reason: event.payload.reason }],
-      };
+      const aborts = [
+        ...state.aborts,
+        {
+          attempt: state.currentAttempt,
+          phase: event.payload.phase,
+          reason: event.payload.reason,
+        },
+      ];
+      // Recomputed here, not only on TEST_RUN: the abort arrives *after* the runs
+      // it truncates, so leaving `reproduced` alone would let a verdict earned by
+      // an incomplete series stand.
+      return { ...next, aborts, reproduced: isReproduced(state.testRuns, state.registeredRepro, aborts) };
+    }
     case 'RUN_ENDED':
       return {
         ...next,
         endedReason: event.payload.reason,
-        // Derived, not taken on trust. A stream claiming `pr_opened` with no
+        // The PR question is derived: a stream claiming `pr_opened` with no
         // PR_OPENED in it does not get to show a PR, and one claiming
         // `not_reproduced` after a PR was opened does not get to hide it.
+        //
+        // `errored` is the single thing the fold takes on the producer's word,
+        // and that asymmetry is deliberate (ADR-0009). An infrastructure failure
+        // is unevidenced by construction — the container is killed, the channel
+        // dies, no event is written — so untrusted it could not exist at all, and
+        // every operational fault would render as a finding about the bug. The
+        // obvious alternative, deriving it from `aborts`, is worse: an abort is a
+        // failure to observe and the repro can cause one, so the agent under
+        // judgement could flip its own run out of `unresolved` by hanging.
         status: state.pr ? 'pr_opened' : event.payload.reason === 'error' ? 'errored' : 'unresolved',
       };
     case 'PR_OPENED':
@@ -205,7 +236,27 @@ export function apply(state: RunState, event: RunEvent): RunState {
  * costs an info-request (ADR-0007's Tier 3, which the design already treats as a
  * real deliverable); a false positive puts a fabricated verdict on a PR.
  */
-function isReproduced(testRuns: TestRunRecord[], repro: RegisteredRepro | null): boolean {
+function isReproduced(
+  testRuns: TestRunRecord[],
+  repro: RegisteredRepro | null,
+  aborts: RunState['aborts'],
+): boolean {
+  // An attempt whose base or fix phase stopped being observable is an attempt we
+  // did not finish watching, and the fix series it produced is truncated. Nothing
+  // in the log says how many re-runs there should have been, so `every` below
+  // would really be asking "did every run we managed to see pass" — and the runs
+  // we did not see are exactly the ones an agent would arrange to fail.
+  //
+  // Concretely: a repro that passes the first fix run and hangs on the re-run
+  // would otherwise be credited off a single green run, handing the agent under
+  // judgement the flake-survival criterion. An incomplete observation is not a
+  // reproduction.
+  //
+  // `diff` and `cleanup` aborts are not disqualifying: every run had already
+  // completed and been recorded by then.
+  const truncated = new Set(
+    aborts.filter((a) => a.phase === 'base' || a.phase === 'fix').map((a) => a.attempt),
+  );
   // Red then green is only evidence if the same thing ran both times. Without a
   // registered reproduction there is nothing to compare against, and if any run's
   // repro hashes drifted from the registration, two different tests were run —
@@ -221,6 +272,7 @@ function isReproduced(testRuns: TestRunRecord[], repro: RegisteredRepro | null):
     // attempt 0 means no ATTEMPT_STARTED was ever seen, so "within one attempt"
     // is unenforceable and runs from unrelated attempts could be paired.
     if (base.phase !== 'base' || base.attempt === 0) return false;
+    if (truncated.has(base.attempt)) return false;
     // A crash is not a test failure. A signalled death records exit_code -1,
     // which would otherwise sail through the "did it fail" test below — so an
     // OOM-killed base whose partial output happened to contain the symptom

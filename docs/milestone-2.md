@@ -65,14 +65,29 @@ ran. The engine still throws (a caller must never read "could not look" as
 closed by this event, and the Runner flushes the blobs and emits the partial
 stream before exiting 2.
 
-It is deliberately **not** terminal: an attempt can abort and the next one can
-still reach a PR, so the fold records it and leaves the status alone.
+It is deliberately **not** terminal for the run — an attempt can abort and the
+next one can still reach a PR — but it *is* disqualifying for its own attempt
+when it lands in `base` or `fix`. Nothing in the log says how many flake re-runs
+there should have been, so a truncated series is indistinguishable from a
+complete one to anything that merely counts passes. A repro that goes green once
+and then hangs would otherwise be credited red-then-green off a single run, and
+the flake-survival criterion would belong to the agent under judgement. **An
+incomplete observation is not a reproduction.** `diff` and `cleanup` aborts do
+not disqualify: every run had already finished by then.
 
-Neither event lets a producer talk the fold into a conclusion. `RUN_ENDED`'s
-`reason` is the *stated cause of the process halting* — a control-flow fact —
-and the fold derives the outcome from the log regardless: a stream claiming
-`pr_opened` with no `PR_OPENED` in it is `unresolved`, and one claiming
-`not_reproduced` after a real `PR_OPENED` still shows the PR.
+`RUN_ENDED`'s `reason` is the *stated cause of the process halting* — a
+control-flow fact — and the fold derives the outcome from the log rather than
+believing it: a stream claiming `pr_opened` with no `PR_OPENED` in it is
+`unresolved`, and one claiming `not_reproduced` after a real `PR_OPENED` still
+shows the PR. The exception is `errored`, which the fold takes on the producer's
+word because an infrastructure failure is unevidenced by construction. Which
+conclusions a producer may restate, and why that one asymmetry is safe while
+deriving it from the abort record would not be,
+is [ADR-0009](adr/0009-what-a-producer-may-write-back.md).
+
+Known gap: `reason` is prose, so the confidence projection cannot branch on it.
+A machine-readable `kind` lands with 3c, its only consumer — additive, so the
+payload stays `v: 1`.
 
 ## Anti-gaming checks
 
@@ -126,7 +141,11 @@ event schema changes when it does.
      could die inside a container, where an empty channel is all a caller sees.
      `RUN_ENDED` has no producer yet — the attempt loop that emits it arrives
      with the agent in M3.2, and until then it exists as vocabulary the fold
-     understands, exactly as `PR_OPENED` does.
+     understands, exactly as `PR_OPENED` does. Unlike `PR_OPENED` it is not
+     inert, so the fold **records** post-end events rather than throwing on
+     them: the store enforces unique `(run_id, seq)` and nothing enforces
+     terminality at write, and one racing append must not be able to make an
+     immutable log permanently unrenderable.
    - **3c** — tier and confidence as pure projections.
 
 ## Not in this milestone

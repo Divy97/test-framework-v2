@@ -50,6 +50,7 @@ describe('fold', () => {
         head_sha: 'f3a9d1c7e5b2048a6c1d9e7f3b5a2c8d0e4f6a1b',
       },
       aborts: [],
+      afterEnd: [],
       endedReason: null, // the demo run predates RUN_ENDED
       artifactHashes: [
         'sha256:5b7a1de2c3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0',
@@ -225,9 +226,33 @@ describe('a run that ends', () => {
     expect(state.endedReason).toBe('not_reproduced');
   });
 
-  it('refuses events that arrive after the end', () => {
-    const past = [...ended('not_reproduced'), { ...demoRunEvents[1]!, seq: 3 }];
-    expect(() => fold(past)).toThrow(/after the end/);
+  it('records events that arrive after the end without applying them', () => {
+    // The store enforces unique (run_id, seq); nothing enforces terminality at
+    // write. Throwing would let one racing append make the run permanently
+    // unrenderable, and events are immutable — there is no repair path. So the
+    // fold renders the truth plus "this log is malformed".
+    const past = fold([...ended('not_reproduced'), { ...demoRunEvents[1]!, seq: 3 }]);
+    expect(past.afterEnd).toEqual(['SANDBOX_CREATED']);
+    expect(past.status).toBe('unresolved'); // NOT advanced by the late event
+    expect(past.lastSeq).toBe(3);
+  });
+
+  it('does not let a late PR_OPENED rewrite the outcome', () => {
+    const late = fold([
+      ...ended('not_reproduced'),
+      { ...demoRunEvents[6]!, seq: 3 },
+    ]);
+    expect(late.status).toBe('unresolved');
+    expect(late.pr).toBeNull();
+    expect(late.afterEnd).toEqual(['PR_OPENED']);
+  });
+
+  it('reports pr_opened when a run that opened a PR then errored', () => {
+    // Deliberate precedence, and the one case the ternary decides by ordering:
+    // the PR is the deliverable and it exists. The fault stays visible in aborts.
+    const state = fold([...demoRunEvents, end('error', demoRunEvents.length + 1)]);
+    expect(state.status).toBe('pr_opened');
+    expect(state.endedReason).toBe('error');
   });
 });
 
@@ -249,10 +274,38 @@ describe('an attempt that could not be observed', () => {
       aborted('fix', 4),
     ]);
     expect(state.status).toBe('attempting');
-    expect(state.aborts).toEqual([{ phase: 'fix', reason: REASON }]);
+    expect(state.aborts).toEqual([{ attempt: 1, phase: 'fix', reason: REASON }]);
   });
 
   it('never credits a reproduction on its own', () => {
     expect(fold([demoRunEvents[0]!, aborted('base', 2)]).reproduced).toBe(false);
+  });
+
+  it('revokes a reproduction the truncated runs had already earned', () => {
+    // The abort arrives AFTER the runs it truncates, so a fold that only
+    // recomputed on TEST_RUN would leave the verdict standing.
+    const upToFix = fold(demoRunEvents.slice(0, 6));
+    expect(upToFix.reproduced).toBe(true);
+
+    const truncated = fold([...demoRunEvents.slice(0, 6), aborted('fix', 7)]);
+    expect(truncated.reproduced).toBe(false);
+  });
+
+  it('leaves a fully observed attempt alone when a LATER attempt aborts', () => {
+    const state = fold([
+      ...demoRunEvents.slice(0, 6), // attempt 1, fully observed, red -> green
+      { run_id: DEMO_RUN_ID, seq: 7, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      aborted('fix', 8), // attempt 2 dies
+    ]);
+    // Disqualification is scoped to its own attempt, or one bad attempt would
+    // erase a good one — `reproduced` scans the whole history.
+    expect(state.aborts).toEqual([{ attempt: 2, phase: 'fix', reason: REASON }]);
+    expect(state.reproduced).toBe(true);
+  });
+
+  it('does not revoke on a cleanup or diff abort — every run had finished', () => {
+    for (const phase of ['diff', 'cleanup'] as const) {
+      expect(fold([...demoRunEvents.slice(0, 6), aborted(phase, 7)]).reproduced).toBe(true);
+    }
   });
 });

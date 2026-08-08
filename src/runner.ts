@@ -44,6 +44,25 @@ const REPRO_UID = 1000;
 const REPRO_GID = 1000;
 
 /**
+ * What the exit status tells a caller, and specifically whether there is
+ * anything on the channel worth reading.
+ *
+ * `partial` and `silent` were one code until a stream could survive an abort.
+ * They demand opposite things — fold the channel, or ignore it and read stderr —
+ * so collapsing them would leave a caller unable to tell evidence from nothing.
+ */
+const EXIT = {
+  /** Every phase observed; the stream is complete. */
+  complete: 0,
+  /** An engine or Runner bug. Nothing on the channel. */
+  bug: 1,
+  /** Observation stopped, and a partial stream IS on the channel. Fold it. */
+  partial: 2,
+  /** Observation stopped with nothing on the channel — including a failed flush. */
+  silent: 3,
+} as const;
+
+/**
  * Proof the store outlives the container — which `st_dev` alone cannot give.
  *
  * A different device only means "a different filesystem": an anonymous volume
@@ -130,9 +149,8 @@ export async function runJob(
   // A run that could not be observed to the end is still a run that observed
   // things. Losing the base phase because the fix phase died would leave no
   // record at all of the one part that worked — so the partial stream goes out,
-  // closed by the VERIFICATION_ABORTED that says where it stopped, and the exit
-  // code tells a caller the phases did not complete.
-  let exitCode = 0;
+  // closed by the VERIFICATION_ABORTED that says where it stopped.
+  let exitCode: number = EXIT.complete;
   try {
     events = await verify({
       runId: job.runId,
@@ -153,7 +171,7 @@ export async function runJob(
     // stderr instead, where a failure to observe cannot be mistaken for a record.
     if (!(error instanceof ObservationFailed) || error.observed.length === 0) throw error;
     events = error.observed;
-    exitCode = 2;
+    exitCode = EXIT.partial;
   }
 
   // The repro has run for the last time, so the evidence can cross into the
@@ -209,6 +227,9 @@ if (process.argv[1]?.endsWith('runner.ts') || process.argv[1]?.endsWith('runner.
     // it can never be mistaken for an event on the channel.
     const failed = error instanceof ObservationFailed;
     process.stderr.write(`${failed ? 'ObservationFailed' : 'RunnerError'}: ${String(error)}\n`);
-    process.exitCode = failed ? 2 : 1;
+    // Nothing reached the channel on this path — a flush that failed takes the
+    // whole stream with it, deliberately, since refs nothing can resolve are
+    // worse than no refs. `silent`, not `partial`: there is nothing to fold.
+    process.exitCode = failed ? EXIT.silent : EXIT.bug;
   }
 }

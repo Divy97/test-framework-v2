@@ -99,8 +99,17 @@ export type PrOpenedV1 = {
   diff_hash: ArtifactRef;
 };
 
-/** Where the engine was standing when it stopped. */
-export type VerificationPhase = 'setup' | 'base' | 'fix' | 'diff';
+/**
+ * Where the engine was standing when it stopped.
+ *
+ * `cleanup` is separate from `diff` because the distinction is not cosmetic: the
+ * tidy-up runs *after* FIX_DIFF_OBSERVED, so a failure there aborts a run in
+ * which every phase completed and every fact was observed. Labelling that `diff`
+ * would tell an orchestrator to retry a run that already produced valid evidence
+ * — and the retry would then die on the dirty-tree refusal, because the tidy-up
+ * is exactly what failed.
+ */
+export type VerificationPhase = 'setup' | 'base' | 'fix' | 'diff' | 'cleanup';
 
 /**
  * Observation stopped before the phases finished.
@@ -113,6 +122,10 @@ export type VerificationPhase = 'setup' | 'base' | 'fix' | 'diff';
  *
  * It is not terminal either. An attempt can abort and the next one can succeed,
  * so the fold records it and leaves the run's status alone.
+ *
+ * What it DOES do is disqualify its own attempt from being credited a
+ * reproduction when it lands in `base` or `fix`: the run series is truncated,
+ * and an incomplete observation is not a reproduction. See `isReproduced`.
  */
 export type VerificationAbortedV1 = {
   v: 1;
@@ -120,6 +133,13 @@ export type VerificationAbortedV1 = {
   /**
    * Why observation stopped. Bounded, because the message can quote a repro
    * command the agent wrote. Display it; never parse it.
+   *
+   * Deliberately prose, and therefore deliberately unfoldable: the confidence
+   * projection cannot tell "the repro hung" from "the repro tried to escape the
+   * repo" without regexing English, which this field forbids. A machine-readable
+   * `kind` lands with that projection (M2's 3c) rather than now — it is an
+   * additive field, so the payload stays `v: 1` when it does, and shipping it
+   * ahead of its only consumer would be guessing at the taxonomy.
    */
   reason: string;
 };
@@ -128,9 +148,15 @@ export type VerificationAbortedV1 = {
  * The run stopped, and what stopped it.
  *
  * `reason` records the *cause of the process halting* — a control-flow act with
- * consequences in the world (no agent was spawned, no PR was opened). It is not
- * a verdict on the evidence, and the fold pointedly does not read it to decide
- * whether anything was reproduced: that stays derived from the TEST_RUNs.
+ * consequences in the world, such as an agent that was never spawned because the
+ * reproduce-first gate held. It is not a verdict on the evidence, and the fold
+ * pointedly does not read it to decide whether anything was reproduced: that
+ * stays derived from the TEST_RUNs.
+ *
+ * Half these values (`pr_opened`, `not_reproduced`) are conclusions the fold can
+ * reach on its own, which by ADR-0001's letter means they do not belong in an
+ * event. Why they are here anyway, and why `errored` is the one thing the fold
+ * takes on trust, is ADR-0009.
  */
 export type RunEndedV1 = {
   v: 1;

@@ -4,7 +4,7 @@
 // thing ran both times. Everything here either demonstrates that anchor holding,
 // or demonstrates precisely where it does not reach.
 
-import { writeFileSync } from 'node:fs';
+import { chmodSync, writeFileSync } from 'node:fs';
 import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import type {
@@ -15,7 +15,7 @@ import type {
   VerificationAbortedV1,
 } from '../src/events.js';
 import { fold, type RunState } from '../src/fold.js';
-import { ObservationFailed, verify, type VerifyOptions } from '../src/verify.js';
+import { MAX_REASON_CHARS, ObservationFailed, verify, type VerifyOptions } from '../src/verify.js';
 import {
   APPLIED_REPRO,
   cleanupFixtures,
@@ -39,9 +39,13 @@ import {
   SELF_REWRITING_REPRO,
   symlinkInFix,
   symlinkToRoot,
+  unrelatedHistories,
   pinnedSymlink,
   gitignoredWorkDir,
+  HANGS_ON_BASE,
   HANGS_ON_FIX,
+  HANGS_ON_FLAKE_RERUN,
+  LOCKS_THE_TREE_ON_FIX,
   REPRO_PLANTING_SYMLINK,
   type Fixture,
 } from './fixtures/repo.js';
@@ -480,20 +484,29 @@ describe('an abort keeps what was already observed', () => {
     return error as ObservationFailed;
   };
 
+  const abortOn = (events: RunEvent[]) => events.at(-1)!.payload as VerificationAbortedV1;
+
   test('a fix phase that never returns still leaves the base observation on the record', async () => {
-    const error = await abortOf(observe(clean(), { repro: HANGS_ON_FIX, timeoutMs: 2_000 }));
+    const fixture = clean();
+    const error = await abortOf(observe(fixture, { repro: HANGS_ON_FIX, timeoutMs: 2_000 }));
 
     expect(error.observed.map((e) => e.type)).toEqual([
       'REPRO_REGISTERED',
       'TEST_RUN',
       'VERIFICATION_ABORTED',
     ]);
-    // The base phase's facts are intact, not a stub written by the abort handler.
     expect(basePhase(error.observed)).toMatchObject({ exit_code: 1, symptom_matched: true });
 
-    const abort = error.observed.at(-1)!.payload as VerificationAbortedV1;
-    expect(abort.phase).toBe('fix');
-    expect(abort.reason).toMatch(/exceeded 2000ms/);
+    // The exit code and the symptom flag are trivially forgeable, so asserting
+    // them proves only that *something* was written. Resolving the artifact does
+    // the real work: these are the bytes the base run actually produced, and a
+    // stub invented by the abort handler could not satisfy it.
+    const output = await get(fixture.blobRoot, basePhase(error.observed).stdout_hash);
+    expect(output.toString()).toContain('wrong');
+    expect(registration(error.observed).command).toBe('sh repro.sh');
+
+    expect(abortOn(error.observed).phase).toBe('fix');
+    expect(abortOn(error.observed).reason).toMatch(/exceeded 2000ms/);
     // The abort continues the log rather than restarting it: a consumer appending
     // these must not collide with the seq the base observation already took.
     expect(error.observed.map((e) => e.seq)).toEqual([1, 2, 3]);
@@ -506,14 +519,127 @@ describe('an abort keeps what was already observed', () => {
     expect(conclude(error.observed).reproduced).toBe(false);
   });
 
+  /**
+   * The dangerous shape, and the reason the fold consults the abort record at all.
+   *
+   * Here the fix DOES go green — once — and then the re-run hangs. Everything the
+   * fold can count looks like a clean reproduction: a red base matching the
+   * symptom, a green fix, repro hashes intact throughout. Only the truncation
+   * gives it away, and nothing in the log says how many re-runs there should have
+   * been. Credit this and the flake-survival criterion belongs to the agent.
+   */
+  test('a fix that goes green once and then stops being observable is NOT reproduced', async () => {
+    const error = await abortOf(
+      observe(clean(), { repro: HANGS_ON_FLAKE_RERUN, timeoutMs: 2_000, flakeRuns: 2 }),
+    );
+
+    // The trap is real: a green fix run is on the record, and the series is short.
+    expect(fixPhases(error.observed).map((r) => r.exit_code)).toEqual([0]);
+    expect(basePhase(error.observed)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(abortOn(error.observed).phase).toBe('fix');
+
+    expect(conclude(error.observed).reproduced).toBe(false);
+  });
+
+  test('an abort in a later attempt cannot rescue an attempt that was fully observed', async () => {
+    // The disqualification is scoped to its own attempt, or one bad attempt would
+    // erase a good one — and `reproduced` scans the whole history.
+    const events = await observe(clean(), { flakeRuns: 0 });
+    const withLateAbort: RunEvent[] = [
+      ...events,
+      {
+        run_id: RUN_ID,
+        seq: events.length + 1,
+        ts: new Date().toISOString(),
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'fix', reason: 'ObservationFailed: a later attempt died' },
+      },
+    ];
+    // Folded inside ONE attempt, the abort shares it and disqualifies it.
+    expect(conclude(withLateAbort).reproduced).toBe(false);
+    // Given its own attempt, the first attempt's verdict stands.
+    expect(
+      fold([
+        { run_id: RUN_ID, seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+        ...events.map((e, i) => ({ ...e, seq: i + 2 })),
+        {
+          run_id: RUN_ID,
+          seq: events.length + 2,
+          ts: 'T',
+          type: 'ATTEMPT_STARTED',
+          payload: { v: 1, n: 2 },
+        },
+        {
+          run_id: RUN_ID,
+          seq: events.length + 3,
+          ts: 'T',
+          type: 'VERIFICATION_ABORTED',
+          payload: { v: 1, phase: 'fix', reason: 'ObservationFailed: attempt 2 died' },
+        },
+      ]).reproduced,
+    ).toBe(true);
+  });
+
   test('a setup failure aborts with nothing before it, since nothing was observed', async () => {
     const fixture = clean();
     writeFileSync(`${fixture.repo}/stray.txt`, 'uncommitted\n');
     const error = await abortOf(observe(fixture));
 
     expect(error.observed.map((e) => e.type)).toEqual(['VERIFICATION_ABORTED']);
-    expect((error.observed[0]!.payload as VerificationAbortedV1).phase).toBe('setup');
+    expect(abortOn(error.observed).phase).toBe('setup');
   });
+
+  test('a base phase that never returns is labelled base, not setup', async () => {
+    const error = await abortOf(observe(clean(), { repro: HANGS_ON_BASE, timeoutMs: 2_000 }));
+
+    expect(error.observed.map((e) => e.type)).toEqual(['REPRO_REGISTERED', 'VERIFICATION_ABORTED']);
+    expect(abortOn(error.observed).phase).toBe('base');
+  });
+
+  test('a ref that cannot be diffed is labelled diff — every run had already finished', async () => {
+    // Unrelated roots: each phase runs and is recorded, then `git diff a...b`
+    // fails for want of a merge base.
+    const error = await abortOf(observe(unrelatedHistories(), { flakeRuns: 0 }));
+
+    expect(error.observed.map((e) => e.type)).toEqual([
+      'REPRO_REGISTERED',
+      'TEST_RUN',
+      'TEST_RUN',
+      'VERIFICATION_ABORTED',
+    ]);
+    expect(abortOn(error.observed).phase).toBe('diff');
+  });
+
+  // Root ignores the permission bits the fixture relies on.
+  test.skipIf(process.getuid?.() === 0)(
+    'a failed tidy-up is labelled cleanup, and does not void what was observed',
+    async () => {
+      // Every phase completed and every fact was observed; only the postcondition
+      // failed. Called `diff` this would tell an orchestrator to retry a run that
+      // already produced valid evidence — and the retry would die immediately on
+      // the dirty-tree refusal, because the tidy-up is what failed.
+      const fixture = clean();
+      try {
+        const error = await abortOf(
+          observe(fixture, { repro: LOCKS_THE_TREE_ON_FIX, flakeRuns: 0 }),
+        );
+
+        expect(error.observed.map((e) => e.type)).toEqual([
+          'REPRO_REGISTERED',
+          'TEST_RUN',
+          'TEST_RUN',
+          'FIX_DIFF_OBSERVED',
+          'VERIFICATION_ABORTED',
+        ]);
+        expect(abortOn(error.observed).phase).toBe('cleanup');
+        // The reproduction stands: nothing about it was left unobserved.
+        expect(conclude(error.observed).reproduced).toBe(true);
+      } finally {
+        // The fixture defeats `git clean`, so it defeats the temp-dir teardown too.
+        chmodSync(`${fixture.repo}/locked`, 0o700);
+      }
+    },
+  );
 
   test('the reason is bounded: the agent chose the text it quotes', async () => {
     // The message embeds the repro path verbatim, and the event channel is one
@@ -522,17 +648,32 @@ describe('an abort keeps what was already observed', () => {
       observe(clean(), { repro: { command: 'true', files: { [`../${'a'.repeat(10_000)}`]: 'x' } } }),
     );
     const { reason } = error.observed[0]!.payload as VerificationAbortedV1;
-    expect(reason.length).toBeLessThan(2_100);
-    expect(reason).toMatch(/truncated/);
+
+    // Pinned to the constant, so a wrong bound is caught rather than "short enough".
+    expect(reason.length).toBe(MAX_REASON_CHARS + '… (truncated)'.length);
+    // And truncation must keep the beginning. Discarding the text and emitting the
+    // marker alone would satisfy a length check while destroying the diagnosis.
+    expect(reason.startsWith('ObservationFailed: repro path escapes the repository: ../aaa')).toBe(
+      true,
+    );
+    expect(reason.endsWith('… (truncated)')).toBe(true);
   });
 
   test('a bug in the engine is not dressed up as an abort', async () => {
     // Only "I could not look" earns an event. A TypeError means the engine is
     // broken, and turning that into a plausible VERIFICATION_ABORTED would put a
     // fabricated record on the log — the one failure this project cannot have.
-    const broken = observe(clean(), { symptomPattern: undefined as unknown as RegExp });
-    await expect(broken).rejects.toThrow(TypeError);
-    await expect(broken).rejects.not.toThrow(ObservationFailed);
+    //
+    // Asserting the error TYPE is not enough: with the guard removed the throw is
+    // still a TypeError, it just acquires an invented event first. The claim is
+    // about the payload, so that is what is checked.
+    const error = await observe(clean(), { symptomPattern: undefined as unknown as RegExp }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(TypeError);
+    expect((error as { observed?: RunEvent[] }).observed).toBeUndefined();
   });
 });
 

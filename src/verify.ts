@@ -66,7 +66,7 @@ export class ObservationFailed extends Error {
  * path — so it is attacker-influenced, and the event channel is one JSON object
  * per line. An unbounded reason is an unbounded line.
  */
-const MAX_REASON_CHARS = 2000;
+export const MAX_REASON_CHARS = 2000;
 
 const abortReason = (error: Error): string => {
   const text = `${error.name}: ${error.message}`;
@@ -394,10 +394,6 @@ async function observe(
     events.push({ ...event, run_id: runId, seq, ts: new Date().toISOString() } as RunEvent);
   };
 
-  // From here the engine is working on the base commit: a checkout that fails, a
-  // repro that will not apply, and the base command itself are all base-phase
-  // failures. Everything above is setup — argument validation and tree hygiene.
-  progress.phase = 'base';
   const baseSha = await checkout(baseRef, repoPath, gitEnv);
 
   // Applied paths must be additive. Writing over a tracked file would put the
@@ -476,12 +472,22 @@ async function observe(
           await handle.close();
         }
       } catch (error) {
+        // Let our own diagnosis through untouched. The hardlink refusal above is
+        // a tamper signal, and the generic message would bury it — `abortReason`
+        // serialises only `name: message`, never `cause`, so on the abort path
+        // that string IS the durable record of what went wrong.
+        if (error instanceof ObservationFailed) throw error;
         throw new ObservationFailed(`could not read repro file ${path}`, { cause: error });
       }
     }
     return hashes;
   };
 
+  // Only now is the engine working on the base commit. Everything above is
+  // setup — argument validation and tree hygiene — including the checkout and
+  // the committed-path refusal, which touch no worktree state and would
+  // otherwise report a `rev-parse` typo as a base-phase failure.
+  progress.phase = 'base';
   await applyRepro();
   const registered = await hashRepro();
   emit({
@@ -547,8 +553,6 @@ async function observe(
   // attribute base-side commits to the fix, over-reporting the very paths the
   // overlap check trusts. -z avoids core.quotePath mangling non-ASCII names, and
   // --no-renames keeps the original path visible instead of only the destination.
-  // Covers the tidy-up below too: both are what happens after the last run, and a
-  // fifth phase name to distinguish them would buy a reviewer nothing.
   progress.phase = 'diff';
   const range = `${baseSha}...${fixSha}`;
   const changed = await git(['diff', '--name-only', '-z', '--no-renames', range], repoPath, gitEnv);
@@ -567,6 +571,12 @@ async function observe(
   // this the next attempt on the same repo trips the dirty-tree refusal on our own
   // leftovers — and bounded attempts up to three is a documented feature, not an
   // edge case. No fixture can catch this: each builds a fresh repo.
+  //
+  // Its own phase, because a failure here aborts a run in which every phase
+  // completed and every fact was observed. Called `diff` it would tell an
+  // orchestrator to retry good evidence — and the retry would die immediately on
+  // the dirty-tree refusal, since the tidy-up is precisely what failed.
+  progress.phase = 'cleanup';
   await git(['reset', '--hard', '--quiet', fixSha], repoPath, gitEnv);
   await git(['clean', '--quiet', '-dff'], repoPath, gitEnv);
 
