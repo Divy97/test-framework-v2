@@ -28,6 +28,7 @@ describe('fold', () => {
         },
       ],
       reproduced: true,
+      fixDiff: null, // the demo run predates FIX_DIFF_OBSERVED
       pr: {
         repo: 'demo-org/demo-app',
         pr_number: 42,

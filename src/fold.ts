@@ -23,6 +23,8 @@ export type RunState = {
   testRuns: TestRunRecord[];
   /** Interpretation: some attempt saw base fail (exit_code != 0) then fix pass (exit_code == 0). */
   reproduced: boolean;
+  /** What the fix touched. The diff-overlap check reads this; the engine never judges it. */
+  fixDiff: { changed_files: string[]; diff_hash: ArtifactRef } | null;
   pr: { repo: string; pr_number: number; head_sha: string } | null;
   artifactHashes: ArtifactRef[];
   lastSeq: number;
@@ -36,6 +38,7 @@ const initialState = (runId: string): RunState => ({
   currentAttempt: 0,
   testRuns: [],
   reproduced: false,
+  fixDiff: null,
   pr: null,
   artifactHashes: [],
   lastSeq: 0,
@@ -81,6 +84,15 @@ export function apply(state: RunState, event: RunEvent): RunState {
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
     }
+    case 'FIX_DIFF_OBSERVED':
+      return {
+        ...next,
+        fixDiff: {
+          changed_files: event.payload.changed_files,
+          diff_hash: event.payload.diff_hash,
+        },
+        artifactHashes: [...state.artifactHashes, event.payload.diff_hash],
+      };
     case 'PR_OPENED':
       return {
         ...next,
