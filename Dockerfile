@@ -15,6 +15,9 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
 
-# The Runner is PID 1 (ADR-0006): it supervises everything and is the only thing
-# that speaks on the channel out.
-ENTRYPOINT ["npx", "tsx", "src/runner.ts"]
+# node itself is PID 1, not a wrapper. `npx tsx` would fork node as a child, and
+# then /proc/1/fd/1 — the container's real stdout — belongs to npx, so the
+# Runner closing its own fd 1 would leave the event channel wide open to
+# anything the repro cares to write. Being PID 1 is load-bearing here, not
+# ceremony (ADR-0006).
+ENTRYPOINT ["node", "--import", "tsx", "src/runner.ts"]

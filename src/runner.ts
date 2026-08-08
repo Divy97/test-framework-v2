@@ -8,6 +8,7 @@
 // No agent yet: M3.1 proves containment and the event path with nothing
 // non-deterministic in the loop.
 
+import { closeSync, openSync, writeSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -38,7 +39,11 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString();
 }
 
-export async function runJob(job: Job, workDir = WORK): Promise<number> {
+export async function runJob(
+  job: Job,
+  workDir = WORK,
+  emit: (line: string) => void = (line) => process.stdout.write(line),
+): Promise<number> {
   const repoPath = `${workDir}/repo`;
   const blobRoot = `${workDir}/blobs`;
   await mkdir(blobRoot, { recursive: true });
@@ -46,7 +51,9 @@ export async function runJob(job: Job, workDir = WORK): Promise<number> {
   // Clone rather than work in the mounted directory. The mount is the host's
   // tree; verifying in place would put host state inside the evidence and let
   // the run write back out through it.
-  await execFileAsync('git', ['clone', '--quiet', '--no-local', job.sourcePath, repoPath]);
+  // `--` so a sourcePath cannot be read as an option: `--upload-pack=…` and
+  // `ext::sh -c …` are both command execution.
+  await execFileAsync('git', ['clone', '--quiet', '--no-local', '--', job.sourcePath, repoPath]);
 
   const events = await verify({
     runId: job.runId,
@@ -63,19 +70,35 @@ export async function runJob(job: Job, workDir = WORK): Promise<number> {
 
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
-  for (const event of events) process.stdout.write(`${JSON.stringify(event)}\n`);
+  for (const event of events) emit(`${JSON.stringify(event)}\n`);
   return 0;
 }
 
 // Only run when executed directly, so the tests can import runJob.
 if (process.argv[1]?.endsWith('runner.ts') || process.argv[1]?.endsWith('runner.js')) {
+  // The repro runs as root in this PID namespace, so `/proc/1/fd/1` is reachable
+  // — and that file *is* the event channel. An agent could write straight onto
+  // it: forged events, and a write without a trailing newline concatenates onto
+  // the next real one and destroys REPRO_REGISTERED, the anchor everything else
+  // rests on. So take a private handle on the real stdout and leave fd 1 as a
+  // dead end. The agent must never be able to append (ADR-0006).
+  const channel = openSync('/proc/self/fd/1', 'w');
+  closeSync(1);
+  openSync('/dev/null', 'w'); // reuses fd 1, so /proc/1/fd/1 now goes nowhere
+
   try {
-    process.exit(await runJob(JSON.parse(await readStdin()) as Job));
+    const job = JSON.parse(await readStdin()) as Job;
+    // Set the code, never call process.exit: stdout on a pipe is asynchronous,
+    // and exiting discards whatever is still queued. A large FIX_DIFF_OBSERVED
+    // was being cut mid-JSON while the run reported success — silent evidence
+    // loss presented as a clean record, which is the worst failure this project
+    // has.
+    process.exitCode = await runJob(job, WORK, (line) => writeSync(channel, line));
   } catch (error) {
     // A failure to observe is not a verification result. It leaves on stderr so
     // it can never be mistaken for an event on the channel.
     const failed = error instanceof ObservationFailed;
     process.stderr.write(`${failed ? 'ObservationFailed' : 'RunnerError'}: ${String(error)}\n`);
-    process.exit(failed ? 2 : 1);
+    process.exitCode = failed ? 2 : 1;
   }
 }
