@@ -74,6 +74,53 @@ describe('fold', () => {
     });
   });
 
+  it('refuses a reproduction registered against no files at all', () => {
+    // `.every()` over an empty set is vacuously true, so an empty registration
+    // would degenerate into "repro_hashes was present" and credit anything.
+    const events: RunEvent[] = [
+      { run_id: 'r', seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 2,
+        ts: 'T',
+        type: 'REPRO_REGISTERED',
+        payload: { v: 1, command: 'x', files: {}, applied: [] },
+      },
+      {
+        run_id: 'r',
+        seq: 3,
+        ts: 'T',
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'base',
+          commit_sha: 'a',
+          exit_code: 1,
+          stdout_hash: 'sha256:aa',
+          duration_ms: 1,
+          symptom_matched: true,
+          repro_hashes: {},
+        },
+      },
+      {
+        run_id: 'r',
+        seq: 4,
+        ts: 'T',
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'fix',
+          commit_sha: 'b',
+          exit_code: 0,
+          stdout_hash: 'sha256:bb',
+          duration_ms: 1,
+          repro_hashes: {},
+        },
+      },
+    ];
+    expect(fold(events).reproduced).toBe(false);
+  });
+
   it('is deterministic: same events, same state', () => {
     expect(fold(demoRunEvents)).toEqual(fold(demoRunEvents));
   });

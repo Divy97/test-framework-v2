@@ -158,7 +158,9 @@ function isReproduced(testRuns: TestRunRecord[], repro: RegisteredRepro | null):
   // registered reproduction there is nothing to compare against, and if any run's
   // repro hashes drifted from the registration, two different tests were run —
   // which is not weak evidence, it is none.
-  if (!repro) return false;
+  // An empty registration is not an anchor: `.every()` over no files is vacuously
+  // true, so this would degenerate into "repro_hashes was present".
+  if (!repro || Object.keys(repro.files).length === 0) return false;
   const intact = (run: TestRunRecord) =>
     run.repro_hashes !== undefined &&
     Object.entries(repro.files).every(([path, hash]) => run.repro_hashes![path] === hash);

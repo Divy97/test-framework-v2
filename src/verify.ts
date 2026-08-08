@@ -15,9 +15,8 @@
 // same repo must not trip the dirty-tree refusal on this run's leftovers.
 
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, sep } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
 import type { ArtifactRef, RunEvent } from './events.js';
@@ -177,25 +176,33 @@ async function trackedPaths(sha: string, cwd: string): Promise<Set<string>> {
 }
 
 /**
- * Reject a repro path that could write outside the repo or into git's own state.
- * Resolution happens after realpath so a committed symlink cannot be a way out.
+ * Resolve a repro path and prove it stays inside the repository.
+ *
+ * Normalise first, then validate — checking the caller's raw string lets `./`
+ * slip past every guard, and the caller here is the agent under judgement
+ * (ADR-0008). Containment is re-derived at each use rather than cached, because
+ * the fix commit controls the tree's shape: a parent directory committed as a
+ * symlink would redirect a write that was proved safe against the base checkout.
  */
-async function resolveInside(repoPath: string, relative: string): Promise<string> {
-  if (isAbsolute(relative) || relative.split(/[\\/]/).includes('..')) {
-    throw new ObservationFailed(`repro path escapes the repository: ${relative}`);
+async function resolveInside(root: string, input: string): Promise<Resolved> {
+  const target = resolve(root, input);
+  const rel = relative(root, target);
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+    throw new ObservationFailed(`repro path escapes the repository: ${input}`);
   }
-  const root = await realpath(repoPath);
-  const target = join(root, relative);
-  if (relative.split(/[\\/]/)[0] === '.git') {
-    throw new ObservationFailed(`repro path writes into git's own state: ${relative}`);
+  // Every segment, case-folded: `sub/.git/hooks/pre-commit` is git state too, and
+  // on a case-insensitive filesystem so is `.Git`.
+  if (rel.split(sep).some((segment) => segment.toLowerCase() === '.git')) {
+    throw new ObservationFailed(`repro path writes into git's own state: ${input}`);
   }
-  // The parent may not exist yet; resolve the deepest part that does.
+  // The parent may not exist yet; walk up to the deepest part that does and
+  // confirm its real location is still under the root.
   let probe = dirname(target);
   while (probe !== root) {
     try {
       const real = await realpath(probe);
       if (real !== root && !real.startsWith(root + sep)) {
-        throw new ObservationFailed(`repro path resolves outside the repository: ${relative}`);
+        throw new ObservationFailed(`repro path resolves outside the repository: ${input}`);
       }
       break;
     } catch (error) {
@@ -203,19 +210,14 @@ async function resolveInside(repoPath: string, relative: string): Promise<string
       probe = dirname(probe);
     }
   }
-  return target;
+  return { rel, target };
 }
 
-const hashFile = async (path: string): Promise<ArtifactRef> =>
-  `sha256:${createHash('sha256').update(await readFile(path)).digest('hex')}`;
+type Resolved = { rel: string; target: string };
 
 export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   const { runId, repoPath, baseRef, fixRef, repro, blobRoot } = options;
   const reproCommand = repro.command;
-  const appliedFiles = repro.files ?? {};
-  const appliedPaths = Object.keys(appliedFiles);
-  const pinnedPaths = repro.pinned ?? [];
-  const reproPaths = [...appliedPaths, ...pinnedPaths].sort();
   const flakeRuns = options.flakeRuns ?? 2;
   const timeoutMs = options.timeoutMs ?? 120_000;
   const maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
@@ -235,6 +237,19 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
       `working tree at ${repoPath} is not clean; verification would not describe either commit`,
     );
   }
+
+  // Normalise every caller-supplied path once, up front, and work only in the
+  // normalised form from here — the raw strings are never trusted again.
+  const root = await realpath(repoPath);
+  const appliedFiles = new Map<string, string>();
+  for (const [input, content] of Object.entries(repro.files ?? {})) {
+    appliedFiles.set((await resolveInside(root, input)).rel, content);
+  }
+  const pinnedPaths: string[] = [];
+  for (const input of repro.pinned ?? []) {
+    pinnedPaths.push((await resolveInside(root, input)).rel);
+  }
+  const reproPaths = [...appliedFiles.keys(), ...pinnedPaths].sort();
 
   // A reproduction anchored to nothing is a reproduction the fix commit owns
   // outright: it could rewrite the whole suite and still be credited.
@@ -256,47 +271,58 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // tree in the "describes neither commit" state refused above — deliberately,
   // this time, which is worse. Compared lowercased because a case-insensitive
   // filesystem lets `Tests/Repro.js` clobber a committed `tests/repro.js`.
+  // Resolve the fix ref up front: a branch name could move between this check
+  // and the checkout that eventually uses it.
+  const fixSha = (await git(['rev-parse', fixRef], repoPath)).trim();
   const tracked = new Set([
     ...(await trackedPaths(baseSha, repoPath)),
-    ...(await trackedPaths(fixRef, repoPath)),
+    ...(await trackedPaths(fixSha, repoPath)),
   ]);
-  const targets = new Map<string, string>();
-  for (const relative of appliedPaths) {
-    if (tracked.has(relative.toLowerCase())) {
+  for (const path of appliedFiles.keys()) {
+    if (tracked.has(path.toLowerCase())) {
       throw new ObservationFailed(
-        `repro path ${relative} is committed; applying it would overwrite the code under test`,
+        `repro path ${path} is committed; applying it would overwrite the code under test`,
       );
     }
-    targets.set(relative, await resolveInside(repoPath, relative));
   }
 
   const applyRepro = async () => {
-    for (const [relative, target] of targets) {
-      await mkdir(dirname(target), { recursive: true });
-      await writeFile(target, appliedFiles[relative]!);
+    for (const [path, content] of appliedFiles) {
+      // Re-resolved per write: between the base and fix phases the commit under
+      // judgement can turn a parent directory into a symlink pointing anywhere.
+      const { target } = await resolveInside(root, path);
+      try {
+        await mkdir(dirname(target), { recursive: true });
+        await writeFile(target, content);
+      } catch (error) {
+        throw new ObservationFailed(`could not apply repro file ${path}`, { cause: error });
+      }
     }
   };
 
-  /** Hash every repro path as it stands right now, so a later change is a fact. */
+  /**
+   * Hash every repro path as it stands right now, storing the bytes as they are
+   * read. A divergent hash is the tamper this whole design exists to catch, so it
+   * is exactly the artifact a reviewer most needs to be able to open.
+   */
   const hashRepro = async (): Promise<Record<string, ArtifactRef>> => {
     const hashes: Record<string, ArtifactRef> = {};
-    for (const relative of reproPaths) {
-      hashes[relative] = await hashFile(join(repoPath, relative));
+    for (const path of reproPaths) {
+      const { target } = await resolveInside(root, path);
+      try {
+        hashes[path] = await put(blobRoot, await readFile(target));
+      } catch (error) {
+        throw new ObservationFailed(`could not read repro file ${path}`, { cause: error });
+      }
     }
     return hashes;
   };
 
   await applyRepro();
   const registered = await hashRepro();
-  // Store the bytes, not only their hashes: a hash nothing can resolve is not
-  // evidence, and "the same test ran in both phases" would be the one claim a
-  // reviewer could not open (ADR-0001, ADR-0007).
-  for (const relative of reproPaths) {
-    await put(blobRoot, await readFile(join(repoPath, relative)));
-  }
   emit({
     type: 'REPRO_REGISTERED',
-    payload: { v: 1, command: reproCommand, files: registered, applied: [...appliedPaths].sort() },
+    payload: { v: 1, command: reproCommand, files: registered, applied: [...appliedFiles.keys()].sort() },
   });
 
   const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes);
@@ -328,7 +354,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // than it isolates it.
   await git(['reset', '--hard', '--quiet', baseSha], repoPath);
   await git(['clean', '--quiet', '-dff'], repoPath);
-  const fixSha = await checkout(fixRef, repoPath);
+  await checkout(fixSha, repoPath);
   // The same bytes again — this is the whole point. Whatever the fix commit says
   // the reproduction is, the registered version is what runs.
   await applyRepro();

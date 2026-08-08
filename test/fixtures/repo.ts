@@ -157,6 +157,32 @@ export const rewritesTheRepro = () =>
     { 'src.txt': 'wrong\n', 'mutate.sh': 'echo "exit 0" > repro.sh\n' },
   );
 
+/**
+ * The BASE commit rewrites the reproduction mid-run. The base still fails for the
+ * reported reason, and the fix is genuinely green — so nothing except the base
+ * run's own repro hash distinguishes this from a clean reproduction.
+ */
+export const rewritesTheReproOnBase = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', 'mutate.sh': 'echo "# tampered" >> repro.sh\n' },
+    { 'src.txt': 'right\n', 'mutate.sh': 'true\n' },
+  );
+
+/** A parent directory the FIX commit turns into a symlink pointing outside the repo. */
+export const symlinkedParentInFix = (outside: string) => {
+  const fixture = makeRepo({ 'src.txt': 'wrong\n' }, { 'src.txt': 'right\n' });
+  execFileSync('ln', ['-s', outside, join(fixture.repo, 'escape')]);
+  execFileSync('git', ['add', '.'], { cwd: fixture.repo });
+  execFileSync('git', ['commit', '--quiet', '-m', 'fix: add a symlinked dir'], {
+    cwd: fixture.repo,
+  });
+  fixture.fix = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: fixture.repo,
+    encoding: 'utf8',
+  }).trim();
+  return fixture;
+};
+
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () => makeRepo({ 'src.txt': 'right\n' }, { 'notes.md': 'nope\n' });
 

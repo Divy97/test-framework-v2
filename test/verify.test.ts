@@ -28,7 +28,9 @@ import {
   RESIDUE_REPRO,
   residueFromBase,
   rewritesTheRepro,
+  rewritesTheReproOnBase,
   SELF_REWRITING_REPRO,
+  symlinkedParentInFix,
   type Fixture,
 } from './fixtures/repo.js';
 
@@ -139,6 +141,31 @@ describe('the anchor holds', () => {
     expect(conclude(events).reproduced).toBe(false);
   });
 
+  test('a repro rewritten during the BASE run is caught too', async () => {
+    const events = await observe(rewritesTheReproOnBase(), { repro: SELF_REWRITING_REPRO });
+    const registered = registration(events).files;
+
+    // Everything else looks like a clean reproduction: the base failed for the
+    // reported reason and the fix is genuinely green.
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
+    expect(fixPhases(events).every((r) => r.repro_hashes!['repro.sh'] === registered['repro.sh'])).toBe(
+      true,
+    );
+    // Only the base run's own hash gives it away.
+    expect(basePhase(events).repro_hashes!['repro.sh']).not.toBe(registered['repro.sh']);
+    expect(conclude(events).reproduced).toBe(false);
+  });
+
+  test('a divergent repro hash resolves to the bytes that actually ran', async () => {
+    const fixture = rewritesTheRepro();
+    const events = await observe(fixture, { repro: SELF_REWRITING_REPRO });
+    const tampered = fixPhases(events)[0]!.repro_hashes!['repro.sh']!;
+
+    // The tampered version is the artifact a reviewer most needs to open.
+    expect((await get(fixture.blobRoot, tampered)).toString()).toContain('exit 0');
+  });
+
   test('a pinned test rewritten by the fix is detected, though it cannot be prevented', async () => {
     const events = await observe(pinnedTampering(), { repro: PINNED_REPRO });
     const registered = registration(events).files;
@@ -241,14 +268,63 @@ describe('the repro must be anchored to something', () => {
     ).rejects.toThrow(/is committed/);
   });
 
-  test.each([['../escape.sh'], ['/tmp/escape.sh'], ['.git/hooks/pre-commit']])(
-    'refuses to write a repro to %s',
+  // A `./` prefix used to slip past every guard: `./.git/config` reached git's own
+  // config — which `core.fsmonitor` turns into command execution — and
+  // `./tests/existing.sh` overwrote the code under test while the engine went on
+  // recording commit_sha events for a tree that was neither commit.
+  test.each([
+    ['../escape.sh'],
+    ['/tmp/escape.sh'],
+    ['.git/hooks/pre-commit'],
+    ['./.git/config'],
+    ['.//.git/config'],
+    ['.Git/config'],
+    ['sub/.git/hooks/pre-commit'],
+    ['a/../../escape.sh'],
+    ['.'],
+    [''],
+  ])('refuses to write a repro to %j', async (path) => {
+    await expect(
+      observe(clean(), { repro: { command: 'x', files: { [path]: 'echo hi\n' } } }),
+    ).rejects.toThrow(ObservationFailed);
+  });
+
+  test.each([['./tests/existing.sh'], ['tests/./existing.sh'], ['./Tests/Existing.sh']])(
+    'refuses %j, which normalises onto a committed path',
     async (path) => {
       await expect(
-        observe(clean(), { repro: { command: 'x', files: { [path]: 'echo hi\n' } } }),
-      ).rejects.toThrow(ObservationFailed);
+        observe(committedTest(), { repro: { command: 'x', files: { [path]: 'tampered\n' } } }),
+      ).rejects.toThrow(/is committed/);
     },
   );
+
+  test('a pinned path outside the repo is refused rather than silently unanchored', async () => {
+    // It would read a file the commits cannot change, so intact() would hold
+    // unconditionally and the pinned anchor would be quietly disarmed.
+    await expect(
+      observe(clean(), { repro: { command: 'x', pinned: ['../../etc/hosts'] } }),
+    ).rejects.toThrow(ObservationFailed);
+  });
+
+  test('a parent directory the fix commit turns into a symlink cannot redirect the write', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const outside = mkdtempSync(`${tmpdir()}/engine-outside-`);
+
+    // Containment was proved against the base checkout; the fix commit controls
+    // the tree's shape by the time the second write happens.
+    await expect(
+      observe(symlinkedParentInFix(outside), {
+        repro: { command: 'sh escape/repro.sh', files: { 'escape/repro.sh': 'exit 1\n' } },
+      }),
+    ).rejects.toThrow(ObservationFailed);
+  });
+
+  test('a missing pinned path is an ObservationFailed, not a raw fs error', async () => {
+    await expect(
+      observe(clean(), { repro: { command: 'x', pinned: ['tests/nope.sh'] } }),
+    ).rejects.toThrow(ObservationFailed);
+  });
 });
 
 describe('the repro command is run verbatim', () => {
