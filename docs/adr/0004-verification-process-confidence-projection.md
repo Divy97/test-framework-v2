@@ -36,3 +36,9 @@ rebuildable from the log.
   scoring version without touching history.
 - The verdict a run displays is exactly as trustworthy as the facts beneath
   it — which is the point of [ADR-0006](0006-testimony-vs-evidence.md).
+
+**Amended by [ADR-0008](0008-the-reproduction-is-anchored.md).** The
+diff-overlap input is retired — it was disproved by an adversarial fixture
+before it was ever built. Until diff-coverage replaces it, confidence has no
+fix-diff/reproduction-path component, and the reproduction's anchor takes its
+place as an input.

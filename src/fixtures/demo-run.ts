@@ -43,6 +43,19 @@ export const demoRunEvents: RunEvent[] = [
   {
     run_id: DEMO_RUN_ID,
     seq: 4,
+    ts: t(28),
+    // The reproduction is fixed before anything is judged by it.
+    type: 'REPRO_REGISTERED',
+    payload: {
+      v: 1,
+      command: 'npm test -- checkout-discount',
+      files: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
+      applied: ['tests/checkout-discount.test.ts'],
+    },
+  },
+  {
+    run_id: DEMO_RUN_ID,
+    seq: 5,
     ts: t(94),
     type: 'TEST_RUN',
     payload: {
@@ -55,11 +68,12 @@ export const demoRunEvents: RunEvent[] = [
       // The demo is a genuine Tier 1: the base failed for the reported reason.
       symptom_matched: true,
       repeat: 0,
+      repro_hashes: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
     },
   },
   {
     run_id: DEMO_RUN_ID,
-    seq: 5,
+    seq: 6,
     ts: t(203),
     type: 'TEST_RUN',
     payload: {
@@ -70,11 +84,12 @@ export const demoRunEvents: RunEvent[] = [
       stdout_hash: 'sha256:9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b',
       duration_ms: 3987,
       repeat: 0,
+      repro_hashes: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
     },
   },
   {
     run_id: DEMO_RUN_ID,
-    seq: 6,
+    seq: 7,
     ts: t(241),
     type: 'PR_OPENED',
     payload: {

@@ -39,7 +39,8 @@ Corollaries:
 - **Tier 1 — Reproduced by failing test.** Fails on base with symptom-matching output, passes on fix, executed by us. Highest confidence.
 - **Tier 2 — Reproduced by scripted scenario.** Browser script / API sequence / screenshot diff. Deterministically re-runnable, weaker assertion. Medium confidence.
 - **Tier 3 — Not reproduced → NO FIX ATTEMPTED. Hard rule, gate never bends.** Output is a structured info-request back to the source thread ("attempted repro; missing: exact steps / account state / env"). That's a deliverable, not a failure.
-- **Confidence score = tier + deterministic evidence quality** (symptom match, flake re-runs, diff-coverage of fix vs repro path). No vibes, no LLM-judge-only scores. Every point traceable to an artifact.
+- **Confidence score = tier + deterministic evidence quality** (symptom match, flake re-runs, diff-coverage of fix vs repro path).
+  - **Amended (M2, PR 3a):** diff-coverage is not built and is deferred to its own milestone; it needs language-specific instrumentation. See [ADR-0008](docs/adr/0008-the-reproduction-is-anchored.md). No vibes, no LLM-judge-only scores. Every point traceable to an artifact.
 
 ### Q5 — The 3-minute demo
 - **Dashboard-first.** Open a completed run, click **Replay**: task normalization → sandbox creation → agent transcript (live-recorded) → repro test FAILS on base → fix committed → repro PASSES on fix → evidence generated → confidence 96% → PR opened.
@@ -68,6 +69,7 @@ Corollaries:
 - **Testimony vs evidence:** the agent's transcript is *testimony* (displayed, never trusted). Environment facts observed/executed by the Runner are *evidence* (trusted). **Verification facts only ever originate from the Runner's own process boundary — never from agent output.** The agent has zero ability to append events. Two visually distinct event classes in the timeline.
 - Hooks (PostToolUse) as optional garnish for high-fidelity FILE_MODIFIED / COMMAND_EXECUTED signals.
 - **Loose agent, strict judge:** no output schema imposed on the agent (we don't trust its self-report anyway). Our event schema stays rigid (it's our spine, the model never writes it). Verification criteria stay rigid (anti-gaming: base failure must match reported symptom; pass on fix; flake re-runs; fix diff must overlap repro path) — otherwise a cornered agent writes a test that trivially fails-then-passes without touching the bug.
+  - **Amended (M2, PR 3a):** the overlap criterion was disproved by its own adversarial fixture and is retired — see [ADR-0008](docs/adr/0008-the-reproduction-is-anchored.md). The reproduction is now anchored (applied over both checkouts, or pinned and hashed) so that both phases provably run the same thing. Diff-coverage is deferred; until it lands there is no fix-diff/repro-path check at all.
 - **Bounded attempts, honest exit:** `ATTEMPT_STARTED {n}` within the run, max 3, each attempt fed the previous verification facts. After 3 → run ends `UNRESOLVED` with full evidence trail + Tier-3-style structured report to the source thread. UNRESOLVED is a first-class dashboard state, not shame.
 - Terminology split for ADRs: *verification* is an active process emitting fact-events (has side effects); the *confidence score* is the projection (pure fold). A "projection with side effects" is a contradiction we never utter.
 
@@ -102,6 +104,7 @@ Corollaries:
 5. SSE over WebSockets
 6. Testimony vs evidence — why the agent can't write facts
 7. Reproduce-first gate and tiered confidence (Tier 3 = no fix)
+8. The reproduction is anchored, not committed (added M2, PR 3a)
 
 ## Open items
 - [ ] Project name ("test-framework-v2" is a placeholder)

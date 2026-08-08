@@ -36,6 +36,12 @@ Enforcement is structural, not behavioral:
 - **Anti-gaming criteria** on the agent-authored reproduction: it must fail
   on base *with output matching the reported symptom*, pass on the fix,
   survive flake re-runs, and the fix diff must overlap the reproduction path.
+
+**Amended by [ADR-0008](0008-the-reproduction-is-anchored.md).** The fourth
+criterion is retired: the reproduction is no longer part of the commit, so
+"the fix diff overlaps the reproduction path" is unsatisfiable by
+construction. It is replaced by anchoring the reproduction so both phases
+provably run the same thing.
   Exit-code-only gating is gameable; symptom-anchored gating is the judge's
   actual job.
 - **Bounded attempts, honest exit.** `ATTEMPT_STARTED {n}`, max 3, each
