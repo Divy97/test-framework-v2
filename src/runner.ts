@@ -32,6 +32,9 @@ export type Job = {
 };
 
 const WORK = '/work';
+/** Matches the `repro` user created in the Dockerfile. */
+const REPRO_UID = 1000;
+const REPRO_GID = 1000;
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -55,6 +58,16 @@ export async function runJob(
   // `ext::sh -c …` are both command execution.
   await execFileAsync('git', ['clone', '--quiet', '--no-local', '--', job.sourcePath, repoPath]);
 
+  // The repro runs as this user, not as the Runner. Root in the Runner's own
+  // namespace can reach the event channel through /proc/1/fd/N whatever the
+  // Runner does with its own descriptors.
+  const runAs = { uid: REPRO_UID, gid: REPRO_GID };
+  await execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, workDir]);
+  // The Runner stays root, so git now sees a tree owned by someone else and
+  // refuses it as "dubious ownership". Scoped to this path, inside a container
+  // built for exactly one run.
+  await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]);
+
   const events = await verify({
     runId: job.runId,
     afterSeq: job.afterSeq,
@@ -64,6 +77,7 @@ export async function runJob(
     repro: job.repro,
     symptomPattern: new RegExp(job.symptomPattern),
     blobRoot,
+    runAs,
     ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
     ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
   });

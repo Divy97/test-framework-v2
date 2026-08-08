@@ -8,6 +8,10 @@ FROM node:22-alpine
 
 RUN apk add --no-cache git
 
+# The repro executes as uid 1000 — the `node` user this image already ships. The
+# Runner stays root so it can still clone and scrub; only the untrusted command
+# drops privileges, which is what puts /proc/1/fd out of its reach.
+
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci

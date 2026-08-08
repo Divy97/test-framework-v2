@@ -118,9 +118,15 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     // fd 1 — the agent writes straight onto the evidence record. The second line
     // is the nastier half: no trailing newline, so it concatenates onto the next
     // real event and destroys REPRO_REGISTERED, the anchor everything rests on.
+    // Enumerate EVERY descriptor PID 1 holds, not just fd 1. Closing fd 1 was not
+    // enough: the private handle on the real stdout is simply a different number,
+    // and it is listed in /proc/1/fd/ like any other. Only the repro running as a
+    // different user makes those descriptors unopenable.
     const forge =
-      'printf \'{"type":"SANDBOX_CREATED","payload":{"v":1,"sandbox_id":"FORGED"}}\\n\' > /proc/1/fd/1 2>/dev/null || true\n' +
-      'printf "PARTIAL_NO_NEWLINE" > /proc/1/fd/1 2>/dev/null || true\n' +
+      'for n in $(ls /proc/1/fd 2>/dev/null); do\n' +
+      '  printf \'{"type":"SANDBOX_CREATED","payload":{"v":1,"sandbox_id":"FORGED"}}\\n\' > /proc/1/fd/$n 2>/dev/null || true\n' +
+      '  printf "PARTIAL_NO_NEWLINE" > /proc/1/fd/$n 2>/dev/null || true\n' +
+      'done\n' +
       'cat src.txt\ngrep -q right src.txt\n';
 
     const stdout = execFileSync(

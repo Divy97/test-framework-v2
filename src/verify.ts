@@ -82,6 +82,16 @@ export type VerifyOptions = {
   timeoutMs?: number;
   /** Output ceiling. Exceeding it aborts the run rather than storing a truncated artifact. */
   maxOutputBytes?: number;
+  /**
+   * Run the repro as this uid/gid instead of the current user.
+   *
+   * The sandbox sets it. A repro running as root in the Runner's own PID
+   * namespace can open any fd the Runner holds through /proc/1/fd/N — including
+   * the event channel — and no amount of fd juggling inside the Runner closes
+   * that, because every fd it owns is reachable there. Dropping privileges does:
+   * another user's /proc/1/fd/N is listable but not openable.
+   */
+  runAs?: { uid: number; gid: number };
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -100,6 +110,7 @@ async function run(
   cwd: string,
   timeoutMs: number,
   maxOutputBytes: number,
+  runAs?: { uid: number; gid: number },
 ): Promise<Execution> {
   const startedAt = Date.now();
   try {
@@ -107,6 +118,7 @@ async function run(
       cwd,
       timeout: timeoutMs,
       maxBuffer: maxOutputBytes,
+      ...(runAs ?? {}),
     });
     return { exitCode: 0, output: stdout, durationMs: Date.now() - startedAt };
   } catch (error) {
@@ -390,7 +402,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
     payload: { v: 1, command: reproCommand, files: registered, applied: [...appliedFiles.keys()].sort() },
   });
 
-  const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes);
+  const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs);
   emit({
     type: 'TEST_RUN',
     payload: {
@@ -426,7 +438,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // Re-runs deliberately share a working tree: they are re-executions of the same
   // fix, not independent trials, and isolating them would hide order-dependent flake.
   for (let repeat = 0; repeat <= flakeRuns; repeat++) {
-    const fix = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes);
+    const fix = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs);
     emit({
       type: 'TEST_RUN',
       payload: {
