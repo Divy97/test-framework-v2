@@ -29,6 +29,27 @@ export type TestRunV1 = {
   exit_code: number;
   stdout_hash: ArtifactRef;
   duration_ms: number;
+  /**
+   * Whether the captured output matched the reported symptom. An observation,
+   * not an interpretation: the engine ran a regex over output it captured
+   * itself, the same class of act as recording an exit code. The fold cannot
+   * re-derive this — the bytes live in the blob store and the fold is pure —
+   * so the observation is recorded and the conclusion drawn from it is not.
+   * Base phase only; meaningless on the fix phase.
+   */
+  symptom_matched?: boolean;
+  /** Flake re-run index. 0 is the first execution of the phase. */
+  repeat?: number;
+};
+
+/**
+ * What the fix changed, observed by the engine. Carries changed paths rather
+ * than a verdict so the fold can compute repro-path overlap purely.
+ */
+export type FixDiffObservedV1 = {
+  v: 1;
+  changed_files: string[];
+  diff_hash: ArtifactRef;
 };
 
 export type PrOpenedV1 = {
@@ -44,6 +65,7 @@ export type EventPayload =
   | { type: 'SANDBOX_CREATED'; payload: SandboxCreatedV1 }
   | { type: 'ATTEMPT_STARTED'; payload: AttemptStartedV1 }
   | { type: 'TEST_RUN'; payload: TestRunV1 }
+  | { type: 'FIX_DIFF_OBSERVED'; payload: FixDiffObservedV1 }
   | { type: 'PR_OPENED'; payload: PrOpenedV1 };
 
 /** One row of the events table: envelope + typed payload. */
