@@ -26,7 +26,16 @@ export type AttemptStartedV1 = {
 export type TestRunV1 = {
   v: 1;
   phase: 'base' | 'fix';
+  /** The commit actually checked out. Without it the record cannot say what produced the result. */
+  commit_sha: string;
+  /**
+   * The real exit status, or -1 when the process died by signal and never
+   * returned one. -1 is not a status any process can exit with, so it can
+   * never be mistaken for one; `signal` carries what actually happened.
+   */
   exit_code: number;
+  /** Set when the process was killed rather than exiting. A crash is not a test failure. */
+  signal?: string;
   stdout_hash: ArtifactRef;
   duration_ms: number;
   /**
@@ -48,6 +57,9 @@ export type TestRunV1 = {
  */
 export type FixDiffObservedV1 = {
   v: 1;
+  /** Resolved commits, not the symbolic refs — a branch name can move after the fact. */
+  base_sha: string;
+  fix_sha: string;
   changed_files: string[];
   diff_hash: ArtifactRef;
 };
