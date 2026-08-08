@@ -6,13 +6,14 @@
 // daemon should report "not verified", never a false green.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import type { RunEvent } from '../src/events.js';
+import { get } from '../src/blobs.js';
+import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { fold } from '../src/fold.js';
-import { cleanupFixtures, clean } from './fixtures/repo.js';
+import { APPLIED_REPRO, cleanupFixtures, clean } from './fixtures/repo.js';
 
 const dockerAvailable = () => {
   try {
@@ -25,6 +26,20 @@ const dockerAvailable = () => {
 
 const IMAGE = 'test-framework-v2-sandbox:test';
 const RUN_ID = '5a1d0c37-9e42-4b16-8f0a-2c7d3e9b1450';
+
+/** A fresh host directory per run: fixture content is identical across tests, so a
+ *  shared store lets a sibling test pre-populate the very refs under assertion. */
+const hostBlobs = () => mkdtempSync(join(tmpdir(), 'engine-hostblobs-'));
+
+const runInSandbox = (repoDir: string, blobs: string, job: object) =>
+  execFileSync(
+    'docker',
+    ['run', '--rm', '-i', '-v', `${repoDir}:/src:ro`, '-v', `${blobs}:/blobs`, IMAGE],
+    { input: JSON.stringify(job), encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
+  );
+
+const parse = (stdout: string) =>
+  stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as RunEvent);
 
 describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => {
   afterEach(cleanupFixtures);
@@ -64,11 +79,7 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     };
 
     // Read-only mount: the sandbox clones out of it and must never write back.
-    const stdout = execFileSync(
-      'docker',
-      ['run', '--rm', '-i', '-v', `${fixture.repo}:/src:ro`, IMAGE],
-      { input: JSON.stringify(job), encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
-    );
+    const stdout = runInSandbox(fixture.repo, hostBlobs(), job);
 
     const events = stdout
       .trim()
@@ -129,24 +140,16 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
       'done\n' +
       'cat src.txt\ngrep -q right src.txt\n';
 
-    const stdout = execFileSync(
-      'docker',
-      ['run', '--rm', '-i', '-v', `${fixture.repo}:/src:ro`, IMAGE],
-      {
-        input: JSON.stringify({
-          runId: RUN_ID,
-          afterSeq: 0,
-          sourcePath: '/src',
-          baseRef: fixture.base,
-          fixRef: fixture.fix,
-          repro: { command: 'sh repro.sh', files: { 'repro.sh': forge } },
-          symptomPattern: 'wrong',
-          flakeRuns: 0,
-        }),
-        encoding: 'utf8',
-        maxBuffer: 32 * 1024 * 1024,
-      },
-    );
+    const stdout = runInSandbox(fixture.repo, hostBlobs(), {
+      runId: RUN_ID,
+      afterSeq: 0,
+      sourcePath: '/src',
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro: { command: 'sh repro.sh', files: { 'repro.sh': forge } },
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+    });
 
     const lines = stdout.trim().split('\n').filter(Boolean);
     // Every line is a real event, in the expected order, and none is corrupted.
@@ -158,5 +161,93 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     ]);
     expect(stdout).not.toContain('FORGED');
     expect(stdout).not.toContain('PARTIAL_NO_NEWLINE');
+  }, 300_000);
+
+  test('every artifact the events reference outlives the container', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    const events = parse(
+      runInSandbox(fixture.repo, blobs, {
+        runId: RUN_ID,
+        afterSeq: 0,
+        sourcePath: '/src',
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        repro: APPLIED_REPRO,
+        symptomPattern: 'wrong',
+        flakeRuns: 0,
+      }),
+    );
+
+    // Every ref anywhere in the stream, not just stdout_hash: the registration's
+    // files, each run's repro_hashes, and the diff all carry them.
+    const refs = [...new Set(JSON.stringify(events).match(/sha256:[0-9a-f]{64}/g) ?? [])];
+    expect(refs.length).toBeGreaterThan(2);
+    for (const ref of refs) {
+      // get() re-verifies the digest, so resolving is an integrity check too.
+      await expect(get(blobs, ref as ArtifactRef)).resolves.toBeInstanceOf(Buffer);
+    }
+
+    // And the bytes are the real ones, so storing empty strings could not pass.
+    const base = events.find(
+      (e) => e.type === 'TEST_RUN' && e.payload.phase === 'base',
+    )!.payload as { stdout_hash: ArtifactRef };
+    expect((await get(blobs, base.stdout_hash)).toString()).toContain('wrong');
+  }, 300_000);
+
+  test('the run refuses rather than writing evidence into the container layer', () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+
+    // No -v for /blobs. mkdir would happily create it in the container layer and
+    // the run would look perfect while every artifact died with --rm.
+    expect(() =>
+      execFileSync('docker', ['run', '--rm', '-i', '-v', `${fixture.repo}:/src:ro`, IMAGE], {
+        input: JSON.stringify({
+          runId: RUN_ID,
+          afterSeq: 0,
+          sourcePath: '/src',
+          baseRef: fixture.base,
+          fixRef: fixture.fix,
+          repro: APPLIED_REPRO,
+          symptomPattern: 'wrong',
+          flakeRuns: 0,
+        }),
+        encoding: 'utf8',
+      }),
+    ).toThrow(/not a mount point/);
+  }, 300_000);
+
+  test('a hook the repro plants is never executed by the Runner', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // git clean never descends into .git, so the hook survives the phase-boundary
+    // scrub and fires on the fix checkout — as ROOT. That defeats the uid-1000
+    // boundary entirely: the blob store, and every /proc/1/fd descriptor with it.
+    const plant =
+      'mkdir -p .git/hooks 2>/dev/null || true\n' +
+      'printf "#!/bin/sh\\ntouch /blobs/OWNED\\n" > .git/hooks/post-checkout 2>/dev/null || true\n' +
+      'chmod +x .git/hooks/post-checkout 2>/dev/null || true\n' +
+      'cat src.txt\ngrep -q right src.txt\n';
+
+    const events = parse(
+      runInSandbox(fixture.repo, blobs, {
+        runId: RUN_ID,
+        afterSeq: 0,
+        sourcePath: '/src',
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        repro: { command: 'sh repro.sh', files: { 'repro.sh': plant } },
+        symptomPattern: 'wrong',
+        flakeRuns: 0,
+      }),
+    );
+
+    expect(events.length).toBeGreaterThan(0);
+    expect(existsSync(join(blobs, 'OWNED'))).toBe(false);
   }, 300_000);
 });

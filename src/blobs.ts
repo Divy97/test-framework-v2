@@ -15,6 +15,12 @@ const digest = (bytes: string | Buffer): ArtifactRef =>
   `${PREFIX}${createHash('sha256').update(bytes).digest('hex')}`;
 
 export function blobPath(root: string, ref: ArtifactRef): string {
+  // The store now lives on the host, so a malformed ref is a path-traversal
+  // attempt rather than a lookup miss. `put` computes its own ref and is safe;
+  // `get` takes whatever a replayed or third-party stream carries.
+  if (!/^sha256:[0-9a-f]{64}$/.test(ref)) {
+    throw new Error(`not a content-addressed reference: ${ref}`);
+  }
   const hex = ref.slice(PREFIX.length);
   // Two levels of fan-out: 256 dirs deep, so no single directory holds every blob.
   return join(root, hex.slice(0, 2), hex.slice(2, 4), hex.slice(4));

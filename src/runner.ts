@@ -9,6 +9,7 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { mkdir } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -32,9 +33,25 @@ export type Job = {
 };
 
 const WORK = '/work';
+/**
+ * Where the evidence lands. A Runner constant, never a Job field: a
+ * caller-supplied path could aim the blob writes at the repo or the read-only
+ * source mount.
+ */
+const BLOBS = '/blobs';
 /** Matches the `repro` user created in the Dockerfile. */
 const REPRO_UID = 1000;
 const REPRO_GID = 1000;
+
+/** A mounted directory sits on a different device from the container's own layer. */
+async function isMountPoint(path: string): Promise<boolean> {
+  try {
+    const [here, root] = await Promise.all([stat(path), stat('/')]);
+    return here.dev !== root.dev;
+  } catch {
+    return false;
+  }
+}
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -45,24 +62,43 @@ async function readStdin(): Promise<string> {
 export async function runJob(
   job: Job,
   workDir = WORK,
+  blobRoot = BLOBS,
   emit: (line: string) => void = (line) => process.stdout.write(line),
 ): Promise<number> {
   const repoPath = `${workDir}/repo`;
-  const blobRoot = `${workDir}/blobs`;
-  await mkdir(blobRoot, { recursive: true });
+  // Git's own state lives outside the worktree. Inside it, the repro owns .git
+  // and plants a post-checkout hook that `git clean` never descends into, which
+  // the Runner then executes as root — so uid 1000 was never the boundary it
+  // looked like. GIT_DIR is passed explicitly so git never consults the `.git`
+  // file left in the worktree either.
+  const gitDir = `${workDir}/gitdir`;
+  const gitEnv = { GIT_DIR: gitDir, GIT_WORK_TREE: repoPath };
+
+  // Refuse rather than silently write into the container layer. Without the
+  // mount the run still produces a complete, plausible event stream whose
+  // artifacts die with --rm — the exact failure this is here to prevent, only
+  // invisible.
+  if (!(await isMountPoint(blobRoot))) {
+    throw new ObservationFailed(
+      `${blobRoot} is not a mount point; the evidence would not survive the container`,
+    );
+  }
 
   // Clone rather than work in the mounted directory. The mount is the host's
   // tree; verifying in place would put host state inside the evidence and let
   // the run write back out through it.
   // `--` so a sourcePath cannot be read as an option: `--upload-pack=…` and
   // `ext::sh -c …` are both command execution.
-  await execFileAsync('git', ['clone', '--quiet', '--no-local', '--', job.sourcePath, repoPath]);
+  await execFileAsync('git', [
+    'clone', '--quiet', '--no-local', `--separate-git-dir=${gitDir}`, '--', job.sourcePath, repoPath,
+  ]);
 
   // The repro runs as this user, not as the Runner. Root in the Runner's own
   // namespace can reach the event channel through /proc/1/fd/N whatever the
   // Runner does with its own descriptors.
   const runAs = { uid: REPRO_UID, gid: REPRO_GID };
-  await execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, workDir]);
+  // The worktree only. Not the blob store, and not the git dir.
+  await execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, repoPath]);
   // The Runner stays root, so git now sees a tree owned by someone else and
   // refuses it as "dubious ownership". Scoped to this path, inside a container
   // built for exactly one run.
@@ -77,6 +113,7 @@ export async function runJob(
     repro: job.repro,
     symptomPattern: new RegExp(job.symptomPattern),
     blobRoot,
+    gitEnv,
     runAs,
     ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
     ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
@@ -107,7 +144,7 @@ if (process.argv[1]?.endsWith('runner.ts') || process.argv[1]?.endsWith('runner.
     // was being cut mid-JSON while the run reported success — silent evidence
     // loss presented as a clean record, which is the worst failure this project
     // has.
-    process.exitCode = await runJob(job, WORK, (line) => writeSync(channel, line));
+    process.exitCode = await runJob(job, WORK, BLOBS, (line) => writeSync(channel, line));
   } catch (error) {
     // A failure to observe is not a verification result. It leaves on stderr so
     // it can never be mistaken for an event on the channel.

@@ -23,6 +23,8 @@ import type { ArtifactRef, RunEvent } from './events.js';
 
 const execFileAsync = promisify(execFile);
 
+type Env = Record<string, string>;
+
 /** Output capture ceiling. Beyond this the engine refuses to record rather than truncate. */
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
@@ -82,6 +84,17 @@ export type VerifyOptions = {
   timeoutMs?: number;
   /** Output ceiling. Exceeding it aborts the run rather than storing a truncated artifact. */
   maxOutputBytes?: number;
+  /**
+   * Extra environment for the engine's own git calls, never for the repro.
+   *
+   * The sandbox uses it to pin GIT_DIR outside the worktree. Git state inside a
+   * tree the repro can write is a root escalation: it plants
+   * `.git/hooks/post-checkout`, which `git clean` never descends into, and the
+   * Runner then executes it as root on the next checkout. `.git/config` is worse
+   * still — `diff.external` and `core.fsmonitor` turn an ordinary `git diff`
+   * into arbitrary execution.
+   */
+  gitEnv?: Record<string, string>;
   /**
    * Run the repro as this uid/gid instead of the current user.
    *
@@ -162,9 +175,17 @@ async function run(
 }
 
 /** Git is infrastructure, not the thing under test: any failure here is a failure to observe. */
-async function git(args: string[], cwd: string): Promise<string> {
+async function git(
+  args: string[],
+  cwd: string,
+  env?: Env,
+): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: MAX_OUTPUT_BYTES });
+    const { stdout } = await execFileAsync('git', args, {
+      cwd,
+      maxBuffer: MAX_OUTPUT_BYTES,
+      ...(env ? { env: { ...process.env, ...env } } : {}),
+    });
     return stdout;
   } catch (error) {
     const failure = error as { stderr?: string; message?: string };
@@ -176,14 +197,14 @@ async function git(args: string[], cwd: string): Promise<string> {
 }
 
 /** Check out a ref and report the commit it actually resolved to. */
-async function checkout(ref: string, cwd: string): Promise<string> {
-  await git(['checkout', '--quiet', ref], cwd);
-  return (await git(['rev-parse', 'HEAD'], cwd)).trim();
+async function checkout(ref: string, cwd: string, env?: Env): Promise<string> {
+  await git(['checkout', '--quiet', ref], cwd, env);
+  return (await git(['rev-parse', 'HEAD'], cwd, env)).trim();
 }
 
 /** Every path committed at a given commit, lowercased — case-insensitive filesystems clobber. */
-async function trackedPaths(sha: string, cwd: string): Promise<Set<string>> {
-  const listing = await git(['ls-tree', '-r', '-z', '--name-only', sha], cwd);
+async function trackedPaths(sha: string, cwd: string, env?: Env): Promise<Set<string>> {
+  const listing = await git(['ls-tree', '-r', '-z', '--name-only', sha], cwd, env);
   return new Set(listing.split('\0').filter(Boolean).map((p) => p.toLowerCase()));
 }
 
@@ -261,6 +282,7 @@ type Resolved = { rel: string; target: string };
 export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   const { runId, repoPath, baseRef, fixRef, repro, blobRoot } = options;
   const reproCommand = repro.command;
+  const gitEnv = options.gitEnv;
   const flakeRuns = options.flakeRuns ?? 2;
   const timeoutMs = options.timeoutMs ?? 120_000;
   const maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
@@ -274,7 +296,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
 
   // Uncommitted work would silently ride along into both phases, so the result
   // would describe neither commit. Refuse rather than verify the wrong tree.
-  const dirty = await git(['status', '--porcelain', '--untracked-files=all'], repoPath);
+  const dirty = await git(['status', '--porcelain', '--untracked-files=all'], repoPath, gitEnv);
   if (dirty.trim()) {
     throw new ObservationFailed(
       `working tree at ${repoPath} is not clean; verification would not describe either commit`,
@@ -311,7 +333,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
     events.push({ ...event, run_id: runId, seq: ++seq, ts: new Date().toISOString() } as RunEvent);
   };
 
-  const baseSha = await checkout(baseRef, repoPath);
+  const baseSha = await checkout(baseRef, repoPath, gitEnv);
 
   // Applied paths must be additive. Writing over a tracked file would put the
   // tree in the "describes neither commit" state refused above — deliberately,
@@ -319,10 +341,10 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // filesystem lets `Tests/Repro.js` clobber a committed `tests/repro.js`.
   // Resolve the fix ref up front: a branch name could move between this check
   // and the checkout that eventually uses it.
-  const fixSha = (await git(['rev-parse', fixRef], repoPath)).trim();
+  const fixSha = (await git(['rev-parse', fixRef], repoPath, gitEnv)).trim();
   const tracked = new Set([
-    ...(await trackedPaths(baseSha, repoPath)),
-    ...(await trackedPaths(fixSha, repoPath)),
+    ...(await trackedPaths(baseSha, repoPath, gitEnv)),
+    ...(await trackedPaths(fixSha, repoPath, gitEnv)),
   ]);
   for (const path of appliedFiles.keys()) {
     if (tracked.has(path.toLowerCase())) {
@@ -429,9 +451,9 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // Ignored files are deliberately spared: they are usually installed
   // dependencies, and removing them would change what is under test far more
   // than it isolates it.
-  await git(['reset', '--hard', '--quiet', baseSha], repoPath);
-  await git(['clean', '--quiet', '-dff'], repoPath);
-  await checkout(fixSha, repoPath);
+  await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
+  await git(['clean', '--quiet', '-dff'], repoPath, gitEnv);
+  await checkout(fixSha, repoPath, gitEnv);
   // The same bytes again — this is the whole point. Whatever the fix commit says
   // the reproduction is, the registered version is what runs.
   await applyRepro();
@@ -460,7 +482,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // overlap check trusts. -z avoids core.quotePath mangling non-ASCII names, and
   // --no-renames keeps the original path visible instead of only the destination.
   const range = `${baseSha}...${fixSha}`;
-  const changed = await git(['diff', '--name-only', '-z', '--no-renames', range], repoPath);
+  const changed = await git(['diff', '--name-only', '-z', '--no-renames', range], repoPath, gitEnv);
   emit({
     type: 'FIX_DIFF_OBSERVED',
     payload: {
@@ -468,7 +490,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
       base_sha: baseSha,
       fix_sha: fixSha,
       changed_files: changed.split('\0').filter(Boolean),
-      diff_hash: await put(blobRoot, await git(['diff', range], repoPath)),
+      diff_hash: await put(blobRoot, await git(['diff', range], repoPath, gitEnv)),
     },
   });
 
@@ -476,8 +498,8 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // this the next attempt on the same repo trips the dirty-tree refusal on our own
   // leftovers — and bounded attempts up to three is a documented feature, not an
   // edge case. No fixture can catch this: each builds a fresh repo.
-  await git(['reset', '--hard', '--quiet', fixSha], repoPath);
-  await git(['clean', '--quiet', '-dff'], repoPath);
+  await git(['reset', '--hard', '--quiet', fixSha], repoPath, gitEnv);
+  await git(['clean', '--quiet', '-dff'], repoPath, gitEnv);
 
   return events;
 }
