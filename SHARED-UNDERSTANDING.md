@@ -84,11 +84,13 @@ Corollaries:
 
 ## v1 scope freeze
 
-**Core:** Slack adapter · GitHub Issues adapter · Docker sandbox · Claude Code runner · Verification engine · GitHub PR creation
+**Core:** Slack adapter · GitHub Issues adapter · CLI adapter · Docker sandbox · Claude Code runner · Verification engine · GitHub PR creation
 **Architecture:** Event bus · Event store · Replay engine
 **UI:** Live execution timeline · Agent transcript · Replay mode · Evidence report · Confidence score
 **Docs:** Architecture diagram · Honest limitations · Recorded 3-minute demo · ADRs (seeds below)
-**Adapters:** exactly two real ones; `TaskAdapter { parse, fetchContext, normalize }` interface documented so Jira/Asana/Linear are 50-line README examples. Intake across N tools is one skill — demonstrate the pattern, not the copies.
+**Adapters:** three real ones; `TaskAdapter { parse, fetchContext, normalize }` interface documented so Jira/Asana/Linear are 50-line README examples. Intake across N tools is one skill — demonstrate the pattern, not the copies.
+
+**Amended (M2 scoping): CLI adapter added to v1.** A terminal entry point — `<cmd> "the bug"` in a repo — emitting the same `RUN_REQUESTED` as Slack and GitHub. Intake is genuinely ~50 lines; the real cost is the **follow mode** the terminal implies. A CLI that fires and returns nothing is worse than no CLI, so it needs a live tail rendering the same event stream the dashboard renders (same SSE feed, terminal output instead of DOM), plus `--detach` for people who'd rather watch the dashboard. Budget the tail, not the parse.
 
 **Future Work (README section, not code):** Jira · Asana · Linear · compare-two-fixes · multi-agent support · cloud runners · multi-tenant inference story.
 

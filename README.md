@@ -78,7 +78,7 @@ The full decision record from the founding design session: [SHARED-UNDERSTANDING
 
 Early — docs-first founding commit. v1 scope is frozen:
 
-**Core:** Slack adapter · GitHub Issues adapter · Docker sandbox · Claude Code runner · Verification engine · GitHub PR creation
+**Core:** Slack adapter · GitHub Issues adapter · CLI adapter (with live terminal tail) · Docker sandbox · Claude Code runner · Verification engine · GitHub PR creation
 **Architecture:** Event store · Replay engine · SSE streaming
 **UI:** Live execution timeline · Agent transcript · Replay mode · Evidence report · Confidence score
 
