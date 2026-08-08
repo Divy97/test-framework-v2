@@ -290,7 +290,15 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     for (const ref of refs) {
       await expect(get(blobs, ref as ArtifactRef)).resolves.toBeInstanceOf(Buffer);
     }
-    expect(existsSync(join(blobs, 'OWNED'))).toBe(false);
+
+    // The repro CAN still create files in the mount — a bind mount ignores the
+    // permissions set inside the container. What it cannot do is get one read as
+    // evidence: every lookup goes through a hash-derived path, and get()
+    // re-verifies the digest. Asserting the file is absent would be asserting
+    // something false.
+    await expect(get(blobs, 'sha256:OWNED' as ArtifactRef)).rejects.toThrow(
+      /not a content-addressed reference/,
+    );
   }, 300_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {
