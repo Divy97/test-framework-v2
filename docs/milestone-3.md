@@ -68,6 +68,14 @@ develop against.
   read back); base64 down the event channel was rejected (unbounded
   attacker-influenced data through the one path that must stay parseable). This
   mount is the local stand-in for the S3 adapter `blobs.ts` already anticipates.
+  Blobs are written to a root-owned staging directory in the container layer and
+  moved across only once the repro has run for the last time: a bind mount does
+  not honour container permissions — Docker Desktop ignores them, and on Linux
+  the host uid is usually 1000, the uid the repro runs as — so an exposed store
+  lets the fix phase delete what the base phase banked while the stream still
+  comes out clean. The mount must also carry a sentinel file: `st_dev` proves a
+  different filesystem, not a durable one, and an anonymous volume passes that
+  test and then dies with `--rm`.
 - **Git state lives outside the worktree — decided in M3.1b.** `chown`ing the
   repo to the repro user handed it `.git`, so it could plant a
   `post-checkout` hook that `git clean` never descends into and the Runner then

@@ -6,7 +6,7 @@
 // daemon should report "not verified", never a false green.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
@@ -29,7 +29,14 @@ const RUN_ID = '5a1d0c37-9e42-4b16-8f0a-2c7d3e9b1450';
 
 /** A fresh host directory per run: fixture content is identical across tests, so a
  *  shared store lets a sibling test pre-populate the very refs under assertion. */
-const hostBlobs = () => mkdtempSync(join(tmpdir(), 'engine-hostblobs-'));
+const stores: string[] = [];
+const hostBlobs = () => {
+  const dir = mkdtempSync(join(tmpdir(), 'engine-hostblobs-'));
+  // The Runner refuses a store it cannot prove pre-existed on the host.
+  writeFileSync(join(dir, '.evidence-store'), '');
+  stores.push(dir);
+  return dir;
+};
 
 const runInSandbox = (repoDir: string, blobs: string, job: object) =>
   execFileSync(
@@ -42,7 +49,10 @@ const parse = (stdout: string) =>
   stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as RunEvent);
 
 describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => {
-  afterEach(cleanupFixtures);
+  afterEach(() => {
+    cleanupFixtures();
+    for (const dir of stores.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
 
   test('a run executes in the container and the host tree is untouched', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
@@ -217,7 +227,70 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
         }),
         encoding: 'utf8',
       }),
-    ).toThrow(/not a mount point/);
+    ).toThrow(/not a host store/);
+  }, 300_000);
+
+  test('an anonymous volume is refused: it dies with --rm like the container layer', () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+
+    // `-v /blobs` is a different device, so a st_dev check waves it through —
+    // and then --rm deletes it. Only proof the host made the directory rules it out.
+    expect(() =>
+      execFileSync(
+        'docker',
+        ['run', '--rm', '-i', '-v', `${fixture.repo}:/src:ro`, '-v', '/blobs', IMAGE],
+        {
+          input: JSON.stringify({
+            runId: RUN_ID,
+            afterSeq: 0,
+            sourcePath: '/src',
+            baseRef: fixture.base,
+            fixRef: fixture.fix,
+            repro: APPLIED_REPRO,
+            symptomPattern: 'wrong',
+            flakeRuns: 0,
+          }),
+          encoding: 'utf8',
+        },
+      ),
+    ).toThrow(/not a host store/);
+  }, 300_000);
+
+  test('the repro cannot destroy artifacts the run has already banked', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // A bind mount does not honour the permissions set inside the container —
+    // Docker Desktop ignores them, and on Linux the host uid is commonly 1000,
+    // exactly what the repro runs as. So the store cannot be exposed while the
+    // repro can still run: the fix phase would delete what the base phase banked
+    // and the stream would still come out clean, complete and exit 0.
+    const wipe =
+      'echo WIPE: $(rm -rf /blobs/* 2>&1)\n' +
+      'echo FORGE: $(touch /blobs/OWNED 2>&1)\n' +
+      'cat src.txt\ngrep -q right src.txt\n';
+
+    const events = parse(
+      runInSandbox(fixture.repo, blobs, {
+        runId: RUN_ID,
+        afterSeq: 0,
+        sourcePath: '/src',
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        repro: { command: 'sh repro.sh', files: { 'repro.sh': wipe } },
+        symptomPattern: 'wrong',
+        flakeRuns: 0,
+      }),
+    );
+
+    const refs = [...new Set(JSON.stringify(events).match(/sha256:[0-9a-f]{64}/g) ?? [])];
+    expect(refs.length).toBeGreaterThan(2);
+    for (const ref of refs) {
+      await expect(get(blobs, ref as ArtifactRef)).resolves.toBeInstanceOf(Buffer);
+    }
+    expect(existsSync(join(blobs, 'OWNED'))).toBe(false);
   }, 300_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {
@@ -225,13 +298,20 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     const fixture = clean();
     const blobs = hostBlobs();
 
-    // git clean never descends into .git, so the hook survives the phase-boundary
-    // scrub and fires on the fix checkout — as ROOT. That defeats the uid-1000
-    // boundary entirely: the blob store, and every /proc/1/fd descriptor with it.
+    // `.git` is a FILE after --separate-git-dir, so `mkdir -p .git/hooks` cannot
+    // plant anything — an earlier version of this test "passed" against a build
+    // with the defense stripped out. An attacker owns the worktree, so it
+    // replaces that file with a real git dir copied from the one it can read,
+    // and plants there. git clean never descends into `.git`, so it survives the
+    // phase-boundary scrub and fires on the fix checkout — as root, unless
+    // GIT_DIR keeps git from ever looking at it.
     const plant =
-      'mkdir -p .git/hooks 2>/dev/null || true\n' +
-      'printf "#!/bin/sh\\ntouch /blobs/OWNED\\n" > .git/hooks/post-checkout 2>/dev/null || true\n' +
+      'rm -f .git\n' +
+      'cp -r /work/gitdir .git 2>/dev/null || true\n' +
+      'printf "#!/bin/sh\\ntouch /work/PWNED\\n" > .git/hooks/post-checkout 2>/dev/null || true\n' +
       'chmod +x .git/hooks/post-checkout 2>/dev/null || true\n' +
+      'echo PLANT: $(ls .git/hooks/post-checkout 2>&1)\n' +
+      'echo MARKER: $(ls /work/PWNED 2>&1)\n' +
       'cat src.txt\ngrep -q right src.txt\n';
 
     const events = parse(
@@ -247,7 +327,21 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
       }),
     );
 
-    expect(events.length).toBeGreaterThan(0);
+    const outputs = await Promise.all(
+      events
+        .filter((e) => e.type === 'TEST_RUN')
+        .map((e) =>
+          get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash).then((b) =>
+            b.toString(),
+          ),
+        ),
+    );
+
+    // The plant must actually land, or the test proves nothing about the defense.
+    expect(outputs[0]).toContain('PLANT: .git/hooks/post-checkout');
+    // And the hook must never have run: /work is root-only, so the marker can
+    // only exist if the Runner executed repro-controlled code as root.
+    for (const output of outputs) expect(output).toContain('MARKER: ls:');
     expect(existsSync(join(blobs, 'OWNED'))).toBe(false);
   }, 300_000);
 });

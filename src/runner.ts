@@ -9,8 +9,7 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
-import { mkdir } from 'node:fs/promises';
+import { chmod, mkdir, stat } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ObservationFailed, verify, type ReproSpec } from './verify.js';
@@ -43,11 +42,22 @@ const BLOBS = '/blobs';
 const REPRO_UID = 1000;
 const REPRO_GID = 1000;
 
-/** A mounted directory sits on a different device from the container's own layer. */
-async function isMountPoint(path: string): Promise<boolean> {
+/**
+ * Proof the store outlives the container — which `st_dev` alone cannot give.
+ *
+ * A different device only means "a different filesystem": an anonymous volume
+ * (`-v /blobs`) passes that test and is then deleted by `--rm`, admitting the
+ * exact silent-loss case the check exists to stop. So the caller must have
+ * created the directory on the host and left a sentinel in it.
+ */
+const SENTINEL = '.evidence-store';
+
+async function hostStoreIsMounted(path: string): Promise<boolean> {
   try {
     const [here, root] = await Promise.all([stat(path), stat('/')]);
-    return here.dev !== root.dev;
+    if (here.dev === root.dev) return false;
+    await stat(`${path}/${SENTINEL}`);
+    return true;
   } catch {
     return false;
   }
@@ -78,11 +88,22 @@ export async function runJob(
   // mount the run still produces a complete, plausible event stream whose
   // artifacts die with --rm — the exact failure this is here to prevent, only
   // invisible.
-  if (!(await isMountPoint(blobRoot))) {
+  if (!(await hostStoreIsMounted(blobRoot))) {
     throw new ObservationFailed(
-      `${blobRoot} is not a mount point; the evidence would not survive the container`,
+      `${blobRoot} is not a host store (mount it and leave a ${SENTINEL} file); ` +
+        'the evidence would not survive the container',
     );
   }
+
+  // Blobs are written here first, in the container layer, root-owned 0700.
+  // /blobs is a bind mount, and a bind mount does not honour those permissions —
+  // Docker Desktop ignores them outright, and on Linux the host uid is commonly
+  // 1000, the very uid the repro runs as. Left there during the run, the repro
+  // could delete artifacts the base phase had already banked and the stream
+  // would still come out clean and complete.
+  const staging = `${workDir}/staging`;
+  await mkdir(staging, { recursive: true });
+  await chmod(staging, 0o700);
 
   // Clone rather than work in the mounted directory. The mount is the host's
   // tree; verifying in place would put host state inside the evidence and let
@@ -112,12 +133,19 @@ export async function runJob(
     fixRef: job.fixRef,
     repro: job.repro,
     symptomPattern: new RegExp(job.symptomPattern),
-    blobRoot,
+    blobRoot: staging,
     gitEnv,
     runAs,
     ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
     ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
   });
+
+  // The repro has run for the last time, so the evidence can cross into the
+  // shared mount now. Ownership follows the host directory, or a non-root host
+  // user cannot clean up what root wrote.
+  const owner = await stat(blobRoot);
+  await execFileAsync('sh', ['-c', `cp -a ${staging}/. ${blobRoot}/`]);
+  await execFileAsync('chown', ['-R', `${owner.uid}:${owner.gid}`, blobRoot]);
 
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
