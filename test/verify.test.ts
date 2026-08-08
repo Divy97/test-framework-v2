@@ -617,6 +617,13 @@ describe('an abort keeps what was already observed', () => {
       'VERIFICATION_ABORTED',
     ]);
     expect(abortOn(error.observed).phase).toBe('diff');
+
+    // And it is still a reproduction. This is the stream the engine really emits
+    // when the diff cannot be computed — the phase is set to `diff` BEFORE the
+    // diff runs, so FIX_DIFF_OBSERVED never arrives. Requiring that event as the
+    // sole completion witness would throw away a genuine Tier 1 because git could
+    // not describe two unrelated histories.
+    expect(conclude(error.observed).reproduced).toBe(true);
   });
 
   // Root ignores the permission bits the fixture relies on.

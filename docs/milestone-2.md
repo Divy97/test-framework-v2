@@ -89,8 +89,17 @@ emitted after the flake loop and nowhere else, so its presence in an attempt is
 proof that attempt's fix series ran to completion. It needs no faith in event
 ordering, and it subsumes the abort case — an attempt that aborted in `base` or
 `fix` never reached the diff either. The abort check is kept beside it as
-defence in depth. `diff` and `cleanup` aborts are not disqualifying on their own,
-because by then the witness has either been emitted or it has not.
+defence in depth.
+
+An abort at phase `diff` or `cleanup` **counts as that witness**. The engine's
+phase only advances past `fix` once the flake loop has closed, so reaching
+either one is the same proof from the same producer. Requiring the event alone
+was a false negative with teeth: the phase is set to `diff` *before* the diff is
+computed, so a diff-phase abort can never carry it — and a genuine Tier 1, red
+base and every fix run green, was discarded because git could not describe two
+unrelated histories. The test that claimed to cover this folded a stream
+containing the witness, which the engine cannot produce for a diff abort, so it
+passed for the wrong reason.
 
 The same cross-attempt bug lived in the registration: one `REPRO_REGISTERED`
 slot meant every attempt's runs were judged against whichever registration came

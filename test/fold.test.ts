@@ -136,6 +136,55 @@ describe('fold', () => {
           repro_hashes: {},
         },
       },
+      // The completion witness, so this reaches the guard under test instead of
+      // being rejected earlier for a truncated series and passing for the wrong
+      // reason.
+      {
+        run_id: 'r',
+        seq: 5,
+        ts: 'T',
+        type: 'FIX_DIFF_OBSERVED',
+        payload: { v: 1, base_sha: 'a', fix_sha: 'b', changed_files: [], diff_hash: 'sha256:cc' },
+      },
+    ];
+    expect(fold(events).reproduced).toBe(false);
+  });
+
+  it('refuses an attempt whose series is vouched for but ran no fix at all', () => {
+    // Witness present, zero fix runs. `.every()` over nothing is vacuously true,
+    // so without the length guard this reads as "the fix passed every time".
+    const events: RunEvent[] = [
+      { run_id: 'r', seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 2,
+        ts: 'T',
+        type: 'REPRO_REGISTERED',
+        payload: { v: 1, command: 'x', files: { f: 'sha256:aa' }, applied: ['f'] },
+      },
+      {
+        run_id: 'r',
+        seq: 3,
+        ts: 'T',
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'base',
+          commit_sha: 'a',
+          exit_code: 1,
+          stdout_hash: 'sha256:aa',
+          duration_ms: 1,
+          symptom_matched: true,
+          repro_hashes: { f: 'sha256:aa' },
+        },
+      },
+      {
+        run_id: 'r',
+        seq: 4,
+        ts: 'T',
+        type: 'FIX_DIFF_OBSERVED',
+        payload: { v: 1, base_sha: 'a', fix_sha: 'b', changed_files: [], diff_hash: 'sha256:cc' },
+      },
     ];
     expect(fold(events).reproduced).toBe(false);
   });
@@ -188,6 +237,7 @@ describe('fold', () => {
       demoRunEvents[3]!, // attempt 1: base fails
       { ...demoRunEvents[4]!, seq: 5, type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
       { ...demoRunEvents[4]!, seq: 6 }, // attempt 2: fix passes, but its base never ran
+      { ...demoRunEvents[6]!, seq: 7 }, // and its series is vouched for
     ];
     expect(fold(events).reproduced).toBe(false);
   });
@@ -369,9 +419,28 @@ describe('an attempt that could not be observed', () => {
     expect(state.reproduced).toBe(true);
   });
 
-  it('does not revoke on a cleanup or diff abort — every run had finished', () => {
+  it('attaches the completion witness to the attempt that earned it', () => {
+    // Attempt 1 runs red -> green but never reaches its diff; attempt 2 emits one.
+    // Nothing may carry attempt 2's proof back to attempt 1.
+    const state = fold([
+      ...demoRunEvents.slice(0, 6), // attempt 1, cut short before the witness
+      { run_id: DEMO_RUN_ID, seq: 7, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      { ...demoRunEvents[6]!, seq: 8 }, // FIX_DIFF_OBSERVED, now inside attempt 2
+    ]);
+    expect(state.completedAttempts).toEqual([2]);
+    expect(state.reproduced).toBe(false);
+  });
+
+  it('treats a diff or cleanup abort as the completion witness itself', () => {
+    // Deliberately WITHOUT FIX_DIFF_OBSERVED, because that is the stream the
+    // engine really emits here: the phase advances to `diff` before the diff is
+    // computed, so a diff-phase abort never carries the event. Reaching either
+    // phase already proves the flake loop closed, which is the same evidence.
+    // Folding a witness-bearing stream would assert nothing about that.
     for (const phase of ['diff', 'cleanup'] as const) {
-      expect(fold([...demoRunEvents.slice(0, 7), aborted(phase, 8)]).reproduced).toBe(true);
+      const state = fold([...demoRunEvents.slice(0, 6), aborted(phase, 7)]);
+      expect(state.completedAttempts).toEqual([1]);
+      expect(state.reproduced).toBe(true);
     }
   });
 });

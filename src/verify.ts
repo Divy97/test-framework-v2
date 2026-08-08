@@ -345,7 +345,10 @@ async function observe(
   const { runId, repoPath, baseRef, fixRef, repro, blobRoot } = options;
   const reproCommand = repro.command;
   const gitEnv = options.gitEnv;
-  const flakeRuns = options.flakeRuns ?? 2;
+  // Clamped, because it arrives over the wire from a Job. A negative value makes
+  // the loop below run zero times, so the engine would emit the completion
+  // witness over a fix phase that never executed.
+  const flakeRuns = Math.max(0, options.flakeRuns ?? 2);
   const timeoutMs = options.timeoutMs ?? 120_000;
   const maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
 

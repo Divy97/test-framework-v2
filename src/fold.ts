@@ -231,10 +231,29 @@ export function apply(state: RunState, event: RunEvent): RunState {
           reason: event.payload.reason,
         },
       ];
+      // An abort in `diff` or `cleanup` witnesses completion just as
+      // FIX_DIFF_OBSERVED does. The engine's phase only advances past `fix` once
+      // the flake loop has closed, so reaching either one proves every re-run was
+      // recorded — same producer, same strength of evidence.
+      //
+      // Without this the witness is unobtainable exactly when the diff is what
+      // failed: the phase is set to `diff` *before* the diff is computed, so a
+      // diff-phase abort always lacks FIX_DIFF_OBSERVED. A genuine Tier 1
+      // reproduction — red base, every fix run green, all observed — would be
+      // thrown away because git could not describe two unrelated histories.
+      const completed =
+        event.payload.phase === 'diff' || event.payload.phase === 'cleanup'
+          ? [...state.completedAttempts, state.currentAttempt]
+          : state.completedAttempts;
       // Recomputed here, not only on TEST_RUN: the abort arrives *after* the runs
       // it truncates, so leaving `reproduced` alone would let a verdict earned by
       // an incomplete series stand.
-      return { ...next, aborts, reproduced: isReproduced(state.testRuns, state.registrations, aborts, state.completedAttempts) };
+      return {
+        ...next,
+        aborts,
+        completedAttempts: completed,
+        reproduced: isReproduced(state.testRuns, state.registrations, aborts, completed),
+      };
     }
     case 'RUN_ENDED':
       return {
@@ -303,9 +322,9 @@ function isReproduced(
   // judgement the flake-survival criterion. An incomplete observation is not a
   // reproduction.
   //
-  // `diff` and `cleanup` aborts are not disqualifying on their own: by then the
-  // completion witness has either been emitted or it has not, and the check below
-  // decides on that rather than on where the abort says it happened.
+  // `diff` and `cleanup` aborts are not disqualifying — they are the opposite.
+  // Reaching either phase proves the flake loop closed, so they COUNT as the
+  // completion witness (see the VERIFICATION_ABORTED case).
   const truncated = new Set(
     aborts.filter((a) => a.phase === 'base' || a.phase === 'fix').map((a) => a.attempt),
   );
@@ -350,7 +369,13 @@ function isReproduced(
     if (base.exit_code === 0 || base.symptom_matched !== true) return false;
     if (!intact(base, repro)) return false;
     const fixes = testRuns.filter((r) => r.phase === 'fix' && r.attempt === base.attempt);
-    return fixes.length > 0 && fixes.every((r) => r.exit_code === 0 && intact(r, repro));
+    // `signal` on the fix side for the same reason it is checked on the base: a
+    // process killed by a signal records exit_code -1, and nothing else here
+    // would notice a fix run that died rather than passed.
+    return (
+      fixes.length > 0 &&
+      fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
+    );
   });
 }
 

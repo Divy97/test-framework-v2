@@ -189,10 +189,12 @@ export async function runJob(
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });
   } catch (error) {
-    // `verify()` always attaches at least its own VERIFICATION_ABORTED, so an
-    // ObservationFailed here always carries something worth emitting. The setup
-    // failures above are thrown before this try and leave on stderr instead.
-    if (!(error instanceof ObservationFailed)) throw error;
+    // `verify()` always attaches at least its own VERIFICATION_ABORTED, so today
+    // the length check cannot fire. It is kept because the whole partial/silent
+    // split rests on setup failures being thrown ABOVE this try: move one inside
+    // and the run would emit an empty stream with exit 2, telling a caller to
+    // fold nothing — and `fold()` throws on an empty stream.
+    if (!(error instanceof ObservationFailed) || error.observed.length === 0) throw error;
     events = error.observed;
     exitCode = EXIT.partial;
   }
