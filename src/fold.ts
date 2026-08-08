@@ -16,6 +16,13 @@ export type TestRunRecord = {
   duration_ms: number;
   symptom_matched?: boolean;
   repeat?: number;
+  repro_hashes?: Record<string, ArtifactRef>;
+};
+
+export type RegisteredRepro = {
+  command: string;
+  files: Record<string, ArtifactRef>;
+  applied: string[];
 };
 
 export type RunState = {
@@ -25,9 +32,11 @@ export type RunState = {
   threadRef: string | null;
   currentAttempt: number; // 0 until the first ATTEMPT_STARTED
   testRuns: TestRunRecord[];
-  /** Interpretation: some attempt saw base fail (exit_code != 0) then fix pass (exit_code == 0). */
+  /** The reproduction's identity, fixed before either phase ran. */
+  registeredRepro: RegisteredRepro | null;
+  /** Interpretation: one attempt ran the same reproduction red on base, then green on the fix. */
   reproduced: boolean;
-  /** What the fix touched. The diff-overlap check reads this; the engine never judges it. */
+  /** What the fix touched. Recorded for the confidence projection; the engine never judges it. */
   fixDiff: { changed_files: string[]; diff_hash: ArtifactRef } | null;
   pr: { repo: string; pr_number: number; head_sha: string } | null;
   artifactHashes: ArtifactRef[];
@@ -41,6 +50,7 @@ const initialState = (runId: string): RunState => ({
   threadRef: null,
   currentAttempt: 0,
   testRuns: [],
+  registeredRepro: null,
   reproduced: false,
   fixDiff: null,
   pr: null,
@@ -66,6 +76,15 @@ export function apply(state: RunState, event: RunEvent): RunState {
         source: event.payload.source,
         threadRef: event.payload.thread_ref,
       };
+    case 'REPRO_REGISTERED':
+      return {
+        ...next,
+        registeredRepro: {
+          command: event.payload.command,
+          files: event.payload.files,
+          applied: event.payload.applied,
+        },
+      };
     case 'SANDBOX_CREATED':
       return { ...next, status: 'sandbox_ready' };
     case 'ATTEMPT_STARTED':
@@ -83,12 +102,13 @@ export function apply(state: RunState, event: RunEvent): RunState {
           duration_ms: event.payload.duration_ms,
           symptom_matched: event.payload.symptom_matched,
           repeat: event.payload.repeat,
+          repro_hashes: event.payload.repro_hashes,
         },
       ];
       return {
         ...next,
         testRuns,
-        reproduced: isReproduced(testRuns),
+        reproduced: isReproduced(testRuns, state.registeredRepro),
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
     }
@@ -133,7 +153,18 @@ export function apply(state: RunState, event: RunEvent): RunState {
  * costs an info-request (ADR-0007's Tier 3, which the design already treats as a
  * real deliverable); a false positive puts a fabricated verdict on a PR.
  */
-function isReproduced(testRuns: TestRunRecord[]): boolean {
+function isReproduced(testRuns: TestRunRecord[], repro: RegisteredRepro | null): boolean {
+  // Red then green is only evidence if the same thing ran both times. Without a
+  // registered reproduction there is nothing to compare against, and if any run's
+  // repro hashes drifted from the registration, two different tests were run —
+  // which is not weak evidence, it is none.
+  // An empty registration is not an anchor: `.every()` over no files is vacuously
+  // true, so this would degenerate into "repro_hashes was present".
+  if (!repro || Object.keys(repro.files).length === 0) return false;
+  const intact = (run: TestRunRecord) =>
+    run.repro_hashes !== undefined &&
+    Object.entries(repro.files).every(([path, hash]) => run.repro_hashes![path] === hash);
+
   return testRuns.some((base) => {
     // attempt 0 means no ATTEMPT_STARTED was ever seen, so "within one attempt"
     // is unenforceable and runs from unrelated attempts could be paired.
@@ -144,8 +175,9 @@ function isReproduced(testRuns: TestRunRecord[]): boolean {
     // string would be credited as a reproduction.
     if (base.signal) return false;
     if (base.exit_code === 0 || base.symptom_matched !== true) return false;
+    if (!intact(base)) return false;
     const fixes = testRuns.filter((r) => r.phase === 'fix' && r.attempt === base.attempt);
-    return fixes.length > 0 && fixes.every((r) => r.exit_code === 0);
+    return fixes.length > 0 && fixes.every((r) => r.exit_code === 0 && intact(r));
   });
 }
 

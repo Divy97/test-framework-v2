@@ -45,8 +45,8 @@ Additive, so payloads stay `v: 1`:
 | Event | Change | Why |
 |---|---|---|
 | `TEST_RUN` | add `symptom_matched?: boolean`, `repeat?: number` | anti-gaming symptom check; flake re-run index |
-| `REPRO_REGISTERED` | new — `{ path, content_hash }` | anchors the diff-overlap check |
-| `FIX_DIFF_OBSERVED` | new — `{ changed_files[], diff_hash }` | lets the fold compute overlap purely |
+| `REPRO_REGISTERED` | new — `{ command, files, applied }` | anchors the reproduction so both phases provably run the same thing ([ADR-0008](adr/0008-the-reproduction-is-anchored.md)) |
+| `FIX_DIFF_OBSERVED` | new — `{ base_sha, fix_sha, changed_files[], diff_hash }` | recorded for the confidence projection |
 | `RUN_ENDED` | new — `{ reason }` | `pr_opened` \| `not_reproduced` \| `attempts_exhausted` \| `error` |
 
 `RUN_ENDED` closes the terminal-state gap: `RunStatus` gains `unresolved`, and
@@ -60,8 +60,12 @@ contributes evidence the fold reads:
 - **Symptom match** — base failure output must match the reported symptom. A
   test that fails for an unrelated reason is not a reproduction.
 - **Flake survival** — the fix phase must pass every re-run, not just once.
-- **Diff overlap** — the fix diff must touch the path the reproduction
-  exercises. A fix that changes nothing relevant did not fix the bug.
+- ~~**Diff overlap** — the fix diff must touch the path the reproduction
+  exercises.~~ **Retired (PR 3a).** Its own adversarial fixture disproved it: a
+  fix that weakens the test *and* makes a cosmetic source edit satisfies filename
+  overlap exactly as a genuine fix does. Replaced by anchoring the reproduction
+  ([ADR-0008](adr/0008-the-reproduction-is-anchored.md)); real diff-coverage needs
+  language-specific instrumentation and is deferred.
 
 Without these, a cornered agent writes a test that trivially fails then passes
 without ever touching the defect, and the tier means nothing.
@@ -93,8 +97,10 @@ event schema changes when it does.
 
 1. **Engine core** — `verify()`, the four phases, the three checks, blob store.
 2. **Fixtures + engine tests** — the five cases above.
-3. **Vocabulary + projections** — new events, `unresolved` status, tier and
-   confidence as pure projections over the log.
+3. **Vocabulary + projections**, split after the PR 3 design review:
+   - **3a** — the reproduction is anchored, not committed (ADR-0008).
+   - **3b** — `RUN_ENDED`, `VERIFICATION_ABORTED`, the `unresolved` status.
+   - **3c** — tier and confidence as pure projections.
 
 ## Not in this milestone
 

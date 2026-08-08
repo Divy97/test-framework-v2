@@ -22,6 +22,7 @@ describe('fold', () => {
           duration_ms: 4312,
           symptom_matched: true,
           repeat: 0,
+          repro_hashes: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
         },
         {
           attempt: 1,
@@ -33,8 +34,14 @@ describe('fold', () => {
           duration_ms: 3987,
           symptom_matched: undefined,
           repeat: 0,
+          repro_hashes: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
         },
       ],
+      registeredRepro: {
+        command: 'npm test -- checkout-discount',
+        files: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
+        applied: ['tests/checkout-discount.test.ts'],
+      },
       reproduced: true,
       fixDiff: null, // the demo run predates FIX_DIFF_OBSERVED
       pr: {
@@ -47,7 +54,7 @@ describe('fold', () => {
         'sha256:9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b',
         'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
       ],
-      lastSeq: 6,
+      lastSeq: 7,
     });
   });
 
@@ -56,6 +63,7 @@ describe('fold', () => {
       { status: 'requested', source: 'slack', reproduced: false },
       { status: 'sandbox_ready', reproduced: false },
       { status: 'attempting', currentAttempt: 1, reproduced: false },
+      { status: 'attempting', reproduced: false }, // repro registered — still nothing proven
       { status: 'attempting', reproduced: false }, // base failed — nothing proven yet
       { status: 'attempting', reproduced: true }, // fix passed — red→green
       { status: 'pr_opened', reproduced: true },
@@ -64,6 +72,53 @@ describe('fold', () => {
       expect(fold(demoRunEvents.slice(0, i + 1))).toMatchObject(partial);
       expect(fold(demoRunEvents.slice(0, i + 1)).lastSeq).toBe(i + 1);
     });
+  });
+
+  it('refuses a reproduction registered against no files at all', () => {
+    // `.every()` over an empty set is vacuously true, so an empty registration
+    // would degenerate into "repro_hashes was present" and credit anything.
+    const events: RunEvent[] = [
+      { run_id: 'r', seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 2,
+        ts: 'T',
+        type: 'REPRO_REGISTERED',
+        payload: { v: 1, command: 'x', files: {}, applied: [] },
+      },
+      {
+        run_id: 'r',
+        seq: 3,
+        ts: 'T',
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'base',
+          commit_sha: 'a',
+          exit_code: 1,
+          stdout_hash: 'sha256:aa',
+          duration_ms: 1,
+          symptom_matched: true,
+          repro_hashes: {},
+        },
+      },
+      {
+        run_id: 'r',
+        seq: 4,
+        ts: 'T',
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'fix',
+          commit_sha: 'b',
+          exit_code: 0,
+          stdout_hash: 'sha256:bb',
+          duration_ms: 1,
+          repro_hashes: {},
+        },
+      },
+    ];
+    expect(fold(events).reproduced).toBe(false);
   });
 
   it('is deterministic: same events, same state', () => {

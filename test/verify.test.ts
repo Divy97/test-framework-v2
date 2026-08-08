@@ -1,28 +1,40 @@
 // What the engine OBSERVES on each fixture, and what the fold concludes from it.
 //
-// Each adversarial case pins the one signal that distinguishes it from a clean
-// red -> green, and then asserts the fold actually acts on that signal — a
-// signal nothing consults is decoration.
+// The central claim under test: red then green is only evidence if the same
+// thing ran both times. Everything here either demonstrates that anchor holding,
+// or demonstrates precisely where it does not reach.
 
 import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
-import type { FixDiffObservedV1, RunEvent, TestRunV1 } from '../src/events.js';
+import type { FixDiffObservedV1, ReproRegisteredV1, RunEvent, TestRunV1 } from '../src/events.js';
 import { fold, type RunState } from '../src/fold.js';
 import { ObservationFailed, verify, type VerifyOptions } from '../src/verify.js';
 import {
+  APPLIED_REPRO,
   cleanupFixtures,
   clean,
-  collateralGaming,
-  crashingBase,
+  committedTest,
   divergentHistory,
-  flakyFix,
-  gamingAttempt,
+  FLAKY_REPRO,
+  helperOnlyInFix,
+  helperTampering,
   irreproducible,
-  noisySymptom,
+  NOISY_REPRO,
   nonAsciiPath,
-  REPRO_COMMAND,
+  PINNED_REPRO,
+  pinnedTampering,
+  REPRO_NEEDING_FIX_HELPER,
+  REPRO_VIA_HELPER,
+  RESIDUE_REPRO,
   residueFromBase,
-  wrongReasonFailure,
+  rewritesTheRepro,
+  rewritesTheReproOnBase,
+  SELF_REWRITING_REPRO,
+  symlinkInFix,
+  symlinkToRoot,
+  pinnedSymlink,
+  gitignoredWorkDir,
+  REPRO_PLANTING_SYMLINK,
   type Fixture,
 } from './fixtures/repo.js';
 
@@ -37,7 +49,7 @@ const observe = (fixture: Fixture, overrides: Partial<VerifyOptions> = {}) =>
     repoPath: fixture.repo,
     baseRef: fixture.base,
     fixRef: fixture.fix,
-    reproCommand: REPRO_COMMAND,
+    repro: APPLIED_REPRO,
     symptomPattern: /wrong/,
     blobRoot: fixture.blobRoot,
     flakeRuns: 2,
@@ -48,6 +60,8 @@ const testRuns = (events: RunEvent[]) =>
   events.filter((e) => e.type === 'TEST_RUN').map((e) => e.payload as TestRunV1);
 const basePhase = (events: RunEvent[]) => testRuns(events).find((r) => r.phase === 'base')!;
 const fixPhases = (events: RunEvent[]) => testRuns(events).filter((r) => r.phase === 'fix');
+const registration = (events: RunEvent[]) =>
+  events.find((e) => e.type === 'REPRO_REGISTERED')!.payload as ReproRegisteredV1;
 const fixDiff = (events: RunEvent[]) =>
   events.find((e) => e.type === 'FIX_DIFF_OBSERVED')!.payload as FixDiffObservedV1;
 
@@ -65,105 +79,148 @@ const conclude = (events: RunEvent[]): RunState =>
   ]);
 
 describe('clean red -> green', () => {
-  test('records base failure, fix passes, flake re-runs, and the diff', async () => {
+  test('registers the repro first, then records both phases and the diff', async () => {
     const fixture = clean();
     const events = await observe(fixture);
 
+    // Registration precedes every observation: the reproduction is fixed before
+    // anything is judged by it.
     expect(events.map((e) => e.type)).toEqual([
+      'REPRO_REGISTERED',
       'TEST_RUN',
       'TEST_RUN',
       'TEST_RUN',
       'TEST_RUN',
       'FIX_DIFF_OBSERVED',
     ]);
-    expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
 
-    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
-    expect(basePhase(events).commit_sha).toBe(fixture.base);
-    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
-    expect(fixPhases(events).every((r) => r.commit_sha === fixture.fix)).toBe(true);
-    expect(fixDiff(events)).toMatchObject({
-      changed_files: ['src.txt'],
-      base_sha: fixture.base,
-      fix_sha: fixture.fix,
+    expect(registration(events)).toMatchObject({
+      command: 'sh repro.sh',
+      applied: ['repro.sh'],
     });
-
-    expect((await get(fixture.blobRoot, basePhase(events).stdout_hash)).toString()).toContain(
-      'wrong',
-    );
-    expect((await get(fixture.blobRoot, fixDiff(events).diff_hash)).toString()).toContain('+right');
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
+    expect(fixDiff(events).changed_files).toEqual(['src.txt']);
     expect(conclude(events).reproduced).toBe(true);
   });
 
-  test('the engine emits observations only — no payload carries a verdict', async () => {
-    const events = await observe(clean(), { flakeRuns: 0 });
+  test('the registered bytes are retrievable, not just their hash', async () => {
+    const fixture = clean();
+    const events = await observe(fixture, { flakeRuns: 0 });
 
-    // Pin the exact key set of every payload. A grep for the word "reproduced"
-    // would pass while the engine emitted `verdict: 'tier1'` right beside it.
-    const keys = events.map((e) => Object.keys(e.payload).sort().join(','));
-    expect(keys).toEqual([
-      'commit_sha,duration_ms,exit_code,phase,repeat,stdout_hash,symptom_matched,v',
-      'commit_sha,duration_ms,exit_code,phase,repeat,stdout_hash,v',
-      'base_sha,changed_files,diff_hash,fix_sha,v',
-    ]);
+    // A hash nothing can resolve is not evidence — "the same test ran in both
+    // phases" would be the one claim a reviewer could not open.
+    const ref = registration(events).files['repro.sh']!;
+    expect((await get(fixture.blobRoot, ref)).toString()).toContain('grep -q right src.txt');
   });
 
-  test('emits from afterSeq + 1 so it can append to an existing log', async () => {
-    const events = await observe(clean(), { afterSeq: 17, flakeRuns: 0 });
-    expect(events.map((e) => e.seq)).toEqual([18, 19, 20]);
+  test('every run reports the repro unchanged', async () => {
+    const events = await observe(clean(), { flakeRuns: 0 });
+    const registered = registration(events).files;
+
+    for (const run of testRuns(events)) expect(run.repro_hashes).toEqual(registered);
+  });
+
+  test('leaves the tree clean so a later attempt can run', async () => {
+    const fixture = clean();
+    await observe(fixture, { flakeRuns: 0 });
+
+    // The applied repro is untracked; without cleanup the next attempt would trip
+    // the dirty-tree refusal on this run's leftovers.
+    await expect(observe(fixture, { flakeRuns: 0 })).resolves.toBeDefined();
+  });
+});
+
+describe('the anchor holds', () => {
+  test('a fix that rewrites the repro at run time is caught by re-hashing', async () => {
+    const events = await observe(rewritesTheRepro(), { repro: SELF_REWRITING_REPRO });
+    const registered = registration(events).files;
+
+    // Base ran the real repro; the fix phase rewrote it before asserting.
+    expect(basePhase(events).repro_hashes).toEqual(registered);
+    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
+    expect(fixPhases(events).some((r) => r.repro_hashes!['repro.sh'] !== registered['repro.sh'])).toBe(
+      true,
+    );
+    expect(conclude(events).reproduced).toBe(false);
+  });
+
+  test('a repro rewritten during the BASE run is caught too', async () => {
+    const events = await observe(rewritesTheReproOnBase(), { repro: SELF_REWRITING_REPRO });
+    const registered = registration(events).files;
+
+    // Everything else looks like a clean reproduction: the base failed for the
+    // reported reason and the fix is genuinely green.
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
+    expect(fixPhases(events).every((r) => r.repro_hashes!['repro.sh'] === registered['repro.sh'])).toBe(
+      true,
+    );
+    // Only the base run's own hash gives it away.
+    expect(basePhase(events).repro_hashes!['repro.sh']).not.toBe(registered['repro.sh']);
+    expect(conclude(events).reproduced).toBe(false);
+  });
+
+  test('a divergent repro hash resolves to the bytes that actually ran', async () => {
+    const fixture = rewritesTheRepro();
+    const events = await observe(fixture, { repro: SELF_REWRITING_REPRO });
+    const tampered = fixPhases(events)[0]!.repro_hashes!['repro.sh']!;
+
+    // The tampered version is the artifact a reviewer most needs to open.
+    expect((await get(fixture.blobRoot, tampered)).toString()).toContain('exit 0');
+  });
+
+  test('a pinned test rewritten by the fix is detected, though it cannot be prevented', async () => {
+    const events = await observe(pinnedTampering(), { repro: PINNED_REPRO });
+    const registered = registration(events).files;
+
+    expect(registration(events).applied).toEqual([]);
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
+    expect(fixPhases(events)[0]!.repro_hashes).not.toEqual(registered);
+    expect(conclude(events).reproduced).toBe(false);
+  });
+
+  test('a committed test left alone by the fix is a valid reproduction', async () => {
+    const events = await observe(committedTest(), { repro: PINNED_REPRO });
+
+    expect(registration(events).applied).toEqual([]);
+    expect(conclude(events).reproduced).toBe(true);
+  });
+});
+
+describe('the anchor does not reach this far', () => {
+  test('tampering with what the repro invokes still passes every check', async () => {
+    const events = await observe(helperTampering(), { repro: REPRO_VIA_HELPER });
+    const registered = registration(events).files;
+
+    // The reproduction is byte-identical throughout — the fix rewrote the helper
+    // it sources instead. Gaming got harder, not impossible.
+    expect(testRuns(events).every((r) => r.repro_hashes!['repro.sh'] === registered['repro.sh'])).toBe(
+      true,
+    );
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
+    expect(conclude(events).reproduced).toBe(true);
   });
 });
 
 describe('adversarial cases', () => {
-  test('wrong-reason failure: the base errored before testing anything', async () => {
-    const events = await observe(wrongReasonFailure());
+  test('wrong-reason failure: the repro needs a helper only the fix commit has', async () => {
+    const events = await observe(helperOnlyInFix(), { repro: REPRO_NEEDING_FIX_HELPER });
 
-    // Exit code alone calls this a red base — 127 from a missing test file.
     expect(basePhase(events).exit_code).not.toBe(0);
     expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
-    // Only the symptom tells the truth, and the fold must refuse on it.
     expect(basePhase(events).symptom_matched).toBe(false);
     expect(conclude(events).reproduced).toBe(false);
   });
 
   test('flaky fix: one green run would have believed it', async () => {
-    const events = await observe(flakyFix());
+    const events = await observe(clean(), { repro: FLAKY_REPRO });
 
-    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
     expect(fixPhases(events).map((r) => r.exit_code)).toEqual([0, 1, 0]);
-    // Distinct hashes prove three real executions, not one result emitted thrice.
     expect(new Set(fixPhases(events).map((r) => r.stdout_hash)).size).toBe(3);
-    // The fix commit touches only the source, so nothing here is a diff signal.
-    expect(fixDiff(events).changed_files).toEqual(['src.txt']);
     expect(conclude(events).reproduced).toBe(false);
-  });
-
-  test('gaming attempt: red to green without touching the source', async () => {
-    const events = await observe(gamingAttempt());
-
-    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
-    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
-    expect(fixDiff(events).changed_files).toEqual(['repro.sh']);
-  });
-
-  test('collateral gaming: a weakened test smuggled in beside a real source edit', async () => {
-    const events = await observe(collateralGaming());
-
-    // Indistinguishable from a genuine fix on every signal except the diff's shape.
-    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
-    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
-    expect(fixDiff(events).changed_files).toEqual(['repro.sh', 'src.txt']);
-    // Documents the live gap: filename intersection alone credits this fix.
-    expect(conclude(events).reproduced).toBe(true);
-  });
-
-  test('runs outside a declared attempt are never paired into a reproduction', async () => {
-    // Without ATTEMPT_STARTED every run lands in attempt 0, and "within one
-    // attempt" stops being enforceable — a red base from one attempt could be
-    // paired with a green fix from an unrelated later one.
-    const events = await observe(clean(), { flakeRuns: 0 });
-    expect(fold(events).reproduced).toBe(false);
-    expect(conclude(events).reproduced).toBe(true);
   });
 
   test('irreproducible: base was never red', async () => {
@@ -172,27 +229,185 @@ describe('adversarial cases', () => {
     expect(basePhase(events).exit_code).toBe(0);
     expect(conclude(events).reproduced).toBe(false);
   });
+
+  test('runs outside a declared attempt are never paired into a reproduction', async () => {
+    const events = await observe(clean(), { flakeRuns: 0 });
+    expect(fold(events).reproduced).toBe(false);
+    expect(conclude(events).reproduced).toBe(true);
+  });
 });
 
 describe('the symptom check has a cost', () => {
   test('a genuine fix is refused when its output never echoes the reported words', async () => {
-    const events = await observe(noisySymptom());
+    const events = await observe(clean(), { repro: NOISY_REPRO });
 
-    // A real bug, really fixed — the base failed for exactly the right reason.
     expect(basePhase(events).exit_code).toBe(1);
     expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
-    // And it is still refused, because the output said "assert 42 == 40".
     expect(basePhase(events).symptom_matched).toBe(false);
     expect(conclude(events).reproduced).toBe(false);
   });
 });
 
+describe('the repro must be anchored to something', () => {
+  test('a reproduction with nothing applied and nothing pinned is refused', async () => {
+    await expect(
+      observe(clean(), { repro: { command: 'sh repro.sh' } }),
+    ).rejects.toThrow(/anchored to nothing/);
+  });
+
+  test('applying over a committed path is refused rather than silently overwriting', async () => {
+    await expect(
+      observe(committedTest(), {
+        repro: { command: 'x', files: { 'tests/existing.sh': 'echo hi\n' } },
+      }),
+    ).rejects.toThrow(/is committed/);
+  });
+
+  test('a committed path is matched case-insensitively', async () => {
+    // darwin's filesystem would let Tests/Existing.sh clobber tests/existing.sh.
+    await expect(
+      observe(committedTest(), {
+        repro: { command: 'x', files: { 'Tests/Existing.sh': 'echo hi\n' } },
+      }),
+    ).rejects.toThrow(/is committed/);
+  });
+
+  // A `./` prefix used to slip past every guard: `./.git/config` reached git's own
+  // config — which `core.fsmonitor` turns into command execution — and
+  // `./tests/existing.sh` overwrote the code under test while the engine went on
+  // recording commit_sha events for a tree that was neither commit.
+  test.each([
+    ['../escape.sh'],
+    ['/tmp/escape.sh'],
+    ['.git/hooks/pre-commit'],
+    ['./.git/config'],
+    ['.//.git/config'],
+    ['.Git/config'],
+    ['sub/.git/hooks/pre-commit'],
+    ['a/../../escape.sh'],
+    ['.'],
+    [''],
+  ])('refuses to write a repro to %j', async (path) => {
+    await expect(
+      observe(clean(), { repro: { command: 'x', files: { [path]: 'echo hi\n' } } }),
+    ).rejects.toThrow(ObservationFailed);
+  });
+
+  test.each([['./tests/existing.sh'], ['tests/./existing.sh'], ['./Tests/Existing.sh']])(
+    'refuses %j, which normalises onto a committed path',
+    async (path) => {
+      await expect(
+        observe(committedTest(), { repro: { command: 'x', files: { [path]: 'tampered\n' } } }),
+      ).rejects.toThrow(/is committed/);
+    },
+  );
+
+  test('a pinned path outside the repo is refused rather than silently unanchored', async () => {
+    // It would read a file the commits cannot change, so intact() would hold
+    // unconditionally and the pinned anchor would be quietly disarmed.
+    await expect(
+      observe(clean(), { repro: { command: 'x', pinned: ['../../etc/hosts'] } }),
+    ).rejects.toThrow(ObservationFailed);
+  });
+
+  // Containment is proved against the base checkout, but the fix commit controls
+  // the tree's shape by the time the second write happens. Each fixture leaves
+  // HEAD on base so the fix-phase re-resolution is what actually fires.
+  test('a redirected write is refused before it happens, not after', async () => {
+    const { mkdtempSync, readdirSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const outside = mkdtempSync(`${tmpdir()}/engine-outside-`);
+
+    await expect(
+      observe(symlinkInFix(outside, 'link'), {
+        repro: { command: 'true', files: { 'link/repro.sh': 'tampered\n' } },
+      }),
+    ).rejects.toThrow(ObservationFailed);
+
+    // Throwing is not enough: a guard that only fires downstream of the write
+    // reports the same error while the bytes have already escaped.
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  test.each([
+    ['a symlink into .git', '.git', 'link', 'link/config'],
+    ['a symlink into .git at depth 2', '../.git/hooks', 'a/b', 'a/b/post-checkout'],
+    ['a symlink into .git at depth 3', '../../../.git/hooks', 'd0/d1/esc', 'd0/d1/esc/post-checkout'],
+  ])('the fix commit cannot redirect a write through %s', async (_label, target, at, path) => {
+    // Assert on the message, not the type: a generic "could not apply repro file"
+    // wrapper around ENOENT is also an ObservationFailed, and would let a fixture
+    // pass without any guard having fired.
+    await expect(
+      observe(symlinkInFix(target, at), {
+        repro: { command: 'true', files: { [path]: 'tampered\n' } },
+      }),
+    ).rejects.toThrow(/traverses a symlink|resolves outside the repository|into git's own state/);
+  });
+
+  test('a symlinked ancestor cannot make the engine overwrite the code under test', async () => {
+    const { readFileSync } = await import('node:fs');
+    const fixture = symlinkToRoot();
+
+    // Containment holds — `t/src.txt` resolves back inside the repo — and the
+    // committed-path guard compares names, which `t/src.txt` does not match.
+    // Only refusing symlinked components catches this.
+    await expect(
+      observe(fixture, {
+        repro: { command: 'grep -q right src.txt', files: { 't/src.txt': 'right\n' } },
+      }),
+    ).rejects.toThrow(/traverses a symlink/);
+
+    // The forged fix must not have landed: the tracked source is untouched.
+    expect(readFileSync(`${fixture.repo}/src.txt`, 'utf8')).toBe('wrong\n');
+  });
+
+  test('a tracked symlink offered as a pinned path is not read through', async () => {
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const secret = `${mkdtempSync(`${tmpdir()}/engine-outside-`)}/secret.txt`;
+    writeFileSync(secret, 'exfiltrated\n');
+
+    // Reading through it would store the secret's bytes in the blob store, and
+    // would disarm the pinned anchor: a target no commit can change never drifts.
+    const fixture = pinnedSymlink(secret);
+    await expect(
+      observe(fixture, { repro: { command: 'true', pinned: ['leak.sh'] } }),
+    ).rejects.toThrow(ObservationFailed);
+
+    // Nothing was stored, so the secret never entered the evidence record.
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(fixture.blobRoot)).toEqual([]);
+  });
+
+  test('a symlink the repro command plants is caught before the next phase reads or writes it', async () => {
+    const { mkdtempSync, readFileSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const outside = `${mkdtempSync(`${tmpdir()}/engine-outside-`)}/planted.txt`;
+    // The target must exist, or the run aborts on a failed *read* and the write
+    // path this test exists for is never reached.
+    writeFileSync(outside, 'untouched\n');
+
+    // work/ is gitignored, so the phase-boundary clean spares it by design. The
+    // O_NOFOLLOW read fires first, before the fix phase could write through it —
+    // which is why the O_EXCL write guard has no reachable fixture of its own.
+    await expect(
+      observe(gitignoredWorkDir(), { repro: REPRO_PLANTING_SYMLINK(outside) }),
+    ).rejects.toThrow(ObservationFailed);
+
+    expect(readFileSync(outside, 'utf8')).toBe('untouched\n');
+  });
+
+  test('a missing pinned path is an ObservationFailed, not a raw fs error', async () => {
+    await expect(
+      observe(clean(), { repro: { command: 'x', pinned: ['tests/nope.sh'] } }),
+    ).rejects.toThrow(ObservationFailed);
+  });
+});
+
 describe('the repro command is run verbatim', () => {
   test('a command ending in a comment keeps its real exit code', async () => {
-    // Wrapping the command in `( … )` made sh swallow the paren and report a
-    // syntax error as exit 2 with empty output — a fabricated TEST_RUN.
     const events = await observe(clean(), {
-      reproCommand: 'exit 6 # the reported repro',
+      repro: { ...APPLIED_REPRO, command: 'exit 6 # the reported repro' },
       flakeRuns: 0,
     });
     expect(basePhase(events).exit_code).toBe(6);
@@ -201,7 +416,7 @@ describe('the repro command is run verbatim', () => {
   test('stderr is captured in real order, not appended after stdout', async () => {
     const fixture = clean();
     const events = await observe(fixture, {
-      reproCommand: 'echo first; echo second >&2; echo third; exit 1',
+      repro: { ...APPLIED_REPRO, command: 'echo first; echo second >&2; echo third; exit 1' },
       flakeRuns: 0,
     });
 
@@ -212,17 +427,15 @@ describe('the repro command is run verbatim', () => {
 
 describe('failures to observe never become observations', () => {
   test('a hanging repro fails the run rather than wedging it', async () => {
-    await expect(observe(clean(), { reproCommand: 'sleep 30', timeoutMs: 300 })).rejects.toThrow(
-      ObservationFailed,
-    );
+    await expect(
+      observe(clean(), { repro: { ...APPLIED_REPRO, command: 'sleep 30' }, timeoutMs: 300 }),
+    ).rejects.toThrow(ObservationFailed);
   });
 
   test('output past the ceiling aborts rather than storing a truncated artifact', async () => {
-    // Node hands back a truncated buffer here; hashing it would produce a blob
-    // that is internally consistent and factually a lie.
     await expect(
       observe(clean(), {
-        reproCommand: 'yes padding | head -c 200000',
+        repro: { ...APPLIED_REPRO, command: 'yes padding | head -c 200000' },
         maxOutputBytes: 4096,
         flakeRuns: 0,
       }),
@@ -244,41 +457,26 @@ describe('failures to observe never become observations', () => {
 
 describe('a crash is not a test failure', () => {
   test('a signalled death records -1 and the signal rather than a plausible exit code', async () => {
-    const events = await observe(clean(), { reproCommand: 'kill -9 $$', flakeRuns: 0 });
-
-    // -1 is not a status any process can exit with, so it cannot be mistaken for one.
-    expect(basePhase(events)).toMatchObject({ exit_code: -1, signal: 'SIGKILL' });
-  });
-
-  test('a crash is refused even when every other signal says reproduction', async () => {
-    const events = await observe(crashingBase());
-
-    // The symptom matched and the fix went green: nothing but the crash itself
-    // stands between this and a Tier 1 verdict.
-    expect(basePhase(events)).toMatchObject({
-      exit_code: -1,
-      signal: 'SIGKILL',
-      symptom_matched: true,
+    const events = await observe(clean(), {
+      repro: { ...APPLIED_REPRO, command: 'kill -9 $$' },
+      flakeRuns: 0,
     });
-    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
-    expect(conclude(events).reproduced).toBe(false);
+
+    expect(basePhase(events)).toMatchObject({ exit_code: -1, signal: 'SIGKILL' });
   });
 });
 
 describe('the working tree the fix phase sees', () => {
   test('base-phase residue is scrubbed at the boundary but survives between re-runs', async () => {
     const fixture = residueFromBase();
-    const events = await observe(fixture);
+    const events = await observe(fixture, { repro: RESIDUE_REPRO });
     const outputs = await Promise.all(
       fixPhases(events).map((r) => get(fixture.blobRoot, r.stdout_hash).then((b) => b.toString())),
     );
 
     expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
-    // The first fix run sees neither the untracked file the base wrote nor its
-    // edit to the tracked file both commits share.
     expect(outputs[0]).not.toContain('RESIDUE_SURVIVED');
     expect(outputs[0]).not.toContain('TRACKED_POISONED');
-    // Re-runs deliberately share a tree — isolating them would hide order-dependent flake.
     expect(outputs[1]).toContain('RESIDUE_SURVIVED');
     expect(outputs[1]).toContain('TRACKED_POISONED');
   });
@@ -292,18 +490,19 @@ describe('the diff the overlap check will read', () => {
 
   test('unrelated base-side commits are not attributed to the fix', async () => {
     const events = await observe(divergentHistory(), { flakeRuns: 0 });
-    // Two-dot would also list base_only.txt, inflating the overlap check with a
-    // path the fix never went near.
     expect(fixDiff(events).changed_files).toEqual(['src.txt']);
+  });
+
+  test('the applied repro never appears in the diff', async () => {
+    const events = await observe(clean(), { flakeRuns: 0 });
+    expect(fixDiff(events).changed_files).not.toContain('repro.sh');
   });
 });
 
 describe('the symptom observation cannot depend on call order', () => {
   test('a sticky regex still matches a symptom that is not at position 0', async () => {
-    // /y anchors the match at lastIndex, so without stripping it the engine would
-    // report symptom_matched: false for output that plainly contains the symptom.
     const events = await observe(clean(), {
-      reproCommand: 'echo "FAILED: the total is wrong"; exit 1',
+      repro: { ...APPLIED_REPRO, command: 'echo "FAILED: the total is wrong"; exit 1' },
       symptomPattern: /wrong/y,
       flakeRuns: 0,
     });

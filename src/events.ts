@@ -23,6 +23,26 @@ export type AttemptStartedV1 = {
   n: number;
 };
 
+/**
+ * The reproduction's identity, fixed before either phase runs.
+ *
+ * A red-then-green comparison only means something if the same thing ran both
+ * times, so the repro is anchored rather than left to the fix commit's mercy:
+ * `applied` paths are bytes the engine wrote over both checkouts, and the rest
+ * are paths already committed, hashed here so a later change is visible.
+ *
+ * Every hash is of bytes the engine itself wrote or read (ADR-0006) — a
+ * caller-supplied hash would be testimony wearing an evidence event's shape.
+ */
+export type ReproRegisteredV1 = {
+  v: 1;
+  command: string;
+  /** Every path the reproduction depends on → sha256 observed at the base checkout. */
+  files: Record<string, ArtifactRef>;
+  /** Which of those the engine wrote itself. The remainder were already committed. */
+  applied: string[];
+};
+
 export type TestRunV1 = {
   v: 1;
   phase: 'base' | 'fix';
@@ -49,11 +69,18 @@ export type TestRunV1 = {
   symptom_matched?: boolean;
   /** Flake re-run index. 0 is the first execution of the phase. */
   repeat?: number;
+  /**
+   * The repro's paths hashed again once this run finished. The engine hashes what
+   * it wrote, not what executed — a pretest hook or a collection-time plugin can
+   * rewrite the test before the assertion runs, and re-runs share a working tree,
+   * so a mutation during run 0 would otherwise silently govern runs 1 and 2.
+   */
+  repro_hashes?: Record<string, ArtifactRef>;
 };
 
 /**
  * What the fix changed, observed by the engine. Carries changed paths rather
- * than a verdict so the fold can compute repro-path overlap purely.
+ * than a verdict so the fold can judge the fix's substance purely (ADR-0008).
  */
 export type FixDiffObservedV1 = {
   v: 1;
@@ -74,6 +101,7 @@ export type PrOpenedV1 = {
 
 export type EventPayload =
   | { type: 'RUN_REQUESTED'; payload: RunRequestedV1 }
+  | { type: 'REPRO_REGISTERED'; payload: ReproRegisteredV1 }
   | { type: 'SANDBOX_CREATED'; payload: SandboxCreatedV1 }
   | { type: 'ATTEMPT_STARTED'; payload: AttemptStartedV1 }
   | { type: 'TEST_RUN'; payload: TestRunV1 }
