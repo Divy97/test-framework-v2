@@ -144,7 +144,10 @@ export async function runJob(
   // shared mount now. Ownership follows the host directory, or a non-root host
   // user cannot clean up what root wrote.
   const owner = await stat(blobRoot);
-  await execFileAsync('sh', ['-c', `cp -a ${staging}/. ${blobRoot}/`]);
+  // No shell: `cp` takes its arguments directly, so nothing here can be read as
+  // syntax. Both paths are Runner constants today, which is precisely the
+  // reasoning that has been wrong before in this codebase.
+  await execFileAsync('cp', ['-a', `${staging}/.`, blobRoot]);
   await execFileAsync('chown', ['-R', `${owner.uid}:${owner.gid}`, blobRoot]);
 
   // One event per line: the channel is append-only in shape as well as intent,
