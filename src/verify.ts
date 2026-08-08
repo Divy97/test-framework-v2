@@ -19,7 +19,7 @@ import { constants, lstat, mkdir, open, realpath, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
-import type { ArtifactRef, RunEvent } from './events.js';
+import type { ArtifactRef, RunEvent, VerificationPhase } from './events.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -41,11 +41,37 @@ const mergeStreams = (command: string) => `exec 2>&1\n${command}`;
 
 /** The engine could not observe the outcome. Never confuse this with observing a failure. */
 export class ObservationFailed extends Error {
+  /**
+   * What the engine had already observed when it stopped, ending in
+   * VERIFICATION_ABORTED. Populated only by `verify()`, at the top of the stack
+   * where the event list lives.
+   *
+   * Those events are real facts and the caller is expected to emit them: a run
+   * that dies in the fix phase still watched the base phase fail for the reported
+   * reason, and throwing that away leaves the run invisible — the worst outcome
+   * for a project whose whole claim is an evidence trail.
+   */
+  observed: RunEvent[] = [];
+
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);
     this.name = 'ObservationFailed';
   }
 }
+
+/**
+ * Ceiling on the text of an abort reason.
+ *
+ * The message quotes things the agent under judgement chose — a repro command, a
+ * path — so it is attacker-influenced, and the event channel is one JSON object
+ * per line. An unbounded reason is an unbounded line.
+ */
+const MAX_REASON_CHARS = 2000;
+
+const abortReason = (error: Error): string => {
+  const text = `${error.name}: ${error.message}`;
+  return text.length <= MAX_REASON_CHARS ? text : `${text.slice(0, MAX_REASON_CHARS)}… (truncated)`;
+};
 
 /**
  * How the reproduction is anchored so both phases run the same thing.
@@ -279,7 +305,43 @@ const hasGitSegment = (path: string) =>
 
 type Resolved = { rel: string; target: string };
 
+/** Mutable bookkeeping shared with the abort handler: where we are, and how far the log got. */
+type Progress = { phase: VerificationPhase; seq: number };
+
+/**
+ * Run the phases, and if observation stops, still hand back what was seen.
+ *
+ * The engine keeps throwing on a failure to observe — a caller must never be able
+ * to mistake "could not look" for "looked and saw nothing wrong". What changed is
+ * that the error now carries the observations that did happen, closed off by a
+ * VERIFICATION_ABORTED saying where it stopped.
+ */
 export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
+  const events: RunEvent[] = [];
+  const progress: Progress = { phase: 'setup', seq: options.afterSeq };
+  try {
+    return await observe(options, events, progress);
+  } catch (error) {
+    // A bug in the engine is not an abortable observation. Only the error type
+    // that means "I could not look" earns an event.
+    if (!(error instanceof ObservationFailed)) throw error;
+    events.push({
+      run_id: options.runId,
+      seq: progress.seq + 1,
+      ts: new Date().toISOString(),
+      type: 'VERIFICATION_ABORTED',
+      payload: { v: 1, phase: progress.phase, reason: abortReason(error) },
+    });
+    error.observed = events;
+    throw error;
+  }
+}
+
+async function observe(
+  options: VerifyOptions,
+  events: RunEvent[],
+  progress: Progress,
+): Promise<RunEvent[]> {
   const { runId, repoPath, baseRef, fixRef, repro, blobRoot } = options;
   const reproCommand = repro.command;
   const gitEnv = options.gitEnv;
@@ -327,12 +389,15 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
     );
   }
 
-  const events: RunEvent[] = [];
-  let seq = options.afterSeq;
   const emit = (event: Omit<RunEvent, 'run_id' | 'seq' | 'ts'>) => {
-    events.push({ ...event, run_id: runId, seq: ++seq, ts: new Date().toISOString() } as RunEvent);
+    const seq = ++progress.seq;
+    events.push({ ...event, run_id: runId, seq, ts: new Date().toISOString() } as RunEvent);
   };
 
+  // From here the engine is working on the base commit: a checkout that fails, a
+  // repro that will not apply, and the base command itself are all base-phase
+  // failures. Everything above is setup — argument validation and tree hygiene.
+  progress.phase = 'base';
   const baseSha = await checkout(baseRef, repoPath, gitEnv);
 
   // Applied paths must be additive. Writing over a tracked file would put the
@@ -451,6 +516,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // Ignored files are deliberately spared: they are usually installed
   // dependencies, and removing them would change what is under test far more
   // than it isolates it.
+  progress.phase = 'fix';
   await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
   await git(['clean', '--quiet', '-dff'], repoPath, gitEnv);
   await checkout(fixSha, repoPath, gitEnv);
@@ -481,6 +547,9 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   // attribute base-side commits to the fix, over-reporting the very paths the
   // overlap check trusts. -z avoids core.quotePath mangling non-ASCII names, and
   // --no-renames keeps the original path visible instead of only the destination.
+  // Covers the tidy-up below too: both are what happens after the last run, and a
+  // fifth phase name to distinguish them would buy a reviewer nothing.
+  progress.phase = 'diff';
   const range = `${baseSha}...${fixSha}`;
   const changed = await git(['diff', '--name-only', '-z', '--no-renames', range], repoPath, gitEnv);
   emit({

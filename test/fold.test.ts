@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { RunEvent } from '../src/events.js';
+import type { RunEndedV1, RunEvent, VerificationPhase } from '../src/events.js';
 import { fold } from '../src/fold.js';
 import { DEMO_RUN_ID, demoRunEvents } from '../src/fixtures/demo-run.js';
 
@@ -49,6 +49,8 @@ describe('fold', () => {
         pr_number: 42,
         head_sha: 'f3a9d1c7e5b2048a6c1d9e7f3b5a2c8d0e4f6a1b',
       },
+      aborts: [],
+      endedReason: null, // the demo run predates RUN_ENDED
       artifactHashes: [
         'sha256:5b7a1de2c3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0',
         'sha256:9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b',
@@ -171,5 +173,86 @@ describe('fold', () => {
       { ...demoRunEvents[4]!, seq: 6 }, // attempt 2: fix passes, but its base never ran
     ];
     expect(fold(events).reproduced).toBe(false);
+  });
+});
+
+/**
+ * A run's ending is a control-flow act, not a verdict. These fix the line: the
+ * fold records WHY the process stopped and derives WHAT that means from the
+ * facts, so a producer cannot talk the log into a conclusion it did not earn.
+ */
+describe('a run that ends', () => {
+  const end = (reason: RunEndedV1['reason'], seq: number): RunEvent => ({
+    run_id: DEMO_RUN_ID,
+    seq,
+    ts: 'T',
+    type: 'RUN_ENDED',
+    payload: { v: 1, reason },
+  });
+  /** The shortest honest run: it was requested, and then it stopped. */
+  const ended = (reason: RunEndedV1['reason']): RunEvent[] => [demoRunEvents[0]!, end(reason, 2)];
+
+  it('is unresolved when nothing reproduced — a deliverable, not a failure', () => {
+    const state = fold(ended('not_reproduced'));
+    expect(state.status).toBe('unresolved');
+    expect(state.endedReason).toBe('not_reproduced');
+  });
+
+  it('is unresolved, not errored, when the attempts ran out', () => {
+    expect(fold(ended('attempts_exhausted')).status).toBe('unresolved');
+  });
+
+  it('separates an infrastructure failure from a finding about the bug', () => {
+    // Reporting "we could not reproduce it" when the truth is "the sandbox fell
+    // over" is a lie about the bug, told by a status field.
+    expect(fold(ended('error')).status).toBe('errored');
+  });
+
+  it('will not show a PR on a stream that only claims one', () => {
+    // The reason says pr_opened; no PR_OPENED event exists. The fold reports what
+    // the log can support, and keeps the claim visible beside it.
+    const state = fold(ended('pr_opened'));
+    expect(state.status).toBe('unresolved');
+    expect(state.pr).toBeNull();
+    expect(state.endedReason).toBe('pr_opened');
+  });
+
+  it('will not hide a PR the log actually contains', () => {
+    // The mirror image: a real PR_OPENED, and a reason claiming nothing was
+    // reproduced. Facts win in both directions.
+    const state = fold([...demoRunEvents, end('not_reproduced', demoRunEvents.length + 1)]);
+    expect(state.status).toBe('pr_opened');
+    expect(state.endedReason).toBe('not_reproduced');
+  });
+
+  it('refuses events that arrive after the end', () => {
+    const past = [...ended('not_reproduced'), { ...demoRunEvents[1]!, seq: 3 }];
+    expect(() => fold(past)).toThrow(/after the end/);
+  });
+});
+
+describe('an attempt that could not be observed', () => {
+  const REASON = 'ObservationFailed: repro command exceeded 100ms';
+  const aborted = (phase: VerificationPhase, seq: number): RunEvent => ({
+    run_id: DEMO_RUN_ID,
+    seq,
+    ts: 'T',
+    type: 'VERIFICATION_ABORTED',
+    payload: { v: 1, phase, reason: REASON },
+  });
+
+  it('is recorded without ending the run — the next attempt may still succeed', () => {
+    const state = fold([
+      demoRunEvents[0]!,
+      demoRunEvents[1]!,
+      demoRunEvents[2]!, // ATTEMPT_STARTED n=1
+      aborted('fix', 4),
+    ]);
+    expect(state.status).toBe('attempting');
+    expect(state.aborts).toEqual([{ phase: 'fix', reason: REASON }]);
+  });
+
+  it('never credits a reproduction on its own', () => {
+    expect(fold([demoRunEvents[0]!, aborted('base', 2)]).reproduced).toBe(false);
   });
 });

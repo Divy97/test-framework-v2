@@ -230,6 +230,19 @@ export const REPRO_PLANTING_SYMLINK = (target: string): ReproSpec => ({
 export const gitignoredWorkDir = () =>
   makeRepo({ 'src.txt': 'wrong\n', '.gitignore': 'work/\n' }, { 'src.txt': 'right\n' });
 
+/**
+ * Fails fast on base for the reported reason, then hangs forever on the fix.
+ *
+ * The only shape that makes the engine stop observing *after* it has already
+ * observed something real — which is exactly the case the abort event exists for.
+ * Every other failure-to-observe in the suite fires during setup, when there is
+ * nothing yet to lose.
+ */
+export const HANGS_ON_FIX: ReproSpec = {
+  command: 'sh repro.sh',
+  files: { 'repro.sh': 'cat src.txt\ngrep -q right src.txt || exit 1\nsleep 600\n' },
+};
+
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () => makeRepo({ 'src.txt': 'right\n' }, { 'notes.md': 'nope\n' });
 

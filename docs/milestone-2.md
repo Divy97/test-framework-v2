@@ -47,10 +47,32 @@ Additive, so payloads stay `v: 1`:
 | `TEST_RUN` | add `symptom_matched?: boolean`, `repeat?: number` | anti-gaming symptom check; flake re-run index |
 | `REPRO_REGISTERED` | new — `{ command, files, applied }` | anchors the reproduction so both phases provably run the same thing ([ADR-0008](adr/0008-the-reproduction-is-anchored.md)) |
 | `FIX_DIFF_OBSERVED` | new — `{ base_sha, fix_sha, changed_files[], diff_hash }` | recorded for the confidence projection |
+| `VERIFICATION_ABORTED` | new — `{ phase, reason }` | observation stopped; the events before it are still real |
 | `RUN_ENDED` | new — `{ reason }` | `pr_opened` \| `not_reproduced` \| `attempts_exhausted` \| `error` |
 
-`RUN_ENDED` closes the terminal-state gap: `RunStatus` gains `unresolved`, and
-the Tier 3 outcome (ADR-0007) becomes expressible for the first time.
+`RUN_ENDED` closes the terminal-state gap: `RunStatus` gains `unresolved` — the
+Tier 3 outcome (ADR-0007) becomes expressible for the first time — and `errored`
+beside it, because "we could not reproduce it" is a finding about the bug while
+"the sandbox fell over" is not, and one status for both would let the second
+wear the first's clothes.
+
+`VERIFICATION_ABORTED` closes a quieter gap. `verify()` accumulated events and
+threw on any failure to observe, so a run that died in the fix phase discarded a
+perfectly good base-phase observation and emitted nothing at all — a container
+exiting non-zero with an empty channel, indistinguishable from one that never
+ran. The engine still throws (a caller must never read "could not look" as
+"looked and saw nothing wrong"), but the error now carries what was observed,
+closed by this event, and the Runner flushes the blobs and emits the partial
+stream before exiting 2.
+
+It is deliberately **not** terminal: an attempt can abort and the next one can
+still reach a PR, so the fold records it and leaves the status alone.
+
+Neither event lets a producer talk the fold into a conclusion. `RUN_ENDED`'s
+`reason` is the *stated cause of the process halting* — a control-flow fact —
+and the fold derives the outcome from the log regardless: a stream claiming
+`pr_opened` with no `PR_OPENED` in it is `unresolved`, and one claiming
+`not_reproduced` after a real `PR_OPENED` still shows the PR.
 
 ## Anti-gaming checks
 
@@ -100,6 +122,11 @@ event schema changes when it does.
 3. **Vocabulary + projections**, split after the PR 3 design review:
    - **3a** — the reproduction is anchored, not committed (ADR-0008).
    - **3b** — `RUN_ENDED`, `VERIFICATION_ABORTED`, the `unresolved` status.
+     Landed after M3.1: the abort path only became worth building once a run
+     could die inside a container, where an empty channel is all a caller sees.
+     `RUN_ENDED` has no producer yet — the attempt loop that emits it arrives
+     with the agent in M3.2, and until then it exists as vocabulary the fold
+     understands, exactly as `PR_OPENED` does.
    - **3c** — tier and confidence as pure projections.
 
 ## Not in this milestone

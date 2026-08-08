@@ -12,6 +12,7 @@ import { closeSync, openSync, writeSync } from 'node:fs';
 import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import type { RunEvent } from './events.js';
 import { ObservationFailed, verify, type ReproSpec } from './verify.js';
 
 const execFileAsync = promisify(execFile);
@@ -125,20 +126,35 @@ export async function runJob(
   // built for exactly one run.
   await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]);
 
-  const events = await verify({
-    runId: job.runId,
-    afterSeq: job.afterSeq,
-    repoPath,
-    baseRef: job.baseRef,
-    fixRef: job.fixRef,
-    repro: job.repro,
-    symptomPattern: new RegExp(job.symptomPattern),
-    blobRoot: staging,
-    gitEnv,
-    runAs,
-    ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
-    ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
-  });
+  let events: RunEvent[];
+  // A run that could not be observed to the end is still a run that observed
+  // things. Losing the base phase because the fix phase died would leave no
+  // record at all of the one part that worked — so the partial stream goes out,
+  // closed by the VERIFICATION_ABORTED that says where it stopped, and the exit
+  // code tells a caller the phases did not complete.
+  let exitCode = 0;
+  try {
+    events = await verify({
+      runId: job.runId,
+      afterSeq: job.afterSeq,
+      repoPath,
+      baseRef: job.baseRef,
+      fixRef: job.fixRef,
+      repro: job.repro,
+      symptomPattern: new RegExp(job.symptomPattern),
+      blobRoot: staging,
+      gitEnv,
+      runAs,
+      ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
+      ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
+    });
+  } catch (error) {
+    // Nothing observed means nothing to report on the channel; let it out to
+    // stderr instead, where a failure to observe cannot be mistaken for a record.
+    if (!(error instanceof ObservationFailed) || error.observed.length === 0) throw error;
+    events = error.observed;
+    exitCode = 2;
+  }
 
   // The repro has run for the last time, so the evidence can cross into the
   // shared mount now. Ownership follows the host directory, or a non-root host
@@ -165,7 +181,7 @@ export async function runJob(
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
   for (const event of events) emit(`${JSON.stringify(event)}\n`);
-  return 0;
+  return exitCode;
 }
 
 // Only run when executed directly, so the tests can import runJob.

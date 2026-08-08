@@ -2,9 +2,23 @@
 // happens (ADR-0001/0004): events say what occurred; the fold says what it means.
 // Zero I/O, zero side effects. Replay (ADR-0003) is just this function.
 
-import type { ArtifactRef, RunEvent } from './events.js';
+import type { ArtifactRef, RunEndedV1, RunEvent, VerificationPhase } from './events.js';
 
-export type RunStatus = 'requested' | 'sandbox_ready' | 'attempting' | 'pr_opened';
+/**
+ * `unresolved` and `errored` are deliberately separate terminal states.
+ *
+ * "We could not reproduce it" is a real deliverable (ADR-0007) and belongs on the
+ * dashboard as an outcome. "The sandbox fell over" is an operational failure and
+ * belongs there as a fault. Folding them into one status would let an
+ * infrastructure problem masquerade as a finding about the bug.
+ */
+export type RunStatus =
+  | 'requested'
+  | 'sandbox_ready'
+  | 'attempting'
+  | 'pr_opened'
+  | 'unresolved'
+  | 'errored';
 
 export type TestRunRecord = {
   attempt: number;
@@ -39,6 +53,18 @@ export type RunState = {
   /** What the fix touched. Recorded for the confidence projection; the engine never judges it. */
   fixDiff: { changed_files: string[]; diff_hash: ArtifactRef } | null;
   pr: { repo: string; pr_number: number; head_sha: string } | null;
+  /**
+   * Every phase that stopped being observable, in order. Not terminal: an attempt
+   * can abort and the next one can still reach a PR, so these are kept for display
+   * rather than folded into the status.
+   */
+  aborts: { phase: VerificationPhase; reason: string }[];
+  /**
+   * What the run said stopped it, verbatim. Recorded as a stated cause, never read
+   * as a verdict — `reproduced` and `status` are derived from the facts regardless
+   * of what this claims.
+   */
+  endedReason: RunEndedV1['reason'] | null;
   artifactHashes: ArtifactRef[];
   lastSeq: number;
 };
@@ -54,6 +80,8 @@ const initialState = (runId: string): RunState => ({
   reproduced: false,
   fixDiff: null,
   pr: null,
+  aborts: [],
+  endedReason: null,
   artifactHashes: [],
   lastSeq: 0,
 });
@@ -64,6 +92,14 @@ export function apply(state: RunState, event: RunEvent): RunState {
   }
   if (event.seq !== state.lastSeq + 1) {
     throw new Error(`seq gap in run ${state.runId}: expected ${state.lastSeq + 1}, got ${event.seq}`);
+  }
+  // RUN_ENDED means it ended. A stream that keeps going has two runs' events
+  // interleaved, or a producer that restarted against a closed log — either way
+  // the fold would be summarising something that never happened as one run.
+  if (state.endedReason !== null) {
+    throw new Error(
+      `run ${state.runId} already ended (${state.endedReason}); ${event.type} at seq ${event.seq} is after the end`,
+    );
   }
 
   const next: RunState = { ...state, lastSeq: event.seq };
@@ -120,6 +156,22 @@ export function apply(state: RunState, event: RunEvent): RunState {
           diff_hash: event.payload.diff_hash,
         },
         artifactHashes: [...state.artifactHashes, event.payload.diff_hash],
+      };
+    case 'VERIFICATION_ABORTED':
+      // Status deliberately untouched. The run is still attempting until something
+      // says it ended, and a later attempt may yet succeed.
+      return {
+        ...next,
+        aborts: [...state.aborts, { phase: event.payload.phase, reason: event.payload.reason }],
+      };
+    case 'RUN_ENDED':
+      return {
+        ...next,
+        endedReason: event.payload.reason,
+        // Derived, not taken on trust. A stream claiming `pr_opened` with no
+        // PR_OPENED in it does not get to show a PR, and one claiming
+        // `not_reproduced` after a PR was opened does not get to hide it.
+        status: state.pr ? 'pr_opened' : event.payload.reason === 'error' ? 'errored' : 'unresolved',
       };
     case 'PR_OPENED':
       return {

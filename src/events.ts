@@ -99,6 +99,44 @@ export type PrOpenedV1 = {
   diff_hash: ArtifactRef;
 };
 
+/** Where the engine was standing when it stopped. */
+export type VerificationPhase = 'setup' | 'base' | 'fix' | 'diff';
+
+/**
+ * Observation stopped before the phases finished.
+ *
+ * This is not a verification result and must never be read as one: it says the
+ * engine could not finish looking, not that the fix is bad. The events that came
+ * before it are still real observations and are kept — discarding them was the
+ * bug this event exists to fix, because a run that died in the fix phase used to
+ * throw away a perfectly good base-phase observation and emit nothing at all.
+ *
+ * It is not terminal either. An attempt can abort and the next one can succeed,
+ * so the fold records it and leaves the run's status alone.
+ */
+export type VerificationAbortedV1 = {
+  v: 1;
+  phase: VerificationPhase;
+  /**
+   * Why observation stopped. Bounded, because the message can quote a repro
+   * command the agent wrote. Display it; never parse it.
+   */
+  reason: string;
+};
+
+/**
+ * The run stopped, and what stopped it.
+ *
+ * `reason` records the *cause of the process halting* — a control-flow act with
+ * consequences in the world (no agent was spawned, no PR was opened). It is not
+ * a verdict on the evidence, and the fold pointedly does not read it to decide
+ * whether anything was reproduced: that stays derived from the TEST_RUNs.
+ */
+export type RunEndedV1 = {
+  v: 1;
+  reason: 'pr_opened' | 'not_reproduced' | 'attempts_exhausted' | 'error';
+};
+
 export type EventPayload =
   | { type: 'RUN_REQUESTED'; payload: RunRequestedV1 }
   | { type: 'REPRO_REGISTERED'; payload: ReproRegisteredV1 }
@@ -106,7 +144,9 @@ export type EventPayload =
   | { type: 'ATTEMPT_STARTED'; payload: AttemptStartedV1 }
   | { type: 'TEST_RUN'; payload: TestRunV1 }
   | { type: 'FIX_DIFF_OBSERVED'; payload: FixDiffObservedV1 }
-  | { type: 'PR_OPENED'; payload: PrOpenedV1 };
+  | { type: 'VERIFICATION_ABORTED'; payload: VerificationAbortedV1 }
+  | { type: 'PR_OPENED'; payload: PrOpenedV1 }
+  | { type: 'RUN_ENDED'; payload: RunEndedV1 };
 
 /** One row of the events table: envelope + typed payload. */
 export type RunEvent = EventPayload & {
