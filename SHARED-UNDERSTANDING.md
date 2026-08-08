@@ -72,7 +72,7 @@ Corollaries:
 - Terminology split for ADRs: *verification* is an active process emitting fact-events (has side effects); the *confidence score* is the projection (pure fold). A "projection with side effects" is a contradiction we never utter.
 
 ### Q8 — Demo target
-- **(a) Purpose-built demo app** (small TS/Next.js), 5–6 seeded bugs spanning tiers — logic bug, API bug, UI bug, and one irreproducible-by-design to demo Tier 3 / UNRESOLVED. One `docker build`, never flakes. Doubles as the verification engine's test fixture.
+- **(a) Purpose-built demo app** (small TS/Next.js), 5–6 seeded bugs spanning tiers — logic bug, API bug, UI bug, and one irreproducible-by-design to demo Tier 3 / UNRESOLVED. One `docker build`, never flakes. **Amended (M2 scoping):** it does *not* double as the verification engine's test fixture — the engine is tested against tiny generated git repos that include the adversarial cases (symptom mismatch, flaky fix, gaming attempt). A demo app is too slow and too coarse for that, and seeding deliberate gaming attempts into a demo makes the demo worse. Two artifacts, two purposes.
 - **Plus one recorded run against a real OSS issue**, kept as a replayable artifact — generality proven without live-demo risk.
 
 ### Q9 — Fresh repo
@@ -84,11 +84,13 @@ Corollaries:
 
 ## v1 scope freeze
 
-**Core:** Slack adapter · GitHub Issues adapter · Docker sandbox · Claude Code runner · Verification engine · GitHub PR creation
+**Core:** Slack adapter · GitHub Issues adapter · CLI adapter · Docker sandbox · Claude Code runner · Verification engine · GitHub PR creation
 **Architecture:** Event bus · Event store · Replay engine
 **UI:** Live execution timeline · Agent transcript · Replay mode · Evidence report · Confidence score
 **Docs:** Architecture diagram · Honest limitations · Recorded 3-minute demo · ADRs (seeds below)
-**Adapters:** exactly two real ones; `TaskAdapter { parse, fetchContext, normalize }` interface documented so Jira/Asana/Linear are 50-line README examples. Intake across N tools is one skill — demonstrate the pattern, not the copies.
+**Adapters:** three real ones; `TaskAdapter { parse, fetchContext, normalize }` interface documented so Jira/Asana/Linear are 50-line README examples. Intake across N tools is one skill — demonstrate the pattern, not the copies.
+
+**Amended (M2 scoping): CLI adapter added to v1.** A terminal entry point — `<cmd> "the bug"` in a repo — emitting the same `RUN_REQUESTED` as Slack and GitHub. Intake is genuinely ~50 lines; the real cost is the **follow mode** the terminal implies. A CLI that fires and returns nothing is worse than no CLI, so it needs a live tail rendering the same event stream the dashboard renders (same SSE feed, terminal output instead of DOM), plus `--detach` for people who'd rather watch the dashboard. Budget the tail, not the parse.
 
 **Future Work (README section, not code):** Jira · Asana · Linear · compare-two-fixes · multi-agent support · cloud runners · multi-tenant inference story.
 
@@ -103,7 +105,7 @@ Corollaries:
 
 ## Open items
 - [ ] Project name ("test-framework-v2" is a placeholder)
-- [ ] Timeline / milestone cut
-- [ ] Stack detail pass (queue choice, blob store: disk vs S3, dashboard framework)
+- [x] Timeline / milestone cut — M1 event core (merged); M2 verification engine, engine-first with no agent and no container ([docs/milestone-2.md](docs/milestone-2.md)); M3 Runner + sandbox
+- [ ] Stack detail pass (queue choice, dashboard framework) — blob store settled: content-addressed local directory, S3 as an adapter later
 - [ ] Seeded-bug list for the demo app
 - [ ] Which real OSS issue for the recorded run
