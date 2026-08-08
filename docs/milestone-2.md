@@ -139,5 +139,13 @@ demo app.
 - **The engine runs arbitrary commands on the host.** That is what it is for,
   and it is exactly what the M3 sandbox exists to contain. Until then it runs
   only against fixtures we generate.
-- **No command timeout yet.** A hanging repro command hangs the engine. Add a
-  timeout when a real repro command (rather than a fixture) first runs.
+- ~~**No command timeout yet.**~~ Landed: `timeoutMs`, default 120s, and a
+  timeout is a failure to observe rather than a recorded result.
+- **The timeout kills the shell, not the process group.** Found while building
+  the abort fixture, and left open deliberately rather than fixed in passing.
+  A repro that spawns a child outlives its own timeout: on the host it leaks,
+  and in either mode the survivor keeps executing *while the next phase is being
+  judged* — base-phase work still running against the fix checkout. The sandbox
+  bounds the blast radius to the container's lifetime, which is why this is a
+  known risk rather than an emergency, but it is an evidence-integrity defect
+  and needs its own change (spawn detached, kill the group).

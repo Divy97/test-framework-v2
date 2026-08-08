@@ -237,10 +237,18 @@ export const gitignoredWorkDir = () =>
  * observed something real — which is exactly the case the abort event exists for.
  * Every other failure-to-observe in the suite fires during setup, when there is
  * nothing yet to lose.
+ *
+ * It spins in the shell rather than calling `sleep`, and that is not a stylistic
+ * choice: the engine's timeout kills the shell, not the process group, so a
+ * `sleep` here is orphaned and outlives the run. This fixture would litter the
+ * developer's machine on every pass — and, in the engine proper, a survivor keeps
+ * executing while the *next* phase is being judged. That defect is real and
+ * predates this fixture; it gets its own change rather than being smuggled in
+ * here, and until then this hangs in a way that dies when it is killed.
  */
 export const HANGS_ON_FIX: ReproSpec = {
   command: 'sh repro.sh',
-  files: { 'repro.sh': 'cat src.txt\ngrep -q right src.txt || exit 1\nsleep 600\n' },
+  files: { 'repro.sh': 'cat src.txt\ngrep -q right src.txt || exit 1\nwhile :; do :; done\n' },
 };
 
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
