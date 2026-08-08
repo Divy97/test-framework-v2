@@ -256,6 +256,36 @@ export const pinnedTampering = () =>
     { 'tests/existing.sh': 'cat src.txt\nexit 0\n' },
   );
 
+/**
+ * The whole fix is one symlink: `t -> .`. An applied path of `t/src.txt` matches
+ * nothing tracked by name, passes containment (it resolves back inside the repo),
+ * and lands on the tracked `src.txt` — so the engine itself writes the agent's
+ * bytes over the code it is judging, and credits the result.
+ */
+export const symlinkToRoot = (): Fixture => {
+  const repo = mkdtempSync(join(tmpdir(), 'engine-fixture-'));
+  const blobRoot = mkdtempSync(join(tmpdir(), 'engine-blobs-'));
+  created.push(repo, blobRoot);
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo });
+  const head = () =>
+    execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+
+  git('init', '--quiet', '--initial-branch=main');
+  git('config', 'user.email', 'fixture@example.com');
+  git('config', 'user.name', 'Fixture');
+  writeFileSync(join(repo, 'src.txt'), 'wrong\n');
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'base: the bug');
+  const base = head();
+
+  execFileSync('ln', ['-s', '.', join(repo, 't')]);
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'fix: ship a symlink and nothing else');
+  const fix = head();
+  git('checkout', '--quiet', base);
+  return { repo, base, fix, blobRoot };
+};
+
 /** A changed path git would C-quote and escape unless asked not to. */
 export const nonAsciiPath = () =>
   makeRepo({ 'src.txt': 'wrong\n', 'café.txt': 'a\n' }, { 'src.txt': 'right\n', 'café.txt': 'b\n' });

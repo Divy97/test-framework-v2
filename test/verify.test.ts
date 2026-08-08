@@ -31,6 +31,7 @@ import {
   rewritesTheReproOnBase,
   SELF_REWRITING_REPRO,
   symlinkInFix,
+  symlinkToRoot,
   pinnedSymlink,
   gitignoredWorkDir,
   REPRO_PLANTING_SYMLINK,
@@ -333,11 +334,31 @@ describe('the repro must be anchored to something', () => {
     ['a symlink into .git at depth 2', '../.git/hooks', 'a/b', 'a/b/post-checkout'],
     ['a symlink into .git at depth 3', '../../../.git/hooks', 'd0/d1/esc', 'd0/d1/esc/post-checkout'],
   ])('the fix commit cannot redirect a write through %s', async (_label, target, at, path) => {
+    // Assert on the message, not the type: a generic "could not apply repro file"
+    // wrapper around ENOENT is also an ObservationFailed, and would let a fixture
+    // pass without any guard having fired.
     await expect(
       observe(symlinkInFix(target, at), {
         repro: { command: 'true', files: { [path]: 'tampered\n' } },
       }),
-    ).rejects.toThrow(ObservationFailed);
+    ).rejects.toThrow(/traverses a symlink|resolves outside the repository|into git's own state/);
+  });
+
+  test('a symlinked ancestor cannot make the engine overwrite the code under test', async () => {
+    const { readFileSync } = await import('node:fs');
+    const fixture = symlinkToRoot();
+
+    // Containment holds — `t/src.txt` resolves back inside the repo — and the
+    // committed-path guard compares names, which `t/src.txt` does not match.
+    // Only refusing symlinked components catches this.
+    await expect(
+      observe(fixture, {
+        repro: { command: 'grep -q right src.txt', files: { 't/src.txt': 'right\n' } },
+      }),
+    ).rejects.toThrow(/traverses a symlink/);
+
+    // The forged fix must not have landed: the tracked source is untouched.
+    expect(readFileSync(`${fixture.repo}/src.txt`, 'utf8')).toBe('wrong\n');
   });
 
   test('a tracked symlink offered as a pinned path is not read through', async () => {

@@ -15,8 +15,8 @@
 // same repo must not trip the dirty-tree refusal on this run's leftovers.
 
 import { execFile } from 'node:child_process';
-import { constants, mkdir, open, realpath, rm } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { constants, lstat, mkdir, open, realpath, rm } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
 import type { ArtifactRef, RunEvent } from './events.js';
@@ -184,7 +184,7 @@ async function trackedPaths(sha: string, cwd: string): Promise<Set<string>> {
  * the fix commit controls the tree's shape: a parent directory committed as a
  * symlink would redirect a write that was proved safe against the base checkout.
  */
-async function resolveInside(root: string, input: string): Promise<Resolved> {
+async function resolveInside(root: string, input: string, allowSymlinks = false): Promise<Resolved> {
   const target = resolve(root, input);
   const rel = relative(root, target);
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
@@ -192,6 +192,28 @@ async function resolveInside(root: string, input: string): Promise<Resolved> {
   }
   if (hasGitSegment(rel)) {
     throw new ObservationFailed(`repro path writes into git's own state: ${input}`);
+  }
+  // Containment is not the invariant. The committed-path guard compares *names*,
+  // so a fix commit that ships `t -> .` makes the applied path `t/src.txt` — a
+  // name matching nothing tracked — land on the tracked `src.txt`, and the engine
+  // writes the agent's bytes over the code it is judging. The path has to be what
+  // its name says, so walk down from the root refusing any symlinked component.
+  //
+  // lstat, not realpath: a dangling link makes realpath throw, and the loop below
+  // would then treat "cannot resolve" as "nothing to check".
+  if (!allowSymlinks) {
+    let walked = root;
+    for (const segment of rel.split(sep)) {
+      walked = join(walked, segment);
+      try {
+        if ((await lstat(walked)).isSymbolicLink()) {
+          throw new ObservationFailed(`repro path traverses a symlink: ${input}`);
+        }
+      } catch (error) {
+        if (error instanceof ObservationFailed) throw error;
+        break; // Does not exist yet, so nothing below it can either.
+      }
+    }
   }
   // Both rules again, this time against the *real* path. The lexical check above
   // only sees the name: a symlink the fix commit ships can point into `.git`
@@ -256,8 +278,11 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   }
   const pinnedPaths: string[] = [];
   for (const input of repro.pinned ?? []) {
-    pinnedPaths.push((await resolveInside(root, input)).rel);
+    // Pinned paths are only ever read, and a repo may legitimately symlink a
+    // test directory; containment below still refuses anything outside.
+    pinnedPaths.push((await resolveInside(root, input, true)).rel);
   }
+  const pinned = new Set(pinnedPaths);
   const reproPaths = [...appliedFiles.keys(), ...pinnedPaths].sort();
 
   // A reproduction anchored to nothing is a reproduction the fix commit owns
@@ -307,11 +332,12 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
         // check above and this write cannot redirect it — and the repro command
         // gets to run arbitrary shell between phases.
         //
-        // Knowingly untested: a planted symlink is caught deterministically by
-        // the O_NOFOLLOW read in hashRepro, which runs first, so no fixture can
-        // reach this branch. It closes the residual race where the link appears
-        // between resolveInside above and this open — real, because the repro may
-        // leave a background process running.
+        // Knowingly untested, and I was wrong about why once already: it is the
+        // realpath containment check that covers the fixtures, not the O_NOFOLLOW
+        // read — removing both fs primitives leaves the suite green, which it
+        // could not if O_NOFOLLOW were doing this work. What remains here is the
+        // residual race where a link appears between resolveInside above and this
+        // open, which no fixture can schedule.
         await rm(target, { force: true });
         const handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
         try {
@@ -333,12 +359,19 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   const hashRepro = async (): Promise<Record<string, ArtifactRef>> => {
     const hashes: Record<string, ArtifactRef> = {};
     for (const path of reproPaths) {
-      const { target } = await resolveInside(root, path);
+      const { target } = await resolveInside(root, path, pinned.has(path));
       try {
-        // O_NOFOLLOW: a pinned path that is itself a symlink would otherwise read
-        // — and store in the blob store — whatever it points at.
+        // O_NOFOLLOW stops a symlink at the leaf. It is a second layer here: the
+        // containment check above already refuses a link pointing outside, so
+        // this covers the ordering where the link appears after that check.
         const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
         try {
+          // O_NOFOLLOW refuses a symlink; a hardlink is a second *name* for the
+          // same inode and looks like an ordinary file, so the bytes of anything
+          // linked into the tree would land in the evidence store.
+          if ((await handle.stat()).nlink > 1) {
+            throw new ObservationFailed(`repro path ${path} is a hardlink to another file`);
+          }
           hashes[path] = await put(blobRoot, await handle.readFile());
         } finally {
           await handle.close();
