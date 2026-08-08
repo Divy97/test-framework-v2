@@ -9,7 +9,7 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { chmod, mkdir, stat } from 'node:fs/promises';
+import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ObservationFailed, verify, type ReproSpec } from './verify.js';
@@ -144,11 +144,23 @@ export async function runJob(
   // shared mount now. Ownership follows the host directory, or a non-root host
   // user cannot clean up what root wrote.
   const owner = await stat(blobRoot);
-  // No shell: `cp` takes its arguments directly, so nothing here can be read as
-  // syntax. Both paths are Runner constants today, which is precisely the
-  // reasoning that has been wrong before in this codebase.
-  await execFileAsync('cp', ['-a', `${staging}/.`, blobRoot]);
-  await execFileAsync('chown', ['-R', `${owner.uid}:${owner.gid}`, blobRoot]);
+  try {
+    // No shell: `cp` takes its arguments directly, so nothing here can be read as
+    // syntax. Both paths are Runner constants today, which is precisely the
+    // reasoning that has been wrong before in this codebase.
+    await execFileAsync('cp', ['-a', `${staging}/.`, blobRoot]);
+    await execFileAsync('chown', ['-R', `${owner.uid}:${owner.gid}`, blobRoot]);
+    // The repro can delete the sentinel mid-run, which would brick this store for
+    // the next run against it. Restore it rather than leave a footgun.
+    await writeFile(`${blobRoot}/${SENTINEL}`, '');
+  } catch (error) {
+    // Failing to persist the evidence is a failure to OBSERVE, not a broken
+    // Runner. A repro can force this — /blobs has only 256 fanout names, so
+    // pre-creating them all as files makes `cp` refuse — and the exit code is
+    // what tells a human where to look. Fail-closed either way: this runs before
+    // any event is emitted, so a flush failure kills the whole stream.
+    throw new ObservationFailed(`could not persist the evidence to ${blobRoot}`, { cause: error });
+  }
 
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
