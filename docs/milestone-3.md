@@ -42,13 +42,20 @@ develop against.
 
 ## Decisions this milestone must make
 
-- **Docker-in-Docker.** If the target repo's own setup is `docker compose up`, we
-  are running Docker inside Docker. Mounting the host socket, real DinD, and
-  requiring services to start in-container all have teeth. Flagged in M2 and
-  deferred deliberately; 3a is where it gets answered.
-- **How the repo enters the sandbox.** Clone inside, or mount a prepared
-  checkout. Mounting is faster and leaks host state; cloning is slower and
-  cleaner. Evidence integrity argues for cloning.
+- **Docker-in-Docker — decided in M3.1: no docker client in the sandbox.**
+  Mounting the host socket hands a container full control of the host daemon,
+  which is the opposite of what this milestone is for; privileged DinD weakens
+  the isolation being built. The sandbox carries git, node and a shell and
+  nothing else, so a repo whose own setup needs Docker is **refused** rather
+  than granted a path back out to the host daemon.
+  That refusal is the reproduce-first gate working, not a gap: "we could not
+  stand this repo up" is a Tier 3 info-request, which ADR-0007 already treats as
+  a real deliverable. Revisit against a named repo we actually care about, so the
+  cost is paid deliberately rather than by default.
+- **How the repo enters the sandbox — decided in M3.1: mounted read-only, cloned
+  inside.** Verifying in the mount would put host state into the evidence and
+  give the run a path to write back out through it. The mount is `:ro` and the
+  Runner clones out of it, so the tree under test is the sandbox's own.
 - **Where the blob store lives.** `blobs.ts` is already behind `put`/`get`, so
   this is an adapter choice, not a rewrite — but the container needs to write
   somewhere the host can still read.
