@@ -56,9 +56,33 @@ develop against.
   inside.** Verifying in the mount would put host state into the evidence and
   give the run a path to write back out through it. The mount is `:ro` and the
   Runner clones out of it, so the tree under test is the sandbox's own.
-- **Where the blob store lives.** `blobs.ts` is already behind `put`/`get`, so
-  this is an adapter choice, not a rewrite — but the container needs to write
-  somewhere the host can still read.
+- **Where the blob store lives — decided in M3.1b: a host directory bind-mounted
+  at `/blobs`, written by the Runner as root.** The evidence has to leave the
+  container, and this is the narrowest way: no attacker-controlled string ever
+  reaches a blob path, because `put()` derives every filename from
+  `sha256(content)` computed inside itself. One directory, hash-named files,
+  trusted writer — categorically unlike the host writes M2 was doing. The Runner
+  refuses to start if `/blobs` is not a mount point, since otherwise a forgotten
+  flag yields a complete, plausible event stream whose artifacts die with `--rm`.
+  A named volume was rejected (same trust boundary, needs a second container to
+  read back); base64 down the event channel was rejected (unbounded
+  attacker-influenced data through the one path that must stay parseable). This
+  mount is the local stand-in for the S3 adapter `blobs.ts` already anticipates.
+  Blobs are written to a root-owned staging directory in the container layer and
+  moved across only once the repro has run for the last time: a bind mount does
+  not honour container permissions — Docker Desktop ignores them, and on Linux
+  the host uid is usually 1000, the uid the repro runs as — so an exposed store
+  lets the fix phase delete what the base phase banked while the stream still
+  comes out clean. The mount must also carry a sentinel file: `st_dev` proves a
+  different filesystem, not a durable one, and an anonymous volume passes that
+  test and then dies with `--rm`.
+- **Git state lives outside the worktree — decided in M3.1b.** `chown`ing the
+  repo to the repro user handed it `.git`, so it could plant a
+  `post-checkout` hook that `git clean` never descends into and the Runner then
+  executes **as root** — which defeated the uid boundary entirely, including
+  M3.1's event-channel guarantee. The clone uses `--separate-git-dir` and every
+  engine git call carries an explicit `GIT_DIR`, so the `.git` file left in the
+  worktree is never consulted.
 - **Dependency install.** Deferred from M2 with no answer: a reproduction that
   needs a package the base commit lacks is currently unrunnable. The sandbox is
   where a `setupCommand` would live if we add one.

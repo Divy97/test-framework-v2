@@ -9,7 +9,7 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ObservationFailed, verify, type ReproSpec } from './verify.js';
@@ -32,9 +32,36 @@ export type Job = {
 };
 
 const WORK = '/work';
+/**
+ * Where the evidence lands. A Runner constant, never a Job field: a
+ * caller-supplied path could aim the blob writes at the repo or the read-only
+ * source mount.
+ */
+const BLOBS = '/blobs';
 /** Matches the `repro` user created in the Dockerfile. */
 const REPRO_UID = 1000;
 const REPRO_GID = 1000;
+
+/**
+ * Proof the store outlives the container — which `st_dev` alone cannot give.
+ *
+ * A different device only means "a different filesystem": an anonymous volume
+ * (`-v /blobs`) passes that test and is then deleted by `--rm`, admitting the
+ * exact silent-loss case the check exists to stop. So the caller must have
+ * created the directory on the host and left a sentinel in it.
+ */
+const SENTINEL = '.evidence-store';
+
+async function hostStoreIsMounted(path: string): Promise<boolean> {
+  try {
+    const [here, root] = await Promise.all([stat(path), stat('/')]);
+    if (here.dev === root.dev) return false;
+    await stat(`${path}/${SENTINEL}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -45,24 +72,54 @@ async function readStdin(): Promise<string> {
 export async function runJob(
   job: Job,
   workDir = WORK,
+  blobRoot = BLOBS,
   emit: (line: string) => void = (line) => process.stdout.write(line),
 ): Promise<number> {
   const repoPath = `${workDir}/repo`;
-  const blobRoot = `${workDir}/blobs`;
-  await mkdir(blobRoot, { recursive: true });
+  // Git's own state lives outside the worktree. Inside it, the repro owns .git
+  // and plants a post-checkout hook that `git clean` never descends into, which
+  // the Runner then executes as root — so uid 1000 was never the boundary it
+  // looked like. GIT_DIR is passed explicitly so git never consults the `.git`
+  // file left in the worktree either.
+  const gitDir = `${workDir}/gitdir`;
+  const gitEnv = { GIT_DIR: gitDir, GIT_WORK_TREE: repoPath };
+
+  // Refuse rather than silently write into the container layer. Without the
+  // mount the run still produces a complete, plausible event stream whose
+  // artifacts die with --rm — the exact failure this is here to prevent, only
+  // invisible.
+  if (!(await hostStoreIsMounted(blobRoot))) {
+    throw new ObservationFailed(
+      `${blobRoot} is not a host store (mount it and leave a ${SENTINEL} file); ` +
+        'the evidence would not survive the container',
+    );
+  }
+
+  // Blobs are written here first, in the container layer, root-owned 0700.
+  // /blobs is a bind mount, and a bind mount does not honour those permissions —
+  // Docker Desktop ignores them outright, and on Linux the host uid is commonly
+  // 1000, the very uid the repro runs as. Left there during the run, the repro
+  // could delete artifacts the base phase had already banked and the stream
+  // would still come out clean and complete.
+  const staging = `${workDir}/staging`;
+  await mkdir(staging, { recursive: true });
+  await chmod(staging, 0o700);
 
   // Clone rather than work in the mounted directory. The mount is the host's
   // tree; verifying in place would put host state inside the evidence and let
   // the run write back out through it.
   // `--` so a sourcePath cannot be read as an option: `--upload-pack=…` and
   // `ext::sh -c …` are both command execution.
-  await execFileAsync('git', ['clone', '--quiet', '--no-local', '--', job.sourcePath, repoPath]);
+  await execFileAsync('git', [
+    'clone', '--quiet', '--no-local', `--separate-git-dir=${gitDir}`, '--', job.sourcePath, repoPath,
+  ]);
 
   // The repro runs as this user, not as the Runner. Root in the Runner's own
   // namespace can reach the event channel through /proc/1/fd/N whatever the
   // Runner does with its own descriptors.
   const runAs = { uid: REPRO_UID, gid: REPRO_GID };
-  await execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, workDir]);
+  // The worktree only. Not the blob store, and not the git dir.
+  await execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, repoPath]);
   // The Runner stays root, so git now sees a tree owned by someone else and
   // refuses it as "dubious ownership". Scoped to this path, inside a container
   // built for exactly one run.
@@ -76,11 +133,34 @@ export async function runJob(
     fixRef: job.fixRef,
     repro: job.repro,
     symptomPattern: new RegExp(job.symptomPattern),
-    blobRoot,
+    blobRoot: staging,
+    gitEnv,
     runAs,
     ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
     ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
   });
+
+  // The repro has run for the last time, so the evidence can cross into the
+  // shared mount now. Ownership follows the host directory, or a non-root host
+  // user cannot clean up what root wrote.
+  const owner = await stat(blobRoot);
+  try {
+    // No shell: `cp` takes its arguments directly, so nothing here can be read as
+    // syntax. Both paths are Runner constants today, which is precisely the
+    // reasoning that has been wrong before in this codebase.
+    await execFileAsync('cp', ['-a', `${staging}/.`, blobRoot]);
+    await execFileAsync('chown', ['-R', `${owner.uid}:${owner.gid}`, blobRoot]);
+    // The repro can delete the sentinel mid-run, which would brick this store for
+    // the next run against it. Restore it rather than leave a footgun.
+    await writeFile(`${blobRoot}/${SENTINEL}`, '');
+  } catch (error) {
+    // Failing to persist the evidence is a failure to OBSERVE, not a broken
+    // Runner. A repro can force this — /blobs has only 256 fanout names, so
+    // pre-creating them all as files makes `cp` refuse — and the exit code is
+    // what tells a human where to look. Fail-closed either way: this runs before
+    // any event is emitted, so a flush failure kills the whole stream.
+    throw new ObservationFailed(`could not persist the evidence to ${blobRoot}`, { cause: error });
+  }
 
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
@@ -107,7 +187,7 @@ if (process.argv[1]?.endsWith('runner.ts') || process.argv[1]?.endsWith('runner.
     // was being cut mid-JSON while the run reported success — silent evidence
     // loss presented as a clean record, which is the worst failure this project
     // has.
-    process.exitCode = await runJob(job, WORK, (line) => writeSync(channel, line));
+    process.exitCode = await runJob(job, WORK, BLOBS, (line) => writeSync(channel, line));
   } catch (error) {
     // A failure to observe is not a verification result. It leaves on stderr so
     // it can never be mistaken for an event on the channel.
