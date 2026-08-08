@@ -1,0 +1,110 @@
+# Milestone 2 — the verification engine
+
+**Goal:** the engine that turns a claimed fix into evidence, built and tested
+without an agent and without a container.
+
+The engine is the moat. It has no hard dependency on Claude Code or Docker, so
+it gets built first, against fixtures that include the adversarial cases. When
+the Runner arrives in M3 it calls an engine that is already trustworthy —
+rather than three unproven layers debugged at once, with no way to tell which
+one lied.
+
+## The shape
+
+```ts
+verify({ repoPath, baseRef, fixRef, reproCommand, symptomPattern, flakeRuns })
+  -> RunEvent[]
+```
+
+Executed at the engine's own process boundary (ADR-0006), in order:
+
+1. checkout `baseRef` → run `reproCommand` → capture exit code + stdout → hash
+2. checkout `fixRef` → run `reproCommand` → capture, hash
+3. re-run the fix phase `flakeRuns` times
+4. observe the fix diff: changed file paths + diff hash
+
+It emits fact-events and returns them. It issues no verdict — `reproduced`,
+tier, and confidence stay in the fold (ADR-0001, ADR-0004).
+
+### The subtle line: observation vs interpretation
+
+`symptom_matched` is a **fact**. The engine ran a regex against output it
+captured itself and recorded what it saw — the same class of act as recording
+an exit code. "Tier 1, reproduced" is an **interpretation** and belongs to the
+fold.
+
+The test is whether the fold could re-derive it from the log alone. It cannot
+re-run a regex over stdout it does not have (the blob store holds the bytes,
+the fold is pure). So the observation is recorded; the conclusion drawn from it
+is not.
+
+## Event vocabulary changes
+
+Additive, so payloads stay `v: 1`:
+
+| Event | Change | Why |
+|---|---|---|
+| `TEST_RUN` | add `symptom_matched?: boolean`, `repeat?: number` | anti-gaming symptom check; flake re-run index |
+| `REPRO_REGISTERED` | new — `{ path, content_hash }` | anchors the diff-overlap check |
+| `FIX_DIFF_OBSERVED` | new — `{ changed_files[], diff_hash }` | lets the fold compute overlap purely |
+| `RUN_ENDED` | new — `{ reason }` | `pr_opened` \| `not_reproduced` \| `attempts_exhausted` \| `error` |
+
+`RUN_ENDED` closes the terminal-state gap: `RunStatus` gains `unresolved`, and
+the Tier 3 outcome (ADR-0007) becomes expressible for the first time.
+
+## Anti-gaming checks
+
+Per Q7 "loose agent, strict judge". Each is executed by the engine; each
+contributes evidence the fold reads:
+
+- **Symptom match** — base failure output must match the reported symptom. A
+  test that fails for an unrelated reason is not a reproduction.
+- **Flake survival** — the fix phase must pass every re-run, not just once.
+- **Diff overlap** — the fix diff must touch the path the reproduction
+  exercises. A fix that changes nothing relevant did not fix the bug.
+
+Without these, a cornered agent writes a test that trivially fails then passes
+without ever touching the defect, and the tier means nothing.
+
+## Fixtures
+
+Tiny git repos generated into a temp dir at test setup — not committed as
+nested repos. One per case the engine must get right:
+
+1. clean red → green (Tier 1)
+2. symptom mismatch — base fails for the wrong reason
+3. flaky fix — passes 2 of 3 re-runs
+4. gaming attempt — red → green, but the diff never touches the repro path
+5. irreproducible — base and fix both pass (Tier 3, no fix attempted)
+
+Cases 2–5 are the point. They are also why the demo app cannot serve as this
+fixture: a Next.js app behind a Docker build is too slow and too coarse for
+unit-level assertions, and shipping deliberate gaming attempts inside a demo
+makes the demo worse. Two artifacts, two purposes —
+[SHARED-UNDERSTANDING.md](../SHARED-UNDERSTANDING.md) Q8 updated accordingly.
+
+## Blob store
+
+Content-addressed local directory: `blobs/ab/cd/<rest-of-hash>`. `put(bytes)`
+returns the `sha256:` ref that events carry. S3 becomes one adapter later; no
+event schema changes when it does.
+
+## PR breakdown
+
+1. **Engine core** — `verify()`, the four phases, the three checks, blob store.
+2. **Fixtures + engine tests** — the five cases above.
+3. **Vocabulary + projections** — new events, `unresolved` status, tier and
+   confidence as pure projections over the log.
+
+## Not in this milestone
+
+Docker sandbox · live Claude Code · adapters · SSE · dashboard · the Next.js
+demo app.
+
+## Known risks
+
+- **The engine runs arbitrary commands on the host.** That is what it is for,
+  and it is exactly what the M3 sandbox exists to contain. Until then it runs
+  only against fixtures we generate.
+- **No command timeout yet.** A hanging repro command hangs the engine. Add a
+  timeout when a real repro command (rather than a fixture) first runs.

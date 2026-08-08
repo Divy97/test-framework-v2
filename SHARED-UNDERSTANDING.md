@@ -72,7 +72,7 @@ Corollaries:
 - Terminology split for ADRs: *verification* is an active process emitting fact-events (has side effects); the *confidence score* is the projection (pure fold). A "projection with side effects" is a contradiction we never utter.
 
 ### Q8 — Demo target
-- **(a) Purpose-built demo app** (small TS/Next.js), 5–6 seeded bugs spanning tiers — logic bug, API bug, UI bug, and one irreproducible-by-design to demo Tier 3 / UNRESOLVED. One `docker build`, never flakes. Doubles as the verification engine's test fixture.
+- **(a) Purpose-built demo app** (small TS/Next.js), 5–6 seeded bugs spanning tiers — logic bug, API bug, UI bug, and one irreproducible-by-design to demo Tier 3 / UNRESOLVED. One `docker build`, never flakes. **Amended (M2 scoping):** it does *not* double as the verification engine's test fixture — the engine is tested against tiny generated git repos that include the adversarial cases (symptom mismatch, flaky fix, gaming attempt). A demo app is too slow and too coarse for that, and seeding deliberate gaming attempts into a demo makes the demo worse. Two artifacts, two purposes.
 - **Plus one recorded run against a real OSS issue**, kept as a replayable artifact — generality proven without live-demo risk.
 
 ### Q9 — Fresh repo
@@ -103,7 +103,7 @@ Corollaries:
 
 ## Open items
 - [ ] Project name ("test-framework-v2" is a placeholder)
-- [ ] Timeline / milestone cut
-- [ ] Stack detail pass (queue choice, blob store: disk vs S3, dashboard framework)
+- [x] Timeline / milestone cut — M1 event core (merged); M2 verification engine, engine-first with no agent and no container ([docs/milestone-2.md](docs/milestone-2.md)); M3 Runner + sandbox
+- [ ] Stack detail pass (queue choice, dashboard framework) — blob store settled: content-addressed local directory, S3 as an adapter later
 - [ ] Seeded-bug list for the demo app
 - [ ] Which real OSS issue for the recorded run
