@@ -48,9 +48,13 @@ export const demoRunEvents: RunEvent[] = [
     payload: {
       v: 1,
       phase: 'base',
+      commit_sha: '8d41c6b2a09f7e5d3c1b0a98765432104f6e2d1c',
       exit_code: 1,
       stdout_hash: 'sha256:5b7a1de2c3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0',
       duration_ms: 4312,
+      // The demo is a genuine Tier 1: the base failed for the reported reason.
+      symptom_matched: true,
+      repeat: 0,
     },
   },
   {
@@ -61,9 +65,11 @@ export const demoRunEvents: RunEvent[] = [
     payload: {
       v: 1,
       phase: 'fix',
+      commit_sha: 'f3a9d1c7e5b2048a6c1d9e7f3b5a2c8d0e4f6a1b',
       exit_code: 0,
       stdout_hash: 'sha256:9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b',
       duration_ms: 3987,
+      repeat: 0,
     },
   },
   {

@@ -9,9 +9,13 @@ export type RunStatus = 'requested' | 'sandbox_ready' | 'attempting' | 'pr_opene
 export type TestRunRecord = {
   attempt: number;
   phase: 'base' | 'fix';
+  commit_sha: string;
   exit_code: number;
+  signal?: string;
   stdout_hash: ArtifactRef;
   duration_ms: number;
+  symptom_matched?: boolean;
+  repeat?: number;
 };
 
 export type RunState = {
@@ -72,9 +76,13 @@ export function apply(state: RunState, event: RunEvent): RunState {
         {
           attempt: state.currentAttempt,
           phase: event.payload.phase,
+          commit_sha: event.payload.commit_sha,
           exit_code: event.payload.exit_code,
+          signal: event.payload.signal,
           stdout_hash: event.payload.stdout_hash,
           duration_ms: event.payload.duration_ms,
+          symptom_matched: event.payload.symptom_matched,
+          repeat: event.payload.repeat,
         },
       ];
       return {
@@ -111,16 +119,29 @@ export function apply(state: RunState, event: RunEvent): RunState {
   }
 }
 
-/** Base failed, then fix passed, within the same attempt. */
+/**
+ * A reproduction is a base that failed *for the reported reason*, and a fix that
+ * passed *every* time, within one attempt.
+ *
+ * Each clause exists because the engine collects a signal that would otherwise be
+ * decorative. `symptom_matched` rejects a base that failed for some unrelated
+ * reason — including the common case of a repro that errors because the test file
+ * only exists in the fix commit. `every` rather than `some` rejects a fix that
+ * passed two runs in three; a flake that happens to pass once is not a fix.
+ *
+ * This deliberately errs toward *not* crediting a reproduction. A false negative
+ * costs an info-request (ADR-0007's Tier 3, which the design already treats as a
+ * real deliverable); a false positive puts a fabricated verdict on a PR.
+ */
 function isReproduced(testRuns: TestRunRecord[]): boolean {
-  return testRuns.some(
-    (fix) =>
-      fix.phase === 'fix' &&
-      fix.exit_code === 0 &&
-      testRuns.some(
-        (base) => base.attempt === fix.attempt && base.phase === 'base' && base.exit_code !== 0,
-      ),
-  );
+  return testRuns.some((base) => {
+    // attempt 0 means no ATTEMPT_STARTED was ever seen, so "within one attempt"
+    // is unenforceable and runs from unrelated attempts could be paired.
+    if (base.phase !== 'base' || base.attempt === 0) return false;
+    if (base.exit_code === 0 || base.symptom_matched !== true) return false;
+    const fixes = testRuns.filter((r) => r.phase === 'fix' && r.attempt === base.attempt);
+    return fixes.length > 0 && fixes.every((r) => r.exit_code === 0);
+  });
 }
 
 export function fold(events: RunEvent[]): RunState {

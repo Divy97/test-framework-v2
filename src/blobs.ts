@@ -1,15 +1,18 @@
 // Content-addressed blob store. Events stay small and carry sha256: refs
 // (ADR-0001); the bytes themselves — stdout, diffs, transcripts — live here.
 //
-// ponytail: local directory, no S3. S3 becomes one adapter behind put/path
+// ponytail: local directory, no S3. S3 becomes one adapter behind put/get
 // when a run needs to outlive the machine; no event schema changes when it does.
 
-import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { ArtifactRef } from './events.js';
 
 const PREFIX = 'sha256:';
+
+const digest = (bytes: string | Buffer): ArtifactRef =>
+  `${PREFIX}${createHash('sha256').update(bytes).digest('hex')}`;
 
 export function blobPath(root: string, ref: ArtifactRef): string {
   const hex = ref.slice(PREFIX.length);
@@ -17,15 +20,27 @@ export function blobPath(root: string, ref: ArtifactRef): string {
   return join(root, hex.slice(0, 2), hex.slice(2, 4), hex.slice(4));
 }
 
-/** Store bytes, return the ref events will carry. Identical bytes rewrite the same path. */
+/** Store bytes, return the ref events will carry. */
 export async function put(root: string, bytes: string | Buffer): Promise<ArtifactRef> {
-  const ref: ArtifactRef = `${PREFIX}${createHash('sha256').update(bytes).digest('hex')}`;
+  const ref = digest(bytes);
   const path = blobPath(root, ref);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, bytes);
+  // Write aside and rename: rename is atomic within a directory, so a crash or a
+  // concurrent writer can never leave truncated bytes sitting at a path whose
+  // name asserts the hash of the complete content.
+  const staged = `${path}.${randomUUID()}.tmp`;
+  await writeFile(staged, bytes);
+  await rename(staged, path);
   return ref;
 }
 
-export function get(root: string, ref: ArtifactRef): Promise<Buffer> {
-  return readFile(blobPath(root, ref));
+/** Read bytes back, proving they are what the ref claims. */
+export async function get(root: string, ref: ArtifactRef): Promise<Buffer> {
+  const bytes = await readFile(blobPath(root, ref));
+  const actual = digest(bytes);
+  if (actual !== ref) {
+    // A content-addressed store that never checks its content is just a filesystem.
+    throw new Error(`blob ${ref} contains ${actual} — this artifact is not the evidence it claims`);
+  }
+  return bytes;
 }
