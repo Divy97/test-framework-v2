@@ -30,7 +30,10 @@ import {
   rewritesTheRepro,
   rewritesTheReproOnBase,
   SELF_REWRITING_REPRO,
-  symlinkedParentInFix,
+  symlinkInFix,
+  pinnedSymlink,
+  gitignoredWorkDir,
+  REPRO_PLANTING_SYMLINK,
   type Fixture,
 } from './fixtures/repo.js';
 
@@ -306,18 +309,71 @@ describe('the repro must be anchored to something', () => {
     ).rejects.toThrow(ObservationFailed);
   });
 
-  test('a parent directory the fix commit turns into a symlink cannot redirect the write', async () => {
-    const { mkdtempSync } = await import('node:fs');
+  // Containment is proved against the base checkout, but the fix commit controls
+  // the tree's shape by the time the second write happens. Each fixture leaves
+  // HEAD on base so the fix-phase re-resolution is what actually fires.
+  test('a redirected write is refused before it happens, not after', async () => {
+    const { mkdtempSync, readdirSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const outside = mkdtempSync(`${tmpdir()}/engine-outside-`);
 
-    // Containment was proved against the base checkout; the fix commit controls
-    // the tree's shape by the time the second write happens.
     await expect(
-      observe(symlinkedParentInFix(outside), {
-        repro: { command: 'sh escape/repro.sh', files: { 'escape/repro.sh': 'exit 1\n' } },
+      observe(symlinkInFix(outside, 'link'), {
+        repro: { command: 'true', files: { 'link/repro.sh': 'tampered\n' } },
       }),
     ).rejects.toThrow(ObservationFailed);
+
+    // Throwing is not enough: a guard that only fires downstream of the write
+    // reports the same error while the bytes have already escaped.
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  test.each([
+    ['a symlink into .git', '.git', 'link', 'link/config'],
+    ['a symlink into .git at depth 2', '../.git/hooks', 'a/b', 'a/b/post-checkout'],
+    ['a symlink into .git at depth 3', '../../../.git/hooks', 'd0/d1/esc', 'd0/d1/esc/post-checkout'],
+  ])('the fix commit cannot redirect a write through %s', async (_label, target, at, path) => {
+    await expect(
+      observe(symlinkInFix(target, at), {
+        repro: { command: 'true', files: { [path]: 'tampered\n' } },
+      }),
+    ).rejects.toThrow(ObservationFailed);
+  });
+
+  test('a tracked symlink offered as a pinned path is not read through', async () => {
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const secret = `${mkdtempSync(`${tmpdir()}/engine-outside-`)}/secret.txt`;
+    writeFileSync(secret, 'exfiltrated\n');
+
+    // Reading through it would store the secret's bytes in the blob store, and
+    // would disarm the pinned anchor: a target no commit can change never drifts.
+    const fixture = pinnedSymlink(secret);
+    await expect(
+      observe(fixture, { repro: { command: 'true', pinned: ['leak.sh'] } }),
+    ).rejects.toThrow(ObservationFailed);
+
+    // Nothing was stored, so the secret never entered the evidence record.
+    const { readdirSync } = await import('node:fs');
+    expect(readdirSync(fixture.blobRoot)).toEqual([]);
+  });
+
+  test('a symlink the repro command plants is caught before the next phase reads or writes it', async () => {
+    const { mkdtempSync, readFileSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const outside = `${mkdtempSync(`${tmpdir()}/engine-outside-`)}/planted.txt`;
+    // The target must exist, or the run aborts on a failed *read* and the write
+    // path this test exists for is never reached.
+    writeFileSync(outside, 'untouched\n');
+
+    // work/ is gitignored, so the phase-boundary clean spares it by design. The
+    // O_NOFOLLOW read fires first, before the fix phase could write through it —
+    // which is why the O_EXCL write guard has no reachable fixture of its own.
+    await expect(
+      observe(gitignoredWorkDir(), { repro: REPRO_PLANTING_SYMLINK(outside) }),
+    ).rejects.toThrow(ObservationFailed);
+
+    expect(readFileSync(outside, 'utf8')).toBe('untouched\n');
   });
 
   test('a missing pinned path is an ObservationFailed, not a raw fs error', async () => {

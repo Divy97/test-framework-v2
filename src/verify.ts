@@ -15,7 +15,7 @@
 // same repo must not trip the dirty-tree refusal on this run's leftovers.
 
 import { execFile } from 'node:child_process';
-import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
+import { constants, mkdir, open, realpath, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
@@ -190,28 +190,37 @@ async function resolveInside(root: string, input: string): Promise<Resolved> {
   if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
     throw new ObservationFailed(`repro path escapes the repository: ${input}`);
   }
-  // Every segment, case-folded: `sub/.git/hooks/pre-commit` is git state too, and
-  // on a case-insensitive filesystem so is `.Git`.
-  if (rel.split(sep).some((segment) => segment.toLowerCase() === '.git')) {
+  if (hasGitSegment(rel)) {
     throw new ObservationFailed(`repro path writes into git's own state: ${input}`);
   }
-  // The parent may not exist yet; walk up to the deepest part that does and
-  // confirm its real location is still under the root.
-  let probe = dirname(target);
+  // Both rules again, this time against the *real* path. The lexical check above
+  // only sees the name: a symlink the fix commit ships can point into `.git`
+  // while satisfying containment, which is the same arbitrary-config write by a
+  // different door. The walk starts at the target itself, not its parent — the
+  // final component is a symlink the attacker controls just as easily.
+  let probe = target;
   while (probe !== root) {
     try {
-      const real = await realpath(probe);
-      if (real !== root && !real.startsWith(root + sep)) {
+      const realRel = relative(root, await realpath(probe));
+      if (realRel.startsWith('..') || isAbsolute(realRel)) {
         throw new ObservationFailed(`repro path resolves outside the repository: ${input}`);
+      }
+      if (hasGitSegment(realRel)) {
+        throw new ObservationFailed(`repro path resolves into git's own state: ${input}`);
       }
       break;
     } catch (error) {
       if (error instanceof ObservationFailed) throw error;
+      // Does not exist yet: keep walking up to the deepest part that does.
       probe = dirname(probe);
     }
   }
   return { rel, target };
 }
+
+/** `.git` in any position, case-folded — `sub/.git/hooks` and `.Git` are git state too. */
+const hasGitSegment = (path: string) =>
+  path.split(sep).some((segment) => segment.toLowerCase() === '.git');
 
 type Resolved = { rel: string; target: string };
 
@@ -293,7 +302,23 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
       const { target } = await resolveInside(root, path);
       try {
         await mkdir(dirname(target), { recursive: true });
-        await writeFile(target, content);
+        // Remove, then create exclusively. O_CREAT|O_EXCL refuses to open an
+        // existing path *including a symlink*, so a link planted between the
+        // check above and this write cannot redirect it — and the repro command
+        // gets to run arbitrary shell between phases.
+        //
+        // Knowingly untested: a planted symlink is caught deterministically by
+        // the O_NOFOLLOW read in hashRepro, which runs first, so no fixture can
+        // reach this branch. It closes the residual race where the link appears
+        // between resolveInside above and this open — real, because the repro may
+        // leave a background process running.
+        await rm(target, { force: true });
+        const handle = await open(target, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+        try {
+          await handle.writeFile(content);
+        } finally {
+          await handle.close();
+        }
       } catch (error) {
         throw new ObservationFailed(`could not apply repro file ${path}`, { cause: error });
       }
@@ -310,7 +335,14 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
     for (const path of reproPaths) {
       const { target } = await resolveInside(root, path);
       try {
-        hashes[path] = await put(blobRoot, await readFile(target));
+        // O_NOFOLLOW: a pinned path that is itself a symlink would otherwise read
+        // — and store in the blob store — whatever it points at.
+        const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          hashes[path] = await put(blobRoot, await handle.readFile());
+        } finally {
+          await handle.close();
+        }
       } catch (error) {
         throw new ObservationFailed(`could not read repro file ${path}`, { cause: error });
       }

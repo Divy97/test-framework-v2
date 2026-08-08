@@ -168,20 +168,67 @@ export const rewritesTheReproOnBase = () =>
     { 'src.txt': 'right\n', 'mutate.sh': 'true\n' },
   );
 
-/** A parent directory the FIX commit turns into a symlink pointing outside the repo. */
-export const symlinkedParentInFix = (outside: string) => {
+/**
+ * The FIX commit ships a symlink at `link`, so the redirect only exists once the
+ * engine switches phases. HEAD is left on the BASE commit: otherwise the up-front
+ * guard fires before the base phase and the fix-phase re-resolution — the thing
+ * under test — never runs at all.
+ */
+export const symlinkInFix = (target: string, at = 'link') => {
   const fixture = makeRepo({ 'src.txt': 'wrong\n' }, { 'src.txt': 'right\n' });
-  execFileSync('ln', ['-s', outside, join(fixture.repo, 'escape')]);
-  execFileSync('git', ['add', '.'], { cwd: fixture.repo });
-  execFileSync('git', ['commit', '--quiet', '-m', 'fix: add a symlinked dir'], {
-    cwd: fixture.repo,
-  });
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: fixture.repo });
+  mkdirSync(dirname(join(fixture.repo, at)), { recursive: true });
+  execFileSync('ln', ['-s', target, join(fixture.repo, at)]);
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'fix: add a symlink');
   fixture.fix = execFileSync('git', ['rev-parse', 'HEAD'], {
     cwd: fixture.repo,
     encoding: 'utf8',
   }).trim();
+  git('checkout', '--quiet', fixture.base);
   return fixture;
 };
+
+/**
+ * A tracked symlink pointing outside the repo, offered as a pinned repro path.
+ * Built commit-by-commit rather than by amending: amending the base detaches the
+ * fix commit from it, and the run would then fail on a missing merge base — a
+ * throw that has nothing to do with the symlink under test.
+ */
+export const pinnedSymlink = (target: string): Fixture => {
+  const repo = mkdtempSync(join(tmpdir(), 'engine-fixture-'));
+  const blobRoot = mkdtempSync(join(tmpdir(), 'engine-blobs-'));
+  created.push(repo, blobRoot);
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo });
+  const head = () =>
+    execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+
+  git('init', '--quiet', '--initial-branch=main');
+  git('config', 'user.email', 'fixture@example.com');
+  git('config', 'user.name', 'Fixture');
+  writeFileSync(join(repo, 'src.txt'), 'wrong\n');
+  execFileSync('ln', ['-s', target, join(repo, 'leak.sh')]);
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'base: the bug');
+  const base = head();
+
+  writeFileSync(join(repo, 'src.txt'), 'right\n');
+  git('commit', '--quiet', '-am', 'fix: the claim');
+  return { repo, base, fix: head(), blobRoot };
+};
+
+/**
+ * The repro command itself plants a symlink where the next phase will write. The
+ * directory is gitignored, so the phase-boundary clean deliberately spares it —
+ * no race needed, just the arbitrary shell the design already assumes is hostile.
+ */
+export const REPRO_PLANTING_SYMLINK = (target: string): ReproSpec => ({
+  command: 'rm -f work/repro.sh; ln -s ' + target + ' work/repro.sh; exit 1',
+  files: { 'work/repro.sh': 'exit 1\n' },
+});
+
+export const gitignoredWorkDir = () =>
+  makeRepo({ 'src.txt': 'wrong\n', '.gitignore': 'work/\n' }, { 'src.txt': 'right\n' });
 
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () => makeRepo({ 'src.txt': 'right\n' }, { 'notes.md': 'nope\n' });
