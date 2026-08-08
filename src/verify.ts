@@ -22,6 +22,17 @@ const execFileAsync = promisify(execFile);
 /** Output capture ceiling. Beyond this the engine refuses to record rather than truncate. */
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
+/**
+ * Redirect the shell's own stderr, then run the command verbatim on its own line.
+ *
+ * Wrapping the command in `( … )` looked equivalent and is not: a command ending
+ * in a comment swallows the closing paren, so `sh` dies of a syntax error and
+ * reports exit 2 with empty output — a fabricated TEST_RUN. `exec 2>&1` never
+ * touches the command text, and it captures sh's own diagnostics too, so a
+ * malformed repro shows up in the artifact instead of vanishing.
+ */
+const mergeStreams = (command: string) => `exec 2>&1\n${command}`;
+
 /** The engine could not observe the outcome. Never confuse this with observing a failure. */
 export class ObservationFailed extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -46,6 +57,8 @@ export type VerifyOptions = {
   flakeRuns?: number;
   /** Per-command ceiling. A repro that hangs must fail the run, not wedge it. */
   timeoutMs?: number;
+  /** Output ceiling. Exceeding it aborts the run rather than storing a truncated artifact. */
+  maxOutputBytes?: number;
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -59,17 +72,18 @@ type Execution = { exitCode: number; signal?: string; output: string; durationMs
  * because recording it would put a plausible-looking exit code on an execution
  * that never produced one.
  */
-async function run(command: string, cwd: string, timeoutMs: number): Promise<Execution> {
+async function run(
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+  maxOutputBytes: number,
+): Promise<Execution> {
   const startedAt = Date.now();
-  // Merge stderr into stdout inside the child so the artifact preserves real
-  // interleaving; concatenating two buffers would invent an ordering and let the
-  // symptom regex match across the seam between them.
-  const merged = `( ${command} ) 2>&1`;
   try {
-    const { stdout } = await execFileAsync('sh', ['-c', merged], {
+    const { stdout } = await execFileAsync('sh', ['-c', mergeStreams(command)], {
       cwd,
       timeout: timeoutMs,
-      maxBuffer: MAX_OUTPUT_BYTES,
+      maxBuffer: maxOutputBytes,
     });
     return { exitCode: 0, output: stdout, durationMs: Date.now() - startedAt };
   } catch (error) {
@@ -112,9 +126,18 @@ async function run(command: string, cwd: string, timeoutMs: number): Promise<Exe
   }
 }
 
+/** Git is infrastructure, not the thing under test: any failure here is a failure to observe. */
 async function git(args: string[], cwd: string): Promise<string> {
-  const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: MAX_OUTPUT_BYTES });
-  return stdout;
+  try {
+    const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: MAX_OUTPUT_BYTES });
+    return stdout;
+  } catch (error) {
+    const failure = error as { stderr?: string; message?: string };
+    const detail = (failure.stderr || failure.message || '').trim().split('\n')[0];
+    throw new ObservationFailed(`git ${args.join(' ')} failed in ${cwd}: ${detail}`, {
+      cause: error,
+    });
+  }
 }
 
 /** Check out a ref and report the commit it actually resolved to. */
@@ -127,6 +150,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   const { runId, repoPath, baseRef, fixRef, reproCommand, blobRoot } = options;
   const flakeRuns = options.flakeRuns ?? 2;
   const timeoutMs = options.timeoutMs ?? 120_000;
+  const maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
 
   // A caller's /g or /y regex carries lastIndex between calls, so the same output
   // could be observed differently on a second run. Strip the stateful flags.
@@ -151,7 +175,7 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
   };
 
   const baseSha = await checkout(baseRef, repoPath);
-  const base = await run(reproCommand, repoPath, timeoutMs);
+  const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes);
   emit({
     type: 'TEST_RUN',
     payload: {
@@ -167,16 +191,23 @@ export async function verify(options: VerifyOptions): Promise<RunEvent[]> {
     },
   });
 
-  const fixSha = await checkout(fixRef, repoPath);
-  // Whatever the base phase left behind — caches, generated files, a seeded DB —
-  // could carry the fix phase to green on its own. Ignored files are deliberately
-  // spared: they are usually installed dependencies, and removing them would
-  // change what is under test far more than it isolates it.
+  // Scrub before switching, not after. Whatever the base phase left behind —
+  // caches, generated files, a seeded DB, an edit to a tracked file that both
+  // commits share — could carry the fix phase to green on its own. `checkout`
+  // preserves modifications to files the two commits agree on, and aborts
+  // outright when untracked residue collides with a file the fix commit adds, so
+  // cleaning afterwards is both too late and unreachable.
+  //
+  // Ignored files are deliberately spared: they are usually installed
+  // dependencies, and removing them would change what is under test far more
+  // than it isolates it.
+  await git(['reset', '--hard', '--quiet', baseSha], repoPath);
   await git(['clean', '--quiet', '-dff'], repoPath);
+  const fixSha = await checkout(fixRef, repoPath);
   // Re-runs deliberately share a working tree: they are re-executions of the same
   // fix, not independent trials, and isolating them would hide order-dependent flake.
   for (let repeat = 0; repeat <= flakeRuns; repeat++) {
-    const fix = await run(reproCommand, repoPath, timeoutMs);
+    const fix = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes);
     emit({
       type: 'TEST_RUN',
       payload: {

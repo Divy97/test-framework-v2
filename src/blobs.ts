@@ -28,6 +28,11 @@ export async function put(root: string, bytes: string | Buffer): Promise<Artifac
   // Write aside and rename: rename is atomic within a directory, so a crash or a
   // concurrent writer can never leave truncated bytes sitting at a path whose
   // name asserts the hash of the complete content.
+  //
+  // Knowingly untested: proving this needs fault injection mid-write, and a test
+  // that cannot fail on the direct-write version would only be decoration. The
+  // guarantee is structural — get()'s digest check below is what catches a blob
+  // that went bad by any route this did not prevent.
   const staged = `${path}.${randomUUID()}.tmp`;
   await writeFile(staged, bytes);
   await rename(staged, path);

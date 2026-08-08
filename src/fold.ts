@@ -138,6 +138,11 @@ function isReproduced(testRuns: TestRunRecord[]): boolean {
     // attempt 0 means no ATTEMPT_STARTED was ever seen, so "within one attempt"
     // is unenforceable and runs from unrelated attempts could be paired.
     if (base.phase !== 'base' || base.attempt === 0) return false;
+    // A crash is not a test failure. A signalled death records exit_code -1,
+    // which would otherwise sail through the "did it fail" test below — so an
+    // OOM-killed base whose partial output happened to contain the symptom
+    // string would be credited as a reproduction.
+    if (base.signal) return false;
     if (base.exit_code === 0 || base.symptom_matched !== true) return false;
     const fixes = testRuns.filter((r) => r.phase === 'fix' && r.attempt === base.attempt);
     return fixes.length > 0 && fixes.every((r) => r.exit_code === 0);

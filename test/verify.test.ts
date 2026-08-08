@@ -13,11 +13,15 @@ import {
   cleanupFixtures,
   clean,
   collateralGaming,
+  crashingBase,
+  divergentHistory,
   flakyFix,
   gamingAttempt,
   irreproducible,
   noisySymptom,
+  nonAsciiPath,
   REPRO_COMMAND,
+  residueFromBase,
   wrongReasonFailure,
   type Fixture,
 } from './fixtures/repo.js';
@@ -153,6 +157,15 @@ describe('adversarial cases', () => {
     expect(conclude(events).reproduced).toBe(true);
   });
 
+  test('runs outside a declared attempt are never paired into a reproduction', async () => {
+    // Without ATTEMPT_STARTED every run lands in attempt 0, and "within one
+    // attempt" stops being enforceable — a red base from one attempt could be
+    // paired with a green fix from an unrelated later one.
+    const events = await observe(clean(), { flakeRuns: 0 });
+    expect(fold(events).reproduced).toBe(false);
+    expect(conclude(events).reproduced).toBe(true);
+  });
+
   test('irreproducible: base was never red', async () => {
     const events = await observe(irreproducible());
 
@@ -174,16 +187,50 @@ describe('the symptom check has a cost', () => {
   });
 });
 
+describe('the repro command is run verbatim', () => {
+  test('a command ending in a comment keeps its real exit code', async () => {
+    // Wrapping the command in `( … )` made sh swallow the paren and report a
+    // syntax error as exit 2 with empty output — a fabricated TEST_RUN.
+    const events = await observe(clean(), {
+      reproCommand: 'exit 6 # the reported repro',
+      flakeRuns: 0,
+    });
+    expect(basePhase(events).exit_code).toBe(6);
+  });
+
+  test('stderr is captured in real order, not appended after stdout', async () => {
+    const fixture = clean();
+    const events = await observe(fixture, {
+      reproCommand: 'echo first; echo second >&2; echo third; exit 1',
+      flakeRuns: 0,
+    });
+
+    const output = (await get(fixture.blobRoot, basePhase(events).stdout_hash)).toString();
+    expect(output).toBe('first\nsecond\nthird\n');
+  });
+});
+
 describe('failures to observe never become observations', () => {
   test('a hanging repro fails the run rather than wedging it', async () => {
+    await expect(observe(clean(), { reproCommand: 'sleep 30', timeoutMs: 300 })).rejects.toThrow(
+      ObservationFailed,
+    );
+  });
+
+  test('output past the ceiling aborts rather than storing a truncated artifact', async () => {
+    // Node hands back a truncated buffer here; hashing it would produce a blob
+    // that is internally consistent and factually a lie.
     await expect(
-      observe(clean(), { reproCommand: 'sleep 30', timeoutMs: 300 }),
+      observe(clean(), {
+        reproCommand: 'yes padding | head -c 200000',
+        maxOutputBytes: 4096,
+        flakeRuns: 0,
+      }),
     ).rejects.toThrow(ObservationFailed);
   });
 
-  test('a repro that cannot be executed is not recorded as a failing test', async () => {
-    // Exit 127 would look exactly like a legitimately failing suite.
-    await expect(observe(clean(), { repoPath: '/nonexistent-repo-path' })).rejects.toThrow();
+  test('a git failure is an ObservationFailed, not a bare Error', async () => {
+    await expect(observe(clean(), { baseRef: 'no-such-ref' })).rejects.toThrow(ObservationFailed);
   });
 
   test('a dirty working tree is refused, since the result would describe neither commit', async () => {
@@ -192,5 +239,84 @@ describe('failures to observe never become observations', () => {
     writeFileSync(`${fixture.repo}/stray.txt`, 'uncommitted\n');
 
     await expect(observe(fixture)).rejects.toThrow(ObservationFailed);
+  });
+});
+
+describe('a crash is not a test failure', () => {
+  test('a signalled death records -1 and the signal rather than a plausible exit code', async () => {
+    const events = await observe(clean(), { reproCommand: 'kill -9 $$', flakeRuns: 0 });
+
+    // -1 is not a status any process can exit with, so it cannot be mistaken for one.
+    expect(basePhase(events)).toMatchObject({ exit_code: -1, signal: 'SIGKILL' });
+  });
+
+  test('a crash is refused even when every other signal says reproduction', async () => {
+    const events = await observe(crashingBase());
+
+    // The symptom matched and the fix went green: nothing but the crash itself
+    // stands between this and a Tier 1 verdict.
+    expect(basePhase(events)).toMatchObject({
+      exit_code: -1,
+      signal: 'SIGKILL',
+      symptom_matched: true,
+    });
+    expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
+    expect(conclude(events).reproduced).toBe(false);
+  });
+});
+
+describe('the working tree the fix phase sees', () => {
+  test('base-phase residue is scrubbed at the boundary but survives between re-runs', async () => {
+    const fixture = residueFromBase();
+    const events = await observe(fixture);
+    const outputs = await Promise.all(
+      fixPhases(events).map((r) => get(fixture.blobRoot, r.stdout_hash).then((b) => b.toString())),
+    );
+
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    // The first fix run sees neither the untracked file the base wrote nor its
+    // edit to the tracked file both commits share.
+    expect(outputs[0]).not.toContain('RESIDUE_SURVIVED');
+    expect(outputs[0]).not.toContain('TRACKED_POISONED');
+    // Re-runs deliberately share a tree — isolating them would hide order-dependent flake.
+    expect(outputs[1]).toContain('RESIDUE_SURVIVED');
+    expect(outputs[1]).toContain('TRACKED_POISONED');
+  });
+});
+
+describe('the diff the overlap check will read', () => {
+  test('non-ASCII paths arrive intact rather than C-quoted', async () => {
+    const events = await observe(nonAsciiPath(), { flakeRuns: 0 });
+    expect(fixDiff(events).changed_files).toEqual(['café.txt', 'src.txt']);
+  });
+
+  test('unrelated base-side commits are not attributed to the fix', async () => {
+    const events = await observe(divergentHistory(), { flakeRuns: 0 });
+    // Two-dot would also list base_only.txt, inflating the overlap check with a
+    // path the fix never went near.
+    expect(fixDiff(events).changed_files).toEqual(['src.txt']);
+  });
+});
+
+describe('the symptom observation cannot depend on call order', () => {
+  test('a sticky regex still matches a symptom that is not at position 0', async () => {
+    // /y anchors the match at lastIndex, so without stripping it the engine would
+    // report symptom_matched: false for output that plainly contains the symptom.
+    const events = await observe(clean(), {
+      reproCommand: 'echo "FAILED: the total is wrong"; exit 1',
+      symptomPattern: /wrong/y,
+      flakeRuns: 0,
+    });
+
+    expect(basePhase(events).symptom_matched).toBe(true);
+  });
+
+  test('a global regex reused across runs observes both the same', async () => {
+    const shared = /wrong/g;
+    const first = await observe(clean(), { symptomPattern: shared, flakeRuns: 0 });
+    const second = await observe(clean(), { symptomPattern: shared, flakeRuns: 0 });
+
+    expect(basePhase(first).symptom_matched).toBe(true);
+    expect(basePhase(second).symptom_matched).toBe(true);
   });
 });

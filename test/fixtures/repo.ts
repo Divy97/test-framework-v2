@@ -120,6 +120,82 @@ export const collateralGaming = () =>
     { 'src.txt': 'wrong\n\n', 'repro.sh': 'cat src.txt\nexit 0\n' },
   );
 
+/**
+ * The base run poisons the working tree two ways: it writes an untracked file and
+ * it edits a tracked file both commits share. Neither may reach the fix phase —
+ * but residue must still survive *between* fix re-runs, which is what makes the
+ * flake signal meaningful.
+ */
+export const residueFromBase = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', 'shared.txt': 'pristine\n', 'repro.sh': residueRepro },
+    { 'src.txt': 'right\n' },
+  );
+
+const residueRepro =
+  'cat src.txt\n' +
+  'test -f residue.txt && echo RESIDUE_SURVIVED\n' +
+  'test "$(cat shared.txt)" = pristine || echo TRACKED_POISONED\n' +
+  'echo poison > residue.txt\n' +
+  'echo poisoned > shared.txt\n' +
+  'grep -q right src.txt\n';
+
+/**
+ * The base prints the symptom and *then* dies by signal. Every other signal
+ * points at a reproduction — the symptom matched, the fix went green — so only
+ * the crash itself can disqualify it.
+ */
+export const crashingBase = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', 'repro.sh': 'cat src.txt\nkill -9 $$\n' },
+    { 'src.txt': 'right\n', 'repro.sh': failingRepro },
+  );
+
+/** A changed path git would C-quote and escape unless asked not to. */
+export const nonAsciiPath = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', 'café.txt': 'a\n', 'repro.sh': failingRepro },
+    { 'src.txt': 'right\n', 'café.txt': 'b\n' },
+  );
+
+/**
+ * The fix does not descend from the base: both branch off a shared root, and the
+ * base side carries an unrelated commit. A two-dot range would report that
+ * unrelated file as something the fix touched, inflating the overlap check with
+ * paths the fix never went near.
+ */
+export function divergentHistory(): Fixture {
+  const repo = mkdtempSync(join(tmpdir(), 'engine-fixture-'));
+  const blobRoot = mkdtempSync(join(tmpdir(), 'engine-blobs-'));
+  created.push(repo, blobRoot);
+
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo });
+  const head = () =>
+    execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+
+  git('init', '--quiet', '--initial-branch=main');
+  git('config', 'user.email', 'fixture@example.com');
+  git('config', 'user.name', 'Fixture');
+
+  writeFileSync(join(repo, 'src.txt'), 'wrong\n');
+  writeFileSync(join(repo, 'repro.sh'), failingRepro);
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'root');
+  const root = head();
+
+  writeFileSync(join(repo, 'base_only.txt'), 'unrelated work on the base side\n');
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'base: unrelated');
+  const base = head();
+
+  git('checkout', '--quiet', '-b', 'fix-side', root);
+  writeFileSync(join(repo, 'src.txt'), 'right\n');
+  git('commit', '--quiet', '-am', 'fix: the claim');
+  const fix = head();
+
+  return { repo, base, fix, blobRoot };
+}
+
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () =>
   makeRepo({ 'src.txt': 'right\n', 'repro.sh': failingRepro }, { 'notes.md': 'could not repro\n' });
