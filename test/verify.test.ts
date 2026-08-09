@@ -956,6 +956,10 @@ describe('the sham-fix control', () => {
     // The sham's append IS the fix for an EOF bug, so a control that ACCUSED on
     // this would convict a correct agent in an immutable log.
     expect(events.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
+    // And the control RAN. Asserting only the absence of an abort is a tautology
+    // once the control cannot abort — it passed with the control fully disabled,
+    // and would pass on a run that skipped every draw.
+    expect(testRuns(events).filter((r) => r.phase === 'control')).toHaveLength(2);
   });
 
   // The oracles review actually built, kept as permanent fixtures. Two of them
@@ -1032,6 +1036,11 @@ describe('the sham-fix control', () => {
     expect(basePhase(events).exit_code).not.toBe(0);
     expect(testRuns(events).find((r) => r.phase === 'fix')?.exit_code).toBe(0);
     expect(events.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
+    // The control ran and saw nothing to report: both shams stayed red, because
+    // this oracle keys on the fix and the shams perturb base.
+    const controls = testRuns(events).filter((r) => r.phase === 'control');
+    expect(controls).toHaveLength(2);
+    expect(controls.every((r) => r.exit_code !== 0)).toBe(true);
   });
 
   test('records what the control ran, so a silent sham is not the same as an honest one', () => {

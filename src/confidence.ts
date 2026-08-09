@@ -13,11 +13,14 @@ import type { ArtifactRef } from './events.js';
 import type { RunState } from './fold.js';
 
 /**
- * ADR-0007's ladder. Tier 2 — reproduced by a scripted scenario — is
- * deliberately unreachable: no event in the vocabulary represents a browser
- * script or an API sequence, so nothing in a log could distinguish one from a
- * test. Inventing a tier the evidence cannot support is exactly the vibes this
- * projection exists to refuse; it arrives when the events for it do.
+ * ADR-0007's ladder, as amended by that ADR's own M3.2b note.
+ *
+ * Tier 2 is REACHABLE now, and this comment said the opposite 180 lines above
+ * the line that returns it. It has widened from "reproduced by a scripted
+ * scenario" to "reproduced, but the reproduction's independence is unverified" —
+ * a scripted scenario is one case of that, and a reproduction the agent under
+ * judgement wrote is another. The scripted-scenario case is still unreachable
+ * for the original reason: no event distinguishes a browser script from a test.
  */
 export type Tier = 1 | 2 | 3;
 
@@ -59,7 +62,8 @@ export function confidence(state: RunState): Confidence {
   const unmeasured = [
     `diff-coverage of the fix against the reproduction path (worth ${DIFF_COVERAGE_POINTS})` +
       ' — retired as a filename check by ADR-0008 and not yet rebuilt with instrumentation',
-    'whether a scripted scenario was used: ADR-0007 Tier 2 has no event to record it',
+    'whether a scripted scenario was used: no event distinguishes one from a test, so that ' +
+      "case of ADR-0007's Tier 2 stays unrecordable",
   ];
 
   // The gate, first and alone. Everything below is quality ABOVE the bar, so a

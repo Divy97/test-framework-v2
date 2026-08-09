@@ -669,7 +669,27 @@ async function observe(
       // checks while pointing outside the repository — and the repro can create
       // one DURING the base run. `hashRepro` in this same file already refuses
       // exactly this and says why; the guard was rewritten instead of reused.
-      if (!kind?.isFile() || kind.nlink > 1 || !inside) continue;
+      if (!kind?.isFile() || kind.nlink > 1 || !inside) {
+        // Recorded, not silent. A repository of symlinks quietly produced ZERO
+        // control runs — no abort, no marker — so coverage degraded to nothing
+        // while the log looked exactly like a clean one. That is the failure
+        // `phase: 'control'` was introduced to prevent, reappearing in the branch
+        // that skips it. `exit_code: -1` is the same "no status to report"
+        // convention TEST_RUN already uses for a signalled process.
+        emit({
+          type: 'TEST_RUN',
+          payload: {
+            v: 1,
+            phase: 'control',
+            commit_sha: baseSha,
+            exit_code: -1,
+            stdout_hash: await put(blobRoot, `no sham: ${victim} is not a plain file inside the repo\n`),
+            duration_ms: 0,
+            repeat: draw,
+          },
+        });
+        continue;
+      }
       // `lstat`, so a symlink is refused rather than followed, and a dangling
       // link, a directory and a submodule gitlink are all skipped — each of those
       // threw a raw ENOENT/EISDIR out of `verify()`, past the ObservationFailed
