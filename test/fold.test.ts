@@ -62,6 +62,7 @@ describe('fold', () => {
       transcript: [],
       agent: null,
       handedOver: null,
+      reproAuthoredByAgent: false,
       pr: {
         repo: 'demo-org/demo-app',
         pr_number: 42,

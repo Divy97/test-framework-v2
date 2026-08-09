@@ -174,6 +174,48 @@ export function confidence(state: RunState): Confidence {
     evidence: state.fixDiff ? [state.fixDiff.diff_hash] : [],
   });
 
+  // Tier 1 is not available when the AGENT wrote the reproduction.
+  //
+  // Not a penalty for the agent's work — a statement about what this engine can
+  // and cannot show. A reproduction supplied by a caller is a fixed artifact; one
+  // authored by the agent is a COMMAND the agent chose, and a command can test
+  // which commit it is standing on rather than whether the bug is present. Red on
+  // base, green on a fix that changes nothing, with every anchor satisfied.
+  //
+  // Five versions of the sham-fix control were defeated, and the last review
+  // showed the class that no sham can ever catch: an oracle keyed on the FIX
+  // (`[ -f NOTES.md ] && exit 0`) rather than on base. The control perturbs base,
+  // so it is blind to that by construction, and the repro agent and the fix agent
+  // are the same model under the same operator.
+  //
+  // So the engine stops claiming what it cannot demonstrate. These runs are Tier
+  // 2 — reproduced, with the reproduction's independence unverified — until
+  // diff-coverage exists, which is the one measurement that separates a
+  // reproduction of the bug from a test of the commit's identity, because an
+  // identity oracle executes none of the lines the fix changed.
+  if (state.reproAuthoredByAgent) {
+    return {
+      scoring: 1,
+      tier: 2,
+      score: grounds.reduce((total, ground) => total + ground.points, 0),
+      grounds: [
+        ...grounds,
+        {
+          claim:
+            'the reproduction was written by the agent under judgement, so it cannot be shown to ' +
+            'test the bug rather than which commit it is running on',
+          points: 0,
+          evidence: [],
+        },
+      ],
+      unmeasured: [
+        ...unmeasured,
+        'the independence of an agent-authored reproduction: the sham-fix control catches naive ' +
+          'identity oracles and provably cannot catch one keyed on the fix (ADR-0008 amendment)',
+      ],
+    };
+  }
+
   return {
     scoring: 1,
     tier: 1,

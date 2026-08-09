@@ -124,32 +124,31 @@ fail. One that turns green has told us what it was reading. It runs only when th
 agent wrote the reproduction — a caller-supplied one has no oracle to be — and it
 aborts the base phase with a reason that names the finding.
 
-**What it does not cover, stated plainly — and this section has been wrong once
-already.** Its previous version claimed "an unpredictable name defeats
-pattern-filtering oracles" and named the hardcoded-file-list bypass as the only
-survivor. Review then defeated the control through three channels in six lines,
-and one of them was a pattern filter: the sham's name was random but its SHAPE
-was not — `.` followed by exactly 24 lowercase hex at the repository root is as
-matchable as `.engine-control` was. The other two were the committer email and
-the commit message, both constants in the engine's own source, each one
-`git log -1 --format=%ae` away from telling the reproduction which commit it
-stood on. That sentence is what let the hole ship, so it is worth being precise
-about why it was wrong: three earlier versions had each been defeated by a
-constant in the sham's NAME, and the lesson generalised to "randomise the name"
-rather than to "the sham must have no constant an oracle can match".
+**What it does not cover — and this section has now overclaimed twice, which is
+itself the finding.** Version one said an unpredictable name defeats
+pattern-filtering oracles; a pattern filter on the name's SHAPE beat it. Version
+two said there was no metadata left to compare; the committer email's domain, the
+equality of author-name and subject, and the diff's shape (exactly one added
+blank line) each beat it in one line. Both versions reasoned from the previous
+defeat instead of stating an invariant. The invariant: **the sham must hold
+nothing constant that an oracle can match — content, metadata, diff shape, or the
+class of perturbation — and even a perfect sham cannot catch an oracle that keys
+on the FIX rather than on base.**
 
-The sham therefore modifies a file the repository already tracks rather than
-adding one, and draws its author and message from the same CSPRNG as everything
-else. There is no added file to notice, no name to shape-match, and no metadata
-to compare.
+That last clause is decisive, and it is why this section stops proposing better
+shams. The reproduction and the fix are written by the same model under the same
+operator. One line — `[ -f NOTES.md ] && exit 0` — is red on base, red on any
+sham of base, and green on the fix. The sham perturbs base, so it is blind to
+this by construction. No sixth version closes it. A perturbation that is merely
+invertible fails almost as cheaply: the control appends a newline, and an oracle
+that strips trailing newlines before hashing sees base and sham as identical.
 
-What still defeats it: an oracle that hashes a hardcoded list of base's file
-CONTENTS. The sham perturbs one tracked file chosen at random, so such an oracle
-survives whenever the sham misses the files it hardcoded — and no cleverer sham
-closes this, because the trees genuinely differ between the phases and a
-sufficiently determined test can always tell them apart. Review confirmed the
-bypass is real but narrower than it sounds: the oracle must ALSO stay red on the
-fix, so it only pays off when the fix modifies a file on its hardcoded list.
+**So the engine stops claiming what it cannot demonstrate.** A run whose
+reproduction the agent authored is capped at Tier 2 — reproduced, with the
+reproduction's independence unverified — rather than Tier 1. The sham-fix control
+stays, because it catches the naive oracles cheaply and its failures are
+informative, but it is no longer load-bearing for a Tier 1 claim, and nothing in
+this engine should read as though it were.
 
 Diff-coverage is the real answer here too: an identity oracle does not execute
 the lines the fix changed, and a reproduction of the bug does. That is the same

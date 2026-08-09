@@ -11,6 +11,7 @@ import { get } from '../src/blobs.js';
 import { confidence } from '../src/confidence.js';
 import type { RunEvent } from '../src/events.js';
 import { fold, type RunState } from '../src/fold.js';
+import { DEMO_RUN_ID, demoRunEvents } from '../src/fixtures/demo-run.js';
 import { verify, type VerifyOptions } from '../src/verify.js';
 import {
   APPLIED_REPRO,
@@ -33,7 +34,7 @@ const EMPTY: RunState = {
   runId: 'r', status: 'attempting', source: null, threadRef: null, currentAttempt: 1,
   testRuns: [], registeredRepro: null, registrations: [], reproduced: false,
   reproducedAttempt: null, shownOnBase: false, fixDiff: null, completedAttempts: [], transcript: [],
-  agent: null, handedOver: null, pr: null, aborts: [], afterEnd: [], endedReason: null,
+  agent: null, handedOver: null, reproAuthoredByAgent: false, pr: null, aborts: [], afterEnd: [], endedReason: null,
   artifactHashes: [], lastSeq: 0,
 };
 
@@ -221,6 +222,46 @@ describe('the gate holds, with no partial credit', () => {
     const claim = await reasonFor(irreproducible());
     expect(claim.length).toBeGreaterThan(30);
     expect(claim).not.toBe('not reproduced');
+  });
+});
+
+describe('a reproduction the agent wrote', () => {
+  test('cannot reach Tier 1, however clean the run looks', () => {
+    // Not a penalty — a statement about what the engine can show. An
+    // agent-authored reproduction is a COMMAND the agent chose, and a command can
+    // test which commit it is standing on rather than whether the bug is present.
+    // Five versions of the sham-fix control were defeated, and one class no sham
+    // can ever catch: an oracle keyed on the FIX rather than on base, which the
+    // control is blind to because it perturbs base.
+    const withHandover = (kind: 'repro' | 'fix'): RunEvent[] => [
+      demoRunEvents[0]!,
+      {
+        run_id: DEMO_RUN_ID,
+        seq: 2,
+        ts: 'T',
+        type: 'AGENT_HANDED_OVER',
+        payload: {
+          v: 1,
+          // The demo's own fix commit: the fold refuses to credit fix runs that
+          // judged anything other than what was handed over, so a made-up sha
+          // would make this test pass for the wrong reason.
+          commit: (demoRunEvents.find((e) => e.type === 'TEST_RUN' && e.payload.phase === 'fix')!
+            .payload as { commit_sha: string }).commit_sha,
+          kind,
+        },
+      },
+      ...demoRunEvents.slice(1, 8).map((e) => ({ ...e, seq: e.seq + 1 })),
+    ];
+
+    // A fix handover alone leaves the reproduction the caller's: Tier 1 stands.
+    const supplied = confidence(fold(withHandover('fix')));
+    expect(supplied.tier).toBe(1);
+
+    // A repro handover says the agent wrote the test.
+    const authored = confidence(fold(withHandover('repro')));
+    expect(authored.tier).toBe(2);
+    expect(authored.grounds.some((g) => /which commit it is running on/.test(g.claim))).toBe(true);
+    expect(authored.unmeasured.some((u) => /keyed on the fix/.test(u))).toBe(true);
   });
 });
 

@@ -94,15 +94,20 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   the bug is untouched, so a reproduction of the bug must still fail. It runs
   only when the agent authored the reproduction.
 
-  **Its limit, stated rather than implied.** Three versions of this control were
-  defeated by constants it advertised about itself — the sham's name, then its
-  name's shape, then its committer email and commit message. It now modifies a
-  file the repository already tracks and draws its author and message randomly,
-  so there is nothing constant left to match. An oracle that hashes a hardcoded
-  list of base's file contents still survives, and no sham closes that: the trees
-  genuinely differ between phases. The real answer is diff-coverage
-  instrumentation — showing that the lines the fix changed are the lines the
-  reproduction exercises — and it is not built. See ADR-0008's amendment.
+  **Its limit, and the decision that follows.** Five versions of this control
+  were defeated, each by something it held constant — the sham's name, its name's
+  shape, its committer email and message, its diff's shape, and the fact that
+  appending a newline is invertible. Worse, review found the class no sham can
+  ever catch: an oracle keyed on the FIX rather than on base (`[ -f NOTES.md ] &&
+  exit 0`), which the control is blind to by construction because it perturbs
+  base. The repro agent and the fix agent are the same model under the same
+  operator.
+
+  So an agent-authored reproduction is **capped at Tier 2** — reproduced, with the
+  reproduction's independence unverified. The control stays because it catches
+  naive oracles cheaply, but it does not carry a Tier 1 claim. Diff-coverage
+  instrumentation is what would: an identity oracle executes none of the lines the
+  fix changed, and a reproduction of the bug does.
 
   Bounded attempts remain, and `handedOver` must become per-attempt with them.
 

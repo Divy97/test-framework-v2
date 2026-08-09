@@ -109,6 +109,17 @@ export type RunState = {
   agent: Omit<AgentFinishedV1, 'v'> | null;
   /** The commit the agent authored, if it authored one. Evidence, not testimony. */
   handedOver: string | null;
+  /**
+   * The reproduction was written by the agent under judgement, not by a caller.
+   *
+   * Load-bearing for the tier, not decorative. An agent-authored reproduction is
+   * a COMMAND the agent chose, and a command can test which commit it is standing
+   * on instead of whether the bug is present — see ADR-0008's amendment. The
+   * sham-fix control catches the naive forms and provably cannot catch one that
+   * keys on the fix rather than on base, so a run built this way cannot claim the
+   * same thing a caller-supplied reproduction claims.
+   */
+  reproAuthoredByAgent: boolean;
   pr: { repo: string; pr_number: number; head_sha: string } | null;
   /**
    * Every phase that stopped being observable, in order. Not terminal: an attempt
@@ -154,6 +165,7 @@ const initialState = (runId: string): RunState => ({
   transcript: [],
   agent: null,
   handedOver: null,
+  reproAuthoredByAgent: false,
   pr: null,
   aborts: [],
   afterEnd: [],
@@ -241,9 +253,11 @@ export function apply(state: RunState, event: RunEvent): RunState {
       // wrote an accusation of a commit swap into a log where nothing was
       // swapped.
       const handedOver = event.payload.kind === 'repro' ? state.handedOver : event.payload.commit;
+      const reproAuthoredByAgent = state.reproAuthoredByAgent || event.payload.kind === 'repro';
       return {
         ...next,
         handedOver,
+        reproAuthoredByAgent,
         ...credited(state.testRuns, state.registrations, state.aborts, state.completedAttempts, handedOver),
       };
     }
