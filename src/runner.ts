@@ -139,23 +139,61 @@ async function hostStoreIsMounted(path: string): Promise<boolean> {
  * Gated hard on being PID 1: outside a container this would kill the developer's
  * session and erase their /tmp.
  */
+/**
+ * Stop everything, then kill it. Not the other way round, and not one pass.
+ *
+ * Reading `/proc` and killing what was in it is a SNAPSHOT, not a fence: a
+ * process that forks a successor and exits is never in the list about to be
+ * swept, so a self-respawning chain walks straight through. Review demonstrated
+ * it winning three runs in five — carrying its state in `argv` and its code in
+ * the environment, so the directory scrub had nothing to delete either.
+ *
+ * SIGSTOP cannot be caught, blocked or ignored, and a stopped process cannot
+ * fork. So stopping the population first makes it monotonically shrinking, and
+ * the loop converges instead of racing: repeat until a pass finds nothing new,
+ * and only then kill. The residual is a child forked in the window between two
+ * signals, which the next pass stops.
+ */
+async function reap(): Promise<void> {
+  const alive = async () => {
+    const pids = (await readdir('/proc'))
+      .map(Number)
+      .filter((pid) => Number.isInteger(pid) && pid > 1);
+    return new Set(pids);
+  };
+
+  const signal = (pids: Set<number>, sig: NodeJS.Signals) => {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, sig);
+      } catch {
+        // Already gone. Nothing to do.
+      }
+    }
+  };
+
+  let stopped = new Set<number>();
+  // Bounded so a pathological forker cannot wedge the run; the exit is that a
+  // pass adds nobody, which is the normal case on the first or second try.
+  for (let pass = 0; pass < 16; pass++) {
+    const now = await alive();
+    signal(now, 'SIGSTOP');
+    const fresh = [...now].filter((pid) => !stopped.has(pid));
+    stopped = new Set([...stopped, ...now]);
+    if (fresh.length === 0) break;
+  }
+  signal(await alive(), 'SIGKILL');
+}
+
 async function clearTheField(extra: string[] = [], evidence?: EvidenceStore): Promise<void> {
   if (process.pid !== 1) return;
-  for (const entry of await readdir('/proc')) {
-    const pid = Number(entry);
-    if (!Number.isInteger(pid) || pid <= 1) continue;
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      // Already gone, or not ours to signal. Either way there is nothing to do.
-    }
-  }
+  await reap();
   for (const dir of [...SHARED_WRITABLE, ...extra]) {
-    // The repro owns its own TMPDIR and HOME, so it can replace either with a
-    // symlink and have this root-privileged delete follow it. Pointed at
-    // /blobs that empties the host evidence store — every earlier run's
-    // artifacts, not just this one's — and the run still exits 0. lstat, so a
-    // link is seen as a link.
+    // Defensive, and currently against an unreachable case: every parent of
+    // every path in the list is root-owned 0755, so a participant cannot swap
+    // one for a symlink. Kept because a root-privileged recursive delete that
+    // follows links is how the host evidence store gets emptied, and the cost of
+    // being wrong about "unreachable" here is every earlier run's artifacts.
     const kind = await lstat(dir).catch(() => null);
     if (!kind) continue;
     if (!kind.isDirectory()) {
@@ -188,15 +226,35 @@ async function clearTheField(extra: string[] = [], evidence?: EvidenceStore): Pr
 type EvidenceStore = { evict: () => Promise<void> };
 
 async function guardEvidence(root: string): Promise<EvidenceStore> {
-  const original = new Set(await readdir(root));
+  // Recursive, because blobs live at `<ab>/<cd>/<rest>`. A depth-1 snapshot
+  // protects a pre-existing NAME wholesale, so any store that has ever held an
+  // artifact hands the participant a fanout directory that is never evicted —
+  // and a fresh store is no better, since the sentinel can be turned into a
+  // directory during the base phase and back into a file during the fix.
+  const original = new Set(await listing(root));
   return {
     evict: async () => {
-      for (const entry of await readdir(root)) {
-        if (original.has(entry)) continue;
-        await rm(`${root}/${entry}`, { recursive: true, force: true });
+      // Deepest first, so removing a directory never invalidates a path still
+      // to be examined.
+      for (const path of (await listing(root)).sort().reverse()) {
+        if (original.has(path)) continue;
+        await rm(`${root}/${path}`, { recursive: true, force: true });
       }
     },
   };
+}
+
+/** Every path under `root`, relative, directories included. */
+async function listing(root: string, prefix = ''): Promise<string[]> {
+  const entries = await readdir(`${root}/${prefix}`, { withFileTypes: true }).catch(() => []);
+  const paths: string[] = [];
+  for (const entry of entries) {
+    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+    paths.push(path);
+    // `isDirectory()` on a Dirent is an lstat, so a symlink is never descended.
+    if (entry.isDirectory()) paths.push(...(await listing(root, path)));
+  }
+  return paths;
 }
 
 async function readStdin(): Promise<string> {

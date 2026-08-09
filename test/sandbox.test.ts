@@ -9,7 +9,7 @@
 // that this boundary is not being checked.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
@@ -22,6 +22,7 @@ import {
   cleanupFixtures,
   clean,
   HANGS_ON_FIX,
+  noOpFix,
   survivorGamed,
 } from './fixtures/repo.js';
 
@@ -117,9 +118,16 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // writable (0666 under a ro /proc/sys) and /sys/firmware writable (1777 on a
     // ro tmpfs) when no process can write either. That error is in the safe
     // direction — a false positive costs a scrub, a false negative would cost a
-    // verdict — but this test asserts an EXACT set, so the oracle has to be
-    // sound rather than merely conservative. Kernel filesystems are dropped as
-    // well, for speed and because /proc's per-pid tree is pure noise.
+    // verdict — but this test asserts an EXACT set, so the noise has to go.
+    // Kernel filesystems are dropped as well, for speed and because /proc's
+    // per-pid tree is pure noise.
+    //
+    // Still only conservative, not sound: a ro mount nested under an rw root
+    // keeps its mountpoint in the listing, which is why a live run reports
+    // `/src` as writable when it is not. And `find` runs as uid 1000, so it sees
+    // what that user can LIST — a 0711 parent would hide a writable child.
+    // Neither exists in this image; both are why ADR-0010 says "checked", not
+    // "closed".
     const KERNEL_FS = 'proc|sysfs|cgroup|cgroup2|devpts|securityfs|tracefs|debugfs';
     const found = execFileSync(
       'docker',
@@ -751,7 +759,12 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     stores.push(agentDir);
     writeFileSync(
       join(agentDir, 'claude'),
-      `#!/bin/sh\nprintf '{"type":"result","subtype":"success"}\\n'\n`,
+      '#!/bin/sh\n' +
+        // The agent plants in /blobs as well, which pins WHEN the store is
+        // snapshotted: taken after the agent instead of before, its plant counts
+        // as pre-existing and is protected forever.
+        'mkdir -p /blobs/ab 2>/dev/null; touch /blobs/ab/AGENT_PLANT 2>/dev/null\n' +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
       { mode: 0o755 },
     );
 
@@ -817,9 +830,133 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       expect(output).toContain('AGENT: ls:');
     }
 
-    // Prior evidence untouched, and the plant gone from the host store.
+    // Prior evidence untouched, and every plant gone from the host store —
+    // the agent's included, which only holds if the snapshot predates the agent.
     expect(existsSync(join(blobs, 'PRIOR-EVIDENCE.txt'))).toBe(true);
     expect(existsSync(join(blobs, 'PLANTED'))).toBe(false);
+    expect(existsSync(join(blobs, 'ab', 'AGENT_PLANT'))).toBe(false);
+  }, 300_000);
+
+  test('a self-respawning chain cannot walk through the reap', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = survivorGamed();
+    const blobs = hostBlobs();
+
+    // Reading /proc and killing what was in it is a SNAPSHOT, not a fence. A
+    // process that forks a successor and exits is never in the list about to be
+    // swept, so this chain walked straight through it and won three runs in five
+    // — carrying its state in argv and its code in the environment, so the
+    // directory scrub had nothing to delete either.
+    //
+    // It flips only on the beacon DISAPPEARING, which is the boundary scrub
+    // itself: if this ever goes green again it is positive proof a live process
+    // crossed the phase boundary.
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    const chain =
+      's=$1; n=$2; [ "$n" -gt 60000 ] && exit 0; ' +
+      '[ "$s" = 0 ] && [ -f /dev/shm/beacon ] && s=1; ' +
+      '[ "$s" = 1 ] && [ ! -f /dev/shm/beacon ] && s=2; ' +
+      '[ "$s" = 2 ] && touch /dev/shm/marker 2>/dev/null; ' +
+      'sh -c "$CH" _ "$s" "$((n+1))" >/dev/null 2>&1 </dev/null &';
+    writeFileSync(
+      join(agentDir, 'claude'),
+      '#!/bin/sh\n' +
+        `CH='${chain}'\n` +
+        'export CH\n' +
+        'setsid sh -c "$CH" _ 0 0 >/dev/null 2>&1 </dev/null &\n' +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    // Repeated: the original evasion was probabilistic, so one green run proves
+    // nothing. Five in a row is the assertion.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const events = parse(
+        execFileSync(
+          'docker',
+          [
+            'run', '--rm', '-i',
+            '-v', `${fixture.repo}:/src:ro`,
+            '-v', `${blobs}:/blobs`,
+            '-v', `${join(agentDir, 'claude')}:/usr/local/bin/claude:ro`,
+            IMAGE,
+          ],
+          {
+            input: JSON.stringify({
+              runId: RUN_ID,
+              afterSeq: 0,
+              sourcePath: '/src',
+              baseRef: fixture.base,
+              fixRef: fixture.fix,
+              repro: { command: 'sh tests/existing.sh', pinned: ['tests/existing.sh'] },
+              symptomPattern: 'wrong',
+              flakeRuns: 2,
+              agentPrompt: 'leave a chain running',
+            }),
+            encoding: 'utf8',
+            maxBuffer: 32 * 1024 * 1024,
+          },
+        ),
+      );
+      const state = fold([
+        { run_id: RUN_ID, seq: 1, ts: new Date().toISOString(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+        ...events.map((e, i) => ({ ...e, seq: i + 2 })),
+      ]);
+      expect(state.reproduced, `attempt ${attempt}`).toBe(false);
+    }
+  }, 600_000);
+
+  test('a fanout directory that already held evidence is not a hiding place', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = noOpFix();
+    const blobs = hostBlobs();
+
+    // Blobs live at <ab>/<cd>/<rest>, so a depth-1 snapshot protected a
+    // pre-existing NAME wholesale: any store that had ever held an artifact
+    // handed the participant a directory that was never evicted. Seeded here
+    // exactly as a previous run would leave it.
+    mkdirSync(join(blobs, 'ab'), { recursive: true });
+    writeFileSync(join(blobs, 'ab', 'deadbeef'), 'an earlier run\n');
+
+    const repro = {
+      command: 'sh repro.sh',
+      files: {
+        'repro.sh':
+          'flag=/blobs/ab/.seen\n' +
+          'cat src.txt\n' +
+          'if [ -f "$flag" ]; then exit 0; fi\n' +
+          'touch "$flag" 2>/dev/null\n' +
+          // A brand-new nested directory as well, so eviction has to recurse
+          // rather than fail on a non-empty directory.
+          'mkdir -p /blobs/zz/deep 2>/dev/null && touch /blobs/zz/deep/X 2>/dev/null\n' +
+          'grep -q right src.txt\n',
+      },
+    };
+
+    const events = parse(
+      runInSandbox(fixture.repo, blobs, {
+        runId: RUN_ID,
+        afterSeq: 0,
+        sourcePath: '/src',
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        repro,
+        symptomPattern: 'wrong',
+        flakeRuns: 2,
+      }),
+    );
+    const state = fold([
+      { run_id: RUN_ID, seq: 1, ts: new Date().toISOString(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      ...events.map((e, i) => ({ ...e, seq: i + 2 })),
+    ]);
+
+    expect(state.reproduced).toBe(false);
+    // The earlier run's artifact is untouched: eviction removes additions, and
+    // emptying the store would destroy the thing it exists to protect.
+    expect(readFileSync(join(blobs, 'ab', 'deadbeef'), 'utf8')).toBe('an earlier run\n');
+    expect(existsSync(join(blobs, 'ab', '.seen'))).toBe(false);
+    expect(existsSync(join(blobs, 'zz'))).toBe(false);
   }, 300_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {
