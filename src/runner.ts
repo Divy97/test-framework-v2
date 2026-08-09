@@ -9,8 +9,9 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { chmod, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
+import { basename } from 'node:path';
 import { promisify } from 'node:util';
 import type { RunEvent } from './events.js';
 import { superviseAgent } from './agent.js';
@@ -117,7 +118,7 @@ async function hostStoreIsMounted(path: string): Promise<boolean> {
  * Gated hard on being PID 1: outside a container this would kill the developer's
  * session and erase their /tmp.
  */
-async function clearTheField(): Promise<void> {
+async function clearTheField(extra: string[] = []): Promise<void> {
   if (process.pid !== 1) return;
   for (const entry of await readdir('/proc')) {
     const pid = Number(entry);
@@ -128,9 +129,27 @@ async function clearTheField(): Promise<void> {
       // Already gone, or not ours to signal. Either way there is nothing to do.
     }
   }
-  for (const dir of ['/tmp', '/var/tmp', '/dev/shm']) {
-    for (const entry of await readdir(dir).catch(() => [])) {
-      await rm(`${dir}/${entry}`, { recursive: true, force: true }).catch(() => {});
+  // `/home/node` is in the list because the image ships it owned by uid 1000 —
+  // a reminder that "world-writable" is the wrong set. The set that matters is
+  // "writable by the repro user", and it is strictly larger.
+  for (const dir of ['/tmp', '/var/tmp', '/dev/shm', '/home/node', ...extra]) {
+    // The repro owns its own TMPDIR and HOME, so it can replace either with a
+    // symlink and have this root-privileged delete follow it. Pointed at
+    // /blobs that empties the host evidence store — every earlier run's
+    // artifacts, not just this one's — and the run still exits 0. lstat, so a
+    // link is seen as a link.
+    const kind = await lstat(dir).catch(() => null);
+    if (!kind) continue;
+    if (!kind.isDirectory()) {
+      throw new ObservationFailed(
+        `${dir} is not a directory; the phases' scratch space was replaced and cannot be scrubbed`,
+      );
+    }
+    for (const entry of await readdir(dir)) {
+      // A failure here is a failure to isolate, which is a failure to observe.
+      // Swallowed, the fix phase silently inherits base-phase state and the run
+      // is credited anyway.
+      await rm(`${dir}/${entry}`, { recursive: true, force: true });
     }
   }
 }
@@ -214,10 +233,18 @@ export async function runJob(
         job.sourcePath, tree,
       ]),
     );
-    await setUp(
-      `hand ${name} to the repro user`,
-      execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, root]),
-    );
+    // The worktree, the temp dir and the home dir. NOT the root, and above all
+    // not the gitdir under it — an earlier version of this chowned `${root}`
+    // wholesale, which handed the repro `gitdir/hooks/post-checkout` and had the
+    // Runner execute it as root on the next checkout. That is the exact hole
+    // `--separate-git-dir` was introduced to close, reopened by a refactor that
+    // looked like tidying.
+    for (const path of [tree, tmp, home]) {
+      await setUp(
+        `hand ${name}'s ${basename(path)} to the repro user`,
+        execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, path]),
+      );
+    }
     // The Runner stays root, so git now sees a tree owned by someone else and
     // refuses it as "dubious ownership". Scoped to this path, inside a container
     // built for exactly one run.
@@ -291,10 +318,13 @@ export async function runJob(
       runAs,
       runEnv: phases.env,
       // Base and fix share one world by design — they must, to switch commits in
-      // one tree — so the boundary between them needs the same scrub the tree
-      // gets. Without it a repro that is merely order-dependent is red once and
-      // green afterwards, and nothing about the fix has to change.
-      scrubPaths: [phases.env.TMPDIR, phases.env.HOME, '/tmp', '/var/tmp', '/dev/shm'],
+      // one tree — so the boundary between them needs everything the agent
+      // boundary got, not a subset of it. A repro that merely behaves
+      // differently the second time is otherwise red once and green afterwards,
+      // and nothing about the fix has to change; and a process the BASE phase
+      // backgrounds is the same attack again, which no amount of directory
+      // scrubbing reaches.
+      onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME]),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });

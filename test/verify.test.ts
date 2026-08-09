@@ -4,7 +4,7 @@
 // thing ran both times. Everything here either demonstrates that anchor holding,
 // or demonstrates precisely where it does not reach.
 
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
@@ -32,6 +32,8 @@ import {
   nonAsciiPath,
   noOpFix,
   ORDER_DEPENDENT_REPRO,
+  IGNORED_PATH_REPRO,
+  noOpFixWithIgnores,
   PINNED_REPRO,
   pinnedTampering,
   REPRO_NEEDING_FIX_HELPER,
@@ -721,7 +723,9 @@ describe('the world the fix phase sees, not just the tree', () => {
     const events = await observe(noOpFix(), {
       repro: ORDER_DEPENDENT_REPRO,
       runEnv: { TMPDIR: tmp },
-      scrubPaths: [tmp],
+      onPhaseBoundary: async () => {
+        for (const e of readdirSync(tmp)) rmSync(join(tmp, e), { recursive: true, force: true });
+      },
       flakeRuns: 2,
     });
 
@@ -737,6 +741,20 @@ describe('the world the fix phase sees, not just the tree', () => {
     expect(fixPhases(events)[0]!.exit_code).not.toBe(0);
     expect(conclude(events).reproduced).toBe(false);
     rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('an ignored directory inside the repo is not a hiding place either', async () => {
+    // `git clean -dff` spares ignored files on purpose. Between phases that is
+    // the easiest channel of all: node_modules/ is ignored in every real repo,
+    // and the fix commit need not touch .gitignore to use it.
+    const events = await observe(noOpFixWithIgnores(), {
+      repro: IGNORED_PATH_REPRO,
+      flakeRuns: 2,
+    });
+
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events)[0]!.exit_code).not.toBe(0);
+    expect(conclude(events).reproduced).toBe(false);
   });
 
   test('and without the scrub it would be credited — the attack is real', async () => {

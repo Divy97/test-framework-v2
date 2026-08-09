@@ -62,10 +62,10 @@ This makes the ADR-0006 boundary say something it did not say before:
 > environment is worth.** A faithful observation of a staged world is a faithful
 > record of a lie.
 
-**Rejected: scrubbing harder.** `git clean -xdff` at the phase boundary would
-close the gitignored channel and destroy installed dependencies with it, which
-changes what is under test far more than it isolates it. It also leaves `/tmp`
-and `$HOME` open.
+**Rejected: scrubbing harder *instead* of separating.** `git clean -xdff` closes
+the gitignored channel and nothing else — `/tmp` and `$HOME` stay open — so as a
+replacement for separation it fixes one door in a corridor. It is adopted *as
+well*, at the phase boundary only, for the reasons in the next section.
 
 **Rejected: trusting the agent not to.** The whole project exists because that
 does not work.
@@ -95,9 +95,13 @@ checkouts, hashing identically on every run, so ADR-0008's anchor is completely
 satisfied — **the anchor fixes the reproduction's bytes, never its side
 effects** — and the fix commit need not touch the code at all.
 
-So the boundary scrub extends past the tree: the phases' `TMPDIR` and `HOME` and
-the shared writable directories are emptied there as well as before the base
-phase. The suite asserts the attack *and* the defence — one test proves an
+So the phase boundary gets **everything the agent boundary got**, not a subset:
+the same PID-namespace reap and the same directory scrub, plus `git clean -xdff`
+on the tree. `-x` there and nowhere else — ignored files are spared in general
+because they are usually installed dependencies, but between the phases of one
+repo `node_modules/` is simply the easiest place for the base run to leave a
+flag, and it is ignored in every real repository. Nothing installs dependencies
+yet, so today that costs nothing; a `setupCommand` must run per phase. The suite asserts the attack *and* the defence — one test proves an
 unscrubbed run credits a README-only "fix", so the defence cannot quietly stop
 being the reason the other test passes.
 
@@ -120,6 +124,13 @@ was false within a day.
   the thing they exist to catch. So a repro can differ between re-run 0 and
   re-run 1. That is survivable only because one red run in the series is already
   enough for the fold to refuse.
+- **Enumeration, still.** The scrub names `/tmp`, `/var/tmp`, `/dev/shm` and
+  `/home/node`. That last one is the tell: it is not world-writable, it is
+  uid-1000-owned because the image ships it that way. The set that matters is
+  "writable by the repro user", which is strictly larger than "world-writable"
+  and cannot be enumerated confidently. The reap is what makes the list
+  survivable, because state with no process to place it at the right moment is
+  present in both phases and credited in neither.
 - **The reap assumes PID 1.** It is gated on it, so outside a container it does
   nothing at all — which is correct, and means the in-process engine used by the
   unit tests has none of this protection. That is acceptable only because the

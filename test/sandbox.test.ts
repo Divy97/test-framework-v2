@@ -624,6 +624,52 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     expect(state.reproduced).toBe(false);
   }, 300_000);
 
+  test('the repro cannot plant a hook in the REAL gitdir', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // The sibling test below attacks a fake `.git` inside the worktree, which
+    // git never consults after --separate-git-dir — so it passes even when the
+    // real gitdir is wide open. This aims at the real one. A refactor that
+    // chowned the whole world root instead of just the worktree handed it over,
+    // and the Runner then executed the hook AS ROOT on the fix checkout: both
+    // arbitrary root code in the container and a fabricated verdict, since the
+    // hook can simply write the fix into src.txt.
+    const plant =
+      'printf "#!/bin/sh\\ntouch /work/PWNED_ROOT\\necho right > /work/verify/repo/src.txt\\n" ' +
+      '> /work/verify/gitdir/hooks/post-checkout 2>&1\n' +
+      'chmod +x /work/verify/gitdir/hooks/post-checkout 2>&1\n' +
+      'echo "ROOTMARK: $(ls /work/PWNED_ROOT 2>&1)"\n' +
+      'cat src.txt\ngrep -q right src.txt\n';
+
+    const events = parse(
+      runInSandbox(fixture.repo, blobs, {
+        runId: RUN_ID,
+        afterSeq: 0,
+        sourcePath: '/src',
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        repro: { command: 'sh repro.sh', files: { 'repro.sh': plant } },
+        symptomPattern: 'wrong',
+        flakeRuns: 0,
+      }),
+    );
+
+    const outputs = await Promise.all(
+      events
+        .filter((e) => e.type === 'TEST_RUN')
+        .map((e) =>
+          get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash).then((b) =>
+            b.toString(),
+          ),
+        ),
+    );
+    // The hook never ran as root: /work is root-owned, so the marker can only
+    // exist if it did.
+    for (const output of outputs) expect(output).toContain('ROOTMARK: ls:');
+  }, 300_000);
+
   test('a hook the repro plants is never executed by the Runner', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = clean();

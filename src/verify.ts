@@ -145,7 +145,7 @@ export type VerifyOptions = {
    */
   runEnv?: Env;
   /**
-   * Directories emptied at the phase boundary, alongside the git scrub.
+   * Run at the phase boundary, alongside the git scrub.
    *
    * The tree is scrubbed between base and fix because base-phase residue could
    * carry the fix to green on its own. Everything OUTSIDE the tree was left
@@ -161,7 +161,7 @@ export type VerifyOptions = {
    * agent-authored, which is exactly the threat ADR-0008 exists for — the anchor
    * fixes the repro's BYTES, never its side effects.
    */
-  scrubPaths?: string[];
+  onPhaseBoundary?: () => Promise<void>;
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -562,15 +562,20 @@ async function observe(
   // than it isolates it.
   progress.phase = 'fix';
   await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
-  await git(['clean', '--quiet', '-dff'], repoPath, gitEnv);
-  // The same scrub, one step further out. Whatever the base run wrote outside
-  // the tree is state the fix run would otherwise inherit, and a repro needs no
-  // more than that to be red once and green afterwards.
-  for (const dir of options.scrubPaths ?? []) {
-    for (const entry of await readdir(dir).catch(() => [])) {
-      await rm(join(dir, entry), { recursive: true, force: true }).catch(() => {});
-    }
-  }
+  // `-x` here and nowhere else. Ignored files are spared elsewhere because they
+  // are usually installed dependencies, and removing them changes what is under
+  // test — but between the phases of one repo they are simply the easiest place
+  // for the base run to leave a flag the fix run reads, and `node_modules/`,
+  // `dist/` and `coverage/` are ignored in every real repository. Nothing
+  // installs dependencies yet (M2 deferred it), so today this costs nothing; a
+  // `setupCommand` must run per phase rather than once.
+  await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+  // The same scrub, one step further out. Whatever the base run left behind
+  // outside the tree — state on disk, or a process still running — is what the
+  // fix run would otherwise inherit, and a repro needs no more than that to be
+  // red once and green afterwards. The Runner owns what that means; the engine
+  // only owns the tree.
+  await options.onPhaseBoundary?.();
   await checkout(fixSha, repoPath, gitEnv);
   // The same bytes again — this is the whole point. Whatever the fix commit says
   // the reproduction is, the registered version is what runs.

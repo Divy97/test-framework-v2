@@ -386,6 +386,34 @@ export const ORDER_DEPENDENT_REPRO: ReproSpec = {
 export const noOpFix = () =>
   makeRepo({ 'src.txt': 'wrong\n' }, { 'README.md': 'an unrelated change\n' });
 
+/**
+ * The same order-dependent trick, with the flag inside the repo — in a directory
+ * `.gitignore` already covers.
+ *
+ * `git clean -dff` spares ignored files by design, because they are usually
+ * installed dependencies. Between the phases of one repo that reasoning does not
+ * hold: `node_modules/`, `dist/` and `coverage/` are ignored in every real
+ * repository, and each is simply the easiest place for the base run to leave a
+ * flag the fix run reads.
+ */
+export const IGNORED_PATH_REPRO: ReproSpec = {
+  command: 'sh repro.sh',
+  files: {
+    'repro.sh':
+      'flag=node_modules/.seen\n' +
+      'cat src.txt\n' +
+      'if [ -f "$flag" ]; then exit 0; fi\n' +
+      'mkdir -p node_modules && touch "$flag"\n' +
+      'grep -q right src.txt\n',
+  },
+};
+
+export const noOpFixWithIgnores = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', '.gitignore': 'node_modules/\n' },
+    { 'README.md': 'an unrelated change\n' },
+  );
+
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () => makeRepo({ 'src.txt': 'right\n' }, { 'notes.md': 'nope\n' });
 
