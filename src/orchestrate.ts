@@ -26,7 +26,7 @@
 // content-addressed, so collecting is a copy that cannot collide meaningfully.
 
 import { spawn } from 'node:child_process';
-import { cp, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RunEvent } from './events.js';
@@ -34,6 +34,8 @@ import type { Job } from './runner.js';
 
 /** Output ceiling per container. Matches what the sandbox tests already allow. */
 const MAX_STREAM_BYTES = 32 * 1024 * 1024;
+/** Tail of a container's diagnostics. The reason is at the end, not the start. */
+const MAX_STDERR_CHARS = 8 * 1024;
 
 export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only'> & {
   /** Host path to the repository. Mounted read-only into every container. */
@@ -55,6 +57,16 @@ export type PhaseResult = {
   phase: 'agent' | 'base' | 'fix';
   events: RunEvent[];
   exitCode: number;
+  /**
+   * What the container said on stderr, bounded.
+   *
+   * `EXIT.silent` is documented as "ignore the channel and read stderr", and
+   * discarding it made that exit code unreadable: a store missing its sentinel
+   * looked exactly like a missing image, an OOM kill, or a spawn failure. For a
+   * project whose subject is evidence, an operational failure with no diagnosis
+   * is the wrong thing to ship.
+   */
+  stderr: string;
 };
 
 export type RunOutcome = {
@@ -72,6 +84,19 @@ export type RunOutcome = {
  * and the partial stream already says where it stopped.
  */
 export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
+  // The sentinel check moved layers with the store and had to move with it.
+  // Each container now gets a store this function creates, so the Runner's own
+  // check passes by construction and says nothing about durability — the
+  // question "will the evidence outlive this run" is now the HOST's, and this is
+  // where it has to be asked. Without it a typo'd path yields a complete,
+  // plausible event stream whose artifacts were collected into nowhere.
+  await stat(join(plan.blobRoot, '.evidence-store')).catch(() => {
+    throw new Error(
+      `${plan.blobRoot} is not an evidence store (create it and leave a .evidence-store file); ` +
+        'the artifacts these containers produce would be collected into nothing',
+    );
+  });
+
   const phases: PhaseResult[] = [];
   const events: RunEvent[] = [];
   let afterSeq = plan.afterSeq ?? 0;
@@ -158,9 +183,15 @@ async function runContainer(
     }
     stdout += chunk;
   });
-  // Drained, or a container that says a lot on stderr blocks writing to it and
-  // never reaches its own exit — the same deadlock the agent supervisor has.
-  child.stderr.resume();
+  // Kept, not just drained. Draining is still required — a container that says
+  // a lot on stderr blocks writing to it and never reaches its own exit, the
+  // same deadlock the agent supervisor has — but the last few KB are what makes
+  // a non-zero exit diagnosable.
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk: string) => {
+    stderr = (stderr + chunk).slice(-MAX_STDERR_CHARS);
+  });
 
   const exitCode = await new Promise<number>((resolve) => {
     child.on('close', (code) => resolve(code ?? 1));
@@ -182,7 +213,7 @@ async function runContainer(
     // fold would reject it anyway on the seq that never arrived.
     throw new Error(`the ${phase} container produced more than ${MAX_STREAM_BYTES} bytes of events`);
   }
-  return { phase, events: parse(stdout), exitCode };
+  return { phase, events: parse(stdout), exitCode, stderr: stderr.trim() };
 }
 
 const parse = (stdout: string): RunEvent[] =>

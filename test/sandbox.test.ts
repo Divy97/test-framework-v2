@@ -1139,6 +1139,56 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
   }, 600_000);
 
+  test('a container that could not run says why', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+
+    // A non-zero exit with an empty channel is only actionable if the diagnosis
+    // survives. Discarded, a missing image looked exactly like an OOM kill or a
+    // refused store — and for a project about evidence, an operational failure
+    // with no diagnosis is the wrong thing to ship.
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: hostBlobs(),
+      image: 'test-framework-v2-sandbox:does-not-exist',
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+    });
+
+    expect(outcome.complete).toBe(false);
+    expect(outcome.phases[0]!.events).toEqual([]);
+    expect(outcome.phases[0]!.stderr).toMatch(/does-not-exist/);
+  }, 600_000);
+
+  test('a store that would not outlive the run is refused before anything runs', async () => {
+    // The sentinel check moved layers with the store. Each container now gets a
+    // store `orchestrate` creates, so the Runner's own check passes by
+    // construction — the durability question is the host's now, and a typo'd
+    // path would otherwise yield a complete, plausible stream whose artifacts
+    // were collected into nothing.
+    const fixture = clean();
+    const bare = mkdtempSync(join(tmpdir(), 'engine-nosentinel-'));
+    stores.push(bare);
+
+    await expect(
+      orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: bare,
+        image: IMAGE,
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        repro: APPLIED_REPRO,
+        symptomPattern: 'wrong',
+        flakeRuns: 0,
+      }),
+    ).rejects.toThrow(/not an evidence store/);
+  }, 300_000);
+
   test('a hook the repro plants is never executed by the Runner', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = clean();
