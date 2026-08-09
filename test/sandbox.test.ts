@@ -1052,6 +1052,93 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(state.reproduced).toBe(false);
   }, 600_000);
 
+  test('the fix container cannot see the base container evidence', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = noOpFix();
+    const blobs = hostBlobs();
+
+    // The channel the split created and nearly shipped. Mounting the real store
+    // into every container is worse than not splitting at all: the base
+    // container flushes before it exits, the fix container mounts the same
+    // directory, `guardEvidence` counts those blobs as pre-existing and never
+    // evicts them, and a bind mount ignores container permissions. In the
+    // whole-run path the store is empty during both phases, because blobs sit in
+    // root-owned staging until the last repro has finished.
+    const repro = {
+      command: 'sh repro.sh',
+      files: {
+        'repro.sh':
+          'cat src.txt\n' +
+          'if [ -n "$(find /blobs -type f ! -name .evidence-store 2>/dev/null)" ]; then exit 0; fi\n' +
+          'grep -q right src.txt\n',
+      },
+    };
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro,
+      symptomPattern: 'wrong',
+      flakeRuns: 2,
+    });
+
+    const state = fold([
+      { run_id: RUN_ID, seq: 1, ts: new Date().toISOString(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      ...outcome.events.map((e, i) => ({ ...e, seq: i + 2 })),
+    ]);
+    // The fix commit touches only README.md.
+    expect(state.reproduced).toBe(false);
+
+    // And the evidence still reaches the host from both containers, which is the
+    // half a naive "just do not mount it" fix would break.
+    const refs = [...new Set(JSON.stringify(outcome.events).match(/sha256:[0-9a-f]{64}/g) ?? [])];
+    expect(refs.length).toBeGreaterThan(2);
+    for (const ref of refs) {
+      await expect(get(blobs, ref as ArtifactRef)).resolves.toBeInstanceOf(Buffer);
+    }
+  }, 600_000);
+
+  test('the agent container observes nothing', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\nprintf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'say nothing',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    // Without `only: 'agent'` this container ran the agent AND both phases, so
+    // the fix phase started on the machine the agent had been working in — and
+    // it stayed invisible because the duplicate registrations made the fold
+    // stricter rather than wrong.
+    const agent = outcome.phases.find((p) => p.phase === 'agent')!;
+    expect(agent.events.map((e) => e.type)).toEqual(['AGENT_MESSAGE', 'AGENT_FINISHED']);
+    expect(outcome.events.filter((e) => e.type === 'REPRO_REGISTERED')).toHaveLength(1);
+    expect(outcome.events.filter((e) => e.type === 'FIX_DIFF_OBSERVED')).toHaveLength(1);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+  }, 600_000);
+
   test('a hook the repro plants is never executed by the Runner', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = clean();

@@ -13,10 +13,22 @@
 // no window on the evidence store between phases.
 //
 // Only two things cross between containers, both explicitly: the commits (via
-// the read-only source mount) and the seq counter. Nothing else is carried,
-// because nothing else exists to carry.
+// the read-only source mount) and the seq counter.
+//
+// The evidence store is the exception that had to be built, not assumed. Mounted
+// straight through, it defeated the whole point: the base container flushes
+// before it exits, the fix container mounts the same directory, `guardEvidence`
+// treats those blobs as pre-existing and never evicts them, and a bind mount
+// does not honour container permissions — so a repro could read them and be red
+// once, green after. That is strictly WORSE than the whole-run path, where blobs
+// sit in root-owned staging until the last repro has finished. So each container
+// gets its own empty store and the host collects from it afterwards. Blobs are
+// content-addressed, so collecting is a copy that cannot collide meaningfully.
 
 import { spawn } from 'node:child_process';
+import { cp, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { RunEvent } from './events.js';
 import type { Job } from './runner.js';
 
@@ -30,6 +42,12 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only'> & {
   blobRoot: string;
   image: string;
   afterSeq?: number;
+  /**
+   * Host path to a `claude` executable, mounted over the image's. For tests: the
+   * image ships no agent yet, and a hostile fake is how the supervision boundary
+   * is exercised without one.
+   */
+  agentImageMount?: string;
 };
 
 /** What one container reported, and how it exited. */
@@ -63,7 +81,13 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // discarded" becomes when the world is a container: it is not scrubbed, it
   // ceases to exist.
   const steps: { phase: PhaseResult['phase']; job: Partial<Job> }[] = [];
-  if (plan.agentPrompt) steps.push({ phase: 'agent', job: { agentPrompt: plan.agentPrompt } });
+  // `only: 'agent'` matters: without it the agent container ran the agent AND
+  // both phases, so the fix phase started on the very machine the agent had been
+  // working in. It stayed invisible because the duplicate registrations made the
+  // fold stricter rather than wrong.
+  if (plan.agentPrompt) {
+    steps.push({ phase: 'agent', job: { agentPrompt: plan.agentPrompt, only: 'agent' } });
+  }
   steps.push({ phase: 'base', job: { only: 'base' } });
   steps.push({ phase: 'fix', job: { only: 'fix' } });
 
@@ -101,10 +125,16 @@ async function runContainer(
     ...overrides,
   };
 
+  // A store of this container's own, empty, with the sentinel the Runner insists
+  // on. Nothing another participant wrote is visible from inside it.
+  const store = await mkdtemp(join(tmpdir(), 'engine-phase-store-'));
+  await writeFile(join(store, '.evidence-store'), '');
+
   const args = [
     'run', '--rm', '-i',
     '-v', `${plan.repoPath}:/src:ro`,
-    '-v', `${plan.blobRoot}:/blobs`,
+    '-v', `${store}:/blobs`,
+    ...(plan.agentImageMount ? ['-v', `${plan.agentImageMount}:/usr/local/bin/claude:ro`] : []),
     plan.image,
   ];
 
@@ -136,6 +166,16 @@ async function runContainer(
     child.on('close', (code) => resolve(code ?? 1));
     child.on('error', () => resolve(1));
   });
+
+  // Collect the artifacts into the real store, from the host, once the container
+  // is gone. Whatever a participant planted in its own store comes along, but it
+  // was only ever visible to itself — and the sentinel is skipped so a store that
+  // never held one does not acquire it here.
+  for (const entry of await readdir(store)) {
+    if (entry === '.evidence-store') continue;
+    await cp(join(store, entry), join(plan.blobRoot, entry), { recursive: true, force: true });
+  }
+  await rm(store, { recursive: true, force: true });
 
   if (truncated) {
     // Refusing beats guessing: a stream cut mid-line is not a stream, and the
