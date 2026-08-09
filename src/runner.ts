@@ -85,8 +85,13 @@ const EXIT = {
 const SENTINEL = '.evidence-store';
 
 /**
- * Every directory in the sandbox image a participant can write, and therefore
- * every place one of them can leave state for another to read.
+ * Every directory in the sandbox IMAGE a participant can write.
+ *
+ * Not every place one can leave state for another — that was an overclaim. The
+ * run adds mounts the image does not have, and two of them are channels this
+ * list cannot cover: `/blobs`, which a bind mount leaves writable regardless of
+ * container permissions and which outlives the run, and the agent's own world.
+ * Those are handled where they are created; this list is about the image.
  *
  * This list was three guesses long and kept being wrong — `/home/node` is not
  * world-writable, it is uid-1000-owned because the image ships it that way, and
@@ -134,7 +139,7 @@ async function hostStoreIsMounted(path: string): Promise<boolean> {
  * Gated hard on being PID 1: outside a container this would kill the developer's
  * session and erase their /tmp.
  */
-async function clearTheField(extra: string[] = []): Promise<void> {
+async function clearTheField(extra: string[] = [], evidence?: EvidenceStore): Promise<void> {
   if (process.pid !== 1) return;
   for (const entry of await readdir('/proc')) {
     const pid = Number(entry);
@@ -165,6 +170,33 @@ async function clearTheField(extra: string[] = []): Promise<void> {
       await rm(`${dir}/${entry}`, { recursive: true, force: true });
     }
   }
+  await evidence?.evict();
+}
+
+/**
+ * The evidence store is a writable directory shared by every participant, so it
+ * is a channel like any other — and the worst-placed one, because a bind mount
+ * does not honour container permissions and it OUTLIVES the run. State left
+ * there reaches the next phase, the host, and every later run against the same
+ * store.
+ *
+ * It cannot simply be emptied: that is where the evidence lives. But the Runner
+ * writes nothing here until the final flush — every blob goes to root-owned
+ * staging first — so anything that appears mid-run was put there by a
+ * participant. Snapshot what was already present, and evict the rest.
+ */
+type EvidenceStore = { evict: () => Promise<void> };
+
+async function guardEvidence(root: string): Promise<EvidenceStore> {
+  const original = new Set(await readdir(root));
+  return {
+    evict: async () => {
+      for (const entry of await readdir(root)) {
+        if (original.has(entry)) continue;
+        await rm(`${root}/${entry}`, { recursive: true, force: true });
+      }
+    },
+  };
 }
 
 async function readStdin(): Promise<string> {
@@ -202,6 +234,10 @@ export async function runJob(
   // 1000, the very uid the repro runs as. Left there during the run, the repro
   // could delete artifacts the base phase had already banked and the stream
   // would still come out clean and complete.
+  // Before anything else runs: what was already in the store is evidence from
+  // earlier runs, and everything that appears from here is a participant's doing.
+  const evidence = await guardEvidence(blobRoot);
+
   const staging = `${workDir}/staging`;
   await mkdir(staging, { recursive: true });
   await chmod(staging, 0o700);
@@ -303,7 +339,14 @@ export async function runJob(
 
   // Nothing the agent started may still be running when the phases begin, and
   // nothing it left in a shared directory may still be there.
-  if (agentWorld) await clearTheField();
+  if (agentWorld) {
+    await clearTheField([], evidence);
+    // The agent's world is discarded outright, not scrubbed. ADR-0010 already
+    // says its tree does not survive — but the tree, TMPDIR and HOME are all
+    // uid-1000-owned, so leaving them standing lets the BASE phase write there
+    // and the fix phase read it back. Nothing downstream wants any of it.
+    await rm(`${workDir}/agent`, { recursive: true, force: true });
+  }
 
   // Cloned now, not earlier: a tree that existed while the agent ran is a tree
   // the agent could have written to.
@@ -337,7 +380,7 @@ export async function runJob(
       // and nothing about the fix has to change; and a process the BASE phase
       // backgrounds is the same attack again, which no amount of directory
       // scrubbing reaches.
-      onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME]),
+      onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME], evidence),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });
@@ -355,6 +398,12 @@ export async function runJob(
   // The repro has run for the last time, so the evidence can cross into the
   // shared mount now. Ownership follows the host directory, or a non-root host
   // user cannot clean up what root wrote.
+  // Once more before the evidence crosses. The boundary evicts protect the fix
+  // phase from the base phase, but the LAST phase to run has no boundary after
+  // it — without this its plants ride out to the host store and wait there for
+  // the next run against it.
+  await evidence.evict();
+
   const owner = await stat(blobRoot);
   try {
     // No shell: `cp` takes its arguments directly, so nothing here can be read as

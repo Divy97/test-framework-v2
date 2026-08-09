@@ -107,18 +107,25 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // Enumerated as the repro user, across every mount rather than one, because
     // /dev/shm and /dev/mqueue are separate filesystems and `-xdev` is exactly
     // how /dev/mqueue stayed hidden.
-    // Real filesystems only. procfs is deliberately out of scope and the
-    // exclusion is informed rather than convenient: enumerating it turns up
-    // `/proc/sys/kernel/ns_last_pid`, writable by uid 1000. That is a kernel
-    // tunable, not a place to leave a file — it cannot be scrubbed by removing
-    // anything, and every process creation rewrites it. A different threat
-    // class, recorded in ADR-0010 rather than papered over here.
-    const roots = ['/', '/dev', '/dev/shm', '/dev/mqueue', '/run'];
+    // Roots come from /proc/mounts, not from a hand-written list. Hardcoding
+    // them would be the very failure this test exists to end: a base image that
+    // gains a mount would hide a writable path exactly as /dev/mqueue hid behind
+    // `-xdev` on `/` alone.
+    //
+    // Only `rw` mounts, because `test -w` answers about MODE BITS and knows
+    // nothing about read-only mounts. It calls /proc/sys/kernel/ns_last_pid
+    // writable (0666 under a ro /proc/sys) and /sys/firmware writable (1777 on a
+    // ro tmpfs) when no process can write either. That error is in the safe
+    // direction — a false positive costs a scrub, a false negative would cost a
+    // verdict — but this test asserts an EXACT set, so the oracle has to be
+    // sound rather than merely conservative. Kernel filesystems are dropped as
+    // well, for speed and because /proc's per-pid tree is pure noise.
+    const KERNEL_FS = 'proc|sysfs|cgroup|cgroup2|devpts|securityfs|tracefs|debugfs';
     const found = execFileSync(
       'docker',
       ['run', '--rm', '--user', '1000:1000', '--entrypoint', 'sh', IMAGE, '-c',
-        `for m in ${roots.join(' ')}; do ` +
-          "for t in d f; do find $m -xdev -type $t -exec test -w {} ';' -print 2>/dev/null; done; " +
+        `awk '$4 ~ /^rw/ && $3 !~ /^(${KERNEL_FS})$/ {print $2}' /proc/mounts | sort -u | while read -r m; do ` +
+          "for t in d f; do find \"$m\" -xdev -type $t -exec test -w {} ';' -print 2>/dev/null; done; " +
           'done | sort -u'],
       { encoding: 'utf8' },
     )
@@ -728,6 +735,91 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // The hook never ran as root: /work is root-owned, so the marker can only
     // exist if it did.
     for (const output of outputs) expect(output).toContain('ROOTMARK: ls:');
+  }, 300_000);
+
+  test('neither /blobs nor the agent world carries state across the phase boundary', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // Two channels the image scan cannot see, because they exist only during a
+    // run. /blobs is a bind mount — permissions inside the container do not
+    // apply to it — and it OUTLIVES the run, so state left there reaches the
+    // next phase, the host, and every later run against the same store. The
+    // agent's world is uid-1000-owned and was simply left standing.
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\nprintf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    // Something already in the store before the run. It is prior evidence and
+    // must survive: the fix is to evict what a participant ADDS, never to empty
+    // the store.
+    writeFileSync(join(blobs, 'PRIOR-EVIDENCE.txt'), 'from an earlier run\n');
+
+    const repro = {
+      command: 'sh repro.sh',
+      files: {
+        'repro.sh':
+          'cat src.txt\n' +
+          'echo "BLOBS: $(ls /blobs/PLANTED 2>&1)"\n' +
+          'echo "AGENT: $(ls /work/agent/tmp/PLANTED 2>&1)"\n' +
+          'touch /blobs/PLANTED 2>/dev/null || true\n' +
+          'mkdir -p /work/agent/tmp 2>/dev/null && touch /work/agent/tmp/PLANTED 2>/dev/null || true\n' +
+          'grep -q right src.txt\n',
+      },
+    };
+
+    const events = parse(
+      execFileSync(
+        'docker',
+        [
+          'run', '--rm', '-i',
+          '-v', `${fixture.repo}:/src:ro`,
+          '-v', `${blobs}:/blobs`,
+          '-v', `${join(agentDir, 'claude')}:/usr/local/bin/claude:ro`,
+          IMAGE,
+        ],
+        {
+          input: JSON.stringify({
+            runId: RUN_ID,
+            afterSeq: 0,
+            sourcePath: '/src',
+            baseRef: fixture.base,
+            fixRef: fixture.fix,
+            repro,
+            symptomPattern: 'wrong',
+            flakeRuns: 0,
+            agentPrompt: 'say nothing',
+          }),
+          encoding: 'utf8',
+          maxBuffer: 32 * 1024 * 1024,
+        },
+      ),
+    );
+
+    const outputs = await Promise.all(
+      events
+        .filter((e) => e.type === 'TEST_RUN')
+        .map((e) =>
+          get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash).then((b) =>
+            b.toString(),
+          ),
+        ),
+    );
+    expect(outputs).toHaveLength(2);
+    // `ls:` is the error prefix: the fix phase found neither plant.
+    for (const output of outputs) {
+      expect(output).toContain('BLOBS: ls:');
+      expect(output).toContain('AGENT: ls:');
+    }
+
+    // Prior evidence untouched, and the plant gone from the host store.
+    expect(existsSync(join(blobs, 'PRIOR-EVIDENCE.txt'))).toBe(true);
+    expect(existsSync(join(blobs, 'PLANTED'))).toBe(false);
   }, 300_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {

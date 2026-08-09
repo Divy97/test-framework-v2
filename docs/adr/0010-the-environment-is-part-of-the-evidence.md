@@ -132,13 +132,24 @@ was false within a day.
   repro user and asserted to be *exactly* the scrubbed set, so a base image that
   gains a writable path fails the suite instead of waiting for the next review.
   The answer to "the set cannot be enumerated with confidence" turned out to be
-  that it can — it is five directories — and that the confidence has to come
-  from a test rather than from care.
-- **procfs is out of scope, deliberately.** The enumeration covers real
-  filesystems. Extending it to `/proc` turns up `/proc/sys/kernel/ns_last_pid`,
-  writable by uid 1000 — a kernel tunable rather than a place to leave a file.
-  It cannot be scrubbed by removing anything and every process creation rewrites
-  it, so it is a different threat class and is recorded rather than swept in.
+  that it can — five directories in the image — and that the confidence has to
+  come from a test rather than from care.
+- **The image is not the run.** That enumeration covers the image; a live run
+  mounts more, and review found two channels there immediately: `/blobs`, which
+  a bind mount leaves writable whatever the container says and which *outlives
+  the run*, and the agent's own world, left standing and uid-1000-owned. The
+  store cannot simply be emptied — it is where the evidence lives — so what was
+  already in it is snapshotted and only additions are evicted, at each boundary
+  and once more before the flush, since the last phase has no boundary after it.
+  The agent's world is deleted outright.
+- **Read-only mounts are why the oracle had to change.** `test -w` answers about
+  mode bits and knows nothing about a ro mount: it calls
+  `/proc/sys/kernel/ns_last_pid` writable (0666 beneath a ro `/proc/sys`) and
+  `/sys/firmware` writable (1777 on a ro tmpfs) when no process can write
+  either. An earlier draft of this ADR argued at length that `ns_last_pid` was a
+  "different threat class"; it is simply not writable, and the argument was
+  defending a hole that does not exist. The enumeration now takes only `rw`
+  mounts from `/proc/mounts`.
 - **The reap assumes PID 1.** It is gated on it, so outside a container it does
   nothing at all — which is correct, and means the in-process engine used by the
   unit tests has none of this protection. That is acceptable only because the
