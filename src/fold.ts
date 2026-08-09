@@ -66,6 +66,15 @@ export type RunState = {
   registrations: RegisteredRepro[];
   /** Interpretation: one attempt ran the same reproduction red on base, then green on the fix. */
   reproduced: boolean;
+  /**
+   * WHICH attempt earned that, or null. Recorded rather than left to be
+   * re-derived: a second definition of "the credited attempt" living in a
+   * consumer is free to disagree with this one, and did — the confidence
+   * projection scored a later junk attempt as Tier 1 and cited its green base
+   * run as proof the reproduction had failed (ADR-0009's rule against
+   * reimplementing the fold).
+   */
+  reproducedAttempt: number | null;
   /** What the fix touched. Recorded for the confidence projection; the engine never judges it. */
   fixDiff: { changed_files: string[]; diff_hash: ArtifactRef } | null;
   /**
@@ -129,6 +138,7 @@ const initialState = (runId: string): RunState => ({
   registeredRepro: null,
   registrations: [],
   reproduced: false,
+  reproducedAttempt: null,
   fixDiff: null,
   completedAttempts: [],
   transcript: [],
@@ -188,7 +198,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // Ordinarily a no-op — registration precedes the runs it anchors — but it
         // keeps the value derived from the current inputs rather than left over
         // from the last TEST_RUN.
-        reproduced: isReproduced(state.testRuns, registrations, state.aborts, state.completedAttempts),
+        ...credited(state.testRuns, registrations, state.aborts, state.completedAttempts),
       };
     }
     case 'AGENT_MESSAGE':
@@ -240,7 +250,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // deciding one on any stream `verify()` can emit. It is kept because the
         // fold does not get to assume event ordering (ADR-0009) — but no fixture
         // can make it load-bearing, and pretending otherwise would be decoration.
-        reproduced: isReproduced(testRuns, state.registrations, state.aborts, state.completedAttempts),
+        ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts),
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
     }
@@ -255,7 +265,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         completedAttempts,
         // The completion witness arrives after the runs it vouches for, so a fold
         // that only recomputed on TEST_RUN would never see it.
-        reproduced: isReproduced(state.testRuns, state.registrations, state.aborts, completedAttempts),
+        ...credited(state.testRuns, state.registrations, state.aborts, completedAttempts),
         artifactHashes: [...state.artifactHashes, event.payload.diff_hash],
       };
     }
@@ -291,7 +301,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         ...next,
         aborts,
         completedAttempts: completed,
-        reproduced: isReproduced(state.testRuns, state.registrations, aborts, completed),
+        ...credited(state.testRuns, state.registrations, aborts, completed),
       };
     }
     case 'RUN_ENDED':
@@ -344,12 +354,23 @@ export function apply(state: RunState, event: RunEvent): RunState {
  * costs an info-request (ADR-0007's Tier 3, which the design already treats as a
  * real deliverable); a false positive puts a fabricated verdict on a PR.
  */
-function isReproduced(
+/** `reproduced` and `reproducedAttempt` together, so they can never disagree. */
+function credited(
   testRuns: TestRunRecord[],
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
   completedAttempts: number[],
-): boolean {
+): { reproduced: boolean; reproducedAttempt: number | null } {
+  const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts);
+  return { reproduced: attempt !== null, reproducedAttempt: attempt };
+}
+
+function reproducedAttempt(
+  testRuns: TestRunRecord[],
+  registrations: RegisteredRepro[],
+  aborts: RunState['aborts'],
+  completedAttempts: number[],
+): number | null {
   // An attempt whose base or fix phase stopped being observable is an attempt we
   // did not finish watching, and the fix series it produced is truncated. Nothing
   // in the log says how many re-runs there should have been, so `every` below
@@ -381,7 +402,7 @@ function isReproduced(
     run.repro_hashes !== undefined &&
     Object.entries(repro.files).every(([path, hash]) => run.repro_hashes![path] === hash);
 
-  return testRuns.some((base) => {
+  const credit = testRuns.find((base) => {
     // attempt 0 means no ATTEMPT_STARTED was ever seen, so "within one attempt"
     // is unenforceable and runs from unrelated attempts could be paired.
     if (base.phase !== 'base' || base.attempt === 0) return false;
@@ -416,6 +437,7 @@ function isReproduced(
       fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
     );
   });
+  return credit ? credit.attempt : null;
 }
 
 export function fold(events: RunEvent[]): RunState {

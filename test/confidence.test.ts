@@ -70,6 +70,45 @@ describe('a clean reproduction', () => {
     }
   });
 
+  test('every scored ground cites bytes — the rule, not an aggregate count', async () => {
+    // ADR-0004 stated directly. Counting refs across all grounds let any single
+    // ground be emptied while the total stayed healthy, so the rule was checked
+    // in a way that could not detect breaking it.
+    const fixture = clean();
+    const score = confidence(conclude(await observe(fixture)));
+
+    for (const ground of score.grounds) {
+      if (ground.points === 0) continue;
+      expect(ground.evidence, ground.claim).not.toHaveLength(0);
+      for (const ref of ground.evidence) {
+        await expect(get(fixture.blobRoot, ref)).resolves.toBeInstanceOf(Buffer);
+      }
+    }
+  });
+
+  test('an applied wrapper around a pinned test is not a fully applied anchor', async () => {
+    // A spec may mix `files` and `pinned`. The wrapper cannot be touched, but
+    // the test it invokes is exactly what a fix commit rewrites — so the anchor
+    // is only as strong as its weakest part, and scoring it as untouchable
+    // credits a protection that is not there.
+    const mixed = confidence(
+      conclude(
+        await observe(committedTest(), {
+          repro: {
+            command: 'sh wrap.sh',
+            files: { 'wrap.sh': 'sh tests/existing.sh\n' },
+            pinned: ['tests/existing.sh'],
+          },
+        }),
+      ),
+    );
+    const fully = confidence(conclude(await observe(clean())));
+
+    expect(mixed.tier).toBe(1);
+    expect(mixed.score).toBeLessThan(fully.score);
+    expect(mixed.grounds.some((g) => g.claim.includes('detectable, not preventable'))).toBe(true);
+  });
+
   test('stops at 85 and says what the missing points were for', async () => {
     // 100 would claim the fix diff was checked against the reproduction path.
     // It was not — ADR-0008 retired the filename version as disproved and the
@@ -83,6 +122,14 @@ describe('a clean reproduction', () => {
     expect(score.score).toBeLessThanOrEqual(85);
     expect(score.unmeasured.join(' ')).toMatch(/diff-coverage/);
     expect(score.unmeasured.join(' ')).toMatch(/Tier 2/);
+  });
+
+  test('the re-run bonus is capped, so the advertised ceiling stays true', async () => {
+    // Uncapped, a long flake loop scores past 85 and the type's own "0–85"
+    // becomes a lie — and the extra points would be bought with repetition
+    // rather than with any new kind of evidence.
+    const many = confidence(conclude(await observe(clean(), { flakeRuns: 8 })));
+    expect(many.score).toBe(85);
   });
 
   test('scores fewer re-runs lower, because fewer flakes could have been caught', async () => {
@@ -138,6 +185,18 @@ describe('the gate holds, with no partial credit', () => {
     );
   });
 
+  test('a raw Runner stream is not accused of tampering', async () => {
+    // `verify()` emits no ATTEMPT_STARTED, so a Runner stream folds with
+    // attempt 0 everywhere and the fold refuses to pair the runs. A flawless run
+    // was being reported as "the reproduction that ran was not the one
+    // registered" — a worse lie than saying nothing.
+    const events = await observe(clean(), { flakeRuns: 0 });
+    const score = confidence(fold(events.map((e, i) => ({ ...e, seq: i + 1 }))));
+
+    expect(score.tier).toBe(3);
+    expect(score.grounds[0]!.claim).toMatch(/no attempt was ever declared/);
+  });
+
   test('a repro that errors on base for want of a fix-only helper is not credited', async () => {
     // Exit code alone calls this a red base — the repro fails to load because
     // the helper only exists in the fix commit. Only the symptom check disagrees.
@@ -153,6 +212,66 @@ describe('the gate holds, with no partial credit', () => {
     const claim = await reasonFor(irreproducible());
     expect(claim.length).toBeGreaterThan(30);
     expect(claim).not.toBe('not reproduced');
+  });
+});
+
+describe('more than one attempt', () => {
+  /** Two real runs folded as consecutive attempts, sharing a blob store so every ref resolves. */
+  const twoAttempts = async (first: RunEvent[], second: RunEvent[]): Promise<RunState> =>
+    fold([
+      { run_id: RUN_ID, seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      ...first.map((e, i) => ({ ...e, seq: i + 2 })),
+      {
+        run_id: RUN_ID,
+        seq: first.length + 2,
+        ts: 'T',
+        type: 'ATTEMPT_STARTED',
+        payload: { v: 1, n: 2 },
+      },
+      ...second.map((e, i) => ({ ...e, seq: first.length + 3 + i })),
+    ]);
+
+  test('scores the attempt the fold credited, not the last one', async () => {
+    // The dangerous shape. Attempt 1 genuinely reproduces; attempt 2 is junk —
+    // its base run PASSES. Re-deriving "the credited attempt" as "the last
+    // completed one" scored attempt 2 as Tier 1 and cited its green base run as
+    // proof the reproduction ran red.
+    const store = clean();
+    const good = await observe(store, { flakeRuns: 0 });
+    const junk = await observe(irreproducible(), { blobRoot: store.blobRoot, flakeRuns: 0 });
+
+    const state = await twoAttempts(good, junk);
+    expect(state.reproducedAttempt).toBe(1);
+
+    const score = confidence(state);
+    expect(score.tier).toBe(1);
+    // Attempt 1's base failed; attempt 2's passed. The cited artifact must be
+    // the one that actually failed, or the ground is a sentence over a lie.
+    const cited = score.grounds[0]!.evidence[0]!;
+    expect((await get(store.blobRoot, cited)).toString()).toContain('wrong');
+  });
+
+  test('a later junk attempt cannot lift the score', async () => {
+    const store = clean();
+    const good = await observe(store, { flakeRuns: 0 });
+    const junk = await observe(irreproducible(), { blobRoot: store.blobRoot, flakeRuns: 2 });
+
+    // Attempt 2 has more fix runs. Scoring it would pay for re-runs that
+    // happened in an attempt nothing was credited to.
+    const alone = confidence(await twoAttempts(good, []));
+    const withJunk = confidence(await twoAttempts(good, junk));
+    expect(withJunk.score).toBe(alone.score);
+  });
+
+  test('renders rather than throws when the credited runs are missing', async () => {
+    // A projection that refuses to render is worse than one that renders the
+    // truth plus "this log is malformed" — and `cli.ts` calls this straight
+    // after replay, so a throw makes the run permanently unviewable.
+    const state = await twoAttempts(await observe(clean(), { flakeRuns: 0 }), []);
+    const broken: RunState = { ...state, registrations: [] };
+
+    expect(() => confidence(broken)).not.toThrow();
+    expect(confidence(broken).tier).toBe(3);
   });
 });
 

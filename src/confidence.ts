@@ -26,9 +26,10 @@ export type Ground = {
   claim: string;
   points: number;
   /**
-   * Artifacts a reviewer can open. Empty only where the claim is about an
-   * absence — nothing was aborted, no scenario was recorded — which cannot have
-   * bytes by definition.
+   * Artifacts a reviewer can open. Empty only where the log genuinely holds no
+   * bytes for the claim — a run so malformed the runs behind it are missing.
+   * Every scored ground cites something; a point that cannot be checked is the
+   * vibe ADR-0004 forbids.
    */
   evidence: ArtifactRef[];
 };
@@ -80,13 +81,37 @@ export function confidence(state: RunState): Confidence {
     };
   }
 
-  // The attempt the fold actually credited. `reproduced` is true because one
-  // attempt satisfied every clause, so scoring must describe that attempt rather
-  // than the run's runs in aggregate.
-  const attempt = creditedAttempt(state);
-  const base = state.testRuns.find((r) => r.phase === 'base' && r.attempt === attempt)!;
+  // The attempt the fold credited — taken from the fold, never re-derived. A
+  // second definition of "which attempt" is free to disagree with the first, and
+  // an earlier version of this file proved it: it picked the LAST completed
+  // attempt, so a junk attempt appended after a genuine one was scored Tier 1
+  // with its green base run cited as proof the reproduction had failed.
+  const attempt = state.reproducedAttempt;
+  const base = state.testRuns.find((r) => r.phase === 'base' && r.attempt === attempt);
   const fixes = state.testRuns.filter((r) => r.phase === 'fix' && r.attempt === attempt);
-  const registration = state.registrations.find((r) => r.attempt === attempt)!;
+  // The LAST registration of the attempt, matching the fold's own Map, which
+  // later entries overwrite. `.find` would take the first and score a run
+  // against a registration nothing was compared to.
+  const registration = state.registrations.filter((r) => r.attempt === attempt).at(-1);
+
+  // A projection must render, not throw (ADR-0009's reasoning about the fold).
+  // `cli.ts` calls this straight after replay, and one malformed log should not
+  // make a run permanently unviewable.
+  if (!base || !registration) {
+    return {
+      scoring: 1,
+      tier: 3,
+      score: 0,
+      grounds: [
+        {
+          claim: 'the log says a reproduction was credited but does not contain the runs behind it',
+          points: 0,
+          evidence: [],
+        },
+      ],
+      unmeasured,
+    };
+  }
 
   const grounds: Ground[] = [
     {
@@ -109,11 +134,16 @@ export function confidence(state: RunState): Confidence {
   // the engine overwrites the fix commit's version before it runs. A pinned path
   // is only ever hashed, so tampering is detectable rather than preventable
   // (ADR-0008), and that is genuinely less evidence.
-  const applied = registration.applied.length > 0;
+  // Every registered file, not merely one. A spec may mix `files` and `pinned`,
+  // and an applied wrapper around a pinned test is only as strong as the pinned
+  // test — which is exactly what a fix commit rewrites.
+  const registered = Object.keys(registration.files);
+  const applied =
+    registered.length > 0 && registered.every((path) => registration.applied.includes(path));
   grounds.push({
     claim: applied
-      ? 'the reproduction was written by the engine over both checkouts, so the fix commit could not touch it'
-      : 'the reproduction was a committed path, hashed rather than applied: tampering is detectable, not preventable',
+      ? 'every file of the reproduction was written by the engine over both checkouts, so the fix commit could not touch it'
+      : 'part of the reproduction was a committed path, hashed rather than applied: tampering there is detectable, not preventable',
     points: applied ? 15 : 8,
     evidence: Object.values(registration.files),
   });
@@ -127,13 +157,21 @@ export function confidence(state: RunState): Confidence {
     evidence: [base, ...fixes].flatMap((r) => hashesOf(r.repro_hashes)),
   });
 
-  const aborted = state.aborts.some((a) => a.attempt === attempt);
+  // Only `base` and `fix` aborts mean something went unwatched. Reaching `diff`
+  // or `cleanup` proves the flake loop closed — the fold treats those as the
+  // completion witness itself — so docking for them would contradict the fold
+  // and call a fully observed run half-seen.
+  const unwatched = state.aborts.some(
+    (a) => a.attempt === attempt && (a.phase === 'base' || a.phase === 'fix'),
+  );
   grounds.push({
-    claim: aborted
+    claim: unwatched
       ? 'an observation in this attempt stopped early, so part of it went unwatched'
-      : 'every phase of this attempt was observed to completion',
-    points: aborted ? 0 : 3,
-    evidence: [],
+      : 'the fix series ran to completion, witnessed by the diff observed after it',
+    points: unwatched ? 0 : 3,
+    // The witness has bytes, so this ground cites them like every other. An
+    // unevidenced point is the vibe ADR-0004 forbids, whatever it is scoring.
+    evidence: state.fixDiff ? [state.fixDiff.diff_hash] : [],
   });
 
   return {
@@ -146,20 +184,6 @@ export function confidence(state: RunState): Confidence {
 }
 
 /**
- * Which attempt earned the verdict. The fold credits a run if ANY attempt
- * cleared every clause; the score has to describe that one, not a mixture.
- */
-function creditedAttempt(state: RunState): number {
-  const completed = new Set(state.completedAttempts);
-  const attempts = state.testRuns
-    .filter((r) => r.phase === 'base' && r.attempt > 0 && completed.has(r.attempt))
-    .map((r) => r.attempt);
-  // The last one, because a later attempt is the one that succeeded after
-  // earlier ones did not.
-  return Math.max(...attempts);
-}
-
-/**
  * Why the gate held. A Tier 3 outcome is a deliverable (ADR-0007), and "no
  * reproduction" tells whoever reads it nothing — the value is in which clause
  * failed, because that is what a follow-up would have to change.
@@ -168,8 +192,17 @@ function notReproducedBecause(state: RunState): string {
   if (state.registrations.length === 0) return 'no reproduction was ever registered';
   if (state.testRuns.length === 0) return 'the reproduction was registered but never ran';
 
-  const base = state.testRuns.find((r) => r.phase === 'base');
+  // The LAST base run, because a later attempt is the one a follow-up would act
+  // on. Taking the first describes an attempt that has already been superseded.
+  const base = state.testRuns.filter((r) => r.phase === 'base').at(-1);
   if (!base) return 'no base-commit run was recorded, so there is nothing the fix could be compared against';
+  // The ordinary shape of a raw Runner stream: `verify()` emits no
+  // ATTEMPT_STARTED, so nothing declares an attempt and the fold refuses to pair
+  // runs that might belong to different ones. Without this branch a flawless run
+  // was reported as tampering, which is a worse lie than saying nothing.
+  if (base.attempt === 0) {
+    return 'no attempt was ever declared, so these runs cannot be shown to belong to the same one';
+  }
   if (base.signal) return `the base run died on ${base.signal} rather than failing: a crash is not a reproduction`;
   if (base.exit_code === 0) return 'the reproduction passed on the base commit, so it does not reproduce the report';
   if (base.symptom_matched !== true) {
@@ -180,6 +213,12 @@ function notReproducedBecause(state: RunState): string {
   if (fixes.length === 0) return 'the base run failed as reported, but no fix was ever run against it';
   if (fixes.some((r) => r.exit_code !== 0)) {
     return `the fix passed ${fixes.filter((r) => r.exit_code === 0).length} of ${fixes.length} runs: a flake is not a fix`;
+  }
+  const killed = fixes.find((r) => r.signal);
+  if (killed) return `a fix run died on ${killed.signal} rather than passing: a crash is not a pass`;
+  const registration = state.registrations.filter((r) => r.attempt === base.attempt).at(-1);
+  if (!registration || Object.keys(registration.files).length === 0) {
+    return 'the reproduction was registered against no files, so there is nothing it could be anchored to';
   }
   if (!state.completedAttempts.includes(base.attempt)) {
     return 'the run stopped before the fix series finished, so the passes that were seen prove nothing about the ones that were not';
