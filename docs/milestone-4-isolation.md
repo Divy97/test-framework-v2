@@ -1,7 +1,22 @@
 # Milestone 4 (proposed) — one container per participant
 
-**Status: scoped, not started.** It carries a real cost and a real architectural
-commitment, so it is written down rather than begun.
+**Status: scoped, and still the answer.** An earlier draft downgraded this to
+"less urgent" on the grounds that the enumeration had been closed by a test.
+That was premature: the very next review round walked a self-respawning process
+chain through the reap — the one invariant this doc called load-bearing — and
+found a writable path inside `/blobs` that survived every scrub. Both are fixed,
+and both were found by looking rather than by the design preventing them.
+
+Six rounds is the evidence. Each fix has been correct and each has been
+followed by another way in, because per-participant *directories* and a
+best-effort *sweep* are approximations of isolation. Namespaces are not.
+
+Measured, not assumed: `unshare --user --map-root-user` **is** blocked under
+Docker's default seccomp profile in this image (`unshare(0x30020000): Operation
+not permitted`) and succeeds under `seccomp=unconfined`. So candidate A costs a
+seccomp change after all — a narrower one than `CAP_SYS_ADMIN`, but a
+container-wide relaxation nonetheless, and a custom profile means shipping a copy
+of Docker's default that will drift.
 
 ## Why
 
@@ -18,7 +33,9 @@ which is exactly the shape of a defence that is losing.
 
 What holds today is the **reap** — the Runner is PID 1, so it can end every
 process in its namespace — because state nobody is alive to place at the right
-moment appears in both phases and is credited in neither. ADR-0010 puts it
+moment appears in both phases and is credited in neither. It took two attempts
+to get right: the first was a `/proc` snapshot, which a chain that forks a
+successor and exits simply outruns. ADR-0010 puts it
 exactly right: the reap is what makes the *list* survivable. M3 has other
 invariants that owe nothing to enumeration — the `:ro` source mount, the uid drop
 that puts `/proc/1/fd` out of reach, `--separate-git-dir` with an explicit

@@ -84,6 +84,27 @@ const EXIT = {
  */
 const SENTINEL = '.evidence-store';
 
+/**
+ * Every directory in the sandbox IMAGE a participant can write.
+ *
+ * Not every place one can leave state for another — that was an overclaim. The
+ * run adds mounts the image does not have, and two of them are channels this
+ * list cannot cover: `/blobs`, which a bind mount leaves writable regardless of
+ * container permissions and which outlives the run, and the agent's own world.
+ * Those are handled where they are created; this list is about the image.
+ *
+ * This list was three guesses long and kept being wrong — `/home/node` is not
+ * world-writable, it is uid-1000-owned because the image ships it that way, and
+ * `/dev/mqueue` was simply never thought of. What was missing was not a longer
+ * list but a way to know when the list is complete.
+ *
+ * `test/sandbox.test.ts` enumerates the image as the repro user and asserts the
+ * result is exactly this array, so the guessing is over: change the base image
+ * and add a writable path, and the suite says so instead of the next review
+ * round finding it. The entry that matters is whichever one is not here yet.
+ */
+export const SHARED_WRITABLE = ['/tmp', '/var/tmp', '/dev/shm', '/dev/mqueue', '/home/node'];
+
 async function hostStoreIsMounted(path: string): Promise<boolean> {
   try {
     const [here, root] = await Promise.all([stat(path), stat('/')]);
@@ -118,26 +139,61 @@ async function hostStoreIsMounted(path: string): Promise<boolean> {
  * Gated hard on being PID 1: outside a container this would kill the developer's
  * session and erase their /tmp.
  */
-async function clearTheField(extra: string[] = []): Promise<void> {
-  if (process.pid !== 1) return;
-  for (const entry of await readdir('/proc')) {
-    const pid = Number(entry);
-    if (!Number.isInteger(pid) || pid <= 1) continue;
-    try {
-      process.kill(pid, 'SIGKILL');
-    } catch {
-      // Already gone, or not ours to signal. Either way there is nothing to do.
+/**
+ * Stop everything, then kill it. Not the other way round, and not one pass.
+ *
+ * Reading `/proc` and killing what was in it is a SNAPSHOT, not a fence: a
+ * process that forks a successor and exits is never in the list about to be
+ * swept, so a self-respawning chain walks straight through. Review demonstrated
+ * it winning three runs in five — carrying its state in `argv` and its code in
+ * the environment, so the directory scrub had nothing to delete either.
+ *
+ * SIGSTOP cannot be caught, blocked or ignored, and a stopped process cannot
+ * fork. So stopping the population first makes it monotonically shrinking, and
+ * the loop converges instead of racing: repeat until a pass finds nothing new,
+ * and only then kill. The residual is a child forked in the window between two
+ * signals, which the next pass stops.
+ */
+async function reap(): Promise<void> {
+  const alive = async () => {
+    const pids = (await readdir('/proc'))
+      .map(Number)
+      .filter((pid) => Number.isInteger(pid) && pid > 1);
+    return new Set(pids);
+  };
+
+  const signal = (pids: Set<number>, sig: NodeJS.Signals) => {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, sig);
+      } catch {
+        // Already gone. Nothing to do.
+      }
     }
+  };
+
+  let stopped = new Set<number>();
+  // Bounded so a pathological forker cannot wedge the run; the exit is that a
+  // pass adds nobody, which is the normal case on the first or second try.
+  for (let pass = 0; pass < 16; pass++) {
+    const now = await alive();
+    signal(now, 'SIGSTOP');
+    const fresh = [...now].filter((pid) => !stopped.has(pid));
+    stopped = new Set([...stopped, ...now]);
+    if (fresh.length === 0) break;
   }
-  // `/home/node` is in the list because the image ships it owned by uid 1000 —
-  // a reminder that "world-writable" is the wrong set. The set that matters is
-  // "writable by the repro user", and it is strictly larger.
-  for (const dir of ['/tmp', '/var/tmp', '/dev/shm', '/home/node', ...extra]) {
-    // The repro owns its own TMPDIR and HOME, so it can replace either with a
-    // symlink and have this root-privileged delete follow it. Pointed at
-    // /blobs that empties the host evidence store — every earlier run's
-    // artifacts, not just this one's — and the run still exits 0. lstat, so a
-    // link is seen as a link.
+  signal(await alive(), 'SIGKILL');
+}
+
+async function clearTheField(extra: string[] = [], evidence?: EvidenceStore): Promise<void> {
+  if (process.pid !== 1) return;
+  await reap();
+  for (const dir of [...SHARED_WRITABLE, ...extra]) {
+    // Defensive, and currently against an unreachable case: every parent of
+    // every path in the list is root-owned 0755, so a participant cannot swap
+    // one for a symlink. Kept because a root-privileged recursive delete that
+    // follows links is how the host evidence store gets emptied, and the cost of
+    // being wrong about "unreachable" here is every earlier run's artifacts.
     const kind = await lstat(dir).catch(() => null);
     if (!kind) continue;
     if (!kind.isDirectory()) {
@@ -152,6 +208,53 @@ async function clearTheField(extra: string[] = []): Promise<void> {
       await rm(`${dir}/${entry}`, { recursive: true, force: true });
     }
   }
+  await evidence?.evict();
+}
+
+/**
+ * The evidence store is a writable directory shared by every participant, so it
+ * is a channel like any other — and the worst-placed one, because a bind mount
+ * does not honour container permissions and it OUTLIVES the run. State left
+ * there reaches the next phase, the host, and every later run against the same
+ * store.
+ *
+ * It cannot simply be emptied: that is where the evidence lives. But the Runner
+ * writes nothing here until the final flush — every blob goes to root-owned
+ * staging first — so anything that appears mid-run was put there by a
+ * participant. Snapshot what was already present, and evict the rest.
+ */
+type EvidenceStore = { evict: () => Promise<void> };
+
+async function guardEvidence(root: string): Promise<EvidenceStore> {
+  // Recursive, because blobs live at `<ab>/<cd>/<rest>`. A depth-1 snapshot
+  // protects a pre-existing NAME wholesale, so any store that has ever held an
+  // artifact hands the participant a fanout directory that is never evicted —
+  // and a fresh store is no better, since the sentinel can be turned into a
+  // directory during the base phase and back into a file during the fix.
+  const original = new Set(await listing(root));
+  return {
+    evict: async () => {
+      // Deepest first, so removing a directory never invalidates a path still
+      // to be examined.
+      for (const path of (await listing(root)).sort().reverse()) {
+        if (original.has(path)) continue;
+        await rm(`${root}/${path}`, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+/** Every path under `root`, relative, directories included. */
+async function listing(root: string, prefix = ''): Promise<string[]> {
+  const entries = await readdir(`${root}/${prefix}`, { withFileTypes: true }).catch(() => []);
+  const paths: string[] = [];
+  for (const entry of entries) {
+    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+    paths.push(path);
+    // `isDirectory()` on a Dirent is an lstat, so a symlink is never descended.
+    if (entry.isDirectory()) paths.push(...(await listing(root, path)));
+  }
+  return paths;
 }
 
 async function readStdin(): Promise<string> {
@@ -189,6 +292,10 @@ export async function runJob(
   // 1000, the very uid the repro runs as. Left there during the run, the repro
   // could delete artifacts the base phase had already banked and the stream
   // would still come out clean and complete.
+  // Before anything else runs: what was already in the store is evidence from
+  // earlier runs, and everything that appears from here is a participant's doing.
+  const evidence = await guardEvidence(blobRoot);
+
   const staging = `${workDir}/staging`;
   await mkdir(staging, { recursive: true });
   await chmod(staging, 0o700);
@@ -290,7 +397,14 @@ export async function runJob(
 
   // Nothing the agent started may still be running when the phases begin, and
   // nothing it left in a shared directory may still be there.
-  if (agentWorld) await clearTheField();
+  if (agentWorld) {
+    await clearTheField([], evidence);
+    // The agent's world is discarded outright, not scrubbed. ADR-0010 already
+    // says its tree does not survive — but the tree, TMPDIR and HOME are all
+    // uid-1000-owned, so leaving them standing lets the BASE phase write there
+    // and the fix phase read it back. Nothing downstream wants any of it.
+    await rm(`${workDir}/agent`, { recursive: true, force: true });
+  }
 
   // Cloned now, not earlier: a tree that existed while the agent ran is a tree
   // the agent could have written to.
@@ -324,7 +438,7 @@ export async function runJob(
       // and nothing about the fix has to change; and a process the BASE phase
       // backgrounds is the same attack again, which no amount of directory
       // scrubbing reaches.
-      onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME]),
+      onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME], evidence),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });
@@ -342,6 +456,12 @@ export async function runJob(
   // The repro has run for the last time, so the evidence can cross into the
   // shared mount now. Ownership follows the host directory, or a non-root host
   // user cannot clean up what root wrote.
+  // Once more before the evidence crosses. The boundary evicts protect the fix
+  // phase from the base phase, but the LAST phase to run has no boundary after
+  // it — without this its plants ride out to the host store and wait there for
+  // the next run against it.
+  await evidence.evict();
+
   const owner = await stat(blobRoot);
   try {
     // No shell: `cp` takes its arguments directly, so nothing here can be read as

@@ -42,18 +42,26 @@ process that flips a marker *between* them manufactures red-then-green against
 an untouched committed test and a no-op fix.
 
 Killing the agent's process group is necessary and not sufficient: a grandchild
-that calls `setsid` leaves the group. What closes it is that the Runner is PID 1
-in the container's own namespace, so every other process in `/proc` is something
-this run started, and nothing legitimate is alive between the agent finishing
-and the base phase. The Runner reaps them all.
+that calls `setsid` leaves the group. Being PID 1 in the container's own
+namespace is what makes a complete sweep possible, since every other process in
+`/proc` is something this run started.
 
-The shared writable directories are wiped in the same pass — `/tmp`, `/var/tmp`,
-`/dev/shm`. This is the weaker half and is honestly a list: `TMPDIR` only
-redirects a test that honours it, and one writing `/tmp` literally shares the
-path regardless. The reap is what makes the timing attack impossible; the wipe
-removes debris a later, cleverer variant might use. Verified in that order — the
-attack still lands with the reap removed and the wipe in place, and does not
-land with the reap alone.
+**Reading `/proc` and killing what was in it is not enough either, and the first
+version of this ADR claimed otherwise.** That is a snapshot, not a fence: a
+process that forks a successor and exits is never in the list about to be swept,
+so a self-respawning chain walks through it — measured winning three runs in
+five, carrying its state in `argv` and its code in the environment so the
+directory scrub had nothing to delete. The sweep now stops the population with
+SIGSTOP first, which cannot be caught or blocked and which a process cannot fork
+through, repeats until a pass finds nobody new, and only then kills. That
+converges rather than racing.
+
+The shared writable directories are wiped in the same pass. This is the weaker
+half and is honestly a list: `TMPDIR` only redirects a test that honours it, and
+one writing `/tmp` literally shares the path regardless. The reap is what makes
+the timing attack hard; the wipe removes debris a later variant might use.
+Measured in that order — the attack lands with the reap removed and the wipe in
+place, and does not land with the reap alone.
 
 This makes the ADR-0006 boundary say something it did not say before:
 
@@ -124,13 +132,43 @@ was false within a day.
   the thing they exist to catch. So a repro can differ between re-run 0 and
   re-run 1. That is survivable only because one red run in the series is already
   enough for the fold to refuse.
-- **Enumeration, still.** The scrub names `/tmp`, `/var/tmp`, `/dev/shm` and
-  `/home/node`. That last one is the tell: it is not world-writable, it is
-  uid-1000-owned because the image ships it that way. The set that matters is
-  "writable by the repro user", which is strictly larger than "world-writable"
-  and cannot be enumerated confidently. The reap is what makes the list
-  survivable, because state with no process to place it at the right moment is
-  present in both phases and credited in neither.
+- **Enumeration, checked rather than closed.** Four
+  rounds each added an entry — `/tmp`, then `/home/node`, then `/dev/mqueue`,
+  which nothing had ever considered — and every time the suite went green on a
+  list that was still wrong. What was missing was never a longer list; it was a
+  way to know when the list is complete. The image is now enumerated as the
+  repro user and asserted to be *exactly* the scrubbed set, so a base image that
+  gains a writable path fails the suite instead of waiting for the next review.
+  "The set cannot be enumerated with confidence" turned out to be too pessimistic
+  — it is five directories in the image — but "closed" was too optimistic, and
+  this ADR has now said it twice and been wrong twice. What is true: the list is
+  checked against the image on every run of the suite. What is not: that the
+  check is complete. `find` runs as uid 1000, so it sees what that user can
+  *list*, not what it can *write* — a `0711` parent would hide a writable child
+  silently. No such directory exists in the image today.
+- **The image is not the run.** That enumeration covers the image; a live run
+  mounts more, and review found two channels there immediately: `/blobs`, which
+  a bind mount leaves writable whatever the container says and which *outlives
+  the run*, and the agent's own world, left standing and uid-1000-owned. The
+  store cannot simply be emptied — it is where the evidence lives — so what was
+  already in it is snapshotted and only additions are evicted, at each boundary
+  and once more before the flush, since the last phase has no boundary after it.
+  The agent's world is deleted outright. The snapshot has to be **recursive**:
+  a depth-1 version protected a pre-existing name wholesale, and since blobs
+  live at `<ab>/<cd>/<rest>`, any store that had ever held an artifact handed the
+  participant a fanout directory that was never evicted.
+- **Nothing protects prior evidence from deletion or overwrite.** Eviction
+  removes what a participant added; a participant that instead truncates or
+  unlinks an earlier run's blobs succeeds, and the run still exits 0 with its own
+  refs intact. The store is append-only by convention, not by construction.
+- **Read-only mounts are why the oracle had to change.** `test -w` answers about
+  mode bits and knows nothing about a ro mount: it calls
+  `/proc/sys/kernel/ns_last_pid` writable (0666 beneath a ro `/proc/sys`) and
+  `/sys/firmware` writable (1777 on a ro tmpfs) when no process can write
+  either. An earlier draft of this ADR argued at length that `ns_last_pid` was a
+  "different threat class"; it is simply not writable, and the argument was
+  defending a hole that does not exist. The enumeration now takes only `rw`
+  mounts from `/proc/mounts`.
 - **The reap assumes PID 1.** It is gated on it, so outside a container it does
   nothing at all — which is correct, and means the in-process engine used by the
   unit tests has none of this protection. That is acceptable only because the
