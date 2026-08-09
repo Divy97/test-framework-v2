@@ -557,7 +557,14 @@ async function runContainer(
     events.push(
       own(plan.runId, (events.at(-1)?.seq ?? afterSeq) + 1, {
         type: 'VERIFICATION_ABORTED',
-        payload: { v: 1, phase: 'cleanup', reason: collection.slice(0, MAX_REASON_CHARS) },
+        payload: {
+          v: 1,
+          phase: 'cleanup',
+          // Not `verify()`'s. Without saying so, the fold reads this as proof the
+          // fix series completed — see the witness rule in fold.ts.
+          cause: 'collection',
+          reason: collection.slice(0, MAX_REASON_CHARS),
+        },
       }),
     );
   }

@@ -212,8 +212,16 @@ export type VerificationAbortedV1 = {
    *
    * Prose cannot be a discriminator. This can: it is set by the producer, not
    * inferred, and `reason` stays display-only as documented.
+   *
+   * Absent means `verify()` itself — the engine with the phase machine. That
+   * distinction is load-bearing: the fold reads a `diff` or `cleanup` abort as
+   * PROOF the flake loop closed, and that inference holds only for the producer
+   * whose phase advances past `fix` when the loop ends. A second producer
+   * emitting the same phase label hands the fold a completion witness it has no
+   * standing to assert (ADR-0009), which is exactly what happened when the host
+   * started recording collection failures as `cleanup`.
    */
-  cause?: 'handover';
+  cause?: 'handover' | 'collection';
 };
 
 /**

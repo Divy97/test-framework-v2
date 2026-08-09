@@ -475,6 +475,37 @@ describe('an attempt that could not be observed', () => {
     expect(truncated.reproduced).toBe(false);
   });
 
+  it('will not take a completion witness from a producer that has no phase machine', () => {
+    // The witness rule reads a `diff` or `cleanup` abort as proof the flake loop
+    // closed. That holds for `verify()`, whose phase advances past `fix` only when
+    // the loop ends — and for nothing else. The HOST emits `cleanup` for every
+    // container, agent and base included, written before the fix series has run
+    // at all, so a failed blob copy in an early container handed the fold the one
+    // witness that exists to stop a truncated fix series being credited.
+    const upTo = (n: number) => demoRunEvents.slice(0, n);
+    const truncated = [
+      ...upTo(5), // repro registered, base red, one fix run green
+    ].filter((e) => e.type !== 'FIX_DIFF_OBSERVED');
+
+    const hostAbort = (cause: 'collection' | undefined): RunEvent => ({
+      run_id: DEMO_RUN_ID,
+      seq: truncated.length + 1,
+      ts: 'T',
+      type: 'VERIFICATION_ABORTED',
+      payload: { v: 1, phase: 'cleanup', reason: 'blobs went missing', ...(cause ? { cause } : {}) },
+    });
+
+    // The control: without the abort at all, the series is plainly incomplete.
+    expect(fold(truncated).reproduced).toBe(false);
+    // The engine's own cleanup abort still vouches for the series, as it must —
+    // that is why the rule exists.
+    expect(fold([...truncated, hostAbort(undefined)]).completedAttempts).toContain(1);
+    // The host's does not.
+    const host = fold([...truncated, hostAbort('collection')]);
+    expect(host.completedAttempts).not.toContain(1);
+    expect(host.reproduced).toBe(false);
+  });
+
   it('will not credit fix runs that judged a commit other than the one handed over', () => {
     // ADR-0009: the fold owns interpretation. Without this the invariant lived in
     // a sandbox test — a producer could hand over commit A, verify commit B, and

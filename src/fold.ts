@@ -8,6 +8,7 @@ import type {
   RunEndedV1,
   RunEvent,
   VerificationPhase,
+  VerificationAbortedV1,
 } from './events.js';
 
 /**
@@ -115,7 +116,7 @@ export type RunState = {
    * status — but a `base` or `fix` abort does disqualify its own attempt from
    * being credited a reproduction. See `reproducedAttempt`.
    */
-  aborts: { attempt: number; phase: VerificationPhase; reason: string; cause?: 'handover' }[];
+  aborts: { attempt: number; phase: VerificationPhase; reason: string; cause?: VerificationAbortedV1['cause'] }[];
   /**
    * Event types that arrived after RUN_ENDED, recorded and NOT applied.
    *
@@ -310,8 +311,20 @@ export function apply(state: RunState, event: RunEvent): RunState {
       // diff-phase abort always lacks FIX_DIFF_OBSERVED. A genuine Tier 1
       // reproduction — red base, every fix run green, all observed — would be
       // thrown away because git could not describe two unrelated histories.
+      //
+      // `cause === undefined` is what makes "same producer" true rather than
+      // merely intended. The host emits `cleanup` for EVERY container, including
+      // the agent's and the base's — written before the fix series has run at
+      // all — so without this gate a failed blob copy in an early container
+      // handed the fold the one witness that exists to stop a truncated fix
+      // series being credited. Red base, one green fix run, no
+      // FIX_DIFF_OBSERVED, and the run folded to Tier 1.
+      //
+      // The phase label is prose to a second producer. The discriminator has to
+      // be explicit — the same lesson as `cause` itself.
       const completed =
-        event.payload.phase === 'diff' || event.payload.phase === 'cleanup'
+        event.payload.cause === undefined &&
+        (event.payload.phase === 'diff' || event.payload.phase === 'cleanup')
           ? [...state.completedAttempts, state.currentAttempt]
           : state.completedAttempts;
       // Recomputed here, not only on TEST_RUN: the abort arrives *after* the runs
