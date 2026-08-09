@@ -178,7 +178,13 @@ event schema changes when it does.
      them: the store enforces unique `(run_id, seq)` and nothing enforces
      terminality at write, and one racing append must not be able to make an
      immutable log permanently unrenderable.
-   - **3c** — tier and confidence as pure projections.
+   - **3c** — tier and confidence as pure projections. Landed. Every point cites
+     the artifacts a reviewer would open, and the ceiling is **85, not 100**:
+     the missing 15 is diff-coverage, which ADR-0008 retired as a filename check
+     and which needs instrumentation to rebuild. Scoring it as though measured
+     is exactly the vibe ADR-0004 forbids. Tier 2 is deliberately unreachable —
+     no event in the vocabulary distinguishes a browser script from a test, so
+     the tier arrives when the events for it do.
 
 ## Not in this milestone
 
