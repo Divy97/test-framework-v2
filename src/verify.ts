@@ -15,7 +15,7 @@
 // same repo must not trip the dirty-tree refusal on this run's leftovers.
 
 import { execFile } from 'node:child_process';
-import { constants, lstat, mkdir, open, realpath, rm } from 'node:fs/promises';
+import { constants, lstat, mkdir, open, readdir, realpath, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
@@ -144,6 +144,24 @@ export type VerifyOptions = {
    * still shares the path. That half is closed in the Runner (ADR-0010).
    */
   runEnv?: Env;
+  /**
+   * Directories emptied at the phase boundary, alongside the git scrub.
+   *
+   * The tree is scrubbed between base and fix because base-phase residue could
+   * carry the fix to green on its own. Everything OUTSIDE the tree was left
+   * alone, and that is the same hole one step further out: base and fix share a
+   * TMPDIR, a HOME and every world-writable path in the container, so a repro
+   * that merely behaves differently the second time manufactures red-then-green
+   * against a fix that changes nothing.
+   *
+   *     flag="$TMPDIR/.seen"; [ -f "$flag" ] && exit 0; touch "$flag"; <test>
+   *
+   * That repro is byte-identical across both checkouts and hashes identically on
+   * every run, so the anchor is intact and every anti-gaming check passes. It is
+   * agent-authored, which is exactly the threat ADR-0008 exists for — the anchor
+   * fixes the repro's BYTES, never its side effects.
+   */
+  scrubPaths?: string[];
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -545,6 +563,14 @@ async function observe(
   progress.phase = 'fix';
   await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
   await git(['clean', '--quiet', '-dff'], repoPath, gitEnv);
+  // The same scrub, one step further out. Whatever the base run wrote outside
+  // the tree is state the fix run would otherwise inherit, and a repro needs no
+  // more than that to be red once and green afterwards.
+  for (const dir of options.scrubPaths ?? []) {
+    for (const entry of await readdir(dir).catch(() => [])) {
+      await rm(join(dir, entry), { recursive: true, force: true }).catch(() => {});
+    }
+  }
   await checkout(fixSha, repoPath, gitEnv);
   // The same bytes again — this is the whole point. Whatever the fix commit says
   // the reproduction is, the registered version is what runs.

@@ -290,6 +290,11 @@ export async function runJob(
       gitEnv: { GIT_DIR: phases.gitDir, GIT_WORK_TREE: phases.tree },
       runAs,
       runEnv: phases.env,
+      // Base and fix share one world by design — they must, to switch commits in
+      // one tree — so the boundary between them needs the same scrub the tree
+      // gets. Without it a repro that is merely order-dependent is red once and
+      // green afterwards, and nothing about the fix has to change.
+      scrubPaths: [phases.env.TMPDIR, phases.env.HOME, '/tmp', '/var/tmp', '/dev/shm'],
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });

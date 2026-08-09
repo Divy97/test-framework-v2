@@ -357,6 +357,35 @@ export const survivorGamed = () =>
     { 'README.md': 'an unrelated change\n' },
   );
 
+/**
+ * Red the first time it runs and green every time after, on a flag it keeps
+ * OUTSIDE the repository.
+ *
+ * The simplest possible fabrication, and the one the anchor cannot touch: the
+ * bytes are identical across both checkouts and hash identically on every run,
+ * so ADR-0008 is fully satisfied. The anchor fixes the reproduction's bytes; it
+ * says nothing about its side effects. The git scrub at the phase boundary
+ * cleans the tree and only the tree, so base and fix share a TMPDIR — and one
+ * flag is the whole attack.
+ *
+ * Pair it with `noOpFix()` and the fix commit does not touch the code at all.
+ */
+export const ORDER_DEPENDENT_REPRO: ReproSpec = {
+  command: 'sh repro.sh',
+  files: {
+    'repro.sh':
+      'flag="${TMPDIR:-/tmp}/.seen"\n' +
+      'cat src.txt\n' +
+      'if [ -f "$flag" ]; then exit 0; fi\n' +
+      'touch "$flag"\n' +
+      'grep -q right src.txt\n',
+  },
+};
+
+/** The bug is untouched; the "fix" edits an unrelated file. */
+export const noOpFix = () =>
+  makeRepo({ 'src.txt': 'wrong\n' }, { 'README.md': 'an unrelated change\n' });
+
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () => makeRepo({ 'src.txt': 'right\n' }, { 'notes.md': 'nope\n' });
 

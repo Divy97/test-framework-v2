@@ -74,6 +74,33 @@ does not work.
 commit or it does not arrive — which is the shape the attempt loop wanted
 anyway.
 
+## The same rule applies between the phases
+
+Both versions above framed the problem as agent-versus-phases and missed that
+**base and fix share one world too** — one clone, one `TMPDIR`, one `HOME`. They
+must share the clone, since switching commits in one tree is what the comparison
+is. Everything else they shared was an accident.
+
+`verify()` already scrubbed the tree at the phase boundary, precisely because
+base-phase residue could carry the fix to green. It scrubbed the tree and only
+the tree. So the simplest fabrication of all needs no agent process, no forged
+event and no tampering:
+
+```sh
+flag="$TMPDIR/.seen"; [ -f "$flag" ] && exit 0; touch "$flag"; <the real test>
+```
+
+Red the first time, green every time after. Byte-identical across both
+checkouts, hashing identically on every run, so ADR-0008's anchor is completely
+satisfied — **the anchor fixes the reproduction's bytes, never its side
+effects** — and the fix commit need not touch the code at all.
+
+So the boundary scrub extends past the tree: the phases' `TMPDIR` and `HOME` and
+the shared writable directories are emptied there as well as before the base
+phase. The suite asserts the attack *and* the defence — one test proves an
+unscrubbed run credits a README-only "fix", so the defence cannot quietly stop
+being the reason the other test passes.
+
 ## What still leaks
 
 Named rather than waved at, and the list is deliberately concrete because the
@@ -88,6 +115,11 @@ was false within a day.
   per participant, or running the phases in a container of their own — which is
   also the answer to the process question, and the direction if either bites
   again.
+- **Flake re-runs still share everything.** They must — they are re-executions
+  of the same fix, and isolating them would hide order-dependent flake, which is
+  the thing they exist to catch. So a repro can differ between re-run 0 and
+  re-run 1. That is survivable only because one red run in the series is already
+  enough for the fold to refuse.
 - **The reap assumes PID 1.** It is gated on it, so outside a container it does
   nothing at all — which is correct, and means the in-process engine used by the
   unit tests has none of this protection. That is acceptable only because the
