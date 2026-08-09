@@ -331,6 +331,32 @@ export function unrelatedHistories(): Fixture {
   return { repo, base, fix, blobRoot };
 }
 
+/**
+ * A committed test whose result depends on a process outside the repository.
+ *
+ * The fix commit touches one unrelated file, so nothing about the code under
+ * test changes. The test is maintainer-authored, `pinned`, and byte-identical on
+ * every run — the strongest provenance ADR-0008 recognises. Everything the
+ * engine checks is therefore satisfied, and the verdict is decided entirely by
+ * whether something outside the repo flips the marker between phases.
+ *
+ * It signals through /dev/shm rather than $TMPDIR precisely because a private
+ * TMPDIR does not close this: the survivor runs as the repro user and could
+ * write the phases' own directories just as easily.
+ */
+export const survivorGamed = () =>
+  makeRepo(
+    {
+      'src.txt': 'wrong\n',
+      'tests/existing.sh':
+        'echo x >> /dev/shm/beacon\n' +
+        '[ -f /dev/shm/marker ] && exit 0\n' +
+        'echo "wrong: still broken"\n' +
+        'exit 1\n',
+    },
+    { 'README.md': 'an unrelated change\n' },
+  );
+
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () => makeRepo({ 'src.txt': 'right\n' }, { 'notes.md': 'nope\n' });
 

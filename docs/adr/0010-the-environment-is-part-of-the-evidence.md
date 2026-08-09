@@ -30,8 +30,30 @@ dependencies and fatal here. `$HOME` is a third.
 **Decision.** Anchoring *what* runs is not anchoring *where* it runs. Every
 participant gets its own world: its own clone, its own `TMPDIR`, its own `HOME`.
 The verification tree is cloned only after the agent has finished, so a tree it
-could have written to is never the tree it is judged in. Only a commit crosses
-between them.
+could have written to is never the tree it is judged in.
+
+**And nothing the agent started is still running when the phases begin.** The
+first version of this decision stopped at separate directories and was defeated
+in review by a process the agent backgrounded: it runs as the same uid, so it
+can write the phases' *own private* `TMPDIR` and `HOME`, and separation offers
+it nothing. It also supplies the one thing a static plant cannot — timing. A
+file present in both phases makes the base pass too and is never credited; a
+process that flips a marker *between* them manufactures red-then-green against
+an untouched committed test and a no-op fix.
+
+Killing the agent's process group is necessary and not sufficient: a grandchild
+that calls `setsid` leaves the group. What closes it is that the Runner is PID 1
+in the container's own namespace, so every other process in `/proc` is something
+this run started, and nothing legitimate is alive between the agent finishing
+and the base phase. The Runner reaps them all.
+
+The shared writable directories are wiped in the same pass — `/tmp`, `/var/tmp`,
+`/dev/shm`. This is the weaker half and is honestly a list: `TMPDIR` only
+redirects a test that honours it, and one writing `/tmp` literally shares the
+path regardless. The reap is what makes the timing attack impossible; the wipe
+removes debris a later, cleverer variant might use. Verified in that order — the
+attack still lands with the reap removed and the wipe in place, and does not
+land with the reap alone.
 
 This makes the ADR-0006 boundary say something it did not say before:
 
@@ -43,14 +65,30 @@ This makes the ADR-0006 boundary say something it did not say before:
 **Rejected: scrubbing harder.** `git clean -xdff` at the phase boundary would
 close the gitignored channel and destroy installed dependencies with it, which
 changes what is under test far more than it isolates it. It also leaves `/tmp`
-and `$HOME` open. Separation is cheaper than enumeration, and enumeration is a
-list nobody finishes.
+and `$HOME` open.
 
 **Rejected: trusting the agent not to.** The whole project exists because that
 does not work.
 
 **Consequence.** The agent's working tree is discarded. Its fix must arrive as a
 commit or it does not arrive — which is the shape the attempt loop wanted
-anyway. Residual, and named rather than waved at: the phases still share a
-kernel, a clock, and a network with everything else in the container. Egress
-control is M3.3; the rest is what a container is.
+anyway.
+
+## What still leaks
+
+Named rather than waved at, and the list is deliberately concrete because the
+first version of this ADR claimed "only a commit crosses between them" and that
+was false within a day.
+
+- **A shared kernel, clock and network.** Egress control is M3.3; the rest is
+  what a container is.
+- **The writable filesystem, enumerated rather than isolated.** `/tmp`,
+  `/var/tmp` and `/dev/shm` are wiped, not namespaced. A path not on that list
+  and writable by uid 1000 is still shared. The real answer is a mount namespace
+  per participant, or running the phases in a container of their own — which is
+  also the answer to the process question, and the direction if either bites
+  again.
+- **The reap assumes PID 1.** It is gated on it, so outside a container it does
+  nothing at all — which is correct, and means the in-process engine used by the
+  unit tests has none of this protection. That is acceptable only because the
+  agent never runs there.

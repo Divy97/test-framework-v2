@@ -9,7 +9,7 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { RunEvent } from './events.js';
@@ -91,6 +91,47 @@ async function hostStoreIsMounted(path: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Leave nothing of the agent running, and nothing of its debris lying around,
+ * before the phases begin.
+ *
+ * A process the agent backgrounds outlives it. Running as the repro user it can
+ * write the phases' own private TMPDIR and HOME, so separating those directories
+ * does nothing at all against it — it stages the red-then-green flip from
+ * inside. Killing the agent's process group is not enough either: a grandchild
+ * that calls `setsid` leaves the group.
+ *
+ * Being PID 1 is what makes this closable. The Runner owns the container's PID
+ * namespace, so every other process in /proc is something this run started, and
+ * nothing legitimate is running between the agent finishing and the base phase.
+ *
+ * The shared tmpfs directories go with them. `TMPDIR` only redirects a test that
+ * honours it; one that writes `/tmp` literally shares the path regardless, and
+ * `/var/tmp` and `/dev/shm` are world-writable too. Enumerating them here is
+ * exactly the enumeration ADR-0010 said nobody finishes — which is why the reap
+ * above is the load-bearing half and this is the belt to its braces.
+ *
+ * Gated hard on being PID 1: outside a container this would kill the developer's
+ * session and erase their /tmp.
+ */
+async function clearTheField(): Promise<void> {
+  if (process.pid !== 1) return;
+  for (const entry of await readdir('/proc')) {
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid <= 1) continue;
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone, or not ours to signal. Either way there is nothing to do.
+    }
+  }
+  for (const dir of ['/tmp', '/var/tmp', '/dev/shm']) {
+    for (const entry of await readdir(dir).catch(() => [])) {
+      await rm(`${dir}/${entry}`, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
@@ -197,13 +238,15 @@ export async function runJob(
   //
   // And it gets its OWN world. Anchoring the reproduction fixes what runs; it
   // says nothing about the world it runs in. Sharing a filesystem with the
-  // phases, the agent needs no forged event to fabricate a verdict: it seeds a
-  // file in /tmp, or in a gitignored directory the phase scrub deliberately
-  // spares, or under $HOME, and a test that reads it goes red then green while
-  // the "fix" changes nothing. Every anti-gaming check still passes, because not
-  // one of them is about the environment. So the trees are separate clones, the
+  // phases, the agent needs no forged event to fabricate a verdict: it seeds
+  // state a test reads — a gitignored directory the phase scrub deliberately
+  // spares, $HOME, or a temp dir — and the test goes red then green while the
+  // "fix" changes nothing. Every anti-gaming check still passes, because not one
+  // of them is about the environment. So the trees are separate clones, the
   // verification tree is made only after the agent is finished, and neither
-  // TMPDIR nor HOME is shared.
+  // TMPDIR nor HOME is shared. Separation is not the whole answer, though —
+  // `clearTheField` below is, because a process that outlives the agent runs as
+  // the same uid and can write the phases' private directories anyway.
   const agentWorld = job.agentPrompt ? await world('agent') : null;
   const transcript = agentWorld
     ? await superviseAgent({
@@ -217,6 +260,10 @@ export async function runJob(
         ...(job.agentTimeoutMs === undefined ? {} : { timeoutMs: job.agentTimeoutMs }),
       })
     : [];
+
+  // Nothing the agent started may still be running when the phases begin, and
+  // nothing it left in a shared directory may still be there.
+  if (agentWorld) await clearTheField();
 
   // Cloned now, not earlier: a tree that existed while the agent ran is a tree
   // the agent could have written to.

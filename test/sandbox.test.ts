@@ -13,7 +13,13 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { fold } from '../src/fold.js';
-import { APPLIED_REPRO, cleanupFixtures, clean, HANGS_ON_FIX } from './fixtures/repo.js';
+import {
+  APPLIED_REPRO,
+  cleanupFixtures,
+  clean,
+  HANGS_ON_FIX,
+  survivorGamed,
+} from './fixtures/repo.js';
 
 const dockerAvailable = () => {
   try {
@@ -467,9 +473,16 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     writeFileSync(
       join(agentDir, 'claude'),
       '#!/bin/sh\n' +
-        ': > planted.txt\n' +
-        ': > "${TMPDIR:-/tmp}/planted.txt"\n' +
-        ': > "$HOME/planted.txt"\n' +
+        // `touch`, not `: >`. A redirect failure on a POSIX *special* builtin
+        // kills the shell outright, so the last plant below would take the agent
+        // down with it and the test would pass on an empty transcript.
+        'touch planted.txt\n' +
+        'touch "${TMPDIR:-/tmp}/planted.txt"\n' +
+        'touch "$HOME/planted.txt"\n' +
+        // Straight at the verification tree. It must not exist yet — cloning it
+        // before the agent ran would hand the agent a tree it owns, which is why
+        // the ordering in runJob is load-bearing rather than incidental.
+        'touch /work/verify/repo/planted.txt 2>/dev/null || true\n' +
         `printf '{"type":"result","subtype":"success"}\\n'\n`,
       { mode: 0o755 },
     );
@@ -540,6 +553,75 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
       ...events.map((e, i) => ({ ...e, seq: i + 2 })),
     ]);
     expect(state.reproduced).toBe(true);
+  }, 300_000);
+
+  test('a process the agent leaves running cannot stage the verdict', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = survivorGamed();
+    const blobs = hostBlobs();
+
+    // Separate trees and private TMPDIRs do NOTHING against this. The survivor
+    // runs as the repro user, so it can write the phases' own private
+    // directories — and it supplies the one thing a static plant cannot: timing.
+    // A file present in both phases makes the base pass too and is never
+    // credited; a process that flips it between them manufactures red-then-green
+    // against an untouched committed test and a no-op fix.
+    //
+    // `setsid` so it escapes the agent's process group: killing the group alone
+    // leaves it running. Only PID 1 reaping its own namespace closes this.
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      '#!/bin/sh\n' +
+        'setsid sh -c \'while [ ! -f /dev/shm/beacon ]; do :; done; touch /dev/shm/marker\' ' +
+        '>/dev/null 2>&1 </dev/null &\n' +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    // The reproduction is a committed test the fix never touches — the strongest
+    // provenance ADR-0008 recognises — and it is byte-identical on every run.
+    const repro = {
+      command: 'sh tests/existing.sh',
+      pinned: ['tests/existing.sh'],
+    };
+
+    const events = parse(
+      execFileSync(
+        'docker',
+        [
+          'run', '--rm', '-i',
+          '-v', `${fixture.repo}:/src:ro`,
+          '-v', `${blobs}:/blobs`,
+          '-v', `${join(agentDir, 'claude')}:/usr/local/bin/claude:ro`,
+          IMAGE,
+        ],
+        {
+          input: JSON.stringify({
+            runId: RUN_ID,
+            afterSeq: 0,
+            sourcePath: '/src',
+            baseRef: fixture.base,
+            fixRef: fixture.fix,
+            repro,
+            symptomPattern: 'wrong',
+            flakeRuns: 2,
+            agentPrompt: 'leave something running',
+          }),
+          encoding: 'utf8',
+          maxBuffer: 32 * 1024 * 1024,
+        },
+      ),
+    );
+
+    const state = fold([
+      { run_id: RUN_ID, seq: 1, ts: new Date().toISOString(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      ...events.map((e, i) => ({ ...e, seq: i + 2 })),
+    ]);
+    // The whole point: the survivor never gets to run during a phase, so the
+    // committed test reports the same thing both times and nothing is credited.
+    expect(state.reproduced).toBe(false);
   }, 300_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {

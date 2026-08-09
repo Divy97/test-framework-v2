@@ -124,17 +124,26 @@ export async function superviseAgent(options: AgentOptions): Promise<RunEvent[]>
   /** Resolves the wait even if the pipes never close. Assigned once the promise exists. */
   let release = () => {};
 
-  const finish = (why: AgentFinishedV1['stopped']) => {
-    if (!done) stopped = why;
-    done = true;
-    // The whole process group, not just the child. SIGKILL, not SIGTERM: the
-    // agent is the thing under judgement, and a ceiling it has already breached
-    // is not an invitation to shut down politely.
+  /**
+   * The whole process group, not just the child. SIGKILL, not SIGTERM: the agent
+   * is the thing under judgement, and a ceiling it has breached is not an
+   * invitation to shut down politely.
+   *
+   * Necessary but not sufficient — a grandchild that calls `setsid` leaves the
+   * group. The Runner closes that separately, from PID 1.
+   */
+  const reapGroup = () => {
     try {
       if (child.pid) process.kill(-child.pid, 'SIGKILL');
     } catch {
       // Already gone, or never started. Either way there is nothing to kill.
     }
+  };
+
+  const finish = (why: AgentFinishedV1['stopped']) => {
+    if (!done) stopped = why;
+    done = true;
+    reapGroup();
     child.kill('SIGKILL');
     // `close` waits for the stdio pipes, and an inherited descriptor can hold
     // them open past the kill. Stop waiting: the ceiling has been reached and
@@ -175,7 +184,15 @@ export async function superviseAgent(options: AgentOptions): Promise<RunEvent[]>
     // `close`, not `exit`: exit can fire while stdout still has buffered data,
     // which would drop the agent's last messages — including, usually, its
     // result line.
-    child.on('close', () => resolve());
+    child.on('close', () => {
+      // Reap on the CLEAN path too. Killing only on a ceiling left the ordinary
+      // case — an agent that exits 0 having backgrounded a helper — with a live
+      // process running as uid 1000 straight through the base and fix phases,
+      // free to stage the red-then-green flip. Separating trees and TMPDIRs does
+      // nothing about that: the survivor can write the phases' own private dirs.
+      reapGroup();
+      resolve();
+    });
     child.on('error', () => {
       // Spawn failure (no `claude` on PATH). No process ever existed, so the
       // status Node reports is about the attempt, not about an execution — and a

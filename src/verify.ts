@@ -136,9 +136,12 @@ export type VerifyOptions = {
    *
    * The sandbox uses it to give the phases a private TMPDIR and HOME. Anchoring
    * the reproduction fixes WHAT runs; it says nothing about the world it runs
-   * in, and an agent that shares `/tmp` with the phases can seed a file the test
-   * reads and make a no-op fix go green. Every anti-gaming check still passes,
-   * because none of them is about the environment.
+   * in, and an agent sharing a temp directory with the phases can seed a file
+   * the test reads and make a no-op fix go green. Every anti-gaming check still
+   * passes, because none of them is about the environment.
+   *
+   * It redirects only a test that honours TMPDIR; one writing `/tmp` literally
+   * still shares the path. That half is closed in the Runner (ADR-0010).
    */
   runEnv?: Env;
 };
