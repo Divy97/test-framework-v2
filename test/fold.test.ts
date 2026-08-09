@@ -577,6 +577,39 @@ describe('an attempt that could not be observed', () => {
     expect(state.reproducedAttempt).toBe(1);
   });
 
+  it('refuses a swap hidden behind a handover that predates the attempt', () => {
+    // The `attempt === 0` clause was written to stop the guard VANISHING for
+    // handovers that arrive before any ATTEMPT_STARTED, and `find` made it worse
+    // than the scalar it replaced: attempt 0 always sorts first, so it REPLACED
+    // the attempt's own handover instead of being checked alongside it. Hand over
+    // Y before the attempt is declared, verify X inside it, and the run was
+    // credited — the exact swap the guard exists to catch.
+    const fixSha = (demoRunEvents.find(
+      (e) => e.type === 'TEST_RUN' && e.payload.phase === 'fix',
+    )!.payload as { commit_sha: string }).commit_sha;
+
+    const handed = (commit: string, seq: number): RunEvent => ({
+      run_id: DEMO_RUN_ID,
+      seq,
+      ts: 'T',
+      type: 'AGENT_HANDED_OVER',
+      payload: { v: 1, commit, kind: 'fix' },
+    });
+
+    const swapped = fold([
+      demoRunEvents[0]!,
+      // Before any attempt: the commit that the fix runs DO judge. With `find`
+      // this one matched first and agreed, so the check passed — masking the
+      // attempt's own handover, which is what the agent actually handed over.
+      handed(fixSha, 2),
+      ...demoRunEvents.slice(1, 3).map((e) => ({ ...e, seq: e.seq + 1 })),
+      handed('a'.repeat(40), 5), // what the agent handed over, and nothing ran
+      ...demoRunEvents.slice(3, 8).map((e) => ({ ...e, seq: e.seq + 2 })),
+    ]);
+    // Two handovers that disagree: one of them did not judge what it handed over.
+    expect(swapped.reproduced).toBe(false);
+  });
+
   it('leaves a fully observed attempt alone when a LATER attempt aborts', () => {
     const state = fold([
       ...demoRunEvents.slice(0, 7), // attempt 1, fully observed, red -> green -> diff

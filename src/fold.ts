@@ -572,10 +572,17 @@ function reproducedAttempt(
     // attempt made the check VANISH for those streams rather than apply — the
     // guard silently absent is worse than the scalar it replaced. An
     // unattributed handover is checked against every attempt.
-    const handed = handovers.find(
+    // `filter`, not `find`. `find` returns the FIRST match and an attempt-0
+    // handover always precedes an attempt's own, so it did not get checked
+    // ALONGSIDE the attempt's — it REPLACED it, and the guard failed open on
+    // exactly the swap it exists to catch: hand over Y before the attempt is
+    // declared, verify X inside it, credited. Strictly weaker than the scalar.
+    // Every handover that could belong to this attempt has to agree with every
+    // fix run in it.
+    const handed = handovers.filter(
       (h) => (h.attempt === base.attempt || h.attempt === 0) && h.kind === 'fix',
     );
-    if (handed && fixes.some((r) => r.commit_sha !== handed.commit)) return false;
+    if (handed.some((h) => fixes.some((r) => r.commit_sha !== h.commit))) return false;
     return (
       fixes.length > 0 && fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
     );

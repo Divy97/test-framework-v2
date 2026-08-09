@@ -281,7 +281,16 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // cross-attempt confusion the fold spent two PRs learning to refuse.
   let ended: RunEvent | null = null;
   let refused = false;
+  // Validated, because every unusual value fails in a way that reads as success.
+  // `0` returned `complete: true` on an EMPTY log that `fold()` then refuses —
+  // no attempt declared, no container run, and an outcome claiming it went fine.
+  // `2.5` never satisfies `n === maxAttempts` while still satisfying
+  // `n < maxAttempts`, so the ending is allocated, discarded and rolled back on
+  // the last iteration and the run stays permanently unended. `Infinity` loops.
   const maxAttempts = plan.maxAttempts ?? 1;
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new Error(`maxAttempts must be a positive whole number, not ${String(plan.maxAttempts)}`);
+  }
   for (let n = 1; n <= maxAttempts; n += 1) {
     ended = null;
     refused = false;

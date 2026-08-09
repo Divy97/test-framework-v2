@@ -293,9 +293,19 @@ function notReproducedBecause(state: RunState): string {
   // asserting otherwise while concealing the real finding. That is exactly the
   // "a second definition is free to disagree" failure this file's header
   // commemorates; a clause has to land here whenever one lands in the fold.
-  const wrong = state.handedOver && fixes.find((r) => r.commit_sha !== state.handedOver);
+  // THIS attempt's handovers, not the run's last one. The scalar meant a later
+  // attempt's commit was reported as a swap against an earlier clean attempt —
+  // a fabricated accusation that also CONCEALED the real finding below it. The
+  // fold gained a per-attempt rule and this projection did not, which is the
+  // failure the comment above warns about, one commit later.
+  const handed = state.handovers.filter(
+    (h) => (h.attempt === base.attempt || h.attempt === 0) && h.kind === 'fix',
+  );
+  const wrong = handed
+    .flatMap((h) => fixes.filter((r) => r.commit_sha !== h.commit).map((r) => ({ r, h })))
+    .at(0);
   if (wrong) {
-    return `the fix runs judged ${wrong.commit_sha}, but the agent handed over ${state.handedOver}: the commit verified is not the commit authored`;
+    return `the fix runs judged ${wrong.r.commit_sha}, but the agent handed over ${wrong.h.commit}: the commit verified is not the commit authored`;
   }
   return 'the reproduction that ran was not the one registered: two different tests were compared';
 }
