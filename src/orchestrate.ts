@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
 import type { Job } from './runner.js';
+import type { ReproSpec } from './verify.js';
 import { MAX_REASON_CHARS } from './verify.js';
 
 /** Output ceiling per container. Matches what the sandbox tests already allow. */
@@ -42,7 +43,24 @@ const MAX_STREAM_BYTES = 32 * 1024 * 1024;
 /** Tail of a container's diagnostics. The reason is at the end, not the start. */
 const MAX_STDERR_CHARS = 8 * 1024;
 
-export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef'> & {
+export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 'repro'> & {
+  /**
+   * The reproduction, when the caller supplies it. Omitted when `reproPrompt` is
+   * set: the agent authors it, and a spec chosen in advance would be anchoring a
+   * test nobody had written yet.
+   */
+  repro?: Job['repro'];
+  /**
+   * Ask an agent to WRITE the reproduction first, in a container of its own.
+   *
+   * Its tree does not survive (ADR-0010), so the repro arrives as a commit and
+   * the engine reads the bytes out of it — see `readReproFromCommit`. This is
+   * also what makes ADR-0008's ordering invariant real rather than intended: the
+   * repro is registered by the base container, and the FIX agent does not start
+   * until after that, so `REPRO_REGISTERED` provably precedes the fix agent's
+   * first message by seq. Nobody has to trust that it did.
+   */
+  reproPrompt?: string;
   /**
    * The commit the fix is judged at. Omitted when an agent is writing it: the
    * orchestrator then uses whatever the agent committed, which is the only
@@ -251,12 +269,33 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // becomes when the world is a container: it is not scrubbed, it ceases to
   // exist. Note it runs BEFORE the base container, so the gate cannot prevent
   // spawning it — the gate decides whether a FIX is attempted.
-  const steps: { phase: PhaseResult['phase']; job: Partial<Job>; source: string }[] = [];
+  const steps: { phase: PhaseResult['phase']; job: Partial<Job>; source: string; kind?: 'repro' | 'fix' }[] = [];
   // `only: 'agent'` matters: without it the agent container ran the agent AND
   // both phases, so the fix phase started on the very machine the agent had been
   // working in. It stayed invisible because the duplicate registrations made the
   // fold stricter rather than wrong.
-  if (plan.agentPrompt) {
+  // The repro agent, when there is one, runs before everything: base cannot be
+  // judged against a reproduction that does not exist yet.
+  if (plan.reproPrompt) {
+    steps.push({
+      phase: 'agent',
+      job: { agentPrompt: plan.reproPrompt, only: 'agent', baseRef: base },
+      source: agentSource,
+      kind: 'repro',
+    });
+  }
+  // The FIX agent. With a repro agent present it is DEFERRED to after the base
+  // container has registered the reproduction, so ADR-0008's ordering invariant
+  // becomes a fact about the log rather than an intention: `REPRO_REGISTERED`
+  // provably precedes this agent's first message by seq, so it cannot have
+  // written the fix against a reproduction it had already watched fail. It also
+  // means the gate now stops the agent being spawned at all on a bug that was
+  // never shown — which the earlier ordering explicitly could not do.
+  //
+  // Without a repro agent it stays ahead of base, where every M3.1 and 3b.1 test
+  // exercises it. The caller supplied the repro there, so there is no ordering
+  // between authoring and registration to prove.
+  if (plan.agentPrompt && !plan.reproPrompt) {
     // `baseRef` resolved: the stripped source has one branch and none of the
     // names the plan may have used.
     steps.push({
@@ -269,6 +308,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       // apart.
       job: { agentPrompt: plan.agentPrompt, only: 'agent', baseRef: base },
       source: agentSource,
+      kind: 'fix',
     });
   }
   steps.push({ phase: 'base', job: { only: 'base' }, source });
@@ -276,8 +316,83 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   let ended: RunEvent | null = null;
   let refused = false;
   let fixRef = plan.fixRef;
+  let resolvedRepro = plan.repro;
+
+  /**
+   * Take the commit an agent handed over, or refuse the run and say why.
+   *
+   * One rule for both agents. The repro agent's commit is under exactly the same
+   * suspicion as the fix agent's: an agent that hands back a commit the
+   * repository already had has authored no reproduction either.
+   */
+  const accept = async (result: PhaseResult): Promise<string | null> => {
+    const handover = await applyHandover(source, plan.runId, result.handover);
+    const stale =
+      handover.commit === null
+        ? handover.why
+        : before.has(handover.commit)
+          ? `the agent handed over ${handover.commit}, a commit the repository already had`
+          : handover.tree === baseTree
+            ? `the agent handed over ${handover.commit}, which changes nothing against the base`
+            : null;
+    if (handover.commit === null || stale) {
+      events.push(
+        own(plan.runId, ++afterSeq, {
+          type: 'VERIFICATION_ABORTED',
+          payload: {
+            v: 1,
+            phase: 'setup',
+            cause: 'handover',
+            reason: (stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS),
+          },
+        }),
+      );
+      ended = own(plan.runId, ++afterSeq, {
+        type: 'RUN_ENDED',
+        payload: { v: 1, reason: 'attempts_exhausted' },
+      });
+      refused = true;
+      return null;
+    }
+    events.push(
+      own(plan.runId, ++afterSeq, {
+        type: 'AGENT_HANDED_OVER',
+        payload: { v: 1, commit: handover.commit },
+      }),
+    );
+    return handover.commit;
+  };
+
+  /** Read the reproduction out of the commit the repro agent authored. */
+  const registerRepro = async (head: string): Promise<boolean> => {
+    try {
+      resolvedRepro = await readReproFromCommit(source, head);
+      return true;
+    } catch (error) {
+      events.push(
+        own(plan.runId, ++afterSeq, {
+          type: 'VERIFICATION_ABORTED',
+          payload: {
+            v: 1,
+            phase: 'setup',
+            cause: 'handover',
+            reason: String((error as Error).message).slice(0, MAX_REASON_CHARS),
+          },
+        }),
+      );
+      ended = own(plan.runId, ++afterSeq, {
+        type: 'RUN_ENDED',
+        payload: { v: 1, reason: 'attempts_exhausted' },
+      });
+      refused = true;
+      return false;
+    }
+  };
   for (const step of steps) {
-    const result = await runContainer(plan, step.source, afterSeq, step.phase, step.job);
+    const result = await runContainer(plan, step.source, afterSeq, step.phase, {
+      ...step.job,
+      ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+    });
     // Record what the container reported BEFORE judging any of it. Checking
     // first and breaking discarded the transcript and the container's own
     // stream — the same mistake the abort path made: a run that could not be
@@ -292,70 +407,15 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     }
 
     if (step.phase === 'agent') {
-      // Whatever the agent committed becomes the fix under judgement — but only
-      // once it is shown to be something the agent actually authored.
-      //
-      // Four bugs in this transport all failed the same way: the bundle carried
-      // the repository's own HEAD and the run verified that, crediting the
-      // agent. Each cause was fixed and the run stayed silently wrong, because
-      // nothing ever compared the resolved ref to what existed beforehand. An
-      // agent whose entire body is `echo "I did nothing"` was credited Tier 1.
-      //
-      // So: refuse loudly. A commit that already existed is not a fix the agent
-      // wrote, whether it got there by doing nothing, committing on a branch and
-      // checking out another, resetting back, or swapping the bundle afterwards.
-      const handover = await applyHandover(source, plan.runId, result.handover);
-      const stale =
-        handover.commit === null
-          ? handover.why
-          : before.has(handover.commit)
-            ? `the agent handed over ${handover.commit}, a commit the repository already had`
-            : handover.tree === baseTree
-              ? `the agent handed over ${handover.commit}, which changes nothing against the base`
-              : null;
-      if (handover.commit === null || stale) {
-        // Refused, and SAID SO. This used to emit `RUN_ENDED { error }` and
-        // nothing else, so the one finding that most needs auditing — the agent
-        // handed over work it did not do — was byte-identical in the log to an
-        // OOM kill or a missing image.
-        //
-        // `attempts_exhausted`, not `error`: ADR-0009 is explicit that a status
-        // the agent can choose is not a status, and `errored` is the single thing
-        // the fold takes on trust. An agent that hands over nothing usable has
-        // exhausted its attempt; the fold renders that `unresolved`, which is
-        // ADR-0007's Tier 3 deliverable rather than an infrastructure fault.
-        events.push(
-          own(plan.runId, ++afterSeq, {
-            type: 'VERIFICATION_ABORTED',
-            payload: {
-              v: 1,
-              phase: 'setup',
-              // The discriminator the Tier 3 projection reads. `reason` is prose
-              // and stays display-only.
-              cause: 'handover',
-              // `||`, not `??`: an empty `why` is not nullish, so `??` would pass
-              // it through and emit a blank reason — verbatim the bug runner.ts
-              // already carries a three-line comment about.
-              reason: (stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS),
-            },
-          }),
-        );
-        ended = own(plan.runId, ++afterSeq, {
-          type: 'RUN_ENDED',
-          payload: { v: 1, reason: 'attempts_exhausted' },
-        });
-        refused = true;
-        break;
+      const head = await accept(result);
+      if (head === null) break;
+      // The repro agent's commit is the TEST, not the repair — so it is read, not
+      // set as `fixRef`.
+      if (step.kind === 'repro') {
+        if (!(await registerRepro(head))) break;
+      } else {
+        fixRef = head;
       }
-      const head = handover.commit;
-      // Recorded before it is used, so the log says what was authored and not
-      // only what was verified.
-      const handed = own(plan.runId, ++afterSeq, {
-        type: 'AGENT_HANDED_OVER',
-        payload: { v: 1, commit: head },
-      });
-      events.push(handed);
-      fixRef = head;
     }
   }
 
@@ -365,7 +425,46 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // outcome is a real deliverable, not a failure.
   if (!ended) {
     if (fold(events).shownOnBase) {
-      const fix = await runContainer(plan, source, afterSeq, 'fix', { only: 'fix', fixRef });
+      // The fix agent, deferred to here so the log can PROVE it never saw the
+      // reproduction before that reproduction was registered.
+      if (plan.reproPrompt && plan.agentPrompt) {
+        const author = await runContainer(plan, agentSource, afterSeq, 'agent', {
+          agentPrompt: plan.agentPrompt,
+          only: 'agent',
+          baseRef: base,
+          ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+        });
+        phases.push(author);
+        events.push(...author.events);
+        afterSeq = author.events.at(-1)?.seq ?? afterSeq;
+        if (author.exitCode !== 0) {
+          ended = own(plan.runId, ++afterSeq, {
+            type: 'RUN_ENDED',
+            payload: { v: 1, reason: 'error' },
+          });
+        } else {
+          const head = await accept(author);
+          if (head !== null) fixRef = head;
+        }
+      }
+      // Nested inside `shownOnBase`, NOT a second top-level branch. Flattening it
+      // put the `not_reproduced` else on the wrong condition, so a fix agent that
+      // was refused had its `attempts_exhausted` overwritten with
+      // `not_reproduced` — a run claiming the bug never reproduced when the base
+      // container had just shown that it did.
+      if (ended) {
+        // A refused or failed fix agent has already said why.
+      } else {
+      // `resolvedRepro`, not `plan.repro`. The fix container was the one call
+      // site that did not carry it, so with an agent-authored reproduction it
+      // ran anchored to nothing and aborted AFTER a perfectly good base phase —
+      // the ordering was right and the spec never reached the container judging
+      // the fix.
+      const fix = await runContainer(plan, source, afterSeq, 'fix', {
+        only: 'fix',
+        fixRef,
+        ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+      });
       phases.push(fix);
       events.push(...fix.events);
       afterSeq = fix.events.at(-1)?.seq ?? afterSeq;
@@ -384,6 +483,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
           type: 'RUN_ENDED',
           payload: { v: 1, reason: 'error' },
         });
+      }
       }
     } else {
       // The bug was never shown, so no fix was attempted and none should be. The
@@ -485,7 +585,11 @@ async function runContainer(
     baseRef: plan.baseRef,
     // Resolved rather than planned: with an agent, this is the commit it made.
     fixRef: overrides.fixRef ?? plan.fixRef ?? plan.baseRef,
-    repro: plan.repro,
+    // Resolved by the caller: with a repro agent it is the spec read out of that
+    // agent's commit, and there is nothing to run before it exists. The agent
+    // container never runs a repro at all, which is why an empty one is honest
+    // there rather than a placeholder standing in for a real spec.
+    repro: overrides.repro ?? plan.repro ?? { command: '' },
     symptomPattern: plan.symptomPattern,
     ...(plan.flakeRuns === undefined ? {} : { flakeRuns: plan.flakeRuns }),
     ...(plan.timeoutMs === undefined ? {} : { timeoutMs: plan.timeoutMs }),
@@ -675,4 +779,84 @@ export async function buildAgentSource(source: string, base: string, agentSource
   if (refs.length !== 1 || refs[0] !== 'refs/heads/main') {
     throw new Error(`the agent's source carries refs beyond base: ${refs.join(', ')}; refusing to run`);
   }
+}
+
+/** Where the agent leaves its reproduction. Fixed: a configurable path is a path the agent chooses. */
+export const REPRO_MANIFEST = '.engine/repro.json';
+/** Enough for a reproduction; far short of shipping a payload through the manifest. */
+const MAX_REPRO_FILES = 32;
+const MAX_REPRO_BYTES = 256 * 1024;
+
+/**
+ * The reproduction the agent authored, read out of its commit.
+ *
+ * The agent's tree does not survive its container (ADR-0010), so the repro has to
+ * arrive as a commit exactly as the fix does. What arrives is a manifest NAMING
+ * paths and a command — never hashes, never bytes-as-testimony. The engine reads
+ * the bytes itself out of the commit and hands them to `verify()` as `applied`
+ * files, which it writes over both checkouts.
+ *
+ * That is ADR-0008's anchoring reached from a commit instead of from a Job: the
+ * same bytes run in both phases because the engine put them there, not because
+ * the agent promised it would. A manifest hash would be testimony wearing an
+ * evidence event's shape (ADR-0006), so this format has nowhere to put one.
+ */
+export async function readReproFromCommit(source: string, commit: string): Promise<ReproSpec> {
+  const show = async (path: string): Promise<string> => {
+    // `git show <rev>:<path>` accepts no `--`, so the path is validated before it
+    // can become an argument at all: a leading `-` is an option, and an absolute
+    // or parent-relative path reads outside the tree under judgement. `verify()`
+    // guards the WRITE side; this guards the read.
+    if (!/^[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(path) || path.split('/').includes('..')) {
+      throw new Error(`the manifest names an unusable path: ${path.slice(0, 120)}`);
+    }
+    const { stdout } = await execFile('git', ['-C', source, 'show', `${commit}:${path}`], {
+      maxBuffer: MAX_REPRO_BYTES,
+    });
+    return stdout;
+  };
+
+  let raw: string;
+  try {
+    raw = await show(REPRO_MANIFEST);
+  } catch {
+    throw new Error(`the agent committed no reproduction at ${REPRO_MANIFEST}`);
+  }
+
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(raw);
+  } catch {
+    throw new Error('the reproduction manifest is not JSON');
+  }
+  if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
+    throw new Error('the reproduction manifest is not an object');
+  }
+  const { command, files } = manifest as { command?: unknown; files?: unknown };
+  if (typeof command !== 'string' || command.trim() === '') {
+    throw new Error('the reproduction manifest names no command');
+  }
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error('the reproduction manifest names no files');
+  }
+  if (files.length > MAX_REPRO_FILES) {
+    throw new Error(
+      `the reproduction names ${files.length} files, past the ${MAX_REPRO_FILES} ceiling`,
+    );
+  }
+
+  const contents: Record<string, string> = {};
+  let total = 0;
+  for (const path of files) {
+    if (typeof path !== 'string') {
+      throw new Error('the reproduction manifest names a non-string path');
+    }
+    const body = await show(path);
+    total += Buffer.byteLength(body);
+    if (total > MAX_REPRO_BYTES) {
+      throw new Error(`the reproduction came to more than ${MAX_REPRO_BYTES} bytes`);
+    }
+    contents[path] = body;
+  }
+  return { command, files: contents };
 }

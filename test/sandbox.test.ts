@@ -1382,6 +1382,82 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(outcome.complete).toBe(false);
   }, 600_000);
 
+  test('the agent authors the reproduction, and the log proves it came first', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // ADR-0008's ordering invariant, made real. The repro agent writes the test
+    // as a commit; the base container registers it; only then does the FIX agent
+    // start. So `REPRO_REGISTERED` precedes the fix agent's first message BY SEQ,
+    // and nobody has to trust that the fix was not written against a reproduction
+    // its author had already watched fail.
+    const fixture = regression();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    // One fake agent for both phases: it writes a repro when there is none, and
+    // fixes the bug once one exists. Which phase it is in, it reads off the tree.
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        // Branches on the PROMPT, not on the tree. The fix agent's world is cloned
+        // from the base-only source, so the repro commit is not in it — checking
+        // for the file made both phases write a reproduction and neither fix
+        // anything.
+        `case "$*" in\n` +
+        `  *reproduce*)\n` +
+        `  mkdir -p .engine\n` +
+        // `cat` first: a repro that prints nothing cannot match the reported
+        // symptom, and the gate then holds — correctly — on a reproduction that
+        // fails for reasons nobody can see.
+        `  printf 'cat src.txt\\ngrep -q right src.txt\\n' > repro.sh\n` +
+        `  printf '{"command":"sh repro.sh","files":["repro.sh"]}' > .engine/repro.json\n` +
+        `  git add .engine repro.sh >/dev/null 2>&1\n` +
+        `  git commit -q -m "reproduce it" >/dev/null 2>&1\n` +
+        `  ;;\n` +
+        `  *)\n` +
+        `  echo right > src.txt\n` +
+        `  git add src.txt >/dev/null 2>&1\n` +
+        `  git commit -q -m "fix it" >/dev/null 2>&1\n` +
+        `  ;;\n` +
+        `esac\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      reproPrompt: 'reproduce the bug with a failing test',
+      agentPrompt: 'now fix it',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.refused).toBe(false);
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'agent', 'fix']);
+
+    const registered = outcome.events.find((e) => e.type === 'REPRO_REGISTERED');
+    expect(registered).toBeDefined();
+    // The invariant, read straight off the log: the LAST agent message before the
+    // fix is authored comes after registration. Two handovers, and the second —
+    // the fix — is the commit the fix phase judged.
+    const handovers = outcome.events.filter((e) => e.type === 'AGENT_HANDED_OVER');
+    expect(handovers).toHaveLength(2);
+    expect(handovers[0]!.seq).toBeLessThan(registered!.seq);
+    expect(handovers[1]!.seq).toBeGreaterThan(registered!.seq);
+
+    const state = fold(outcome.events);
+    // The repro the engine registered is the one the agent COMMITTED, read by the
+    // engine out of that commit rather than taken on the manifest's word.
+    expect(state.registeredRepro?.applied).toEqual(['repro.sh']);
+    expect(state.reproduced).toBe(true);
+  }, 900_000);
+
   test('the agent cannot reach a fix the repository already has', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     // The hole the authorship check could not close. Content is all that check can
