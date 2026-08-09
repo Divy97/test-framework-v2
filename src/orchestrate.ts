@@ -319,13 +319,30 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   let resolvedRepro = plan.repro;
 
   /**
+   * How a container's exit ends the run.
+   *
+   * `EXIT.partial` (2) means observation stopped and the stream IS on the
+   * channel — a finding about this run. Collapsing it into `error` handed the
+   * agent the status ADR-0009 exists to deny it: a reproduction of `sleep 600`,
+   * or one naming a path the fix commit tracks, aborts a phase container and the
+   * run then reported `errored` rather than `unresolved`. A status the agent can
+   * choose is not a status, and `errored` is the single thing the fold takes on
+   * trust. Only 1 (an engine bug) and 3 (nothing on the channel at all) are ours.
+   */
+  const endedBy = (exitCode: number): RunEvent =>
+    own(plan.runId, ++afterSeq, {
+      type: 'RUN_ENDED',
+      payload: { v: 1, reason: exitCode === 2 ? 'attempts_exhausted' : 'error' },
+    });
+
+  /**
    * Take the commit an agent handed over, or refuse the run and say why.
    *
    * One rule for both agents. The repro agent's commit is under exactly the same
    * suspicion as the fix agent's: an agent that hands back a commit the
    * repository already had has authored no reproduction either.
    */
-  const accept = async (result: PhaseResult): Promise<string | null> => {
+  const accept = async (result: PhaseResult, kind: 'repro' | 'fix'): Promise<string | null> => {
     const handover = await applyHandover(source, plan.runId, result.handover);
     const stale =
       handover.commit === null
@@ -357,7 +374,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     events.push(
       own(plan.runId, ++afterSeq, {
         type: 'AGENT_HANDED_OVER',
-        payload: { v: 1, commit: handover.commit },
+        payload: { v: 1, commit: handover.commit, kind },
       }),
     );
     return handover.commit;
@@ -392,6 +409,10 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     const result = await runContainer(plan, step.source, afterSeq, step.phase, {
       ...step.job,
       ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+      // The sham-fix control, on exactly when the AGENT wrote the reproduction.
+      // A caller-supplied repro has no oracle to be: whoever wrote it did not
+      // see the tree it would judge.
+      ...(plan.reproPrompt ? { controlRun: true } : {}),
     });
     // Record what the container reported BEFORE judging any of it. Checking
     // first and breaking discarded the transcript and the container's own
@@ -402,12 +423,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     afterSeq = result.events.at(-1)?.seq ?? afterSeq;
 
     if (result.exitCode !== 0) {
-      ended = own(plan.runId, ++afterSeq, { type: 'RUN_ENDED', payload: { v: 1, reason: 'error' } });
+      ended = endedBy(result.exitCode);
       break;
     }
 
     if (step.phase === 'agent') {
-      const head = await accept(result);
+      const head = await accept(result, step.kind === 'repro' ? 'repro' : 'fix');
       if (head === null) break;
       // The repro agent's commit is the TEST, not the repair — so it is read, not
       // set as `fixRef`.
@@ -438,12 +459,9 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         events.push(...author.events);
         afterSeq = author.events.at(-1)?.seq ?? afterSeq;
         if (author.exitCode !== 0) {
-          ended = own(plan.runId, ++afterSeq, {
-            type: 'RUN_ENDED',
-            payload: { v: 1, reason: 'error' },
-          });
+          ended = endedBy(author.exitCode);
         } else {
-          const head = await accept(author);
+          const head = await accept(author, 'fix');
           if (head !== null) fixRef = head;
         }
       }
@@ -479,10 +497,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       // unended run is incomplete; a run ended with the wrong reason is a lie in
       // an immutable log.
       if (fix.exitCode !== 0) {
-        ended = own(plan.runId, ++afterSeq, {
-          type: 'RUN_ENDED',
-          payload: { v: 1, reason: 'error' },
-        });
+        ended = endedBy(fix.exitCode);
       }
       }
     } else {
@@ -809,6 +824,17 @@ export async function readReproFromCommit(source: string, commit: string): Promi
     // guards the WRITE side; this guards the read.
     if (!/^[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(path) || path.split('/').includes('..')) {
       throw new Error(`the manifest names an unusable path: ${path.slice(0, 120)}`);
+    }
+    // A blob, and a regular one. `git show <rev>:<dir>` exits 0 with git's tree
+    // listing as prose, and `<rev>:<symlink>` returns the link's TARGET STRING as
+    // content — neither reads a host file, but both make the reproduction's bytes
+    // something other than the file the manifest named, and the diagnosis then
+    // surfaces two layers away as a mystery write.
+    const { stdout: mode } = await execFile('git', [
+      '-C', source, 'ls-tree', '--format=%(objectmode)', commit, '--', path,
+    ]);
+    if (!['100644', '100755'].includes(mode.trim())) {
+      throw new Error(`the manifest names something that is not a regular file: ${path.slice(0, 120)}`);
     }
     const { stdout } = await execFile('git', ['-C', source, 'show', `${commit}:${path}`], {
       maxBuffer: MAX_REPRO_BYTES,

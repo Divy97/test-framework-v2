@@ -53,6 +53,8 @@ export type Job = {
   only?: 'base' | 'fix' | 'agent';
   flakeRuns?: number;
   timeoutMs?: number;
+  /** Run the sham-fix control. Set when the AGENT wrote the reproduction. */
+  controlRun?: boolean;
 };
 
 const WORK = '/work';
@@ -623,6 +625,7 @@ export async function runJob(
       onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME], evidence),
       ...(job.only === undefined ? {} : { only: job.only }),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
+      ...(job.controlRun === undefined ? {} : { controlRun: job.controlRun }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });
   } catch (error) {

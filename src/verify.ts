@@ -15,7 +15,8 @@
 // same repo must not trip the dirty-tree refusal on this run's leftovers.
 
 import { execFile } from 'node:child_process';
-import { constants, lstat, mkdir, open, readdir, realpath, rm } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
+import { constants, lstat, mkdir, open, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
@@ -67,6 +68,23 @@ export class ObservationFailed extends Error {
  * per line. An unbounded reason is an unbounded line.
  */
 export const MAX_REASON_CHARS = 2000;
+
+/**
+ * The sham fix's payload, named unpredictably.
+ *
+ * A fixed name is filterable, and the first two versions of this control were
+ * defeated by the attack they were written against. The oracle hashed the tree
+ * through `grep -v .engine`, which excluded `.engine-control` — and then still
+ * excluded `.engine-control-<hex>`, because a random SUFFIX leaves the stem to
+ * match on. The agent reads this source, so any constant here is a constant it
+ * can filter by.
+ *
+ * Nothing recognisable survives in the name. An oracle can still beat this by
+ * hashing a hardcoded list of base's files rather than filtering the tree — said
+ * plainly rather than implied away, and the reason the real answer is
+ * diff-coverage instrumentation rather than a cleverer sham.
+ */
+const controlFile = () => `.${randomBytes(12).toString('hex')}`;
 
 const abortReason = (error: Error): string => {
   const text = `${error.name}: ${error.message}`;
@@ -177,6 +195,23 @@ export type VerifyOptions = {
    * bytes hash the same, and a `pinned` path the fix commit rewrote does not.
    */
   only?: 'base' | 'fix';
+  /**
+   * Prove the reproduction is testing the BUG and not the commit's identity.
+   *
+   * Only needed when the agent wrote the reproduction, which is also when it
+   * knows base's tree exactly — it is the tree in its own clone. A repro that
+   * hashes the tree and fails only when that hash matches base passes every
+   * defence this engine has: it is byte-identical across phases, so ADR-0008's
+   * anchor holds; it needs no cross-phase state, so ADR-0010's reap and the
+   * container split are irrelevant to it; and it is deterministic, so the flake
+   * re-runs agree. Red on base, green on the fix, no abort — and the fix changed
+   * nothing. Review demonstrated exactly that: Tier 1, score 80.
+   *
+   * The control is a sham fix. Commit an unrelated file on top of base and run
+   * the reproduction again: the bug is still there, so a reproduction OF THE BUG
+   * must still fail. One that went green has told us it was reading identity.
+   */
+  controlRun?: boolean;
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -576,6 +611,41 @@ async function observe(
         repro_hashes: await hashRepro(),
       },
     });
+  }
+
+  // THE SHAM FIX. A negative control, and the only defence here that is about
+  // what the reproduction MEANS rather than about what it is made of.
+  //
+  // Everything else anchors the repro's bytes, its environment, or its
+  // provenance. None of that can tell a test of the bug from a test of the
+  // commit's identity, because the identity test cheats with no byte out of
+  // place. So: put an unrelated file on top of base and ask again. The bug is
+  // untouched, so a reproduction of the bug must still fail. One that turns
+  // green has just announced it was reading the tree, not the behaviour.
+  //
+  // Deliberately a COMMIT, not an untracked file: a repro hashing `git ls-tree
+  // HEAD` would not notice a stray file, and the cheapest oracle to write is the
+  // one over tracked content.
+  if (options.controlRun && options.only !== 'fix') {
+    progress.phase = 'base';
+    const sham = controlFile();
+    await writeFile(join(repoPath, sham), 'a sham fix: this changes no behaviour\n');
+    await git(['add', '--force', '--', sham], repoPath, gitEnv);
+    await git(
+      ['-c', 'user.email=engine@local', '-c', 'user.name=engine', 'commit', '--quiet', '-m', 'sham'],
+      repoPath,
+      gitEnv,
+    );
+    const control = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+    await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
+    await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+    if (control.exitCode === 0) {
+      throw new ObservationFailed(
+        'the reproduction passes once the commit changes at all, so it is testing which commit ' +
+          'this is rather than whether the bug is present',
+      );
+    }
+    await applyRepro();
   }
 
   // The base container's work ends here. It leaves the tree as it found it, and

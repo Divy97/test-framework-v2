@@ -233,7 +233,14 @@ export function apply(state: RunState, event: RunEvent): RunState {
       // any TEST_RUN today, so nothing changes — but "safe because of the order
       // the producer happens to use" is precisely the assumption this file has
       // been bitten by, and the fold is meant to be order-robust.
-      const handedOver = event.payload.commit;
+      // The FIX handover, never the repro's. Taking the last one was right only
+      // by accident of event order, and `reproPrompt` without `agentPrompt` —
+      // which typechecks and nothing refuses — left the repro commit standing
+      // here. `reproducedAttempt` then compared the fix runs against the commit
+      // that carried the TEST, denied a clean red-then-green, and `confidence`
+      // wrote an accusation of a commit swap into a log where nothing was
+      // swapped.
+      const handedOver = event.payload.kind === 'repro' ? state.handedOver : event.payload.commit;
       return {
         ...next,
         handedOver,

@@ -154,6 +154,16 @@ export type AgentFinishedV1 = {
 export type AgentHandedOverV1 = {
   v: 1;
   commit: string;
+  /**
+   * Which agent authored it. A run now has two, and without this the log carried
+   * two indistinguishable events whose meaning was recoverable only from their
+   * position relative to `REPRO_REGISTERED` — position is not a discriminator,
+   * for the same reason prose is not one.
+   *
+   * Absent on streams written before there were two, which the fold reads as the
+   * fix: that is what the single handover always was.
+   */
+  kind?: 'repro' | 'fix';
 };
 
 /**

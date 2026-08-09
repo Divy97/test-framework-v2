@@ -107,6 +107,29 @@ describe('the reproduction the agent committed', () => {
     await expect(readReproFromCommit(repo.path, repo.head)).rejects.toThrow(/more than \d+ bytes/);
   });
 
+  test('refuses a symlink, whose content is its target string and not the file', async () => {
+    // `git show <rev>:<link>` returns the LINK TARGET as blob content — it never
+    // reads the pointed-at file, so no host byte escapes. But the reproduction's
+    // bytes would then be a path string rather than the file the manifest named.
+    const repo = committed({
+      [REPRO_MANIFEST]: manifest({ command: 'sh repro.sh', files: ['repro.sh'] }),
+      'real.sh': 'true\n',
+    });
+    execFileSync('ln', ['-sf', '/etc/passwd', join(repo.path, 'repro.sh')]);
+    execFileSync('git', ['-C', repo.path, 'add', 'repro.sh']);
+    execFileSync('git', ['-C', repo.path, 'commit', '--quiet', '-m', 'link']);
+    const head = execFileSync('git', ['-C', repo.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    await expect(readReproFromCommit(repo.path, head)).rejects.toThrow(/not a regular file/);
+  });
+
+  test('refuses a directory, which git happily prints as prose', async () => {
+    const repo = committed({
+      [REPRO_MANIFEST]: manifest({ command: 'x', files: ['d'] }),
+      'd/a.txt': 'x\n',
+    });
+    await expect(readReproFromCommit(repo.path, repo.head)).rejects.toThrow(/not a regular file/);
+  });
+
   test('refuses a manifest naming a file the commit does not carry', async () => {
     const repo = committed({ [REPRO_MANIFEST]: manifest({ command: 'x', files: ['missing.sh'] }) });
     await expect(readReproFromCommit(repo.path, repo.head)).rejects.toThrow();
