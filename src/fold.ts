@@ -29,7 +29,8 @@ export type RunStatus =
 
 export type TestRunRecord = {
   attempt: number;
-  phase: 'base' | 'fix';
+  /** `control` is a sham-fix run: evidence, never a phase under judgement. */
+  phase: 'base' | 'fix' | 'control';
   commit_sha: string;
   exit_code: number;
   signal?: string;

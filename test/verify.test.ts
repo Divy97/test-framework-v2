@@ -952,4 +952,31 @@ describe('the sham-fix control', () => {
     expect(runs.find((r) => r.phase === 'fix')?.exit_code).toBe(0);
     expect(events.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
   });
+
+  test('records what the control ran, so a silent sham is not the same as an honest one', () => {
+    // Without this the engine's strongest anti-gaming mechanism was invisible:
+    // "the sham stayed red because the reproduction is honest" and "the sham
+    // stayed red because it corrupted something and the harness died" were the
+    // same silence. Two draws, both recorded, neither creditable.
+    return observe(eofBug(), { controlRun: true, repro: EOF_REPRO, flakeRuns: 0 }).then((events) => {
+      const controls = testRuns(events).filter((r) => r.phase === 'control');
+      expect(controls).toHaveLength(2);
+      expect(controls.map((r) => r.repeat)).toEqual([0, 1]);
+      for (const control of controls) {
+        expect(control.stdout_hash).toMatch(/^sha256:/);
+        // The sham's OWN sha, not base's — what actually ran.
+        expect(control.commit_sha).not.toBe(basePhase(events).commit_sha);
+      }
+      // Evidence, never a phase under judgement: the fold's credit filters key on
+      // `base` and `fix` explicitly, so a control run is excluded by construction
+      // rather than by anyone remembering to exclude it.
+      const folded = fold([
+        { run_id: RUN_ID, seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+        ...events.map((e) => ({ ...e, seq: e.seq + 1 })),
+      ]);
+      expect(folded.testRuns.filter((r) => r.phase === 'control')).toHaveLength(2);
+      expect(folded.testRuns.filter((r) => r.phase === 'base')).toHaveLength(1);
+      expect(folded.reproduced).toBe(true);
+    });
+  });
 });

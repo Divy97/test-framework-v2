@@ -45,7 +45,20 @@ export type ReproRegisteredV1 = {
 
 export type TestRunV1 = {
   v: 1;
-  phase: 'base' | 'fix';
+  /**
+   * `control` is a SHAM-FIX run: the engine perturbed base itself and ran the
+   * reproduction again, to see whether it was testing the bug or the commit's
+   * identity. It is evidence, not a phase under judgement — every fold filter
+   * keys on `base` or `fix` explicitly, so a control run is excluded from credit
+   * by construction rather than by remembering to exclude it.
+   *
+   * It is recorded because the engine's strongest anti-gaming mechanism was
+   * otherwise invisible: nothing said it had run, which file it perturbed, or
+   * what came back, so "the sham stayed red because the reproduction is honest"
+   * and "the sham stayed red because it corrupted something and the harness died"
+   * were the same silence.
+   */
+  phase: 'base' | 'fix' | 'control';
   /** The commit actually checked out. Without it the record cannot say what produced the result. */
   commit_sha: string;
   /**

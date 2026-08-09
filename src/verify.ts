@@ -671,6 +671,20 @@ async function observe(
         gitEnv,
       );
       const control = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+      emit({
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'control',
+          // The sham's own sha: what actually ran, not what was intended.
+          commit_sha: (await git(['rev-parse', 'HEAD'], repoPath, gitEnv)).trim(),
+          exit_code: control.exitCode,
+          ...(control.signal ? { signal: control.signal } : {}),
+          stdout_hash: await put(blobRoot, control.output),
+          duration_ms: control.durationMs,
+          repeat: draw,
+        },
+      });
       await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
       await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
       if (control.exitCode === 0) greens += 1;
