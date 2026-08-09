@@ -122,7 +122,8 @@ out of place. So the engine commits an unrelated file on top of base and runs th
 reproduction again: the bug is untouched, so a reproduction OF THE BUG must still
 fail. One that turns green has told us what it was reading. It runs only when the
 agent wrote the reproduction — a caller-supplied one has no oracle to be — and it
-aborts the base phase with a reason that names the finding.
+records each draw as `TEST_RUN { phase: 'control' }`. It ENDS NOTHING: see below,
+where a control that ended runs turned out to end honest ones.
 
 **What it does not cover — and this section has now overclaimed twice, which is
 itself the finding.** Version one said an unpredictable name defeats
@@ -143,7 +144,7 @@ subject, the pure-hex shape of its inserted line, and the fact that its diff is
 always a modification and never an add, delete, rename or mode change. One of
 them needs no git at all: `grep -rlE "^[0-9a-f]{8,78}$"` finds the sham's own
 filler. Each time this section has been rewritten it has generalised from the
-last defeat; the sham has now been defeated six times, and the correct conclusion
+last defeat; six successive versions of the sham have been defeated, and the correct conclusion
 is not a seventh sham.
 
 **So the control no longer draws a verdict.** It was ending runs, and it convicted
@@ -172,6 +173,9 @@ Diff-coverage is the real answer here too: an identity oracle does not execute
 the lines the fix changed, and a reproduction of the bug does. That is the same
 instrumentation this ADR already defers, now load-bearing for a second reason.
 
-A fixture demonstrates the attack and asserts that the control refuses it, in
-keeping with this ADR's own convention that a defeated defence is asserted rather
-than hidden.
+Fixtures demonstrate the attacks and assert what actually happens to each: three
+oracles are asserted as flagged by a green sham, and the collusion oracle is
+asserted as SURVIVING — red base, green fix that repaired nothing, control
+silent. Asserting a defeated defence as passing is this ADR's own convention, and
+an assertion that the control "refuses" would have been the comfortable claim
+rather than the true one.

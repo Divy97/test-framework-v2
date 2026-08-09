@@ -629,6 +629,9 @@ async function observe(
     // Nothing inside this block may end the run. Whatever it learns, it learns as
     // evidence; whatever goes wrong, goes wrong quietly and the run proceeds as
     // though the control had not been asked for.
+    //
+    // Declared out here so the catch can see how many draws actually happened.
+    let controls = 0;
     try {
     progress.phase = 'base';
     // TWO independent shams, and an accusation only if both go green.
@@ -746,10 +749,30 @@ async function observe(
       });
       await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
       await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+      controls += 1;
       await applyRepro();
-    }
       }
+    }
     } catch {
+      // Recorded before it is swallowed. A `catch` that fires mid-loop takes the
+      // remaining draws with it, and without this the log showed one control run
+      // where two were asked for — indistinguishable from an honest single-draw
+      // run. That is the exact silence the skip marker above exists to break,
+      // reappearing in the branch that handles failure.
+      for (let draw = controls; draw < 2; draw += 1) {
+        emit({
+          type: 'TEST_RUN',
+          payload: {
+            v: 1,
+            phase: 'control',
+            commit_sha: baseSha,
+            exit_code: -1,
+            stdout_hash: await put(blobRoot, 'the control could not complete this draw\n'),
+            duration_ms: 0,
+            repeat: draw,
+          },
+        });
+      }
       // Deliberately swallowed, and deliberately not re-raised as an abort: this
       // is a diagnostic the engine chose to run, not an observation the caller
       // asked for. A control that cannot complete tells us nothing, and telling

@@ -55,9 +55,13 @@ green on a fix that repairs nothing, with every anchor in
 anywhere in the log. Six versions of a negative control failed to catch it, and
 one class provably cannot be caught by any control of that shape.
 
-**So Tier 1 now additionally requires that the engine did not take the
-reproduction from the party under judgement.** A caller-supplied reproduction
-reaches Tier 1 as before. An agent-authored one lands at Tier 2.
+**So Tier 1 now additionally requires that nothing in the log shows the engine
+took the reproduction from the party under judgement.** Stated as what the code
+checks rather than as the ideal: the fold caps the tier when it sees a repro
+handover, a handover whose `kind` is anything but `fix`, or a sham-control run —
+that last one being positive proof, since the engine asks for a control only when
+the agent authored the reproduction. A caller-supplied reproduction reaches Tier
+1 as before.
 
 **Tier 2 widens accordingly**, and this is a deliberate reuse rather than an
 oversight: it was "reproduced by scripted scenario — weaker assertion than a

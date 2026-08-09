@@ -94,10 +94,10 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   the bug is untouched, so a reproduction of the bug must still fail. It runs
   only when the agent authored the reproduction.
 
-  **Its limit, and the decision that follows.** Six versions of this control were
-  defeated. The last review beat it with five oracles keyed on base and one keyed
-  on the fix, and showed it convicting honest reproductions at a rate that
-  depended on a random draw — any bug whose honest assertion is monotone in file
+  **Its limit, and the decision that follows.** Six successive VERSIONS of this
+  control were defeated. The sixth fell to six ORACLES at once — five keyed on
+  base and one keyed on the fix — and the same review showed it convicting honest
+  reproductions at a rate that depended on a random draw — any bug whose honest assertion is monotone in file
   content (non-empty, minimum length, must-differ-from-template) is satisfied by
   both shams.
 
