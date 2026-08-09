@@ -1402,6 +1402,12 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
         `echo "REACHABLE:$(git rev-list --all | wc -l | tr -d ' ')"\n` +
         `git cat-file -t ${fixture.fix} >/dev/null 2>&1 && echo "REACHED-FIX" || echo "NO-FIX"\n` +
         `git checkout ${fixture.fix} >/dev/null 2>&1 && echo "CHECKED-OUT" || echo "NO-CHECKOUT"\n` +
+        // The mounted source ITSELF, not the agent's clone of it. `git clone`
+        // transfers only reachable objects, so an unreferenced survivor would be
+        // invisible from the clone while staying readable straight off /src —
+        // which is mounted, and which `cat-file` will happily read.
+        `echo "SRCOBJ:$(git --git-dir=/src cat-file --batch-all-objects --batch-check='%(objectname)' | wc -l | tr -d ' ')"\n` +
+        `git --git-dir=/src cat-file -e ${fixture.fix} 2>/dev/null && echo "SRC-HAS-FIX" || echo "SRC-NO-FIX"\n` +
         `printf '{"type":"result","subtype":"success"}\\n'\n`,
       { mode: 0o755 },
     );
@@ -1430,6 +1436,11 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(said).toContain('REACHABLE:1');
     expect(said).toContain('NO-FIX');
     expect(said).toContain('NO-CHECKOUT');
+    // Three objects: base's commit, its tree, its one blob. Nothing else was
+    // ever written, because the source is built by pushing base by sha into an
+    // empty repository rather than by cloning and pruning.
+    expect(said).toContain('SRCOBJ:3');
+    expect(said).toContain('SRC-NO-FIX');
   }, 600_000);
 
   test('a revert to an earlier good state is a real fix, not inherited work', async () => {
@@ -1479,7 +1490,54 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(state.reproduced).toBe(true);
   }, 600_000);
 
-  test('an empty commit over an existing fix is refused', async () => {
+  test('independent work matching a fix on another branch is credited, not accused', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // The cost of the rule that was removed. `clean()` carries the fix on another
+    // branch, and the agent — which cannot see that branch at all — writes the
+    // same one-line repair itself. Its tree therefore matches a tree that exists
+    // off base's ancestry.
+    //
+    // The old check called that inheritance and refused it, writing an accusation
+    // into an immutable log against work the agent demonstrably did itself. That
+    // is the ordinary shape when a repository already carries the fix on a branch,
+    // which is exactly what this project benchmarks against.
+    const fixture = clean();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        `echo right > src.txt\n` +
+        `git add src.txt >/dev/null 2>&1\n` +
+        `git commit -q -m "fix it" >/dev/null 2>&1\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'fix it yourself',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.refused).toBe(false);
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'fix']);
+    const state = fold(outcome.events);
+    expect(state.handedOver).not.toBeNull();
+    expect(state.reproduced).toBe(true);
+  }, 600_000);
+
+  test('an empty commit changes nothing, and is refused', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     // Round N+1 of the same bug. The previous check asked whether the agent had
     // created a new SHA, which is not the question — `--allow-empty` on top of a
