@@ -40,6 +40,17 @@ export type Job = {
    */
   agentPrompt?: string;
   agentTimeoutMs?: number;
+  /**
+   * Observe one phase and stop. Omitted, this container runs the whole run, as
+   * M3 did.
+   *
+   * With it, the host runs a container per phase and nothing is shared between
+   * them — no tree, no TMPDIR, no HOME, no surviving process, no `/blobs` window
+   * between phases. Every channel ADR-0010 enumerates comes from base and fix
+   * sharing a machine; this removes the sharing rather than scrubbing it, which
+   * is the only move here that has not needed a follow-up fix.
+   */
+  only?: 'base' | 'fix' | 'agent';
   flakeRuns?: number;
   timeoutMs?: number;
 };
@@ -296,6 +307,34 @@ export async function runJob(
   // earlier runs, and everything that appears from here is a participant's doing.
   const evidence = await guardEvidence(blobRoot);
 
+  /**
+   * Move the run's artifacts into the mounted store, once, after the last repro
+   * has run. Extracted because an agent-only container has to do it too and has
+   * no phases to reach the old inline copy.
+   */
+  const flush = async () => {
+    // The boundary evicts protect the fix phase from the base phase, but the
+    // LAST phase has no boundary after it — without this its plants ride out to
+    // the host store and wait there for the next run against it.
+    await evidence.evict();
+    const owner = await stat(blobRoot);
+    try {
+      // No shell: `cp` takes its arguments directly, so nothing here can be read
+      // as syntax. Ownership follows the host directory, or a non-root host user
+      // cannot clean up what root wrote.
+      await execFileAsync('cp', ['-a', `${staging}/.`, blobRoot]);
+      await execFileAsync('chown', ['-R', `${owner.uid}:${owner.gid}`, blobRoot]);
+      // The repro can delete the sentinel mid-run, which would brick this store
+      // for the next run against it. Restore it rather than leave a footgun.
+      await writeFile(`${blobRoot}/${SENTINEL}`, '');
+    } catch (error) {
+      // Failing to persist the evidence is a failure to OBSERVE, not a broken
+      // Runner. Fail-closed: this runs before any event is emitted, so a flush
+      // failure kills the whole stream.
+      throw new ObservationFailed(`could not persist the evidence to ${blobRoot}`, { cause: error });
+    }
+  };
+
   const staging = `${workDir}/staging`;
   await mkdir(staging, { recursive: true });
   await chmod(staging, 0o700);
@@ -410,6 +449,17 @@ export async function runJob(
   // the agent could have written to.
   const phases = await world('verify');
 
+  // An agent-only container observes nothing. Without this it ran the agent AND
+  // both phases, so the fix phase started on the very machine the agent had just
+  // been working in — the exact opposite of what per-participant containers are
+  // for, and invisible because the fold's extra registrations made the verdict
+  // stricter rather than wrong.
+  if (job.only === 'agent') {
+    await flush();
+    for (const event of transcript) emit(`${JSON.stringify(event)}\n`);
+    return EXIT.complete;
+  }
+
   let events: RunEvent[];
   // A run that could not be observed to the end is still a run that observed
   // things. Losing the base phase because the fix phase died would leave no
@@ -439,6 +489,7 @@ export async function runJob(
       // backgrounds is the same attack again, which no amount of directory
       // scrubbing reaches.
       onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME], evidence),
+      ...(job.only === undefined ? {} : { only: job.only }),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });
@@ -453,33 +504,7 @@ export async function runJob(
     exitCode = EXIT.partial;
   }
 
-  // The repro has run for the last time, so the evidence can cross into the
-  // shared mount now. Ownership follows the host directory, or a non-root host
-  // user cannot clean up what root wrote.
-  // Once more before the evidence crosses. The boundary evicts protect the fix
-  // phase from the base phase, but the LAST phase to run has no boundary after
-  // it — without this its plants ride out to the host store and wait there for
-  // the next run against it.
-  await evidence.evict();
-
-  const owner = await stat(blobRoot);
-  try {
-    // No shell: `cp` takes its arguments directly, so nothing here can be read as
-    // syntax. Both paths are Runner constants today, which is precisely the
-    // reasoning that has been wrong before in this codebase.
-    await execFileAsync('cp', ['-a', `${staging}/.`, blobRoot]);
-    await execFileAsync('chown', ['-R', `${owner.uid}:${owner.gid}`, blobRoot]);
-    // The repro can delete the sentinel mid-run, which would brick this store for
-    // the next run against it. Restore it rather than leave a footgun.
-    await writeFile(`${blobRoot}/${SENTINEL}`, '');
-  } catch (error) {
-    // Failing to persist the evidence is a failure to OBSERVE, not a broken
-    // Runner. A repro can force this — /blobs has only 256 fanout names, so
-    // pre-creating them all as files makes `cp` refuse — and the exit code is
-    // what tells a human where to look. Fail-closed either way: this runs before
-    // any event is emitted, so a flush failure kills the whole stream.
-    throw new ObservationFailed(`could not persist the evidence to ${blobRoot}`, { cause: error });
-  }
+  await flush();
 
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
