@@ -227,8 +227,18 @@ export function apply(state: RunState, event: RunEvent): RunState {
           },
         ],
       };
-    case 'AGENT_HANDED_OVER':
-      return { ...next, handedOver: event.payload.commit };
+    case 'AGENT_HANDED_OVER': {
+      // Recomputes like every other input to the verdict. It is emitted before
+      // any TEST_RUN today, so nothing changes — but "safe because of the order
+      // the producer happens to use" is precisely the assumption this file has
+      // been bitten by, and the fold is meant to be order-robust.
+      const handedOver = event.payload.commit;
+      return {
+        ...next,
+        handedOver,
+        ...credited(state.testRuns, state.registrations, state.aborts, state.completedAttempts, handedOver),
+      };
+    }
     case 'AGENT_FINISHED': {
       const { v, ...finished } = event.payload;
       return { ...next, agent: finished };

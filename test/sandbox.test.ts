@@ -25,6 +25,7 @@ import {
   HANGS_ON_FIX,
   irreproducible,
   noOpFix,
+  regression,
   survivorGamed,
 } from './fixtures/repo.js';
 
@@ -1381,6 +1382,53 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(outcome.complete).toBe(false);
   }, 600_000);
 
+  test('a revert to an earlier good state is a real fix, not inherited work', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // The cost side of the authorship check, and it nearly shipped. `git revert`
+    // of the commit that caused a regression reproduces the earlier good tree
+    // EXACTLY — applied repro paths are additive (ADR-0008), so nothing perturbs
+    // it away — and a check that refuses any previously-seen tree tells a correct
+    // agent, in an immutable record, that it handed over work it did not do.
+    //
+    // What distinguishes the two is where the content came from: base's own
+    // ancestry is history the agent may return to; content living only OFF that
+    // ancestry is a fix it would be inheriting.
+    const fixture = regression();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        `git revert --no-edit HEAD >/dev/null 2>&1\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'revert the regression',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.refused).toBe(false);
+    const state = fold(outcome.events);
+    expect(state.handedOver).not.toBeNull();
+    // It reached the phases at all, which is the whole point: the old check
+    // stopped this run dead before the base container ever started.
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'fix']);
+    expect(state.reproduced).toBe(true);
+  }, 600_000);
+
   test('an empty commit over an existing fix is refused', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     // Round N+1 of the same bug. The previous check asked whether the agent had
@@ -1421,7 +1469,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     const state = fold(outcome.events);
     expect(state.handedOver).toBeNull();
     expect(state.reproduced).toBe(false);
-    expect(state.aborts[0]!.reason).toMatch(/content the repository already had/);
+    expect(state.aborts[0]!.reason).toMatch(/content already exists elsewhere/);
   }, 600_000);
 
   test('the log records what the agent authored, not only what was verified', async () => {

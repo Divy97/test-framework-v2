@@ -87,6 +87,13 @@ export type RunOutcome = {
   phases: PhaseResult[];
   /** True when every container completed its phases; see EXIT in runner.ts. */
   complete: boolean;
+  /**
+   * The agent handed over nothing usable and no phase ran. Separate from
+   * `complete` because a run the GATE stopped is a deliverable (ADR-0007) and a
+   * run the agent forfeited is a finding about the agent — collapsing them lost
+   * the distinction the log exists to keep.
+   */
+  refused: boolean;
 };
 
 /**
@@ -144,22 +151,43 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // pre-existing fix became an ancestor, so even the diff named the right files.
   // `--amend`, `cherry-pick` and `merge` all did the same.
   //
-  // Content is the invariant. A tree that already existed is not a fix the agent
-  // wrote, however new the commit wrapped around it is.
+  // Content is the invariant. But "any tree the repository ever held" was too
+  // broad by far, and it refused the single most common genuine repair: `git
+  // revert` of the commit that caused a regression reproduces the *earlier good
+  // tree* exactly. Applied repro paths are additive and written over both
+  // checkouts (ADR-0008), so nothing perturbs the tree away from the historical
+  // one — a correct agent would have been told, in an immutable record, that it
+  // handed over work it had not done.
+  //
+  // The distinction that actually matters is where the content came FROM.
+  // Content already on base's own ancestry is history the agent is entitled to
+  // return to. Content that exists only OFF that ancestry — on the fix branch,
+  // on the repository's own HEAD, on some stale branch — is work the agent would
+  // be inheriting rather than writing.
   //
   // `--no-replace-objects` because `--mirror` copies `refs/replace/*` and the
-  // phase containers' plain clone does not: without it this set can be computed
+  // phase containers' plain clone does not: without it these sets are computed
   // over a different history than base and fix actually see.
-  const { stdout: existing } = await execFile('git', [
-    // `--no-replace-objects` is a top-level git option and has to precede the
-    // subcommand; rev-list rejects it outright as one of its own.
-    '-C', source, '--no-replace-objects', 'rev-list', '--all', '--format=%H %T',
+  const git = ['-C', source, '--no-replace-objects'];
+  const { stdout: existing } = await execFile('git', [...git, 'rev-list', '--all']);
+  const before = new Set(existing.split('\n').filter(Boolean));
+  // Trees reachable from any ref but NOT from base. `--not <baseRef>` is what
+  // keeps a revert legitimate while an inherited fix stays disqualified.
+  const { stdout: elsewhere } = await execFile('git', [
+    ...git, 'rev-list', '--all', '--not', plan.baseRef, '--no-commit-header', '--format=%T',
   ]);
-  const before = new Set<string>();
-  for (const line of existing.split('\n')) {
-    // `--format` emits a `commit <sha>` header line before each formatted line;
-    // both shas land in one set because either one recurring is disqualifying.
-    for (const sha of line.split(' ')) if (/^[0-9a-f]{40}$/.test(sha)) before.add(sha);
+  const foreign = new Set(elsewhere.split('\n').filter(Boolean));
+  const { stdout: baseTreeOut } = await execFile('git', [...git, 'rev-parse', `${plan.baseRef}^{tree}`]);
+  const baseTree = baseTreeOut.trim();
+
+  // Fail closed. The previous round parsed these sets with `/^[0-9a-f]{40}$/`,
+  // which is the only hard-coded object-ID length in the engine: on a SHA-256
+  // repository every id is 64 hex, not one token matched, `before` came out empty
+  // and the whole authorship check silently evaporated — a do-nothing agent back
+  // to Tier 1 with no error and no abort. A check that can quietly become a
+  // no-op is worse than no check, because the log still reads as verified.
+  if (existing.trim() && before.size === 0) {
+    throw new Error('could not read the repository history; refusing to run an unenforceable check');
   }
 
   // Starts at zero because this function owns the whole run: it emits the first
@@ -196,6 +224,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   steps.push({ phase: 'base', job: { only: 'base' } });
 
   let ended: RunEvent | null = null;
+  let refused = false;
   let fixRef = plan.fixRef;
   for (const step of steps) {
     const result = await runContainer(plan, source, afterSeq, step.phase, step.job);
@@ -230,10 +259,13 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         handover.commit === null
           ? handover.why
           : before.has(handover.commit)
-            ? `the agent handed over ${handover.commit}, which the repository already had`
-            : before.has(handover.tree)
-              ? `the agent handed over ${handover.commit}, whose content the repository already had`
-              : null;
+            ? `the agent handed over ${handover.commit}, a commit the repository already had`
+            : handover.tree === baseTree
+              ? `the agent handed over ${handover.commit}, which changes nothing against the base`
+              : foreign.has(handover.tree)
+                ? `the agent handed over ${handover.commit}, whose content already exists elsewhere ` +
+                  `in the repository and off the base's own history`
+                : null;
       if (handover.commit === null || stale) {
         // Refused, and SAID SO. This used to emit `RUN_ENDED { error }` and
         // nothing else, so the one finding that most needs auditing — the agent
@@ -248,13 +280,17 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         events.push(
           own(plan.runId, ++afterSeq, {
             type: 'VERIFICATION_ABORTED',
-            payload: { v: 1, phase: 'setup', reason: (stale ?? 'the agent handed nothing over').slice(0, MAX_REASON_CHARS) },
+            payload: { v: 1, phase: 'setup', // `||`, not `??`: an empty `why` is not nullish, so `??` would pass it
+            // through and emit a blank reason — verbatim the bug runner.ts already
+            // carries a three-line comment about.
+            reason: (stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS) },
           }),
         );
         ended = own(plan.runId, ++afterSeq, {
           type: 'RUN_ENDED',
           payload: { v: 1, reason: 'attempts_exhausted' },
         });
+        refused = true;
         break;
       }
       const head = handover.commit;
@@ -322,11 +358,14 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     if (phase.handover) await rm(phase.handover, { recursive: true, force: true }).catch(() => {});
   }
 
-  // `ended === null` as well: a refusal breaks out with the agent container at
-  // exit 0 and no base or fix phase run at all, and `every` over that one entry
-  // is vacuously true — so the field documented as "every container completed its
-  // phases" reported success for a run that never reached a phase.
-  return { events, phases, complete: ended === null && phases.every((p) => p.exitCode === 0) };
+  // `refused`, not `ended`. A refusal breaks out with the agent container at exit
+  // 0 and no phase run at all, and `every` over that one entry is vacuously true
+  // — so `complete` reported success for a run that never reached a phase. But
+  // gating on `ended` overshot: `not_reproduced` sets it too, and ADR-0007 calls
+  // that a DELIVERABLE, not a failure. A clean Tier 3 run would have reported
+  // itself incomplete, collapsing "the gate honestly held" with "a container
+  // died".
+  return { events, phases, refused, complete: !refused && phases.every((p) => p.exitCode === 0) };
 }
 
 /**
@@ -456,18 +495,30 @@ async function runContainer(
   // is gone. Whatever a participant planted in its own store comes along, but it
   // was only ever visible to itself — and the sentinel is skipped so a store that
   // never held one does not acquire it here.
-  for (const entry of await readdir(store)) {
-    if (entry === '.evidence-store') continue;
-    await cp(join(store, entry), join(plan.blobRoot, entry), { recursive: true, force: true });
+  //
+  // Never by throwing, though. Both of these run MID-RUN, so a rejection here
+  // propagated out of `orchestrate()` and destroyed every phase captured so far —
+  // the same evidence-loss shape fixed twice already elsewhere in this file, left
+  // standing at the two sites that were not the one being looked at. A collection
+  // failure is reported instead: the events are the record, and a stream whose
+  // blobs went missing is still worth vastly more than no stream.
+  let collection = '';
+  try {
+    for (const entry of await readdir(store)) {
+      if (entry === '.evidence-store') continue;
+      await cp(join(store, entry), join(plan.blobRoot, entry), { recursive: true, force: true });
+    }
+  } catch (error) {
+    collection = `\ncould not collect this container's artifacts: ${String(error)}`;
   }
-  await rm(store, { recursive: true, force: true });
+  await rm(store, { recursive: true, force: true }).catch(() => {});
 
   if (truncated) {
     // Refusing beats guessing: a stream cut mid-line is not a stream, and the
     // fold would reject it anyway on the seq that never arrived.
     throw new Error(`the ${phase} container produced more than ${MAX_STREAM_BYTES} bytes of events`);
   }
-  return { phase, events: parse(stdout), exitCode, stderr: stderr.trim(), ...(handover ? { handover } : {}) };
+  return { phase, events: parse(stdout), exitCode, stderr: (stderr + collection).trim(), ...(handover ? { handover } : {}) };
 }
 
 const parse = (stdout: string): RunEvent[] =>

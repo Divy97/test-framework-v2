@@ -15,7 +15,7 @@ import { basename } from 'node:path';
 import { promisify } from 'node:util';
 import type { RunEvent } from './events.js';
 import { superviseAgent } from './agent.js';
-import { ObservationFailed, verify, type ReproSpec } from './verify.js';
+import { MAX_REASON_CHARS, ObservationFailed, verify, type ReproSpec } from './verify.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -289,9 +289,9 @@ const MAX_BUNDLE_BYTES = 256 * 1024 * 1024;
  * Silently skipped when `/out` is not mounted, because a run that only wants the
  * transcript should not fail for want of somewhere to put code.
  */
-async function handOverCommits(world: { tree: string; gitDir: string }): Promise<void> {
+async function handOverCommits(world: { tree: string; gitDir: string }): Promise<string | null> {
   const mounted = await stat(HANDOVER).then((s) => s.isDirectory()).catch(() => false);
-  if (!mounted) return;
+  if (!mounted) return null;
 
   // The bundle is written by uid 1000 now, so the mount has to be reachable by
   // it. The host owns the directory and reads it afterwards; only this one file
@@ -344,22 +344,17 @@ async function handOverCommits(world: { tree: string; gitDir: string }): Promise
     // finds no bundle, refuses, and records why; everything observed up to that
     // point survives, because a run that cannot be trusted is still a run that
     // observed things.
-    process.stderr.write(
-      `could not bundle the agent commits: ${detail.trim().split('\n')[0] || String(error)}\n`,
-    );
-    return;
+    return `could not bundle the agent commits: ${detail.trim().split('\n')[0] || String(error)}`;
   }
 
   const { size } = await stat(bundle);
   if (size > MAX_BUNDLE_BYTES) {
     await rm(bundle, { force: true });
-    process.stderr.write(
-      `the agent's commits came to ${size} bytes, past the ${MAX_BUNDLE_BYTES} ceiling\n`,
-    );
-    return;
+    return `the agent's commits came to ${size} bytes, past the ${MAX_BUNDLE_BYTES} ceiling`;
   }
   // The host reads it; the agent user must not be able to rewrite it afterwards.
   await chmod(bundle, 0o444);
+  return null;
 }
 
 async function readStdin(): Promise<string> {
@@ -554,7 +549,22 @@ export async function runJob(
     // cannot stop a file's own owner, and a bind mount does not carry the mode
     // to the host anyway.
     await clearTheField([], evidence);
-    await handOverCommits(agentWorld);
+    // Recorded as an event, not written to a stream nothing folds. The size
+    // ceiling and a failed bundle used to reach only `process.stderr`, which the
+    // orchestrator keeps on `PhaseResult.stderr` and never persists — so the
+    // IMMUTABLE LOG stated `no bundle was left at the handover path`, a false
+    // cause, while the true one lived somewhere no projection reads. The Runner
+    // is the sole event writer and is standing right here.
+    const failed = await handOverCommits(agentWorld);
+    if (failed) {
+      transcript.push({
+        run_id: job.runId,
+        seq: (transcript.at(-1)?.seq ?? job.afterSeq) + 1,
+        ts: new Date().toISOString(),
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'setup', reason: failed.slice(0, MAX_REASON_CHARS) },
+      });
+    }
     // The agent's world is discarded outright, not scrubbed. ADR-0010 already
     // says its tree does not survive — but the tree, TMPDIR and HOME are all
     // uid-1000-owned, so leaving them standing lets the BASE phase write there

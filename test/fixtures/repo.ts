@@ -73,6 +73,37 @@ export const APPLIED_REPRO: ReproSpec = {
   files: { 'repro.sh': 'cat src.txt\ngrep -q right src.txt\n' },
 };
 
+/**
+ * A regression: the repo was good, a commit broke it, and NOTHING fixes it yet.
+ *
+ * The shape that makes `git revert` the correct repair — and the shape the
+ * authorship check has to let through. A revert reproduces the earlier good tree
+ * exactly, so a check that refuses any previously-seen tree accuses a correct
+ * agent of handing over work it did not do. There is deliberately no fix commit
+ * anywhere: content identical to an off-base commit is the INHERITANCE signal,
+ * and a fixture carrying a ready-made fix cannot tell the two apart.
+ */
+export function regression(): Fixture {
+  const repo = mkdtempSync(join(tmpdir(), 'engine-fixture-'));
+  const blobRoot = mkdtempSync(join(tmpdir(), 'engine-blobs-'));
+  created.push(repo, blobRoot);
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo });
+  const head = () =>
+    execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+
+  git('init', '--quiet', '--initial-branch=main');
+  git('config', 'user.email', 'fixture@example.com');
+  git('config', 'user.name', 'Fixture');
+  writeFileSync(join(repo, 'src.txt'), 'right\n');
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'good');
+  writeFileSync(join(repo, 'src.txt'), 'wrong\n');
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'the regression');
+  const base = head();
+  return { repo, base, fix: base, blobRoot };
+}
+
 /** Clean red -> green. The only case where every check should be satisfied. */
 export const clean = () => makeRepo({ 'src.txt': 'wrong\n' }, { 'src.txt': 'right\n' });
 
