@@ -4,7 +4,9 @@
 // thing ran both times. Everything here either demonstrates that anchor holding,
 // or demonstrates precisely where it does not reach.
 
-import { chmodSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import type {
@@ -28,6 +30,10 @@ import {
   irreproducible,
   NOISY_REPRO,
   nonAsciiPath,
+  noOpFix,
+  ORDER_DEPENDENT_REPRO,
+  IGNORED_PATH_REPRO,
+  noOpFixWithIgnores,
   PINNED_REPRO,
   pinnedTampering,
   REPRO_NEEDING_FIX_HELPER,
@@ -701,6 +707,71 @@ describe('a crash is not a test failure', () => {
     });
 
     expect(basePhase(events)).toMatchObject({ exit_code: -1, signal: 'SIGKILL' });
+  });
+});
+
+/**
+ * The tree is scrubbed between phases. Everything outside it was not, and that
+ * is the same hole one step further out — reachable with no forged event, no
+ * surviving process, and no tampering with the reproduction's bytes.
+ */
+describe('the world the fix phase sees, not just the tree', () => {
+  const scratch = () => mkdtempSync(join(tmpdir(), 'engine-phase-tmp-'));
+
+  test('a repro that is red once and green after is NOT a reproduction', async () => {
+    const tmp = scratch();
+    const events = await observe(noOpFix(), {
+      repro: ORDER_DEPENDENT_REPRO,
+      runEnv: { TMPDIR: tmp },
+      onPhaseBoundary: async () => {
+        for (const e of readdirSync(tmp)) rmSync(join(tmp, e), { recursive: true, force: true });
+      },
+      flakeRuns: 2,
+    });
+
+    // Everything the engine checks is satisfied: the repro hashes identically on
+    // every run, the base failed with the reported symptom. Only the scrub stops
+    // the fix from inheriting the flag the base run wrote.
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    // The FIRST fix run is the one the scrub decides: it starts without the base
+    // run's flag, so the repro is red again and the fold refuses. The re-runs
+    // after it go green, because flake re-runs deliberately share a world — they
+    // are re-executions of the same fix, not independent trials — and one red
+    // run in the series is already enough.
+    expect(fixPhases(events)[0]!.exit_code).not.toBe(0);
+    expect(conclude(events).reproduced).toBe(false);
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('an ignored directory inside the repo is not a hiding place either', async () => {
+    // `git clean -dff` spares ignored files on purpose. Between phases that is
+    // the easiest channel of all: node_modules/ is ignored in every real repo,
+    // and the fix commit need not touch .gitignore to use it.
+    const events = await observe(noOpFixWithIgnores(), {
+      repro: IGNORED_PATH_REPRO,
+      flakeRuns: 2,
+    });
+
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events)[0]!.exit_code).not.toBe(0);
+    expect(conclude(events).reproduced).toBe(false);
+  });
+
+  test('and without the scrub it would be credited — the attack is real', async () => {
+    // The negative control. Left unscrubbed, a fix commit that touches only
+    // README.md is credited as a Tier 1 reproduction with the anchor intact.
+    // This asserts the vulnerability rather than the defence, so the defence
+    // cannot quietly stop being the reason the first test passes.
+    const tmp = scratch();
+    const events = await observe(noOpFix(), {
+      repro: ORDER_DEPENDENT_REPRO,
+      runEnv: { TMPDIR: tmp },
+      flakeRuns: 2,
+    });
+
+    expect(fixDiff(events).changed_files).toEqual(['README.md']);
+    expect(conclude(events).reproduced).toBe(true);
+    rmSync(tmp, { recursive: true, force: true });
   });
 });
 

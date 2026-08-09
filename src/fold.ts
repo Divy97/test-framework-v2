@@ -2,7 +2,13 @@
 // happens (ADR-0001/0004): events say what occurred; the fold says what it means.
 // Zero I/O, zero side effects. Replay (ADR-0003) is just this function.
 
-import type { ArtifactRef, RunEndedV1, RunEvent, VerificationPhase } from './events.js';
+import type {
+  AgentFinishedV1,
+  ArtifactRef,
+  RunEndedV1,
+  RunEvent,
+  VerificationPhase,
+} from './events.js';
 
 /**
  * `unresolved` and `errored` are deliberately separate terminal states.
@@ -74,6 +80,17 @@ export type RunState = {
    * are immutable, so that truncation is permanent.
    */
   completedAttempts: number[];
+  /**
+   * The agent's transcript. TESTIMONY (ADR-0006) — displayed, never trusted.
+   *
+   * Kept in its own field rather than mixed into the run's record so a consumer
+   * cannot reach it by accident, and deliberately NOT added to `artifactHashes`:
+   * that list feeds the evidence report, and what the agent said is not evidence.
+   * Nothing here is read by `isReproduced`, and nothing here ever should be.
+   */
+  transcript: { n: number; claimed_type: string | null; raw_hash: ArtifactRef; bytes: number }[];
+  /** How supervision ended. This one IS evidence: the Runner watched the process. */
+  agent: Omit<AgentFinishedV1, 'v'> | null;
   pr: { repo: string; pr_number: number; head_sha: string } | null;
   /**
    * Every phase that stopped being observable, in order. Not terminal: an attempt
@@ -114,6 +131,8 @@ const initialState = (runId: string): RunState => ({
   reproduced: false,
   fixDiff: null,
   completedAttempts: [],
+  transcript: [],
+  agent: null,
   pr: null,
   aborts: [],
   afterEnd: [],
@@ -171,6 +190,26 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // from the last TEST_RUN.
         reproduced: isReproduced(state.testRuns, registrations, state.aborts, state.completedAttempts),
       };
+    }
+    case 'AGENT_MESSAGE':
+      // Recorded and nothing else. No status change, no recompute of anything —
+      // the agent talking cannot move the run forward, only the Runner's own
+      // observations can.
+      return {
+        ...next,
+        transcript: [
+          ...state.transcript,
+          {
+            n: event.payload.n,
+            claimed_type: event.payload.claimed_type,
+            raw_hash: event.payload.raw_hash,
+            bytes: event.payload.bytes,
+          },
+        ],
+      };
+    case 'AGENT_FINISHED': {
+      const { v, ...finished } = event.payload;
+      return { ...next, agent: finished };
     }
     case 'SANDBOX_CREATED':
       return { ...next, status: 'sandbox_ready' };

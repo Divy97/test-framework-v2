@@ -15,7 +15,7 @@
 // same repo must not trip the dirty-tree refusal on this run's leftovers.
 
 import { execFile } from 'node:child_process';
-import { constants, lstat, mkdir, open, realpath, rm } from 'node:fs/promises';
+import { constants, lstat, mkdir, open, readdir, realpath, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
@@ -131,6 +131,37 @@ export type VerifyOptions = {
    * another user's /proc/1/fd/N is listable but not openable.
    */
   runAs?: { uid: number; gid: number };
+  /**
+   * Environment for the repro, layered over the engine's own.
+   *
+   * The sandbox uses it to give the phases a private TMPDIR and HOME. Anchoring
+   * the reproduction fixes WHAT runs; it says nothing about the world it runs
+   * in, and an agent sharing a temp directory with the phases can seed a file
+   * the test reads and make a no-op fix go green. Every anti-gaming check still
+   * passes, because none of them is about the environment.
+   *
+   * It redirects only a test that honours TMPDIR; one writing `/tmp` literally
+   * still shares the path. That half is closed in the Runner (ADR-0010).
+   */
+  runEnv?: Env;
+  /**
+   * Run at the phase boundary, alongside the git scrub.
+   *
+   * The tree is scrubbed between base and fix because base-phase residue could
+   * carry the fix to green on its own. Everything OUTSIDE the tree was left
+   * alone, and that is the same hole one step further out: base and fix share a
+   * TMPDIR, a HOME and every world-writable path in the container, so a repro
+   * that merely behaves differently the second time manufactures red-then-green
+   * against a fix that changes nothing.
+   *
+   *     flag="$TMPDIR/.seen"; [ -f "$flag" ] && exit 0; touch "$flag"; <test>
+   *
+   * That repro is byte-identical across both checkouts and hashes identically on
+   * every run, so the anchor is intact and every anti-gaming check passes. It is
+   * agent-authored, which is exactly the threat ADR-0008 exists for — the anchor
+   * fixes the repro's BYTES, never its side effects.
+   */
+  onPhaseBoundary?: () => Promise<void>;
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -150,6 +181,7 @@ async function run(
   timeoutMs: number,
   maxOutputBytes: number,
   runAs?: { uid: number; gid: number },
+  runEnv?: Env,
 ): Promise<Execution> {
   const startedAt = Date.now();
   try {
@@ -158,6 +190,7 @@ async function run(
       timeout: timeoutMs,
       maxBuffer: maxOutputBytes,
       ...(runAs ?? {}),
+      ...(runEnv ? { env: { ...process.env, ...runEnv } } : {}),
     });
     return { exitCode: 0, output: stdout, durationMs: Date.now() - startedAt };
   } catch (error) {
@@ -500,7 +533,7 @@ async function observe(
     payload: { v: 1, command: reproCommand, files: registered, applied: [...appliedFiles.keys()].sort() },
   });
 
-  const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs);
+  const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
   emit({
     type: 'TEST_RUN',
     payload: {
@@ -529,7 +562,20 @@ async function observe(
   // than it isolates it.
   progress.phase = 'fix';
   await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
-  await git(['clean', '--quiet', '-dff'], repoPath, gitEnv);
+  // `-x` here and nowhere else. Ignored files are spared elsewhere because they
+  // are usually installed dependencies, and removing them changes what is under
+  // test — but between the phases of one repo they are simply the easiest place
+  // for the base run to leave a flag the fix run reads, and `node_modules/`,
+  // `dist/` and `coverage/` are ignored in every real repository. Nothing
+  // installs dependencies yet (M2 deferred it), so today this costs nothing; a
+  // `setupCommand` must run per phase rather than once.
+  await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+  // The same scrub, one step further out. Whatever the base run left behind
+  // outside the tree — state on disk, or a process still running — is what the
+  // fix run would otherwise inherit, and a repro needs no more than that to be
+  // red once and green afterwards. The Runner owns what that means; the engine
+  // only owns the tree.
+  await options.onPhaseBoundary?.();
   await checkout(fixSha, repoPath, gitEnv);
   // The same bytes again — this is the whole point. Whatever the fix commit says
   // the reproduction is, the registered version is what runs.
@@ -537,7 +583,7 @@ async function observe(
   // Re-runs deliberately share a working tree: they are re-executions of the same
   // fix, not independent trials, and isolating them would hide order-dependent flake.
   for (let repeat = 0; repeat <= flakeRuns; repeat++) {
-    const fix = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs);
+    const fix = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
     emit({
       type: 'TEST_RUN',
       payload: {

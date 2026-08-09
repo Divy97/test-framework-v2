@@ -9,10 +9,12 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
+import { basename } from 'node:path';
 import { promisify } from 'node:util';
 import type { RunEvent } from './events.js';
+import { superviseAgent } from './agent.js';
 import { ObservationFailed, verify, type ReproSpec } from './verify.js';
 
 const execFileAsync = promisify(execFile);
@@ -28,6 +30,16 @@ export type Job = {
   repro: ReproSpec;
   /** Serialised as a string: JSON has no regex, and the source must survive the wire. */
   symptomPattern: string;
+  /**
+   * Ask the agent this before verifying. Omitted, no agent runs at all — which is
+   * the M3.1 shape, kept working so the engine stays testable without one.
+   *
+   * A prompt, never a command: the Runner chooses the binary and its flags. A
+   * caller-supplied command line would be arbitrary execution wearing a
+   * configuration field's clothes.
+   */
+  agentPrompt?: string;
+  agentTimeoutMs?: number;
   flakeRuns?: number;
   timeoutMs?: number;
 };
@@ -83,6 +95,65 @@ async function hostStoreIsMounted(path: string): Promise<boolean> {
   }
 }
 
+/**
+ * Leave nothing of the agent running, and nothing of its debris lying around,
+ * before the phases begin.
+ *
+ * A process the agent backgrounds outlives it. Running as the repro user it can
+ * write the phases' own private TMPDIR and HOME, so separating those directories
+ * does nothing at all against it — it stages the red-then-green flip from
+ * inside. Killing the agent's process group is not enough either: a grandchild
+ * that calls `setsid` leaves the group.
+ *
+ * Being PID 1 is what makes this closable. The Runner owns the container's PID
+ * namespace, so every other process in /proc is something this run started, and
+ * nothing legitimate is running between the agent finishing and the base phase.
+ *
+ * The shared tmpfs directories go with them. `TMPDIR` only redirects a test that
+ * honours it; one that writes `/tmp` literally shares the path regardless, and
+ * `/var/tmp` and `/dev/shm` are world-writable too. Enumerating them here is
+ * exactly the enumeration ADR-0010 said nobody finishes — which is why the reap
+ * above is the load-bearing half and this is the belt to its braces.
+ *
+ * Gated hard on being PID 1: outside a container this would kill the developer's
+ * session and erase their /tmp.
+ */
+async function clearTheField(extra: string[] = []): Promise<void> {
+  if (process.pid !== 1) return;
+  for (const entry of await readdir('/proc')) {
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid <= 1) continue;
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone, or not ours to signal. Either way there is nothing to do.
+    }
+  }
+  // `/home/node` is in the list because the image ships it owned by uid 1000 —
+  // a reminder that "world-writable" is the wrong set. The set that matters is
+  // "writable by the repro user", and it is strictly larger.
+  for (const dir of ['/tmp', '/var/tmp', '/dev/shm', '/home/node', ...extra]) {
+    // The repro owns its own TMPDIR and HOME, so it can replace either with a
+    // symlink and have this root-privileged delete follow it. Pointed at
+    // /blobs that empties the host evidence store — every earlier run's
+    // artifacts, not just this one's — and the run still exits 0. lstat, so a
+    // link is seen as a link.
+    const kind = await lstat(dir).catch(() => null);
+    if (!kind) continue;
+    if (!kind.isDirectory()) {
+      throw new ObservationFailed(
+        `${dir} is not a directory; the phases' scratch space was replaced and cannot be scrubbed`,
+      );
+    }
+    for (const entry of await readdir(dir)) {
+      // A failure here is a failure to isolate, which is a failure to observe.
+      // Swallowed, the fix phase silently inherits base-phase state and the run
+      // is credited anyway.
+      await rm(`${dir}/${entry}`, { recursive: true, force: true });
+    }
+  }
+}
+
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
@@ -95,14 +166,11 @@ export async function runJob(
   blobRoot = BLOBS,
   emit: (line: string) => void = (line) => process.stdout.write(line),
 ): Promise<number> {
-  const repoPath = `${workDir}/repo`;
-  // Git's own state lives outside the worktree. Inside it, the repro owns .git
-  // and plants a post-checkout hook that `git clean` never descends into, which
-  // the Runner then executes as root — so uid 1000 was never the boundary it
-  // looked like. GIT_DIR is passed explicitly so git never consults the `.git`
-  // file left in the worktree either.
-  const gitDir = `${workDir}/gitdir`;
-  const gitEnv = { GIT_DIR: gitDir, GIT_WORK_TREE: repoPath };
+  // Git's own state lives outside every worktree. Inside one, the repro owns
+  // .git and plants a post-checkout hook that `git clean` never descends into,
+  // which the Runner then executes as root — so uid 1000 was never the boundary
+  // it looked like. GIT_DIR is passed explicitly so git never consults the
+  // `.git` file left in the worktree either.
 
   // Refuse rather than silently write into the container layer. Without the
   // mount the run still produces a complete, plausible event stream whose
@@ -143,29 +211,90 @@ export async function runJob(
     }
   };
 
-  await setUp(
-    `clone ${job.sourcePath}`,
-    execFileAsync('git', [
-      'clone', '--quiet', '--no-local', `--separate-git-dir=${gitDir}`, '--', job.sourcePath, repoPath,
-    ]),
-  );
-
   // The repro runs as this user, not as the Runner. Root in the Runner's own
   // namespace can reach the event channel through /proc/1/fd/N whatever the
   // Runner does with its own descriptors.
   const runAs = { uid: REPRO_UID, gid: REPRO_GID };
-  // The worktree only. Not the blob store, and not the git dir.
-  await setUp(
-    'hand the worktree to the repro user',
-    execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, repoPath]),
-  );
-  // The Runner stays root, so git now sees a tree owned by someone else and
-  // refuses it as "dubious ownership". Scoped to this path, inside a container
-  // built for exactly one run.
-  await setUp(
-    'mark the worktree safe for git',
-    execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]),
-  );
+
+  /** A private world for one participant: its own tree, its own TMPDIR, its own HOME. */
+  const world = async (name: string) => {
+    const root = `${workDir}/${name}`;
+    const tree = `${root}/repo`;
+    const tmp = `${root}/tmp`;
+    const home = `${root}/home`;
+    await mkdir(tmp, { recursive: true });
+    await mkdir(home, { recursive: true });
+    await setUp(
+      `clone ${job.sourcePath} for ${name}`,
+      // `--` so a sourcePath cannot be read as an option: `--upload-pack=…` and
+      // `ext::sh -c …` are both command execution.
+      execFileAsync('git', [
+        'clone', '--quiet', '--no-local', `--separate-git-dir=${root}/gitdir`, '--',
+        job.sourcePath, tree,
+      ]),
+    );
+    // The worktree, the temp dir and the home dir. NOT the root, and above all
+    // not the gitdir under it — an earlier version of this chowned `${root}`
+    // wholesale, which handed the repro `gitdir/hooks/post-checkout` and had the
+    // Runner execute it as root on the next checkout. That is the exact hole
+    // `--separate-git-dir` was introduced to close, reopened by a refactor that
+    // looked like tidying.
+    for (const path of [tree, tmp, home]) {
+      await setUp(
+        `hand ${name}'s ${basename(path)} to the repro user`,
+        execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, path]),
+      );
+    }
+    // The Runner stays root, so git now sees a tree owned by someone else and
+    // refuses it as "dubious ownership". Scoped to this path, inside a container
+    // built for exactly one run.
+    await setUp(
+      `mark ${name} safe for git`,
+      execFileAsync('git', ['config', '--global', '--add', 'safe.directory', tree]),
+    );
+    return { tree, gitDir: `${root}/gitdir`, env: { TMPDIR: tmp, HOME: home } };
+  };
+
+  // The agent goes first and gets its own seq range, so the log reads in the
+  // order things happened: it says its piece, and only then does the engine
+  // start observing. Its events are testimony and are emitted alongside the
+  // evidence, never mixed into it (ADR-0006).
+  //
+  // It runs as the repro user for the same reason the repro does — root in this
+  // PID namespace could open the event channel through /proc/1/fd/N.
+  //
+  // And it gets its OWN world. Anchoring the reproduction fixes what runs; it
+  // says nothing about the world it runs in. Sharing a filesystem with the
+  // phases, the agent needs no forged event to fabricate a verdict: it seeds
+  // state a test reads — a gitignored directory the phase scrub deliberately
+  // spares, $HOME, or a temp dir — and the test goes red then green while the
+  // "fix" changes nothing. Every anti-gaming check still passes, because not one
+  // of them is about the environment. So the trees are separate clones, the
+  // verification tree is made only after the agent is finished, and neither
+  // TMPDIR nor HOME is shared. Separation is not the whole answer, though —
+  // `clearTheField` below is, because a process that outlives the agent runs as
+  // the same uid and can write the phases' private directories anyway.
+  const agentWorld = job.agentPrompt ? await world('agent') : null;
+  const transcript = agentWorld
+    ? await superviseAgent({
+        runId: job.runId,
+        afterSeq: job.afterSeq,
+        prompt: job.agentPrompt!,
+        cwd: agentWorld.tree,
+        blobRoot: staging,
+        runAs,
+        env: agentWorld.env,
+        ...(job.agentTimeoutMs === undefined ? {} : { timeoutMs: job.agentTimeoutMs }),
+      })
+    : [];
+
+  // Nothing the agent started may still be running when the phases begin, and
+  // nothing it left in a shared directory may still be there.
+  if (agentWorld) await clearTheField();
+
+  // Cloned now, not earlier: a tree that existed while the agent ran is a tree
+  // the agent could have written to.
+  const phases = await world('verify');
 
   let events: RunEvent[];
   // A run that could not be observed to the end is still a run that observed
@@ -176,15 +305,26 @@ export async function runJob(
   try {
     events = await verify({
       runId: job.runId,
-      afterSeq: job.afterSeq,
-      repoPath,
+      // Continue the log rather than restart it: the engine's first event must
+      // not collide with the last thing the agent said.
+      afterSeq: transcript.at(-1)?.seq ?? job.afterSeq,
+      repoPath: phases.tree,
       baseRef: job.baseRef,
       fixRef: job.fixRef,
       repro: job.repro,
       symptomPattern: new RegExp(job.symptomPattern),
       blobRoot: staging,
-      gitEnv,
+      gitEnv: { GIT_DIR: phases.gitDir, GIT_WORK_TREE: phases.tree },
       runAs,
+      runEnv: phases.env,
+      // Base and fix share one world by design — they must, to switch commits in
+      // one tree — so the boundary between them needs everything the agent
+      // boundary got, not a subset of it. A repro that merely behaves
+      // differently the second time is otherwise red once and green afterwards,
+      // and nothing about the fix has to change; and a process the BASE phase
+      // backgrounds is the same attack again, which no amount of directory
+      // scrubbing reaches.
+      onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME]),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });
@@ -223,7 +363,10 @@ export async function runJob(
 
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
-  for (const event of events) emit(`${JSON.stringify(event)}\n`);
+  // JSON.stringify is what makes the agent unable to forge a sibling event: a
+  // message shaped like a RunEvent was already put inside a string field, and
+  // this escapes it rather than letting it out onto its own line.
+  for (const event of [...transcript, ...events]) emit(`${JSON.stringify(event)}\n`);
   return exitCode;
 }
 

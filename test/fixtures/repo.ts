@@ -331,6 +331,89 @@ export function unrelatedHistories(): Fixture {
   return { repo, base, fix, blobRoot };
 }
 
+/**
+ * A committed test whose result depends on a process outside the repository.
+ *
+ * The fix commit touches one unrelated file, so nothing about the code under
+ * test changes. The test is maintainer-authored, `pinned`, and byte-identical on
+ * every run — the strongest provenance ADR-0008 recognises. Everything the
+ * engine checks is therefore satisfied, and the verdict is decided entirely by
+ * whether something outside the repo flips the marker between phases.
+ *
+ * It signals through /dev/shm rather than $TMPDIR precisely because a private
+ * TMPDIR does not close this: the survivor runs as the repro user and could
+ * write the phases' own directories just as easily.
+ */
+export const survivorGamed = () =>
+  makeRepo(
+    {
+      'src.txt': 'wrong\n',
+      'tests/existing.sh':
+        'echo x >> /dev/shm/beacon\n' +
+        '[ -f /dev/shm/marker ] && exit 0\n' +
+        'echo "wrong: still broken"\n' +
+        'exit 1\n',
+    },
+    { 'README.md': 'an unrelated change\n' },
+  );
+
+/**
+ * Red the first time it runs and green every time after, on a flag it keeps
+ * OUTSIDE the repository.
+ *
+ * The simplest possible fabrication, and the one the anchor cannot touch: the
+ * bytes are identical across both checkouts and hash identically on every run,
+ * so ADR-0008 is fully satisfied. The anchor fixes the reproduction's bytes; it
+ * says nothing about its side effects. The git scrub at the phase boundary
+ * cleans the tree and only the tree, so base and fix share a TMPDIR — and one
+ * flag is the whole attack.
+ *
+ * Pair it with `noOpFix()` and the fix commit does not touch the code at all.
+ */
+export const ORDER_DEPENDENT_REPRO: ReproSpec = {
+  command: 'sh repro.sh',
+  files: {
+    'repro.sh':
+      'flag="${TMPDIR:-/tmp}/.seen"\n' +
+      'cat src.txt\n' +
+      'if [ -f "$flag" ]; then exit 0; fi\n' +
+      'touch "$flag"\n' +
+      'grep -q right src.txt\n',
+  },
+};
+
+/** The bug is untouched; the "fix" edits an unrelated file. */
+export const noOpFix = () =>
+  makeRepo({ 'src.txt': 'wrong\n' }, { 'README.md': 'an unrelated change\n' });
+
+/**
+ * The same order-dependent trick, with the flag inside the repo — in a directory
+ * `.gitignore` already covers.
+ *
+ * `git clean -dff` spares ignored files by design, because they are usually
+ * installed dependencies. Between the phases of one repo that reasoning does not
+ * hold: `node_modules/`, `dist/` and `coverage/` are ignored in every real
+ * repository, and each is simply the easiest place for the base run to leave a
+ * flag the fix run reads.
+ */
+export const IGNORED_PATH_REPRO: ReproSpec = {
+  command: 'sh repro.sh',
+  files: {
+    'repro.sh':
+      'flag=node_modules/.seen\n' +
+      'cat src.txt\n' +
+      'if [ -f "$flag" ]; then exit 0; fi\n' +
+      'mkdir -p node_modules && touch "$flag"\n' +
+      'grep -q right src.txt\n',
+  },
+};
+
+export const noOpFixWithIgnores = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', '.gitignore': 'node_modules/\n' },
+    { 'README.md': 'an unrelated change\n' },
+  );
+
 /** Base already passes: nothing was reproduced, so no fix should ever be credited. */
 export const irreproducible = () => makeRepo({ 'src.txt': 'right\n' }, { 'notes.md': 'nope\n' });
 

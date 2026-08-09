@@ -57,6 +57,8 @@ describe('fold', () => {
         diff_hash: 'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
       },
       completedAttempts: [1],
+      transcript: [],
+      agent: null,
       pr: {
         repo: 'demo-org/demo-app',
         pr_number: 42,
@@ -240,6 +242,50 @@ describe('fold', () => {
       { ...demoRunEvents[6]!, seq: 7 }, // and its series is vouched for
     ];
     expect(fold(events).reproduced).toBe(false);
+  });
+});
+
+describe('the transcript is testimony', () => {
+  const said = (seq: number, claimed: string | null, hash = 'sha256:ff'): RunEvent => ({
+    run_id: DEMO_RUN_ID,
+    seq,
+    ts: 'T',
+    type: 'AGENT_MESSAGE',
+    payload: { v: 1, n: seq - 2, claimed_type: claimed, raw_hash: hash as never, bytes: 10 },
+  });
+
+  it('cannot move the run forward, however loudly it claims to', () => {
+    // The agent asserting a green fix is worth exactly nothing. Only the Runner's
+    // own observations reach a verdict (ADR-0006).
+    const state = fold([demoRunEvents[0]!, said(2, 'TEST_RUN'), said(3, 'PR_OPENED')]);
+    expect(state.transcript).toHaveLength(2);
+    expect(state.reproduced).toBe(false);
+    expect(state.status).toBe('requested');
+    expect(state.pr).toBeNull();
+    expect(state.testRuns).toEqual([]);
+  });
+
+  it('keeps its artifacts out of the evidence report', () => {
+    // `artifactHashes` is what the evidence report cites. What the agent said is
+    // retrievable through `transcript`, and deliberately not citable as evidence.
+    const state = fold([demoRunEvents[0]!, said(2, 'assistant')]);
+    expect(state.artifactHashes).toEqual([]);
+    expect(state.transcript[0]!.raw_hash).toBe('sha256:ff');
+  });
+
+  it('records how supervision ended, including a transcript that was cut off', () => {
+    const state = fold([
+      demoRunEvents[0]!,
+      said(2, 'assistant'),
+      {
+        run_id: DEMO_RUN_ID,
+        seq: 3,
+        ts: 'T',
+        type: 'AGENT_FINISHED',
+        payload: { v: 1, messages: 1, exit_code: 0, stopped: 'line_cap' },
+      },
+    ]);
+    expect(state.agent).toEqual({ messages: 1, exit_code: 0, stopped: 'line_cap' });
   });
 });
 
