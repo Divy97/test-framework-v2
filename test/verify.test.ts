@@ -917,7 +917,7 @@ describe('the symptom observation cannot depend on call order', () => {
 });
 
 describe('the sham-fix control', () => {
-  test('refuses a reproduction that tests which commit it is running on', async () => {
+  test('flags, without refusing, a reproduction that tests which commit it is on', async () => {
     // The oracle: green unless the tree is exactly base's. Every anchor is
     // satisfied — same bytes both phases, deterministic, no abort — and it is red
     // on base and green on any change at all, which is what the control exists to
@@ -937,11 +937,13 @@ describe('the sham-fix control', () => {
             'exit 0\n',
         },
       },
-    }).catch((error: Error) => error);
-    expect(String(events)).toMatch(/which commit this is/);
+    });
+    // Recorded as a green sham for a human to read. The engine no longer draws a
+    // verdict from it — see the advisory note below.
+    expect(testRuns(events).some((r) => r.phase === 'control' && r.exit_code === 0)).toBe(true);
   });
 
-  test('does not accuse an honest reproduction of a missing-newline bug', async () => {
+  test('never accuses an honest reproduction, whatever the sham does to it', async () => {
     // The false positive that made one sham unsafe: appending to a tracked file
     // IS the fix for an EOF-conformance bug, so a single sham turned a correct
     // agent into an accusation. Two independent draws disagree, and disagreement
@@ -951,6 +953,8 @@ describe('the sham-fix control', () => {
     const runs = testRuns(events);
     expect(runs.find((r) => r.phase === 'base')?.exit_code).not.toBe(0);
     expect(runs.find((r) => r.phase === 'fix')?.exit_code).toBe(0);
+    // The sham's append IS the fix for an EOF bug, so a control that ACCUSED on
+    // this would convict a correct agent in an immutable log.
     expect(events.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
   });
 
@@ -990,12 +994,19 @@ describe('the sham-fix control', () => {
         'exit 0\n',
       true,
     ],
-  ])('catches %s', async (_label, script, caught) => {
+  ])('records a green sham for %s', async (_label, script, flagged) => {
+    // ADVISORY. The control emits what it saw and never ends a run: it convicted
+    // honest reproductions at a rate that depended on `randomInt` — 6 of 12
+    // identical runs — and a permanent accusation decided by a coin flip is worse
+    // than the hole it guards. The Tier 2 cap is what withholds the claim now;
+    // this is a signal a human reads, not a verdict.
     const events = await observe(clean(), {
       controlRun: true,
       repro: { command: 'sh repro.sh', files: { 'repro.sh': script } },
-    }).catch((error: Error) => error);
-    expect(String(events).includes('which commit this is')).toBe(caught);
+    });
+    const greens = testRuns(events).filter((r) => r.phase === 'control' && r.exit_code === 0);
+    expect(greens.length > 0).toBe(flagged);
+    expect(events.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
   });
 
   test('CANNOT catch an oracle keyed on the fix rather than on base', async () => {

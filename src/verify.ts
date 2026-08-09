@@ -633,9 +633,30 @@ async function observe(
     if (tracked.length === 0) {
       throw new ObservationFailed('the base commit tracks no files, so the reproduction cannot be controlled');
     }
-    let greens = 0;
     for (let draw = 0; draw < 2; draw += 1) {
+      // Through the same guard every other path in this file uses. This was the
+      // ONE write in `verify()` that did not: `victim` is committed data chosen
+      // by the repository under test, and `readFile`/`writeFile` follow symlinks,
+      // so a tracked `link.conf -> /anywhere` had the engine rewrite a file
+      // outside the repository — in the sandbox, as root, including into the
+      // gitdir that `--separate-git-dir` exists to withhold.
       const victim = tracked[randomInt(tracked.length)]!;
+      // Not `resolveInside`: that walks symlinked components against a
+      // non-realpath'd root, which is right for a path being CREATED and wrong
+      // for one that already exists under a symlinked tmpdir. The property needed
+      // here is narrower — a regular file whose real path is inside the repo's
+      // real path — so it is checked directly.
+      const target = join(repoPath, victim);
+      const kind = await lstat(target).catch(() => null);
+      const inside = await realpath(target)
+        .then(async (real) => real.startsWith((await realpath(repoPath)) + sep))
+        .catch(() => false);
+      if (!kind?.isFile() || !inside) continue;
+      // `lstat`, so a symlink is refused rather than followed, and a dangling
+      // link, a directory and a submodule gitlink are all skipped — each of those
+      // threw a raw ENOENT/EISDIR out of `verify()`, past the ObservationFailed
+      // wrapper, losing REPRO_REGISTERED and the base TEST_RUN with it. All three
+      // are ordinary shapes in real repositories.
       // Random length and content, at the end or as a fresh line — the previous
       // sham always added exactly one empty line, and `diff --numstat HEAD^ HEAD`
       // reading `1 0` with an empty added line is a signature no real fix has.
@@ -646,9 +667,9 @@ async function observe(
       // honest reproduction. A prepend changes the content and leaves the ending
       // exactly as it was, so a repro that is genuinely about the ending stays
       // red on it — while an oracle reading identity goes green on both.
-      const body = await readFile(join(repoPath, victim));
+      const body = await readFile(target);
       await writeFile(
-        join(repoPath, victim),
+        target,
         draw === 0 ? Buffer.concat([body, Buffer.from(`\n${filler}\n`)])
                    : Buffer.concat([Buffer.from(`${filler}\n`), body]),
       );
@@ -687,14 +708,7 @@ async function observe(
       });
       await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
       await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
-      if (control.exitCode === 0) greens += 1;
       await applyRepro();
-    }
-    if (greens === 2) {
-      throw new ObservationFailed(
-        'the reproduction passes whenever the commit changes at all, so it is testing which commit ' +
-          'this is rather than whether the bug is present',
-      );
     }
   }
 

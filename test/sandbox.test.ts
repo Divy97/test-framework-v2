@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
+import { confidence } from '../src/confidence.js';
 import { fold } from '../src/fold.js';
 import { orchestrate } from '../src/orchestrate.js';
 import { SHARED_WRITABLE } from '../src/runner.js';
@@ -1474,14 +1475,17 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     const base = state.testRuns.find((r) => r.phase === 'base');
     expect(base?.exit_code).toBe(1);
     expect(base?.symptom_matched).toBe(true);
-    // Refused at the base container, before a fix was ever judged — and SAID why,
-    // rather than failing as some anonymous infrastructure fault.
-    expect(state.reproduced).toBe(false);
-    expect(state.aborts.map((a) => a.phase)).toContain('base');
-    expect(state.aborts.some((a) => /which commit this is/.test(a.reason))).toBe(true);
-    // And not `errored`: this is a finding about the run, which is a status the
-    // agent must not be able to choose (ADR-0009).
-    expect(state.endedReason).not.toBe('error');
+
+    // The forgery SUCCEEDS at red-then-green. That is the honest record: the
+    // control is advisory and no longer ends a run, because ending runs meant
+    // convicting honest reproductions on a random draw.
+    expect(state.reproduced).toBe(true);
+    // What withholds the claim is the tier, and it does not depend on any sham
+    // working: the agent wrote the reproduction, so Tier 1 is unavailable.
+    expect(confidence(state).tier).toBe(2);
+    // And the control left evidence a human can read — a sham that went green is
+    // exactly the signal, even though the engine draws nothing from it.
+    expect(state.testRuns.some((r) => r.phase === 'control' && r.exit_code === 0)).toBe(true);
   }, 900_000);
 
   test('the agent authors the reproduction, and the log proves it came first', async () => {

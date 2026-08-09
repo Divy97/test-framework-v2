@@ -135,20 +135,38 @@ nothing constant that an oracle can match — content, metadata, diff shape, or 
 class of perturbation — and even a perfect sham cannot catch an oracle that keys
 on the FIX rather than on base.**
 
-That last clause is decisive, and it is why this section stops proposing better
-shams. The reproduction and the fix are written by the same model under the same
-operator. One line — `[ -f NOTES.md ] && exit 0` — is red on base, red on any
-sham of base, and green on the fix. The sham perturbs base, so it is blind to
-this by construction. No sixth version closes it. A perturbation that is merely
-invertible fails almost as cheaply: the control appends a newline, and an oracle
-that strips trailing newlines before hashing sees base and sham as identical.
+That clause was itself wrong, and this is the third correction to this section.
+The residual is NOT fix-keyed-only. Review defeated the control with five oracles
+keyed on BASE — the sham's committer TLD (`.example`, a literal in the engine's
+source, which is H1 reopened verbatim), the fixed LENGTHS of its author name and
+subject, the pure-hex shape of its inserted line, and the fact that its diff is
+always a modification and never an add, delete, rename or mode change. One of
+them needs no git at all: `grep -rlE "^[0-9a-f]{8,78}$"` finds the sham's own
+filler. Each time this section has been rewritten it has generalised from the
+last defeat; the sham has now been defeated six times, and the correct conclusion
+is not a seventh sham.
 
-**So the engine stops claiming what it cannot demonstrate.** A run whose
-reproduction the agent authored is capped at Tier 2 — reproduced, with the
-reproduction's independence unverified — rather than Tier 1. The sham-fix control
-stays, because it catches the naive oracles cheaply and its failures are
-informative, but it is no longer load-bearing for a Tier 1 claim, and nothing in
-this engine should read as though it were.
+**So the control no longer draws a verdict.** It was ending runs, and it convicted
+honest reproductions: for any bug whose honest assertion is monotone in file
+content — non-empty, minimum size, minimum line count, must-differ-from-template —
+both draws satisfy it, and review measured an honest agent accused in 6 of 12
+identical runs. A permanent, immutable accusation decided by `randomInt` is worse
+than the hole it guards. The control records what it saw as `TEST_RUN
+{ phase: 'control' }` and ends nothing. A human reads it; the engine draws
+nothing from it.
+
+**What withholds the claim is the tier, not the control.** A run whose
+reproduction the agent authored is capped at Tier 2 — reproduced, independence
+unverified — rather than Tier 1. That is a statement about what this engine can
+demonstrate, and it does not depend on any sham working.
+
+Two things are still open and are recorded here rather than implied away. ADR-0007
+defines Tier 1 as "an agent-authored test that fails on the base commit" and Tier
+2 as a scripted scenario; this amendment makes an agent-authored test ineligible
+for Tier 1 and borrows Tier 2 for a different meaning, so ADR-0007 needs amending
+or a new label needs choosing. And the cap moves the tier without moving the
+score: review measured a no-op fix at Tier 2, score 80, still reaching the fix
+container. Whether the tier is the right lever is undecided.
 
 Diff-coverage is the real answer here too: an identity oracle does not execute
 the lines the fix changed, and a reproduction of the bug does. That is the same

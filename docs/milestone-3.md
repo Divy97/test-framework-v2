@@ -94,20 +94,17 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   the bug is untouched, so a reproduction of the bug must still fail. It runs
   only when the agent authored the reproduction.
 
-  **Its limit, and the decision that follows.** Five versions of this control
-  were defeated, each by something it held constant — the sham's name, its name's
-  shape, its committer email and message, its diff's shape, and the fact that
-  appending a newline is invertible. Worse, review found the class no sham can
-  ever catch: an oracle keyed on the FIX rather than on base (`[ -f NOTES.md ] &&
-  exit 0`), which the control is blind to by construction because it perturbs
-  base. The repro agent and the fix agent are the same model under the same
-  operator.
+  **Its limit, and the decision that follows.** Six versions of this control were
+  defeated. The last review beat it with five oracles keyed on base and one keyed
+  on the fix, and showed it convicting honest reproductions at a rate that
+  depended on a random draw — any bug whose honest assertion is monotone in file
+  content (non-empty, minimum length, must-differ-from-template) is satisfied by
+  both shams.
 
-  So an agent-authored reproduction is **capped at Tier 2** — reproduced, with the
-  reproduction's independence unverified. The control stays because it catches
-  naive oracles cheaply, but it does not carry a Tier 1 claim. Diff-coverage
-  instrumentation is what would: an identity oracle executes none of the lines the
-  fix changed, and a reproduction of the bug does.
+  So the control is ADVISORY: it records what it saw and ends nothing. What
+  withholds the claim is the tier — an agent-authored reproduction is capped at
+  Tier 2, independence unverified — which does not depend on any sham working.
+  Diff-coverage remains the measurement that would settle it.
 
   Bounded attempts remain, and `handedOver` must become per-attempt with them.
 
