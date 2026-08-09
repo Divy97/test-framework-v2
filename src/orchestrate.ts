@@ -132,6 +132,19 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // the only place a commit crosses between containers, and it crosses as a
   // bundle: objects and refs, no working tree, nothing else.
   const workspace = await mkdtemp(join(tmpdir(), 'engine-workspace-'));
+  // `finally`, because the throws between here and the end of the run are what
+  // leak. This file already carried the invariant as a COMMENT — "every throw
+  // between the clone and the cleanup at the end leaves a full clone of the
+  // repository in tmpdir() forever" — and then grew six more throw sites inside
+  // that window, plus a fail-closed check whose whole job is to fire repeatedly
+  // while somebody diagnoses why. A comment is not a `finally`.
+  try {
+    return await run();
+  } finally {
+    await rm(workspace, { recursive: true, force: true }).catch(() => {});
+  }
+
+  async function run(): Promise<RunOutcome> {
   const source = join(workspace, 'source');
   // `--mirror`, not a plain clone. A plain clone puts the source's other
   // branches under `refs/remotes/origin/*`, and the container's own clone
@@ -151,19 +164,21 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // pre-existing fix became an ancestor, so even the diff named the right files.
   // `--amend`, `cherry-pick` and `merge` all did the same.
   //
-  // Content is the invariant. But "any tree the repository ever held" was too
-  // broad by far, and it refused the single most common genuine repair: `git
-  // revert` of the commit that caused a regression reproduces the *earlier good
-  // tree* exactly. Applied repro paths are additive and written over both
-  // checkouts (ADR-0008), so nothing perturbs the tree away from the historical
-  // one — a correct agent would have been told, in an immutable record, that it
-  // handed over work it had not done.
+  // Two checks survive, and only two: the commit must be one the repository did
+  // not already have, and its tree must differ from base's.
   //
-  // The distinction that actually matters is where the content came FROM.
-  // Content already on base's own ancestry is history the agent is entitled to
-  // return to. Content that exists only OFF that ancestry — on the fix branch,
-  // on the repository's own HEAD, on some stale branch — is work the agent would
-  // be inheriting rather than writing.
+  // A third — refusing any tree that existed off base's ancestry — was how this
+  // tried to catch INHERITED work, and it is now a pure false positive. The agent
+  // clones a source holding base's ancestry and nothing else, so it cannot copy
+  // content it cannot reach; a tree of its own that happens to match one on some
+  // other branch is therefore independent authorship of the same fix, which is
+  // the ordinary outcome when a repository already carries the fix on a branch —
+  // exactly the shape this project benchmarks. Review measured it refusing a
+  // genuine fix and writing an accusation of inheritance into an immutable log.
+  //
+  // Removing the capability made the recognition rule wrong, not redundant. It
+  // never covered the case its own comment claimed either: `--not <baseRef>`
+  // excludes base's ancestry by construction.
   //
   // `--no-replace-objects` because `--mirror` copies `refs/replace/*` and the
   // phase containers' plain clone does not: without it these sets are computed
@@ -171,44 +186,47 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   const git = ['-C', source, '--no-replace-objects'];
   const { stdout: existing } = await execFile('git', [...git, 'rev-list', '--all']);
   const before = new Set(existing.split('\n').filter(Boolean));
-  // Trees reachable from any ref but NOT from base. `--not <baseRef>` is what
-  // keeps a revert legitimate while an inherited fix stays disqualified.
-  const { stdout: elsewhere } = await execFile('git', [
-    ...git, 'rev-list', '--all', '--not', plan.baseRef, '--no-commit-header', '--format=%T',
-  ]);
-  const foreign = new Set(elsewhere.split('\n').filter(Boolean));
+  const { stdout: baseShaOut } = await execFile('git', [...git, 'rev-parse', `${plan.baseRef}^{commit}`]);
+  const base = baseShaOut.trim();
   const { stdout: baseTreeOut } = await execFile('git', [...git, 'rev-parse', `${plan.baseRef}^{tree}`]);
   const baseTree = baseTreeOut.trim();
-
-  // Fail closed. The previous round parsed these sets with `/^[0-9a-f]{40}$/`,
-  // which is the only hard-coded object-ID length in the engine: on a SHA-256
-  // repository every id is 64 hex, not one token matched, `before` came out empty
-  // and the whole authorship check silently evaporated — a do-nothing agent back
-  // to Tier 1 with no error and no abort. A check that can quietly become a
-  // no-op is worse than no check, because the log still reads as verified.
   // The base commit must be IN the history this check was computed over.
   //
-  // The first attempt at a fail-closed guard here — `existing.trim() &&
-  // before.size === 0` — was a tautology: `filter(Boolean)` leaves the set empty
-  // only when every line was empty, which makes `existing.trim()` falsy too. It
-  // could never fire. A safety net that cannot fail is worse than none, because
-  // it is read as one.
+  // The first fail-closed guard here was `existing.trim() && before.size === 0`,
+  // a tautology: `filter(Boolean)` leaves the set empty only when every line was
+  // empty, which makes `trim()` falsy too. It could never fire. A safety net that
+  // cannot fail is worse than none, because it is read as one.
   //
-  // This can fail, and catches the class that mattered: any future change to how
-  // these sets are read that yields shas the rest of the engine does not agree
-  // with. If base itself is not in `before`, `before` is not this repository's
-  // history and no refusal computed from it means anything.
-  const { stdout: baseSha } = await execFile('git', [...git, 'rev-parse', `${plan.baseRef}^{commit}`]);
-  if (!before.has(baseSha.trim())) {
-    // Take the mirror with it. Every throw between the clone and the cleanup at
-    // the end leaves a full clone of the repository in `tmpdir()` forever, and
-    // fail-closed paths are exactly the ones that run repeatedly while someone
-    // is diagnosing why they fire.
-    await rm(workspace, { recursive: true, force: true }).catch(() => {});
+  // What it was meant to catch: the set was once parsed with `/^[0-9a-f]{40}$/`,
+  // the only hard-coded object-ID length in the engine, so on a SHA-256
+  // repository not one token matched, `before` came out EMPTY, and every handover
+  // passed with no error and no abort. This guard is the record of that, and it
+  // is kept written down because deleting it is not free — the very commit that
+  // removed this paragraph broke SHA-256 repositories again, one construction
+  // over, within a day.
+  if (!before.has(base)) {
     throw new Error(
       'the base commit is not in the history this check reads; refusing to run an unenforceable check',
     );
   }
+
+  // The agent's source: base's ancestry, and NOTHING else.
+  //
+  // The authorship check can only ever see content, so it catches byte-identical
+  // inheritance and stops there — check out a fix the repository already carries,
+  // add one unrelated file, commit, and the result is genuinely new content built
+  // on work the agent did not do. No content-based check can separate that from a
+  // real fix, because the fix IS in the tree and the agent DID author the commit
+  // on top of it.
+  //
+  // So remove the thing being inherited rather than trying to recognise it. The
+  // agent clones this, and a fix commit that is not in its object store cannot be
+  // checked out, cherry-picked, merged or reset to. The hole is closed by
+  // construction rather than by recognition — which is why the recognition rule
+  // that used to stand beside it is gone rather than kept as a second line.
+  //
+  const agentSource = join(workspace, 'agent-source');
+  await buildAgentSource(source, base, agentSource);
 
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
@@ -233,21 +251,33 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // becomes when the world is a container: it is not scrubbed, it ceases to
   // exist. Note it runs BEFORE the base container, so the gate cannot prevent
   // spawning it — the gate decides whether a FIX is attempted.
-  const steps: { phase: PhaseResult['phase']; job: Partial<Job> }[] = [];
+  const steps: { phase: PhaseResult['phase']; job: Partial<Job>; source: string }[] = [];
   // `only: 'agent'` matters: without it the agent container ran the agent AND
   // both phases, so the fix phase started on the very machine the agent had been
   // working in. It stayed invisible because the duplicate registrations made the
   // fold stricter rather than wrong.
   if (plan.agentPrompt) {
-    steps.push({ phase: 'agent', job: { agentPrompt: plan.agentPrompt, only: 'agent' } });
+    // `baseRef` resolved: the stripped source has one branch and none of the
+    // names the plan may have used.
+    steps.push({
+      phase: 'agent',
+      // `baseRef` resolved, and DEAD today: the Runner returns on `only: 'agent'`
+      // before `verify()` ever reads it. Kept because a future agent path should
+      // get the sha rather than a name the stripped source no longer carries.
+      // `fixRef` on this same job is dead for the identical reason and is NOT
+      // resolved — said here rather than left as a silent asymmetry two lines
+      // apart.
+      job: { agentPrompt: plan.agentPrompt, only: 'agent', baseRef: base },
+      source: agentSource,
+    });
   }
-  steps.push({ phase: 'base', job: { only: 'base' } });
+  steps.push({ phase: 'base', job: { only: 'base' }, source });
 
   let ended: RunEvent | null = null;
   let refused = false;
   let fixRef = plan.fixRef;
   for (const step of steps) {
-    const result = await runContainer(plan, source, afterSeq, step.phase, step.job);
+    const result = await runContainer(plan, step.source, afterSeq, step.phase, step.job);
     // Record what the container reported BEFORE judging any of it. Checking
     // first and breaking discarded the transcript and the container's own
     // stream — the same mistake the abort path made: a run that could not be
@@ -282,10 +312,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
             ? `the agent handed over ${handover.commit}, a commit the repository already had`
             : handover.tree === baseTree
               ? `the agent handed over ${handover.commit}, which changes nothing against the base`
-              : foreign.has(handover.tree)
-                ? `the agent handed over ${handover.commit}, whose content already exists elsewhere ` +
-                  `in the repository and off the base's own history`
-                : null;
+              : null;
       if (handover.commit === null || stale) {
         // Refused, and SAID SO. This used to emit `RUN_ENDED { error }` and
         // nothing else, so the one finding that most needs auditing — the agent
@@ -380,7 +407,6 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // Linux an orchestrator running as neither root nor uid 1000 cannot unlink the
   // bundle, and a throw here would discard every event from every container for
   // the sake of disk hygiene.
-  await rm(workspace, { recursive: true, force: true }).catch(() => {});
   for (const phase of phases) {
     if (phase.handover) await rm(phase.handover, { recursive: true, force: true }).catch(() => {});
   }
@@ -393,6 +419,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // itself incomplete, collapsing "the gate honestly held" with "a container
   // died".
   return { events, phases, refused, complete: !refused && phases.every((p) => p.exitCode === 0) };
+  }
 }
 
 /**
@@ -577,3 +604,75 @@ const parse = (stdout: string): RunEvent[] =>
     .split('\n')
     .filter(Boolean)
     .map((line) => JSON.parse(line) as RunEvent);
+
+/**
+ * The agent's source: base's ancestry, and nothing else.
+ *
+ * Exported because both regressions this has had were invisible to the container
+ * suite and provable in milliseconds here — a SHA-256 repository, and a global
+ * `push.followTags`. Verifying a repository build by running a container is
+ * verifying it in the one place it is slowest and least legible.
+ */
+export async function buildAgentSource(source: string, base: string, agentSource: string): Promise<void> {
+  // The source's own hash algorithm, not this git's default. `init` always makes
+  // a SHA-1 repository, and pushing a SHA-256 repository into one fails outright
+  // — a repo class that worked before this construction replaced the previous
+  // one. The comment deleted from the check above was the record of the LAST
+  // time SHA-256 silently broke this, which is precisely why it should not have
+  // been deleted.
+  const { stdout: format } = await execFile('git', ['-C', source, 'rev-parse', '--show-object-format']);
+  await execFile('git', ['init', '--quiet', '--bare', `--object-format=${format.trim()}`, agentSource]);
+  // PUSH by sha, rather than clone-then-strip-then-prune. The objects off base's
+  // ancestry are never written at all, so no gc, cruft pack, prune grace, reflog
+  // or git-version question can resurrect them — the earlier construction leaned
+  // on `reflog expire` whose failure was swallowed, and with
+  // `core.logAllRefUpdates` inherited from a global config the fix survived the
+  // prune with `git fsck --unreachable` reporting nothing at all.
+  //
+  // It does not apply replace refs either — `push` by sha sends the real object,
+  // so the enclosing `--no-replace-objects` that the other traversals carry is not
+  // needed here. Said rather than left for the next reader to re-derive.
+  //
+  // It also does not care WHICH ref holds base. `clone --bare` fetches only
+  // `refs/heads/*` and tags, so a base reachable solely from `refs/remotes/*` —
+  // any repository that is itself a clone — left the object out and the strip
+  // died on a bare exception where the run used to produce an evented abort.
+  //
+  // The flags are not decoration. `push` reads the user's ambient config and the
+  // `clone` it replaced did not, so three ordinary global settings each reach a
+  // construction that is supposed to depend on nothing: `push.followTags` brings
+  // annotated tag objects the postcondition below then reports as a violation,
+  // `push.gpgSign` fails the push outright, and a global `core.hooksPath` with a
+  // `pre-push` hook refuses it. A repository build must not vary with whoever's
+  // machine the host happens to be.
+  await execFile('git', [
+    '-C', source, 'push', '--quiet', '--no-follow-tags', '--no-verify', '--no-signed',
+    agentSource, `${base}:refs/heads/main`,
+  ]);
+  await execFile('git', ['-C', agentSource, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
+
+  // The postcondition the comment above used to merely promise.
+  //
+  // "Verified by the object store, not by the ref listing" has to be something
+  // the code does, not something the prose asserts — a ref listing is exactly
+  // what every earlier round of this check kept believing. Cheap: one batch read
+  // over a repository that holds base's ancestry and nothing else.
+  const objects = await execFile('git', [
+    '-C', agentSource, 'cat-file', '--batch-all-objects', '--batch-check=%(objectname)',
+  ]);
+  const reachable = await execFile('git', ['-C', agentSource, 'rev-list', '--objects', 'refs/heads/main']);
+  const want = new Set(reachable.stdout.split('\n').filter(Boolean).map((line) => line.split(' ')[0]!));
+  const extra = objects.stdout.split('\n').filter(Boolean).filter((o) => !want.has(o));
+  if (extra.length > 0) {
+    throw new Error(
+      `the agent's source holds ${extra.length} objects off the base's ancestry; refusing to run`,
+    );
+  }
+  // And the ref set, which the object check does not cover: `push.followTags` is
+  // exactly a ref-set surprise, and it is how the object check first fired.
+  const { stdout: built } = await execFile('git', ['-C', agentSource, 'for-each-ref', '--format=%(refname)']);
+  const refs = built.split('\n').filter(Boolean);
+  if (refs.length !== 1 || refs[0] !== 'refs/heads/main') {
+    throw new Error(`the agent's source carries refs beyond base: ${refs.join(', ')}; refusing to run`);
+  }
+}

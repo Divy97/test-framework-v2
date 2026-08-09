@@ -72,16 +72,21 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   half: the agent's tree is discarded, so its reproduction has to arrive as a
   commit.
 
-  **It also owns the last hole in the authorship check.** The agent's container
-  clones the whole repository, so wherever a fix already exists — another branch,
-  the repo's own HEAD, `plan.fixRef` — the agent can check it out, add one
-  whitespace byte and hand over a commit whose content is genuinely new and whose
-  work is entirely inherited. Base red, fix green, Tier 1, and the diff names the
-  right files. No content-based check can see this: the fix IS in the tree, and
-  the agent did author the commit on top of it. The structural answer is that the
-  agent's container must start from `baseRef` with nothing else reachable, so
-  there is nothing to inherit — which is a change to what the agent container is
-  given, and belongs here rather than to the check. Bounded attempts belong here too — retrying is only meaningful once a
+  **The last hole in the authorship check is closed, and not by the check.** The
+  agent's container used to clone the whole repository, so wherever a fix already
+  existed — another branch, the repo's own HEAD, `plan.fixRef` — the agent could
+  check it out, add one whitespace byte, and hand over a commit whose content was
+  genuinely new and whose work was entirely inherited. Base red, fix green, Tier
+  1, and the diff naming the right files. No content-based check can see that: the
+  fix IS in the tree, and the agent DID author the commit on top of it.
+
+  Five rounds of trying to recognise inherited work from its content each ended
+  with an escape one byte wide. So the capability was removed instead: the agent
+  clones a source holding base's ancestry and nothing else, built by
+  clone-then-strip-then-prune, and a commit that is not in the object store cannot
+  be checked out, cherry-picked, merged or reset to. The content checks stay as a
+  second line for what this cannot cover — a repository whose base ancestry
+  already contains the fix. Bounded attempts belong here too — retrying is only meaningful once a
   later attempt can propose a different reproduction. The image gains a real
   `claude` here; until then the sandbox tests mount a hostile fake, which proves
   the boundary without the weight.
