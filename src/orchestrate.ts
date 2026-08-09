@@ -30,6 +30,7 @@ import { cp, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RunEvent } from './events.js';
+import { fold } from './fold.js';
 import type { Job } from './runner.js';
 
 /** Output ceiling per container. Matches what the sandbox tests already allow. */
@@ -77,6 +78,14 @@ export type RunOutcome = {
 };
 
 /**
+ * The orchestrator's own events. It is a trusted writer — ADR-0006's constraint
+ * is that the AGENT cannot write facts, and ADR-0009 names the attempt loop as
+ * RUN_ENDED's producer.
+ */
+const own = (runId: string, seq: number, event: Omit<RunEvent, 'run_id' | 'seq' | 'ts'>): RunEvent =>
+  ({ ...event, run_id: runId, seq, ts: new Date().toISOString() }) as RunEvent;
+
+/**
  * Run one attempt as a sequence of containers.
  *
  * Stops at the first container that could not observe its phase. A fix phase run
@@ -105,6 +114,13 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // first phase is ever cloned. This is what ADR-0010's "the agent's world is
   // discarded" becomes when the world is a container: it is not scrubbed, it
   // ceases to exist.
+  // An attempt has to be declared before anything can be credited to it: the
+  // fold refuses to pair runs at attempt 0, because runs from unrelated attempts
+  // could otherwise be matched up. Nothing emitted this before, which is why the
+  // tests had to prepend it by hand.
+  const attempt = own(plan.runId, ++afterSeq, { type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } });
+  events.push(attempt);
+
   const steps: { phase: PhaseResult['phase']; job: Partial<Job> }[] = [];
   // `only: 'agent'` matters: without it the agent container ran the agent AND
   // both phases, so the fix phase started on the very machine the agent had been
@@ -114,15 +130,44 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     steps.push({ phase: 'agent', job: { agentPrompt: plan.agentPrompt, only: 'agent' } });
   }
   steps.push({ phase: 'base', job: { only: 'base' } });
-  steps.push({ phase: 'fix', job: { only: 'fix' } });
 
+  let ended: RunEvent | null = null;
   for (const step of steps) {
     const result = await runContainer(plan, afterSeq, step.phase, step.job);
     phases.push(result);
     events.push(...result.events);
     afterSeq = result.events.at(-1)?.seq ?? afterSeq;
-    if (result.exitCode !== 0) break;
+    if (result.exitCode !== 0) {
+      ended = own(plan.runId, ++afterSeq, { type: 'RUN_ENDED', payload: { v: 1, reason: 'error' } });
+      break;
+    }
   }
+
+  // THE GATE (ADR-0007). No reproduction, no fix — and the decision is read off
+  // the fold rather than worked out here, because a second definition of "did it
+  // reproduce" living in a producer is exactly what ADR-0009 forbids. A Tier 3
+  // outcome is a real deliverable, not a failure.
+  if (!ended) {
+    if (fold(events).shownOnBase) {
+      const fix = await runContainer(plan, afterSeq, 'fix', { only: 'fix' });
+      phases.push(fix);
+      events.push(...fix.events);
+      afterSeq = fix.events.at(-1)?.seq ?? afterSeq;
+      ended = own(plan.runId, ++afterSeq, {
+        type: 'RUN_ENDED',
+        payload: { v: 1, reason: fix.exitCode === 0 ? 'attempts_exhausted' : 'error' },
+      });
+    } else {
+      // The bug was never shown, so no fix was attempted and none should be. The
+      // reason records the CAUSE of stopping, never the verdict — the fold keeps
+      // deriving that from the runs (ADR-0009).
+      ended = own(plan.runId, ++afterSeq, {
+        type: 'RUN_ENDED',
+        payload: { v: 1, reason: 'not_reproduced' },
+      });
+    }
+  }
+  events.push(ended);
 
   return { events, phases, complete: phases.every((p) => p.exitCode === 0) };
 }

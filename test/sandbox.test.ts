@@ -23,6 +23,7 @@ import {
   cleanupFixtures,
   clean,
   HANGS_ON_FIX,
+  irreproducible,
   noOpFix,
   survivorGamed,
 } from './fixtures/repo.js';
@@ -979,20 +980,23 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
 
     expect(outcome.complete).toBe(true);
     expect(outcome.phases.map((p) => p.phase)).toEqual(['base', 'fix']);
-    // One continuous log across two containers: the seq counter is one of the
-    // only two things that crosses between them.
+    // One continuous log across two containers, bracketed by the two events only
+    // the orchestrator can supply: the attempt everything belongs to, and the
+    // fact that the run stopped.
     expect(outcome.events.map((e) => e.type)).toEqual([
+      'ATTEMPT_STARTED',
       'REPRO_REGISTERED',
       'TEST_RUN',
       'TEST_RUN',
       'FIX_DIFF_OBSERVED',
+      'RUN_ENDED',
     ]);
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
 
-    const state = fold([
-      { run_id: RUN_ID, seq: 1, ts: new Date().toISOString(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
-      ...outcome.events.map((e, i) => ({ ...e, seq: i + 2 })),
-    ]);
+    // Folded as it stands. Prepending an ATTEMPT_STARTED by hand — which every
+    // one of these tests used to do — hid the fact that real Runner output could
+    // never be credited at all.
+    const state = fold(outcome.events);
     expect(state.reproduced).toBe(true);
 
     // Every artifact still crosses to the host, from both containers.
@@ -1136,7 +1140,10 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(agent.events.map((e) => e.type)).toEqual(['AGENT_MESSAGE', 'AGENT_FINISHED']);
     expect(outcome.events.filter((e) => e.type === 'REPRO_REGISTERED')).toHaveLength(1);
     expect(outcome.events.filter((e) => e.type === 'FIX_DIFF_OBSERVED')).toHaveLength(1);
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    // The transcript sits inside the attempt, before any observation of it.
+    expect(outcome.events[0]!.type).toBe('ATTEMPT_STARTED');
+    expect(fold(outcome.events).transcript).toHaveLength(1);
   }, 600_000);
 
   test('a container that could not run says why', async () => {
@@ -1188,6 +1195,73 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       }),
     ).rejects.toThrow(/not an evidence store/);
   }, 300_000);
+
+  test('the gate holds: a bug never shown means no fix container runs at all', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // The base passes, so nothing was ever reproduced. ADR-0007's gate says no
+    // fix is attempted — and the cost of getting this wrong is not a wrong
+    // number, it is running an agent against a bug that may not exist.
+    const fixture = irreproducible();
+    const blobs = hostBlobs();
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+    });
+
+    // The fix container never started. Asserting on the phases, not just the
+    // verdict: a run that reaches the same conclusion by running the fix anyway
+    // has not implemented the gate, it has implemented a filter.
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['base']);
+    expect(outcome.events.filter((e) => e.type === 'TEST_RUN')).toHaveLength(1);
+
+    const state = fold(outcome.events);
+    expect(state.shownOnBase).toBe(false);
+    expect(state.reproduced).toBe(false);
+    expect(state.endedReason).toBe('not_reproduced');
+    // Tier 3 is a real outcome, not an error.
+    expect(state.status).toBe('unresolved');
+  }, 600_000);
+
+  test('a run that reproduces goes on to the fix, and ends declaring itself', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+    });
+
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['base', 'fix']);
+    // The orchestrator now supplies both events the log could never produce for
+    // itself: the attempt it all belongs to, and the fact that it stopped.
+    expect(outcome.events[0]!.type).toBe('ATTEMPT_STARTED');
+    expect(outcome.events.at(-1)!.type).toBe('RUN_ENDED');
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+
+    // Folded straight from the stream — no hand-prepended ATTEMPT_STARTED, which
+    // every earlier test needed and which quietly meant the real Runner output
+    // could never be credited at all.
+    const state = fold(outcome.events);
+    expect(state.shownOnBase).toBe(true);
+    expect(state.reproduced).toBe(true);
+    expect(state.reproducedAttempt).toBe(1);
+  }, 600_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
