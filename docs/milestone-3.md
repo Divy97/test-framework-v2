@@ -35,6 +35,29 @@ events. The agent still cannot append events — the Runner writes all of them
 ordering invariant from ADR-0008 has to become real: registration precedes the
 agent seeing or writing the fix, provable from the log by seq.
 
+Split in two once the supervision mechanics turned out to be a whole subject:
+
+- **3b.1 — supervision.** Spawn, bound, translate. `AGENT_MESSAGE` carries the
+  raw line by `sha256:` ref and the `claimed_type` the stream asserted;
+  `AGENT_FINISHED` records how it ended, so a truncated transcript can never
+  read as a complete one. The agent gets no stdin, runs as the repro user, and
+  every line is re-serialised through `JSON.stringify` on its way into a payload
+  — so a message shaped like a `RunEvent` lands inside a string and stays there.
+  No output schema is imposed: `claude` has a `--json-schema` flag and not using
+  it is the point (Q7, "loose agent, strict judge"). Tested against a fake
+  `claude` on `PATH`, which is the only way to exercise hostile output — a
+  forged event, a line that never ends, ten thousand messages — that a real
+  agent will not produce on demand.
+- **3b.2 — the loop.** A real prompt, the agent supplying the `ReproSpec`, the
+  reproduce-first gate, bounded attempts, `RUN_ENDED` finally getting a
+  producer. The image gains a real `claude` here; until then the sandbox test
+  mounts a hostile fake, which proves the boundary without the weight.
+
+**The container has unrestricted network until 3c.** The agent needs to reach
+the model API and nothing stops it reaching anything else. Said plainly rather
+than implied away: the isolation this milestone has built is filesystem and
+privilege isolation, not egress.
+
 **3c · egress control**
 One authenticated channel out, the model API and nothing else. Deliberately last
 because it is the easiest to verify once the first two exist and the hardest to

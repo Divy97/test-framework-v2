@@ -13,6 +13,7 @@ import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { RunEvent } from './events.js';
+import { superviseAgent } from './agent.js';
 import { ObservationFailed, verify, type ReproSpec } from './verify.js';
 
 const execFileAsync = promisify(execFile);
@@ -28,6 +29,16 @@ export type Job = {
   repro: ReproSpec;
   /** Serialised as a string: JSON has no regex, and the source must survive the wire. */
   symptomPattern: string;
+  /**
+   * Ask the agent this before verifying. Omitted, no agent runs at all — which is
+   * the M3.1 shape, kept working so the engine stays testable without one.
+   *
+   * A prompt, never a command: the Runner chooses the binary and its flags. A
+   * caller-supplied command line would be arbitrary execution wearing a
+   * configuration field's clothes.
+   */
+  agentPrompt?: string;
+  agentTimeoutMs?: number;
   flakeRuns?: number;
   timeoutMs?: number;
 };
@@ -167,6 +178,25 @@ export async function runJob(
     execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]),
   );
 
+  // The agent goes first and gets its own seq range, so the log reads in the
+  // order things happened: it says its piece, and only then does the engine
+  // start observing. Its events are testimony and are emitted alongside the
+  // evidence, never mixed into it (ADR-0006).
+  //
+  // It runs as the repro user for the same reason the repro does — root in this
+  // PID namespace could open the event channel through /proc/1/fd/N.
+  const transcript = job.agentPrompt
+    ? await superviseAgent({
+        runId: job.runId,
+        afterSeq: job.afterSeq,
+        prompt: job.agentPrompt,
+        cwd: repoPath,
+        blobRoot: staging,
+        runAs,
+        ...(job.agentTimeoutMs === undefined ? {} : { timeoutMs: job.agentTimeoutMs }),
+      })
+    : [];
+
   let events: RunEvent[];
   // A run that could not be observed to the end is still a run that observed
   // things. Losing the base phase because the fix phase died would leave no
@@ -176,7 +206,9 @@ export async function runJob(
   try {
     events = await verify({
       runId: job.runId,
-      afterSeq: job.afterSeq,
+      // Continue the log rather than restart it: the engine's first event must
+      // not collide with the last thing the agent said.
+      afterSeq: transcript.at(-1)?.seq ?? job.afterSeq,
       repoPath,
       baseRef: job.baseRef,
       fixRef: job.fixRef,
@@ -223,7 +255,10 @@ export async function runJob(
 
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
-  for (const event of events) emit(`${JSON.stringify(event)}\n`);
+  // JSON.stringify is what makes the agent unable to forge a sibling event: a
+  // message shaped like a RunEvent was already put inside a string field, and
+  // this escapes it rather than letting it out onto its own line.
+  for (const event of [...transcript, ...events]) emit(`${JSON.stringify(event)}\n`);
   return exitCode;
 }
 

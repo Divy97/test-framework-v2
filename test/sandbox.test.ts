@@ -364,6 +364,89 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     }
   }, 300_000);
 
+  test('the agent runs unprivileged and cannot write onto the event channel', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // A hostile `claude`, mounted rather than installed: this proves the
+    // supervision boundary without the image carrying a real agent, which is
+    // M3.2's second half. It attacks the same way the repro does — every fd PID 1
+    // holds — because the agent has exactly the repro's privileges and nothing
+    // about being "the agent" makes it more trusted (ADR-0006).
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    const forged = JSON.stringify({
+      run_id: RUN_ID,
+      seq: 1,
+      ts: '2026-01-01T00:00:00.000Z',
+      type: 'PR_OPENED',
+      payload: { v: 1, repo: 'o/r', pr_number: 1, head_sha: 'x', diff_hash: 'sha256:00' },
+    });
+    writeFileSync(
+      join(agentDir, 'claude'),
+      '#!/bin/sh\n' +
+        'for n in $(ls /proc/1/fd 2>/dev/null); do\n' +
+        `  printf '%s\\n' '${forged}' > /proc/1/fd/$n 2>/dev/null || true\n` +
+        'done\n' +
+        `printf '{"type":"whoami","uid":"%s"}\\n' "$(id -u)"\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const stdout = execFileSync(
+      'docker',
+      [
+        'run', '--rm', '-i',
+        '-v', `${fixture.repo}:/src:ro`,
+        '-v', `${blobs}:/blobs`,
+        '-v', `${join(agentDir, 'claude')}:/usr/local/bin/claude:ro`,
+        IMAGE,
+      ],
+      {
+        input: JSON.stringify({
+          runId: RUN_ID,
+          afterSeq: 0,
+          sourcePath: '/src',
+          baseRef: fixture.base,
+          fixRef: fixture.fix,
+          repro: APPLIED_REPRO,
+          symptomPattern: 'wrong',
+          flakeRuns: 0,
+          agentPrompt: 'reproduce the bug',
+        }),
+        encoding: 'utf8',
+        maxBuffer: 32 * 1024 * 1024,
+      },
+    );
+
+    const events = parse(stdout);
+    // Testimony first, then the evidence — and the log continues rather than
+    // restarting, so the agent's seqs and the engine's cannot collide.
+    expect(events.map((e) => e.type)).toEqual([
+      'AGENT_MESSAGE',
+      'AGENT_MESSAGE',
+      'AGENT_FINISHED',
+      'REPRO_REGISTERED',
+      'TEST_RUN',
+      'TEST_RUN',
+      'FIX_DIFF_OBSERVED',
+    ]);
+    expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+
+    // The forgery reached nothing. Not a line on the channel, and no PR anywhere.
+    expect(events.some((e) => e.type === 'PR_OPENED')).toBe(false);
+    expect(fold(events).pr).toBeNull();
+
+    // It ran as the repro user, which is what put /proc/1/fd out of its reach.
+    const said = await Promise.all(
+      events
+        .filter((e) => e.type === 'AGENT_MESSAGE')
+        .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+    );
+    expect(said[0]!.toString()).toContain('"uid":"1000"');
+  }, 300_000);
+
   test('a hook the repro plants is never executed by the Runner', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = clean();

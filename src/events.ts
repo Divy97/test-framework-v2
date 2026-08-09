@@ -100,6 +100,49 @@ export type PrOpenedV1 = {
 };
 
 /**
+ * One line the agent wrote. TESTIMONY, not evidence (ADR-0006).
+ *
+ * Nothing here is a fact about the world — only a fact about what arrived on a
+ * pipe. The Runner observed the bytes; it did not observe that they are true.
+ * The timeline renders this class visibly apart from everything the Runner
+ * executed itself, and no projection may draw a verification conclusion from it.
+ *
+ * The agent cannot forge a sibling event by writing one: the Runner re-serialises
+ * every line through `JSON.stringify`, so a message whose text happens to look
+ * like a RunEvent lands inside a string field and stays there.
+ */
+export type AgentMessageV1 = {
+  v: 1;
+  /** Index in this run's transcript. The count is the record. */
+  n: number;
+  /**
+   * The `type` the agent's own JSON claimed, or null when the line was not JSON
+   * or carried no type. Named as a claim on purpose — it steers the timeline's
+   * grouping and must never steer a verdict.
+   */
+  claimed_type: string | null;
+  /** The line exactly as it arrived. The only thing anyone should trust to BE what arrived. */
+  raw_hash: ArtifactRef;
+  bytes: number;
+};
+
+/**
+ * How supervision ended. An evidence-class fact: the Runner watched the process.
+ *
+ * `stopped` distinguishes a transcript that finished from one that was cut off.
+ * A silently truncated transcript reads exactly like a complete one — the same
+ * failure the verification stream was hardened against.
+ */
+export type AgentFinishedV1 = {
+  v: 1;
+  messages: number;
+  /** -1 when the process died by signal without returning a status. */
+  exit_code: number;
+  signal?: string;
+  stopped: 'exit' | 'line_cap' | 'byte_cap' | 'timeout';
+};
+
+/**
  * Where the engine was standing when it stopped.
  *
  * `cleanup` is separate from `diff` because the distinction is not cosmetic: the
@@ -168,6 +211,8 @@ export type EventPayload =
   | { type: 'REPRO_REGISTERED'; payload: ReproRegisteredV1 }
   | { type: 'SANDBOX_CREATED'; payload: SandboxCreatedV1 }
   | { type: 'ATTEMPT_STARTED'; payload: AttemptStartedV1 }
+  | { type: 'AGENT_MESSAGE'; payload: AgentMessageV1 }
+  | { type: 'AGENT_FINISHED'; payload: AgentFinishedV1 }
   | { type: 'TEST_RUN'; payload: TestRunV1 }
   | { type: 'FIX_DIFF_OBSERVED'; payload: FixDiffObservedV1 }
   | { type: 'VERIFICATION_ABORTED'; payload: VerificationAbortedV1 }
