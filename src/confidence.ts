@@ -250,8 +250,14 @@ function notReproducedBecause(state: RunState): string {
   // documented `Display it; never parse it` (events.ts), which quotes
   // agent-influenced text: a repro named `./handed over` short-circuited this
   // whole ladder, and 3b.2b hands the agent authorship of that spec.
-  const refused = state.aborts.find((a) => a.cause === 'handover');
-  if (refused) return refused.reason;
+  // The LAST attempt's refusal, not the run's first. With attempts bounded, an
+  // early refusal became every later attempt's Tier 3 explanation — so a run
+  // whose second attempt honestly failed to reproduce reported attempt 1's "the
+  // agent handed over a commit the repository already had" instead. The
+  // deliverable is what this projection is for (ADR-0007); describing the wrong
+  // attempt makes it worse than terse.
+  const refused = state.aborts.filter((a) => a.cause === 'handover').at(-1);
+  if (refused && refused.attempt === state.currentAttempt) return refused.reason;
   if (state.registrations.length === 0) return 'no reproduction was ever registered';
   if (state.testRuns.length === 0) return 'the reproduction was registered but never ran';
 

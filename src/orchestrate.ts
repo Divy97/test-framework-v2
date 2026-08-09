@@ -478,7 +478,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // reproduce" living in a producer is exactly what ADR-0009 forbids. A Tier 3
     // outcome is a real deliverable, not a failure.
     if (!ended) {
-      if (fold(events).shownOnBase) {
+      // THIS attempt's reproduction, not the run's. Reading the run-level flag let
+    // attempt 2 spend a fix agent and a fix container on a bug it had just failed
+    // to show, off attempt 1's evidence — ADR-0007 says the gate never bends. The
+    // decision is still read off the fold rather than worked out here (ADR-0009);
+    // what changed is which question the fold is asked.
+    if (fold(events).shownAttempts.includes(n)) {
         // The fix agent, deferred to here so the log can PROVE it never saw the
         // reproduction before that reproduction was registered.
         if (plan.reproPrompt && plan.agentPrompt) {

@@ -83,6 +83,16 @@ export type RunState = {
    * reproduction, no fix — and it is true well before `reproduced` can be.
    */
   shownOnBase: boolean;
+  /**
+   * Which attempts demonstrated the bug, so the gate can be asked per attempt.
+   *
+   * `shownOnBase` is a run-level fact and stays one — "the bug is real, some
+   * attempt showed it". But ADR-0007's gate is a decision about whether to spend
+   * a fix on THIS attempt, and reading the run-level flag let attempt 2 get a fix
+   * agent and a fix container off attempt 1's reproduction, for a bug attempt 2
+   * had just failed to show. "The gate never bends."
+   */
+  shownAttempts: number[];
   /** What the fix touched. Recorded for the confidence projection; the engine never judges it. */
   fixDiff: { changed_files: string[]; diff_hash: ArtifactRef } | null;
   /**
@@ -171,6 +181,7 @@ const initialState = (runId: string): RunState => ({
   reproduced: false,
   reproducedAttempt: null,
   shownOnBase: false,
+  shownAttempts: [],
   fixDiff: null,
   completedAttempts: [],
   transcript: [],
@@ -462,12 +473,18 @@ function credited(
   aborts: RunState['aborts'],
   completedAttempts: number[],
   handovers: RunState['handovers'],
-): { reproduced: boolean; reproducedAttempt: number | null; shownOnBase: boolean } {
+): {
+  reproduced: boolean;
+  reproducedAttempt: number | null;
+  shownOnBase: boolean;
+  shownAttempts: number[];
+} {
   const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts, handovers);
   return {
     reproduced: attempt !== null,
     reproducedAttempt: attempt,
     shownOnBase: demonstrated(testRuns, registrations, aborts).length > 0,
+    shownAttempts: [...new Set(demonstrated(testRuns, registrations, aborts).map((r) => r.attempt))],
   };
 }
 
