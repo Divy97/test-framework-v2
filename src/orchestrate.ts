@@ -27,7 +27,7 @@
 
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { cp, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RunEvent } from './events.js';
@@ -125,7 +125,17 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // bundle: objects and refs, no working tree, nothing else.
   const workspace = await mkdtemp(join(tmpdir(), 'engine-workspace-'));
   const source = join(workspace, 'source');
-  await execFile('git', ['clone', '--quiet', '--no-local', '--', plan.repoPath, source]);
+  // `--mirror`, not a plain clone. A plain clone puts the source's other
+  // branches under `refs/remotes/origin/*`, and the container's own clone
+  // transfers only `refs/heads/*` — so interposing a workspace silently dropped
+  // every non-default branch, and any baseRef or fixRef off `main` stopped
+  // resolving. A mirror keeps them all as local refs.
+  await execFile('git', ['clone', '--quiet', '--no-local', '--mirror', '--', plan.repoPath, source]);
+
+  // Every commit the repository already had. What the agent hands over must not
+  // be one of these — that is the whole check, and it was missing.
+  const { stdout: existing } = await execFile('git', ['-C', source, 'rev-list', '--all']);
+  const before = new Set(existing.split('\n').filter(Boolean));
 
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
@@ -164,19 +174,45 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   let fixRef = plan.fixRef;
   for (const step of steps) {
     const result = await runContainer(plan, source, afterSeq, step.phase, step.job);
-    if (step.phase === 'agent' && result.exitCode === 0) {
-      // Whatever the agent committed becomes the fix under judgement. Fetched
-      // into a namespace of its own so it can never be mistaken for a ref the
-      // repository already had.
-      const head = await applyHandover(source, result.handover!);
-      if (head) fixRef = head;
-    }
+    // Record what the container reported BEFORE judging any of it. Checking
+    // first and breaking discarded the transcript and the container's own
+    // stream — the same mistake the abort path made: a run that could not be
+    // trusted is still a run that observed things.
     phases.push(result);
     events.push(...result.events);
     afterSeq = result.events.at(-1)?.seq ?? afterSeq;
+
     if (result.exitCode !== 0) {
       ended = own(plan.runId, ++afterSeq, { type: 'RUN_ENDED', payload: { v: 1, reason: 'error' } });
       break;
+    }
+
+    if (step.phase === 'agent') {
+      // Whatever the agent committed becomes the fix under judgement — but only
+      // once it is shown to be something the agent actually authored.
+      //
+      // Four bugs in this transport all failed the same way: the bundle carried
+      // the repository's own HEAD and the run verified that, crediting the
+      // agent. Each cause was fixed and the run stayed silently wrong, because
+      // nothing ever compared the resolved ref to what existed beforehand. An
+      // agent whose entire body is `echo "I did nothing"` was credited Tier 1.
+      //
+      // So: refuse loudly. A commit that already existed is not a fix the agent
+      // wrote, whether it got there by doing nothing, committing on a branch and
+      // checking out another, resetting back, or swapping the bundle afterwards.
+      const head = await applyHandover(source, result.handover);
+      if (!head || before.has(head)) {
+        ended = own(plan.runId, ++afterSeq, { type: 'RUN_ENDED', payload: { v: 1, reason: 'error' } });
+        break;
+      }
+      // Recorded before it is used, so the log says what was authored and not
+      // only what was verified.
+      const handed = own(plan.runId, ++afterSeq, {
+        type: 'AGENT_HANDED_OVER',
+        payload: { v: 1, commit: head },
+      });
+      events.push(handed);
+      fixRef = head;
     }
   }
 
@@ -218,6 +254,15 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   }
   if (ended) events.push(ended);
 
+  // The workspace is a full clone and each handover holds whatever the agent
+  // chose to leave in `/out`. Left behind, that is unbounded host-disk growth
+  // per run — and the handover dirs are agent-writable, which is not something
+  // to accumulate.
+  await rm(workspace, { recursive: true, force: true });
+  for (const phase of phases) {
+    if (phase.handover) await rm(phase.handover, { recursive: true, force: true });
+  }
+
   return { events, phases, complete: phases.every((p) => p.exitCode === 0) };
 }
 
@@ -234,14 +279,24 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
  * A distinct branch name still keeps it off `main`: the point was never the ref
  * namespace, it was not overwriting a ref the repository already had.
  */
-async function applyHandover(source: string, dir: string): Promise<string | null> {
+async function applyHandover(source: string, dir: string | undefined): Promise<string | null> {
+  if (!dir) return null;
   const bundle = join(dir, 'agent.bundle');
-  const exists = await stat(bundle).then(() => true).catch(() => false);
-  if (!exists) return null;
+  // lstat: the agent owns `/out` and can leave a symlink where the bundle should
+  // be. Following one would fetch from wherever it points.
+  const kind = await lstat(bundle).catch(() => null);
+  if (!kind?.isFile()) return null;
 
-  await execFile('git', ['-C', source, 'fetch', '--quiet', bundle, '+HEAD:refs/heads/engine/agent-work']);
-  const { stdout } = await execFile('git', ['-C', source, 'rev-parse', 'refs/heads/engine/agent-work']);
-  return stdout.trim();
+  try {
+    await execFile('git', ['-C', source, 'fetch', '--quiet', bundle, '+HEAD:refs/heads/engine/agent-work']);
+    const { stdout } = await execFile('git', ['-C', source, 'rev-parse', 'refs/heads/engine/agent-work']);
+    return stdout.trim();
+  } catch {
+    // A corrupt or hostile bundle is a handover that did not happen, not a
+    // reason to lose the run. Letting this throw discarded the attempt, the
+    // transcript and the agent container's whole stream.
+    return null;
+  }
 }
 
 async function runContainer(

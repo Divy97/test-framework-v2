@@ -106,6 +106,8 @@ export type RunState = {
   transcript: { n: number; claimed_type: string | null; raw_hash: ArtifactRef; bytes: number }[];
   /** How supervision ended. This one IS evidence: the Runner watched the process. */
   agent: Omit<AgentFinishedV1, 'v'> | null;
+  /** The commit the agent authored, if it authored one. Evidence, not testimony. */
+  handedOver: string | null;
   pr: { repo: string; pr_number: number; head_sha: string } | null;
   /**
    * Every phase that stopped being observable, in order. Not terminal: an attempt
@@ -150,6 +152,7 @@ const initialState = (runId: string): RunState => ({
   completedAttempts: [],
   transcript: [],
   agent: null,
+  handedOver: null,
   pr: null,
   aborts: [],
   afterEnd: [],
@@ -224,6 +227,8 @@ export function apply(state: RunState, event: RunEvent): RunState {
           },
         ],
       };
+    case 'AGENT_HANDED_OVER':
+      return { ...next, handedOver: event.payload.commit };
     case 'AGENT_FINISHED': {
       const { v, ...finished } = event.payload;
       return { ...next, agent: finished };

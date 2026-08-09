@@ -61,6 +61,7 @@ describe('fold', () => {
       completedAttempts: [1],
       transcript: [],
       agent: null,
+      handedOver: null,
       pr: {
         repo: 'demo-org/demo-app',
         pr_number: 42,

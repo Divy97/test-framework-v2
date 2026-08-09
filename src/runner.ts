@@ -322,9 +322,12 @@ async function handOverCommits(world: { tree: string; gitDir: string }): Promise
     // git's own words, not a paraphrase. A wrapper that drops them turns a
     // one-line diagnosis into a debugging session — the mistake this codebase
     // has already made twice.
-    const detail = (error as { stderr?: string; message?: string }).stderr ?? '';
+    // `||`, not `??`. `''.split('\n')[0]` is `''` — not nullish — so `??` never
+    // fired and an error with no stderr produced a message ending in a colon.
+    // The comment above this one calls that the mistake made twice already.
+    const detail = (error as { stderr?: string }).stderr ?? '';
     throw new ObservationFailed(
-      `could not bundle the agent commits: ${detail.trim().split('\n')[0] ?? String(error)}`,
+      `could not bundle the agent commits: ${detail.trim().split('\n')[0] || String(error)}`,
     );
   }
 
@@ -524,12 +527,14 @@ export async function runJob(
   // Nothing the agent started may still be running when the phases begin, and
   // nothing it left in a shared directory may still be there.
   if (agentWorld) {
-    // Extract the commits BEFORE the world is destroyed. Doing it after left
-    // `git bundle` staring at a directory that no longer existed — and the
-    // ordering is the right one regardless: take what may leave, then destroy
-    // everything else.
-    await handOverCommits(agentWorld);
+    // Reap FIRST, then extract, then destroy. Bundling before the reap left the
+    // agent's surviving processes alive and owning the finished bundle: one
+    // could wait for it, chmod it back and overwrite it with a bundle of a
+    // different commit, and that commit is what got verified. `chmod 0444`
+    // cannot stop a file's own owner, and a bind mount does not carry the mode
+    // to the host anyway.
     await clearTheField([], evidence);
+    await handOverCommits(agentWorld);
     // The agent's world is discarded outright, not scrubbed. ADR-0010 already
     // says its tree does not survive — but the tree, TMPDIR and HOME are all
     // uid-1000-owned, so leaving them standing lets the BASE phase write there

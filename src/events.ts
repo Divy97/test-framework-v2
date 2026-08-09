@@ -143,6 +143,20 @@ export type AgentFinishedV1 = {
 };
 
 /**
+ * The commit an agent handed over, observed by the orchestrator at its own
+ * boundary (ADR-0006) — not claimed by the agent.
+ *
+ * Without this the log said what was VERIFIED and never what the agent
+ * AUTHORED, so a run that judged the repository's own commit while crediting
+ * the agent was not merely unchecked at the time: it was unauditable afterwards
+ * from the immutable record, which is the artifact this project sells.
+ */
+export type AgentHandedOverV1 = {
+  v: 1;
+  commit: string;
+};
+
+/**
  * Where the engine was standing when it stopped.
  *
  * `cleanup` is separate from `diff` because the distinction is not cosmetic: the
@@ -213,6 +227,7 @@ export type EventPayload =
   | { type: 'ATTEMPT_STARTED'; payload: AttemptStartedV1 }
   | { type: 'AGENT_MESSAGE'; payload: AgentMessageV1 }
   | { type: 'AGENT_FINISHED'; payload: AgentFinishedV1 }
+  | { type: 'AGENT_HANDED_OVER'; payload: AgentHandedOverV1 }
   | { type: 'TEST_RUN'; payload: TestRunV1 }
   | { type: 'FIX_DIFF_OBSERVED'; payload: FixDiffObservedV1 }
   | { type: 'VERIFICATION_ABORTED'; payload: VerificationAbortedV1 }
