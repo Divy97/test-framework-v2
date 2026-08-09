@@ -30,6 +30,8 @@ import type { AgentFinishedV1, RunEvent } from './events.js';
 const MAX_MESSAGES = 10_000;
 const MAX_LINE_BYTES = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 600_000;
+/** How long to wait for the pipes after a kill before giving up on them entirely. */
+const GRACE_MS = 2_000;
 
 export type AgentOptions = {
   runId: string;
@@ -45,6 +47,13 @@ export type AgentOptions = {
   maxLineBytes?: number;
   /** Drop to this uid/gid, as the repro does. Omitted outside the sandbox. */
   runAs?: { uid: number; gid: number };
+  /**
+   * Layered over the Runner's environment. The sandbox uses it to give the agent
+   * a TMPDIR and HOME the verification phases do not share — otherwise the agent
+   * can seed a file the reproduction reads and manufacture a verdict without
+   * forging anything.
+   */
+  env?: Record<string, string>;
 };
 
 /** What the agent's own stream claimed this line was. Testimony about testimony. */
@@ -81,10 +90,19 @@ export async function superviseAgent(options: AgentOptions): Promise<RunEvent[]>
     ['-p', prompt, '--output-format', 'stream-json', '--verbose'],
     {
       cwd,
-      // The agent gets no stdin. It is not an interactive session, and leaving
-      // the parent's stdin attached would hand it the Job on the way in.
+      // The agent gets no stdin. It is not an interactive session, and an
+      // inherited descriptor is a channel in as well as out — the Runner's own
+      // stdin is already drained to EOF by then, so the Job is not what is at
+      // stake, but handing an untrusted process a live descriptor it has no use
+      // for is how the /proc/1/fd lesson started.
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Its own process group, so the kill below reaches everything it started.
+      // SIGKILL to the child alone leaves a backgrounded grandchild holding the
+      // stdout pipe open, `close` never fires, and the timeout never bounds
+      // anything — the supervisor hangs forever with nothing on the channel.
+      detached: true,
       ...(options.runAs ?? {}),
+      ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
     },
   );
 
@@ -103,17 +121,31 @@ export async function superviseAgent(options: AgentOptions): Promise<RunEvent[]>
   /** No process exists when spawn itself failed, so there is no status to report. */
   let spawned = true;
 
+  /** Resolves the wait even if the pipes never close. Assigned once the promise exists. */
+  let release = () => {};
+
   const finish = (why: AgentFinishedV1['stopped']) => {
     if (!done) stopped = why;
     done = true;
-    // SIGKILL, not SIGTERM: the agent is the thing under judgement, and a
-    // ceiling it has already breached is not an invitation to shut down politely.
+    // The whole process group, not just the child. SIGKILL, not SIGTERM: the
+    // agent is the thing under judgement, and a ceiling it has already breached
+    // is not an invitation to shut down politely.
+    try {
+      if (child.pid) process.kill(-child.pid, 'SIGKILL');
+    } catch {
+      // Already gone, or never started. Either way there is nothing to kill.
+    }
     child.kill('SIGKILL');
+    // `close` waits for the stdio pipes, and an inherited descriptor can hold
+    // them open past the kill. Stop waiting: the ceiling has been reached and
+    // the transcript is whatever arrived before it.
+    setTimeout(release, GRACE_MS).unref();
   };
 
   const timer = setTimeout(() => finish('timeout'), timeoutMs);
 
   await new Promise<void>((resolve) => {
+    release = resolve;
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       if (done) return;
@@ -131,7 +163,11 @@ export async function superviseAgent(options: AgentOptions): Promise<RunEvent[]>
       // A line that never ends is how an unbounded write arrives. Stop rather
       // than grow: storing the fragment would be storing truncated bytes as if
       // they were the whole line.
-      if (buffer.length > maxLineBytes) return finish('byte_cap');
+      //
+      // Measured in bytes, not UTF-16 units — the ceiling is named in bytes and
+      // is what bounds the host disk this untrusted stream can consume, and
+      // three-byte characters made the real limit three times the stated one.
+      if (Buffer.byteLength(buffer) > maxLineBytes) return finish('byte_cap');
     });
     // stderr is drained but not recorded. It is the agent's diagnostics, not its
     // transcript, and mixing the two would put unstructured noise in the record.
@@ -144,11 +180,28 @@ export async function superviseAgent(options: AgentOptions): Promise<RunEvent[]>
       // Spawn failure (no `claude` on PATH). No process ever existed, so the
       // status Node reports is about the attempt, not about an execution — and a
       // plausible-looking code there would claim the agent ran and failed.
+      //
+      // Its own `stopped` value, because "the image has no agent in it" is the
+      // state an operator most needs to read off the log, and `exit` with zero
+      // messages is indistinguishable from an agent that ran and said nothing.
       spawned = false;
+      stopped = 'spawn_failed';
       resolve();
     });
   });
   clearTimeout(timer);
+
+  // A last line with no trailing newline. If the process ended on its own, that
+  // buffer IS the complete final line — nothing more was ever coming — and in
+  // stream-json the last line is normally the `result`. Dropping it lost the
+  // agent's conclusion while `stopped: 'exit'` asserted a transcript that
+  // finished, which is precisely the silent truncation this file refuses.
+  //
+  // Only on a clean exit. After a kill the remainder is a fragment, and storing
+  // a fragment as though it were a whole line is the other half of the same sin.
+  if (stopped === 'exit' && spawned && buffer.length > 0 && lines.length < maxMessages) {
+    lines.push({ raw: buffer, type: claimedType(buffer) });
+  }
 
   let seq = options.afterSeq;
   const events: RunEvent[] = [];

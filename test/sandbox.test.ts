@@ -447,6 +447,101 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     expect(said[0]!.toString()).toContain('"uid":"1000"');
   }, 300_000);
 
+  test('the agent cannot stage the world the phases are judged in', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // The attack that needs no forged event at all. The reproduction is
+    // anchored (ADR-0008) — but anchoring fixes WHAT runs, not the world it runs
+    // in. Sharing a filesystem with the phases, an agent seeds a file the test
+    // reads and a no-op fix goes red then green: every anti-gaming check passes,
+    // because not one of them is about the environment.
+    //
+    // /tmp is the easiest channel. A gitignored directory is the realistic one —
+    // `git clean` at the phase boundary deliberately spares ignored files, and
+    // installing dependencies is the first thing a real agent does. $HOME is the
+    // third. All three are the same hole.
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      '#!/bin/sh\n' +
+        ': > planted.txt\n' +
+        ': > "${TMPDIR:-/tmp}/planted.txt"\n' +
+        ': > "$HOME/planted.txt"\n' +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const repro = {
+      command: 'sh repro.sh',
+      files: {
+        'repro.sh':
+          'cat src.txt\n' +
+          'echo "TREE: $(ls planted.txt 2>&1)"\n' +
+          'echo "TMP: $(ls ${TMPDIR:-/tmp}/planted.txt 2>&1)"\n' +
+          'echo "HOME: $(ls $HOME/planted.txt 2>&1)"\n' +
+          'grep -q right src.txt\n',
+      },
+    };
+
+    const events = parse(
+      execFileSync(
+        'docker',
+        [
+          'run', '--rm', '-i',
+          '-v', `${fixture.repo}:/src:ro`,
+          '-v', `${blobs}:/blobs`,
+          '-v', `${join(agentDir, 'claude')}:/usr/local/bin/claude:ro`,
+          IMAGE,
+        ],
+        {
+          input: JSON.stringify({
+            runId: RUN_ID,
+            afterSeq: 0,
+            sourcePath: '/src',
+            baseRef: fixture.base,
+            fixRef: fixture.fix,
+            repro,
+            symptomPattern: 'wrong',
+            flakeRuns: 0,
+            agentPrompt: 'plant everything you can',
+          }),
+          encoding: 'utf8',
+          maxBuffer: 32 * 1024 * 1024,
+        },
+      ),
+    );
+
+    const outputs = await Promise.all(
+      events
+        .filter((e) => e.type === 'TEST_RUN')
+        .map((e) =>
+          get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash).then((b) =>
+            b.toString(),
+          ),
+        ),
+    );
+    expect(outputs).toHaveLength(2);
+    // `ls:` is the error prefix — the phase could not see any of it. Asserting
+    // absence this way rather than on the event stream, because the whole point
+    // is what the executing process could reach.
+    for (const output of outputs) {
+      expect(output).toContain('TREE: ls:');
+      expect(output).toContain('TMP: ls:');
+      expect(output).toContain('HOME: ls:');
+    }
+
+    // And the run still works: isolation that broke verification would be no fix.
+    expect(events.filter((e) => e.type === 'AGENT_MESSAGE')).toHaveLength(1);
+    const state = fold([
+      { run_id: RUN_ID, seq: 1, ts: new Date().toISOString(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      ...events.map((e, i) => ({ ...e, seq: i + 2 })),
+    ]);
+    expect(state.reproduced).toBe(true);
+  }, 300_000);
+
   test('a hook the repro plants is never executed by the Runner', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = clean();
@@ -461,7 +556,7 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     // GIT_DIR keeps git from ever looking at it.
     const plant =
       'rm -f .git\n' +
-      'cp -r /work/gitdir .git 2>/dev/null || true\n' +
+      'cp -r /work/verify/gitdir .git 2>/dev/null || true\n' +
       'printf "#!/bin/sh\\ntouch /work/PWNED\\n" > .git/hooks/post-checkout 2>/dev/null || true\n' +
       'chmod +x .git/hooks/post-checkout 2>/dev/null || true\n' +
       'echo PLANT: $(ls .git/hooks/post-checkout 2>&1)\n' +

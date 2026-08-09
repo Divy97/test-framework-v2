@@ -106,14 +106,11 @@ export async function runJob(
   blobRoot = BLOBS,
   emit: (line: string) => void = (line) => process.stdout.write(line),
 ): Promise<number> {
-  const repoPath = `${workDir}/repo`;
-  // Git's own state lives outside the worktree. Inside it, the repro owns .git
-  // and plants a post-checkout hook that `git clean` never descends into, which
-  // the Runner then executes as root — so uid 1000 was never the boundary it
-  // looked like. GIT_DIR is passed explicitly so git never consults the `.git`
-  // file left in the worktree either.
-  const gitDir = `${workDir}/gitdir`;
-  const gitEnv = { GIT_DIR: gitDir, GIT_WORK_TREE: repoPath };
+  // Git's own state lives outside every worktree. Inside one, the repro owns
+  // .git and plants a post-checkout hook that `git clean` never descends into,
+  // which the Runner then executes as root — so uid 1000 was never the boundary
+  // it looked like. GIT_DIR is passed explicitly so git never consults the
+  // `.git` file left in the worktree either.
 
   // Refuse rather than silently write into the container layer. Without the
   // mount the run still produces a complete, plausible event stream whose
@@ -154,29 +151,41 @@ export async function runJob(
     }
   };
 
-  await setUp(
-    `clone ${job.sourcePath}`,
-    execFileAsync('git', [
-      'clone', '--quiet', '--no-local', `--separate-git-dir=${gitDir}`, '--', job.sourcePath, repoPath,
-    ]),
-  );
-
   // The repro runs as this user, not as the Runner. Root in the Runner's own
   // namespace can reach the event channel through /proc/1/fd/N whatever the
   // Runner does with its own descriptors.
   const runAs = { uid: REPRO_UID, gid: REPRO_GID };
-  // The worktree only. Not the blob store, and not the git dir.
-  await setUp(
-    'hand the worktree to the repro user',
-    execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, repoPath]),
-  );
-  // The Runner stays root, so git now sees a tree owned by someone else and
-  // refuses it as "dubious ownership". Scoped to this path, inside a container
-  // built for exactly one run.
-  await setUp(
-    'mark the worktree safe for git',
-    execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]),
-  );
+
+  /** A private world for one participant: its own tree, its own TMPDIR, its own HOME. */
+  const world = async (name: string) => {
+    const root = `${workDir}/${name}`;
+    const tree = `${root}/repo`;
+    const tmp = `${root}/tmp`;
+    const home = `${root}/home`;
+    await mkdir(tmp, { recursive: true });
+    await mkdir(home, { recursive: true });
+    await setUp(
+      `clone ${job.sourcePath} for ${name}`,
+      // `--` so a sourcePath cannot be read as an option: `--upload-pack=…` and
+      // `ext::sh -c …` are both command execution.
+      execFileAsync('git', [
+        'clone', '--quiet', '--no-local', `--separate-git-dir=${root}/gitdir`, '--',
+        job.sourcePath, tree,
+      ]),
+    );
+    await setUp(
+      `hand ${name} to the repro user`,
+      execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, root]),
+    );
+    // The Runner stays root, so git now sees a tree owned by someone else and
+    // refuses it as "dubious ownership". Scoped to this path, inside a container
+    // built for exactly one run.
+    await setUp(
+      `mark ${name} safe for git`,
+      execFileAsync('git', ['config', '--global', '--add', 'safe.directory', tree]),
+    );
+    return { tree, gitDir: `${root}/gitdir`, env: { TMPDIR: tmp, HOME: home } };
+  };
 
   // The agent goes first and gets its own seq range, so the log reads in the
   // order things happened: it says its piece, and only then does the engine
@@ -185,17 +194,33 @@ export async function runJob(
   //
   // It runs as the repro user for the same reason the repro does — root in this
   // PID namespace could open the event channel through /proc/1/fd/N.
-  const transcript = job.agentPrompt
+  //
+  // And it gets its OWN world. Anchoring the reproduction fixes what runs; it
+  // says nothing about the world it runs in. Sharing a filesystem with the
+  // phases, the agent needs no forged event to fabricate a verdict: it seeds a
+  // file in /tmp, or in a gitignored directory the phase scrub deliberately
+  // spares, or under $HOME, and a test that reads it goes red then green while
+  // the "fix" changes nothing. Every anti-gaming check still passes, because not
+  // one of them is about the environment. So the trees are separate clones, the
+  // verification tree is made only after the agent is finished, and neither
+  // TMPDIR nor HOME is shared.
+  const agentWorld = job.agentPrompt ? await world('agent') : null;
+  const transcript = agentWorld
     ? await superviseAgent({
         runId: job.runId,
         afterSeq: job.afterSeq,
-        prompt: job.agentPrompt,
-        cwd: repoPath,
+        prompt: job.agentPrompt!,
+        cwd: agentWorld.tree,
         blobRoot: staging,
         runAs,
+        env: agentWorld.env,
         ...(job.agentTimeoutMs === undefined ? {} : { timeoutMs: job.agentTimeoutMs }),
       })
     : [];
+
+  // Cloned now, not earlier: a tree that existed while the agent ran is a tree
+  // the agent could have written to.
+  const phases = await world('verify');
 
   let events: RunEvent[];
   // A run that could not be observed to the end is still a run that observed
@@ -209,14 +234,15 @@ export async function runJob(
       // Continue the log rather than restart it: the engine's first event must
       // not collide with the last thing the agent said.
       afterSeq: transcript.at(-1)?.seq ?? job.afterSeq,
-      repoPath,
+      repoPath: phases.tree,
       baseRef: job.baseRef,
       fixRef: job.fixRef,
       repro: job.repro,
       symptomPattern: new RegExp(job.symptomPattern),
       blobRoot: staging,
-      gitEnv,
+      gitEnv: { GIT_DIR: phases.gitDir, GIT_WORK_TREE: phases.tree },
       runAs,
+      runEnv: phases.env,
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });

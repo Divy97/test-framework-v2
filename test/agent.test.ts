@@ -202,6 +202,9 @@ describe('the agent failing is an observation, not a failure to observe', () => 
     const events = await supervise(null);
     expect(messages(events)).toHaveLength(0);
     expect(finished(events).exit_code).toBe(-1);
+    // Its own value: "there is no agent in this image" is what an operator most
+    // needs off the log, and `exit` with zero messages cannot say it.
+    expect(finished(events).stopped).toBe('spawn_failed');
   });
 
   test('the run continues to the engine after the agent fails', async () => {
@@ -222,6 +225,88 @@ describe('the agent has no way in', () => {
     const events = await supervise(`printf 'noise on stderr\\n' >&2\nprintf '{"type":"real"}\\n'`);
     expect(messages(events).map((m) => m.claimed_type)).toEqual(['real']);
   });
+
+  test('a talkative stderr cannot deadlock the run', async () => {
+    // More than a pipe buffer. Unread, the agent blocks writing to stderr and
+    // never reaches its stdout — the supervisor waits for a `close` that cannot
+    // come. Draining is what stops an agent's diagnostics from wedging a run.
+    const events = await supervise(
+      `yes 'noise' | head -20000 >&2\nprintf '{"type":"real"}\\n'`,
+      { timeoutMs: 8_000 },
+    );
+    expect(messages(events).map((m) => m.claimed_type)).toEqual(['real']);
+    expect(finished(events).stopped).toBe('exit');
+  }, 20_000);
+
+  test('blank lines are not counted as things the agent said', async () => {
+    // stream-json separates records with newlines; a trailing or doubled one is
+    // formatting, not a message, and counting it would spend the cap on nothing.
+    const events = await supervise(`printf '{"type":"a"}\\n\\n\\n{"type":"b"}\\n'`);
+    expect(messages(events).map((m) => m.claimed_type)).toEqual(['a', 'b']);
+    expect(finished(events).messages).toBe(2);
+  });
+});
+
+describe('the transcript continues the log it was handed', () => {
+  test('seqs start after afterSeq rather than at 1', async () => {
+    // Every other case passes afterSeq: 0, where continuing and restarting look
+    // identical — so the property the Runner depends on to keep the agent's seqs
+    // from colliding with the engine's was asserted but never tested.
+    const events = await supervise(`printf '{"type":"a"}\\n'\nprintf '{"type":"b"}\\n'`, {
+      afterSeq: 7,
+    });
+    expect(events.map((e) => e.seq)).toEqual([8, 9, 10]);
+  });
+});
+
+describe('a final line with no newline is not lost', () => {
+  test('a clean exit keeps it — that line is usually the result', async () => {
+    // The process ended on its own, so the buffer IS the complete last line. In
+    // stream-json it is normally the `result`, and dropping it while reporting a
+    // clean exit is the silent truncation this whole file refuses.
+    const events = await supervise(
+      `printf '{"type":"assistant"}\\n'\nprintf '{"type":"result","subtype":"success"}'`,
+    );
+    expect(messages(events).map((m) => m.claimed_type)).toEqual(['assistant', 'result']);
+    expect(finished(events)).toMatchObject({ messages: 2, stopped: 'exit' });
+  });
+
+  test('a killed agent keeps its fragment out of the record', async () => {
+    // After a kill the remainder is a fragment, and storing a fragment as if it
+    // were a whole line is the other half of the same sin.
+    const events = await supervise(
+      `printf '{"type":"a"}\\n'\nprintf '{"type":"partial-'\nexec sleep 30`,
+      { timeoutMs: 2_000 },
+    );
+    expect(messages(events).map((m) => m.claimed_type)).toEqual(['a']);
+    expect(finished(events).stopped).toBe('timeout');
+  });
+});
+
+describe('the ceilings are measured in what they are named for', () => {
+  test('the byte cap counts bytes, not UTF-16 units', async () => {
+    // 300 three-byte characters is 900 bytes. Counting `buffer.length` made the
+    // real ceiling up to 3x the stated one — and this is the only bound on how
+    // much host disk an untrusted stream can consume.
+    const events = await supervise(`yes '€' | head -300 | tr -d '\\n'`, { maxLineBytes: 400 });
+    expect(finished(events).stopped).toBe('byte_cap');
+  });
+});
+
+describe('supervision cannot outlive its own timeout', () => {
+  test('a backgrounded grandchild holding the pipe does not hang the Runner', async () => {
+    // `close` waits for the stdio pipes, and a grandchild inherits them. Killing
+    // only the child left them open forever: the promise never settled, the
+    // timeout bounded nothing, and the Runner wedged with nothing on the channel.
+    // A `claude` that spawns helpers is ordinary behaviour, not an attack.
+    const started = Date.now();
+    const events = await supervise(
+      `printf '{"type":"a"}\\n'\nsleep 30 &\nexit 0`,
+      { timeoutMs: 1_000 },
+    );
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(messages(events)).toHaveLength(1);
+  }, 30_000);
 });
 
 describe('the fake is really being used', () => {

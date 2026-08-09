@@ -139,7 +139,7 @@ export type AgentFinishedV1 = {
   /** -1 when the process died by signal without returning a status. */
   exit_code: number;
   signal?: string;
-  stopped: 'exit' | 'line_cap' | 'byte_cap' | 'timeout';
+  stopped: 'exit' | 'line_cap' | 'byte_cap' | 'timeout' | 'spawn_failed';
 };
 
 /**

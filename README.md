@@ -73,6 +73,7 @@ Confidence score = tier + deterministic evidence quality. Every point traceable 
 7. [The reproduce-first gate and tiered confidence](docs/adr/0007-reproduce-first-gate.md)
 8. [The reproduction is anchored, not committed](docs/adr/0008-the-reproduction-is-anchored.md)
 9. [What a producer may write back into the log](docs/adr/0009-what-a-producer-may-write-back.md)
+10. [The environment is part of the evidence](docs/adr/0010-the-environment-is-part-of-the-evidence.md)
 
 The full decision record from the founding design session: [SHARED-UNDERSTANDING.md](SHARED-UNDERSTANDING.md).
 

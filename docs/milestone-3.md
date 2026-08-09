@@ -35,9 +35,18 @@ events. The agent still cannot append events — the Runner writes all of them
 ordering invariant from ADR-0008 has to become real: registration precedes the
 agent seeing or writing the fix, provable from the log by seq.
 
+That ordering invariant belongs to **3b.2**, not 3b.1. In 3b.1 the agent runs
+first and every `AGENT_MESSAGE` carries a lower seq than `REPRO_REGISTERED`,
+because the repro still comes from the Job rather than from the agent.
+
 Split in two once the supervision mechanics turned out to be a whole subject:
 
-- **3b.1 — supervision.** Spawn, bound, translate. `AGENT_MESSAGE` carries the
+- **3b.1 — supervision, and the isolation that makes it safe.** Spawn, bound,
+  translate. Review of this step found that the agent needed no forged event to
+  fabricate a verdict — sharing a filesystem with the phases was enough — so
+  each participant now gets its own clone, `TMPDIR` and `HOME`, and the
+  verification tree is cloned only after the agent has finished
+  ([ADR-0010](adr/0010-the-environment-is-part-of-the-evidence.md)). `AGENT_MESSAGE` carries the
   raw line by `sha256:` ref and the `claimed_type` the stream asserted;
   `AGENT_FINISHED` records how it ended, so a truncated transcript can never
   read as a complete one. The agent gets no stdin, runs as the repro user, and

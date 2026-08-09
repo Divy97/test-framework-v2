@@ -131,6 +131,16 @@ export type VerifyOptions = {
    * another user's /proc/1/fd/N is listable but not openable.
    */
   runAs?: { uid: number; gid: number };
+  /**
+   * Environment for the repro, layered over the engine's own.
+   *
+   * The sandbox uses it to give the phases a private TMPDIR and HOME. Anchoring
+   * the reproduction fixes WHAT runs; it says nothing about the world it runs
+   * in, and an agent that shares `/tmp` with the phases can seed a file the test
+   * reads and make a no-op fix go green. Every anti-gaming check still passes,
+   * because none of them is about the environment.
+   */
+  runEnv?: Env;
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -150,6 +160,7 @@ async function run(
   timeoutMs: number,
   maxOutputBytes: number,
   runAs?: { uid: number; gid: number },
+  runEnv?: Env,
 ): Promise<Execution> {
   const startedAt = Date.now();
   try {
@@ -158,6 +169,7 @@ async function run(
       timeout: timeoutMs,
       maxBuffer: maxOutputBytes,
       ...(runAs ?? {}),
+      ...(runEnv ? { env: { ...process.env, ...runEnv } } : {}),
     });
     return { exitCode: 0, output: stdout, durationMs: Date.now() - startedAt };
   } catch (error) {
@@ -500,7 +512,7 @@ async function observe(
     payload: { v: 1, command: reproCommand, files: registered, applied: [...appliedFiles.keys()].sort() },
   });
 
-  const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs);
+  const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
   emit({
     type: 'TEST_RUN',
     payload: {
@@ -537,7 +549,7 @@ async function observe(
   // Re-runs deliberately share a working tree: they are re-executions of the same
   // fix, not independent trials, and isolating them would hide order-dependent flake.
   for (let repeat = 0; repeat <= flakeRuns; repeat++) {
-    const fix = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs);
+    const fix = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
     emit({
       type: 'TEST_RUN',
       payload: {
