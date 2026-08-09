@@ -261,7 +261,7 @@ describe('a reproduction the agent wrote', () => {
     const authored = confidence(fold(withHandover('repro')));
     expect(authored.tier).toBe(2);
     expect(authored.grounds.some((g) => /which commit it is running on/.test(g.claim))).toBe(true);
-    expect(authored.unmeasured.some((u) => /keyed on the fix/.test(u))).toBe(true);
+    expect(authored.unmeasured.some((u) => /advisory/.test(u))).toBe(true);
   });
 });
 

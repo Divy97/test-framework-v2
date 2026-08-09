@@ -618,6 +618,18 @@ async function observe(
   // HEAD` would not notice a stray file, and the cheapest oracle to write is the
   // one over tracked content.
   if (options.controlRun && options.only !== 'fix' && baseRed) {
+    // ADVISORY MEANS ADVISORY. The previous version removed the accusation and
+    // left every other throwing path standing — `run()` on timeout or overflow,
+    // six `git()` calls, `applyRepro()`, and the no-tracked-files refusal. The
+    // control executes attacker-controlled code two extra times, so review
+    // measured an HONEST reproduction aborted in 5 of 10 identical runs, and
+    // earlier than the accusation would have: before the fix phase ran at all.
+    // That is worse than the defect the advisory change was made to remove.
+    //
+    // Nothing inside this block may end the run. Whatever it learns, it learns as
+    // evidence; whatever goes wrong, goes wrong quietly and the run proceeds as
+    // though the control had not been asked for.
+    try {
     progress.phase = 'base';
     // TWO independent shams, and an accusation only if both go green.
     //
@@ -630,9 +642,10 @@ async function observe(
     // is genuinely about one file's ending survives the one that does not touch
     // it. Disagreement is inconclusive, and inconclusive is not an accusation.
     const tracked = (await git(['ls-files', '-z'], repoPath, gitEnv)).split('\0').filter(Boolean);
-    if (tracked.length === 0) {
-      throw new ObservationFailed('the base commit tracks no files, so the reproduction cannot be controlled');
-    }
+    // Not a refusal, and not a return: an empty root commit is unusual rather
+    // than hostile, and `return events` here would skip the FIX PHASE — ending
+    // the run in the one branch written to avoid ending runs.
+    if (tracked.length > 0) {
     for (let draw = 0; draw < 2; draw += 1) {
       // Through the same guard every other path in this file uses. This was the
       // ONE write in `verify()` that did not: `victim` is committed data chosen
@@ -651,7 +664,12 @@ async function observe(
       const inside = await realpath(target)
         .then(async (real) => real.startsWith((await realpath(repoPath)) + sep))
         .catch(() => false);
-      if (!kind?.isFile() || !inside) continue;
+      // `nlink > 1` too. A hardlink is a second NAME for the same inode: it is a
+      // regular file and realpath does not resolve it away, so it satisfied both
+      // checks while pointing outside the repository — and the repro can create
+      // one DURING the base run. `hashRepro` in this same file already refuses
+      // exactly this and says why; the guard was rewritten instead of reused.
+      if (!kind?.isFile() || kind.nlink > 1 || !inside) continue;
       // `lstat`, so a symlink is refused rather than followed, and a dangling
       // link, a directory and a submodule gitlink are all skipped — each of those
       // threw a raw ENOENT/EISDIR out of `verify()`, past the ObservationFailed
@@ -710,6 +728,19 @@ async function observe(
       await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
       await applyRepro();
     }
+      }
+    } catch {
+      // Deliberately swallowed, and deliberately not re-raised as an abort: this
+      // is a diagnostic the engine chose to run, not an observation the caller
+      // asked for. A control that cannot complete tells us nothing, and telling
+      // nothing must not cost the run its verdict.
+    }
+    // The tree, whatever happened above. A control that died mid-perturbation
+    // must not hand the fix phase a dirty tree — the contamination the container
+    // split exists to prevent.
+    await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv).catch(() => {});
+    await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv).catch(() => {});
+    await applyRepro();
   }
 
   // The base container's work ends here. It leaves the tree as it found it, and

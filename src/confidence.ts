@@ -182,11 +182,11 @@ export function confidence(state: RunState): Confidence {
   // which commit it is standing on rather than whether the bug is present. Red on
   // base, green on a fix that changes nothing, with every anchor satisfied.
   //
-  // Five versions of the sham-fix control were defeated, and the last review
-  // showed the class that no sham can ever catch: an oracle keyed on the FIX
-  // (`[ -f NOTES.md ] && exit 0`) rather than on base. The control perturbs base,
-  // so it is blind to that by construction, and the repro agent and the fix agent
-  // are the same model under the same operator.
+  // Six versions of the sham-fix control were defeated — by oracles keyed on the
+  // FIX, which it is blind to by construction, and by oracles keyed on BASE that
+  // simply out-guessed it. It is advisory now: it records what it saw and decides
+  // nothing, so this cap is what withholds the claim, and it does not depend on
+  // any sham working.
   //
   // So the engine stops claiming what it cannot demonstrate. These runs are Tier
   // 2 — reproduced, with the reproduction's independence unverified — until
@@ -210,8 +210,9 @@ export function confidence(state: RunState): Confidence {
       ],
       unmeasured: [
         ...unmeasured,
-        'the independence of an agent-authored reproduction: the sham-fix control catches naive ' +
-          'identity oracles and provably cannot catch one keyed on the fix (ADR-0008 amendment)',
+        'the independence of an agent-authored reproduction: nothing here shows it tests the bug ' +
+          'rather than which commit it is running on, and the sham-fix control is advisory — it ' +
+          'records what it saw and decides nothing (ADR-0008 amendment)',
       ],
     };
   }

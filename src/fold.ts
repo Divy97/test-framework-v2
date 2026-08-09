@@ -254,7 +254,14 @@ export function apply(state: RunState, event: RunEvent): RunState {
       // wrote an accusation of a commit swap into a log where nothing was
       // swapped.
       const handedOver = event.payload.kind === 'repro' ? state.handedOver : event.payload.commit;
-      const reproAuthoredByAgent = state.reproAuthoredByAgent || event.payload.kind === 'repro';
+      // `!== 'fix'`, not `=== 'repro'`. This flag is now the ONLY thing
+      // withholding a Tier 1 claim from an agent-authored reproduction — the
+      // sham control is advisory and decides nothing — so it must fail CLOSED.
+      // Keyed on equality it failed open five ways: absent `kind`, an
+      // unrecognised `kind`, a missing handover, a second producer, and a log
+      // carrying the engine's own control runs. Only an explicit `fix` is a
+      // handover this engine will treat as leaving Tier 1 available.
+      const reproAuthoredByAgent = state.reproAuthoredByAgent || event.payload.kind !== 'fix';
       return {
         ...next,
         handedOver,
