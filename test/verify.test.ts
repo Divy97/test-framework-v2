@@ -4,6 +4,7 @@
 // thing ran both times. Everything here either demonstrates that anchor holding,
 // or demonstrates precisely where it does not reach.
 
+import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -715,8 +716,16 @@ describe('a crash is not a test failure', () => {
  * is the same hole one step further out — reachable with no forged event, no
  * surviving process, and no tampering with the reproduction's bytes.
  */
+const scratch = () => mkdtempSync(join(tmpdir(), 'engine-phase-tmp-'));
+
+/** A second working copy of a fixture repo, as a second container would get. */
+const cloneOf = (repo: string) => {
+  const into = mkdtempSync(join(tmpdir(), 'engine-phase-clone-'));
+  execFileSync('git', ['clone', '--quiet', '--no-local', repo, `${into}/repo`]);
+  return `${into}/repo`;
+};
+
 describe('the world the fix phase sees, not just the tree', () => {
-  const scratch = () => mkdtempSync(join(tmpdir(), 'engine-phase-tmp-'));
 
   test('a repro that is red once and green after is NOT a reproduction', async () => {
     const tmp = scratch();
@@ -772,6 +781,81 @@ describe('the world the fix phase sees, not just the tree', () => {
     expect(fixDiff(events).changed_files).toEqual(['README.md']);
     expect(conclude(events).reproduced).toBe(true);
     rmSync(tmp, { recursive: true, force: true });
+  });
+});
+
+/**
+ * The M4 shape: each phase observed by a process that never saw the other one.
+ *
+ * The fold has to reach the same verdict either way, and it does so with no
+ * extra plumbing — both halves hash the same `repro.files` bytes, so the anchor
+ * comparison works across containers exactly as it does within one.
+ */
+describe('one phase at a time', () => {
+  /** Base and fix observed separately, on separate clones, stitched into one log. */
+  const separately = async (fixture: Fixture, overrides: Partial<VerifyOptions> = {}) => {
+    // Each half gets its own TMPDIR as well as its own clone, because that is
+    // what a container of its own means. Sharing either would be reproducing the
+    // problem the split exists to remove.
+    const base = await observe(fixture, {
+      ...overrides,
+      only: 'base',
+      runEnv: { ...overrides.runEnv, TMPDIR: scratch() },
+    });
+    const fresh = { ...fixture, repo: cloneOf(fixture.repo) };
+    const fix = await observe(fresh, {
+      ...overrides,
+      only: 'fix',
+      repoPath: fresh.repo,
+      afterSeq: base.length,
+      runEnv: { ...overrides.runEnv, TMPDIR: scratch() },
+    });
+    return [...base, ...fix];
+  };
+
+  test('reaches the same verdict as the whole run', async () => {
+    const together = conclude(await observe(clean(), { flakeRuns: 0 }));
+    const apart = conclude(await separately(clean(), { flakeRuns: 0 }));
+
+    expect(together.reproduced).toBe(true);
+    expect(apart.reproduced).toBe(true);
+    expect(apart.testRuns.map((r) => [r.phase, r.exit_code])).toEqual(
+      together.testRuns.map((r) => [r.phase, r.exit_code]),
+    );
+  });
+
+  test('emits each phase once, in order, with the log continuing across the seam', async () => {
+    const events = await separately(clean(), { flakeRuns: 0 });
+    expect(events.map((e) => e.type)).toEqual([
+      'REPRO_REGISTERED',
+      'TEST_RUN',
+      'TEST_RUN',
+      'FIX_DIFF_OBSERVED',
+    ]);
+    expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+  });
+
+  test('still refuses a fix that does not fix anything', async () => {
+    // The gate has to survive the split, or the split bought nothing.
+    expect(conclude(await separately(irreproducible(), { flakeRuns: 0 })).reproduced).toBe(false);
+  });
+
+  test('still detects a pinned test the fix commit rewrote', async () => {
+    // Across containers this works only because both halves hash the same path
+    // and the fix commit changed it. Nothing is carried between them.
+    const events = await separately(pinnedTampering(), { repro: PINNED_REPRO, flakeRuns: 0 });
+    expect(conclude(events).reproduced).toBe(false);
+  });
+
+  test('the base half leaves nothing for the fix half to inherit', async () => {
+    // The whole reason for the split. An order-dependent repro is red once and
+    // green after; with separate clones and no shared scratch, the fix half
+    // starts from nothing and the trick does not work.
+    const events = await separately(noOpFix(), {
+      repro: ORDER_DEPENDENT_REPRO,
+      flakeRuns: 0,
+    });
+    expect(conclude(events).reproduced).toBe(false);
   });
 });
 

@@ -1,6 +1,14 @@
 # Milestone 4 (proposed) — one container per participant
 
-**Status: scoped, and still the answer.** An earlier draft downgraded this to
+**Status: candidate B landed for the phases.** `verify()` takes `only`,
+`src/orchestrate.ts` runs a container per participant from the host, and the fix
+phase now starts on a machine the base phase never touched. Honest about what
+that bought: collapsing the orchestrator back to one container still refuses
+every attack the suite knows, because the scrubs and the reap close them. The
+scrubs remove channels that were *found*; this removes the sharing they were
+needed for. The agent step is wired but the attempt loop that uses it is 3b.2.
+
+**Status before that, kept because the reasoning still holds:** An earlier draft downgraded this to
 "less urgent" on the grounds that the enumeration had been closed by a test.
 That was premature: the very next review round walked a self-respawning process
 chain through the reap — the one invariant this doc called load-bearing — and

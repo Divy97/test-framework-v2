@@ -16,6 +16,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { fold } from '../src/fold.js';
+import { orchestrate } from '../src/orchestrate.js';
 import { SHARED_WRITABLE } from '../src/runner.js';
 import {
   APPLIED_REPRO,
@@ -958,6 +959,98 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(existsSync(join(blobs, 'ab', '.seen'))).toBe(false);
     expect(existsSync(join(blobs, 'zz'))).toBe(false);
   }, 300_000);
+
+  test('a container per phase reaches the verdict, sharing nothing', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+    });
+
+    expect(outcome.complete).toBe(true);
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['base', 'fix']);
+    // One continuous log across two containers: the seq counter is one of the
+    // only two things that crosses between them.
+    expect(outcome.events.map((e) => e.type)).toEqual([
+      'REPRO_REGISTERED',
+      'TEST_RUN',
+      'TEST_RUN',
+      'FIX_DIFF_OBSERVED',
+    ]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+
+    const state = fold([
+      { run_id: RUN_ID, seq: 1, ts: new Date().toISOString(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      ...outcome.events.map((e, i) => ({ ...e, seq: i + 2 })),
+    ]);
+    expect(state.reproduced).toBe(true);
+
+    // Every artifact still crosses to the host, from both containers.
+    const refs = [...new Set(JSON.stringify(outcome.events).match(/sha256:[0-9a-f]{64}/g) ?? [])];
+    for (const ref of refs) {
+      await expect(get(blobs, ref as ArtifactRef)).resolves.toBeInstanceOf(Buffer);
+    }
+  }, 600_000);
+
+  test('the fix phase runs in a machine the base phase never touched', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = noOpFix();
+    const blobs = hostBlobs();
+
+    // Honest about what this proves. Collapsing the orchestrator back to a
+    // single container ALSO refuses this attack — the scrubs and the reap close
+    // it — so this is not evidence that per-phase containers fix something still
+    // broken. What it pins is the structural property: the fix phase cannot see
+    // base-phase state through /tmp, /var/tmp, /dev/shm, $HOME or an ignored
+    // directory, and here that holds because there is nothing to scrub rather
+    // than because a list was complete. The scrubs remove found channels; this
+    // removes the sharing they were needed for.
+    const repro = {
+      command: 'sh repro.sh',
+      files: {
+        'repro.sh':
+          'for f in /tmp/.seen /var/tmp/.seen /dev/shm/.seen "$HOME/.seen" node_modules/.seen; do\n' +
+          '  [ -f "$f" ] && exit 0\n' +
+          'done\n' +
+          'cat src.txt\n' +
+          'mkdir -p node_modules 2>/dev/null\n' +
+          'for f in /tmp/.seen /var/tmp/.seen /dev/shm/.seen "$HOME/.seen" node_modules/.seen; do\n' +
+          '  touch "$f" 2>/dev/null\n' +
+          'done\n' +
+          'grep -q right src.txt\n',
+      },
+    };
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro,
+      symptomPattern: 'wrong',
+      flakeRuns: 2,
+    });
+
+    const state = fold([
+      { run_id: RUN_ID, seq: 1, ts: new Date().toISOString(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      ...outcome.events.map((e, i) => ({ ...e, seq: i + 2 })),
+    ]);
+    // The fix commit changes only README.md. Crediting this would be the
+    // fabricated verdict five rounds of scrubbing kept almost preventing.
+    expect(state.reproduced).toBe(false);
+  }, 600_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });

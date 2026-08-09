@@ -162,6 +162,21 @@ export type VerifyOptions = {
    * fixes the repro's BYTES, never its side effects.
    */
   onPhaseBoundary?: () => Promise<void>;
+  /**
+   * Observe ONE phase and stop, instead of both.
+   *
+   * The whole-run form shares a filesystem between base and fix by necessity —
+   * switching commits in one tree is what the comparison is — and every channel
+   * ADR-0010 lists exists because of that sharing. Running each phase in a
+   * container of its own removes the sharing rather than scrubbing it, which is
+   * the only move that has not needed a follow-up fix.
+   *
+   * Omitted, the engine behaves exactly as it always has. Both halves emit
+   * REPRO_REGISTERED-comparable hashes from the same `repro.files` bytes, so the
+   * fold's anchor check works across containers with no extra plumbing: matching
+   * bytes hash the same, and a `pinned` path the fix commit rewrote does not.
+   */
+  only?: 'base' | 'fix';
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -527,28 +542,50 @@ async function observe(
   // but no event has been emitted yet, so nothing is left half-observed.
   progress.phase = 'base';
   await applyRepro();
-  const registered = await hashRepro();
-  emit({
-    type: 'REPRO_REGISTERED',
-    payload: { v: 1, command: reproCommand, files: registered, applied: [...appliedFiles.keys()].sort() },
-  });
+  // The base half registers, and only the base half. A fix-only container that
+  // emitted its own registration would anchor the run to hashes taken AFTER the
+  // fix commit had its way with them — so a rewritten `pinned` test would match
+  // its own tampered registration and be credited. The registration has to
+  // predate the thing it judges.
+  if (options.only !== 'fix') {
+    emit({
+      type: 'REPRO_REGISTERED',
+      payload: {
+        v: 1,
+        command: reproCommand,
+        files: await hashRepro(),
+        applied: [...appliedFiles.keys()].sort(),
+      },
+    });
+  }
 
-  const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
-  emit({
-    type: 'TEST_RUN',
-    payload: {
-      v: 1,
-      phase: 'base',
-      commit_sha: baseSha,
-      exit_code: base.exitCode,
-      ...(base.signal ? { signal: base.signal } : {}),
-      stdout_hash: await put(blobRoot, base.output),
-      duration_ms: base.durationMs,
-      symptom_matched: symptom.test(base.output),
-      repeat: 0,
-      repro_hashes: await hashRepro(),
-    },
-  });
+  if (options.only !== 'fix') {
+    const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+    emit({
+      type: 'TEST_RUN',
+      payload: {
+        v: 1,
+        phase: 'base',
+        commit_sha: baseSha,
+        exit_code: base.exitCode,
+        ...(base.signal ? { signal: base.signal } : {}),
+        stdout_hash: await put(blobRoot, base.output),
+        duration_ms: base.durationMs,
+        symptom_matched: symptom.test(base.output),
+        repeat: 0,
+        repro_hashes: await hashRepro(),
+      },
+    });
+  }
+
+  // The base container's work ends here. It leaves the tree as it found it, and
+  // the fix phase happens in a container that never saw this one.
+  if (options.only === 'base') {
+    progress.phase = 'cleanup';
+    await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
+    await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+    return events;
+  }
 
   // Scrub before switching, not after. Whatever the base phase left behind —
   // caches, generated files, a seeded DB, an edit to a tracked file that both
@@ -561,7 +598,10 @@ async function observe(
   // dependencies, and removing them would change what is under test far more
   // than it isolates it.
   progress.phase = 'fix';
-  await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
+  // Only meaningful when this process ran the base phase too. A fix-only
+  // container starts from a clone nothing has touched, which is the point.
+  if (options.only !== 'fix') {
+    await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
   // `-x` here and nowhere else. Ignored files are spared elsewhere because they
   // are usually installed dependencies, and removing them changes what is under
   // test — but between the phases of one repo they are simply the easiest place
@@ -569,13 +609,14 @@ async function observe(
   // `dist/` and `coverage/` are ignored in every real repository. Nothing
   // installs dependencies yet (M2 deferred it), so today this costs nothing; a
   // `setupCommand` must run per phase rather than once.
-  await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
-  // The same scrub, one step further out. Whatever the base run left behind
-  // outside the tree — state on disk, or a process still running — is what the
-  // fix run would otherwise inherit, and a repro needs no more than that to be
-  // red once and green afterwards. The Runner owns what that means; the engine
-  // only owns the tree.
-  await options.onPhaseBoundary?.();
+    await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+    // The same scrub, one step further out. Whatever the base run left behind
+    // outside the tree — state on disk, or a process still running — is what the
+    // fix run would otherwise inherit, and a repro needs no more than that to be
+    // red once and green afterwards. The Runner owns what that means; the engine
+    // only owns the tree.
+    await options.onPhaseBoundary?.();
+  }
   await checkout(fixSha, repoPath, gitEnv);
   // The same bytes again — this is the whole point. Whatever the fix commit says
   // the reproduction is, the registered version is what runs.

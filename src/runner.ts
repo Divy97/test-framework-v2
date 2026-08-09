@@ -40,6 +40,17 @@ export type Job = {
    */
   agentPrompt?: string;
   agentTimeoutMs?: number;
+  /**
+   * Observe one phase and stop. Omitted, this container runs the whole run, as
+   * M3 did.
+   *
+   * With it, the host runs a container per phase and nothing is shared between
+   * them — no tree, no TMPDIR, no HOME, no surviving process, no `/blobs` window
+   * between phases. Every channel ADR-0010 enumerates comes from base and fix
+   * sharing a machine; this removes the sharing rather than scrubbing it, which
+   * is the only move here that has not needed a follow-up fix.
+   */
+  only?: 'base' | 'fix';
   flakeRuns?: number;
   timeoutMs?: number;
 };
@@ -439,6 +450,7 @@ export async function runJob(
       // backgrounds is the same attack again, which no amount of directory
       // scrubbing reaches.
       onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME], evidence),
+      ...(job.only === undefined ? {} : { only: job.only }),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });

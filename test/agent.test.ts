@@ -300,11 +300,14 @@ describe('supervision cannot outlive its own timeout', () => {
     // timeout bounded nothing, and the Runner wedged with nothing on the channel.
     // A `claude` that spawns helpers is ordinary behaviour, not an attack.
     const started = Date.now();
+    // Generous deadline: the claim is "does not hang forever", and a tight one
+    // measures how loaded the machine is rather than whether the pipes are ever
+    // let go of. It failed only under a saturated full-suite run.
     const events = await supervise(
       `printf '{"type":"a"}\\n'\nsleep 30 &\nexit 0`,
-      { timeoutMs: 1_000 },
+      { timeoutMs: 4_000 },
     );
-    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(Date.now() - started).toBeLessThan(20_000);
     expect(messages(events)).toHaveLength(1);
   }, 30_000);
 });
