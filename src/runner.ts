@@ -268,6 +268,77 @@ async function listing(root: string, prefix = ''): Promise<string[]> {
   return paths;
 }
 
+/** Where an agent container leaves its commits. Mounted only for the agent step. */
+const HANDOVER = '/out';
+/**
+ * Ceiling on the bundle. The agent chooses what it commits, so this is the one
+ * place its output reaches host disk unbounded — a single enormous blob in a
+ * commit would otherwise be copied out without anything looking at the size.
+ */
+const MAX_BUNDLE_BYTES = 256 * 1024 * 1024;
+
+/**
+ * The one thing an agent is allowed to carry out of its container: commits.
+ *
+ * Its tree is discarded by design (ADR-0010) — not scrubbed, destroyed with the
+ * container — so a reproduction or a fix it writes reaches the phases as a git
+ * bundle or it does not reach them at all. A bundle is exactly the right shape:
+ * it carries objects and refs and nothing else. No working tree, no untracked
+ * files, no TMPDIR, no processes.
+ *
+ * Silently skipped when `/out` is not mounted, because a run that only wants the
+ * transcript should not fail for want of somewhere to put code.
+ */
+async function handOverCommits(world: { tree: string; gitDir: string }): Promise<void> {
+  const mounted = await stat(HANDOVER).then((s) => s.isDirectory()).catch(() => false);
+  if (!mounted) return;
+
+  // The bundle is written by uid 1000 now, so the mount has to be reachable by
+  // it. The host owns the directory and reads it afterwards; only this one file
+  // is ever created here.
+  await execFileAsync('chown', [`${REPRO_UID}:${REPRO_GID}`, HANDOVER]).catch(() => {});
+  const bundle = `${HANDOVER}/agent.bundle`;
+  try {
+    // `cwd` as well as GIT_DIR: `git bundle` refuses with "Need a repository"
+    // when it is run from outside one, whatever the environment says. The tree
+    // is uid-1000-owned and this runs as root, which is why it was already
+    // marked `safe.directory`.
+    // `HEAD`, not `--all`. `--all` carries refs/heads/*, and the agent's work
+    // sits at HEAD — which on a fresh clone may be detached, so its commit was
+    // in no branch at all and the bundle crossed carrying only what the clone
+    // started with. The run then verified the repository's own fix commit and
+    // called it the agent's.
+    await execFileAsync('git', ['bundle', 'create', bundle, 'HEAD'], {
+      cwd: world.tree,
+      env: { ...process.env, GIT_DIR: world.gitDir, GIT_WORK_TREE: world.tree },
+      // As the author, not as root. The author owns this git dir, so its config
+      // is attacker-controlled — and `diff.external` and `core.fsmonitor` turn
+      // an ordinary git command into arbitrary execution. Dropping privileges
+      // makes that the author's own uid rather than root's.
+      uid: REPRO_UID,
+      gid: REPRO_GID,
+    });
+  } catch (error) {
+    // git's own words, not a paraphrase. A wrapper that drops them turns a
+    // one-line diagnosis into a debugging session — the mistake this codebase
+    // has already made twice.
+    const detail = (error as { stderr?: string; message?: string }).stderr ?? '';
+    throw new ObservationFailed(
+      `could not bundle the agent commits: ${detail.trim().split('\n')[0] ?? String(error)}`,
+    );
+  }
+
+  const { size } = await stat(bundle);
+  if (size > MAX_BUNDLE_BYTES) {
+    await rm(bundle, { force: true });
+    throw new ObservationFailed(
+      `the agent's commits came to ${size} bytes, past the ${MAX_BUNDLE_BYTES} ceiling`,
+    );
+  }
+  // The host reads it; the agent user must not be able to rewrite it afterwards.
+  await chmod(bundle, 0o444);
+}
+
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
@@ -362,8 +433,24 @@ export async function runJob(
   // Runner does with its own descriptors.
   const runAs = { uid: REPRO_UID, gid: REPRO_GID };
 
-  /** A private world for one participant: its own tree, its own TMPDIR, its own HOME. */
-  const world = async (name: string) => {
+  /**
+   * A private world for one participant: its own tree, its own TMPDIR, its own
+   * HOME — and, for an author, its own git dir.
+   *
+   * The phases must NOT own their git dir: a repro that owns it plants
+   * `hooks/post-checkout` and the Runner executes it as root on the next
+   * checkout, which is the hole `--separate-git-dir` was introduced to close.
+   * But an AUTHOR has to write objects to commit at all, and withholding the
+   * git dir left the agent unable to commit — silently, since a failed commit
+   * just means the bundle carries what the clone started with, and the run then
+   * verified the repository's own commit believing it was the agent's.
+   *
+   * Safe for the author because nothing root-privileged ever runs git against
+   * that world afterwards: the only command is `git bundle`, and it runs as the
+   * author's own uid precisely so a `.git/config` carrying `diff.external` or
+   * `core.fsmonitor` executes as uid 1000 rather than as root.
+   */
+  const world = async (name: string, authors = false) => {
     const root = `${workDir}/${name}`;
     const tree = `${root}/repo`;
     const tmp = `${root}/tmp`;
@@ -385,7 +472,7 @@ export async function runJob(
     // Runner execute it as root on the next checkout. That is the exact hole
     // `--separate-git-dir` was introduced to close, reopened by a refactor that
     // looked like tidying.
-    for (const path of [tree, tmp, home]) {
+    for (const path of authors ? [tree, tmp, home, `${root}/gitdir`] : [tree, tmp, home]) {
       await setUp(
         `hand ${name}'s ${basename(path)} to the repro user`,
         execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, path]),
@@ -420,7 +507,7 @@ export async function runJob(
   // TMPDIR nor HOME is shared. Separation is not the whole answer, though —
   // `clearTheField` below is, because a process that outlives the agent runs as
   // the same uid and can write the phases' private directories anyway.
-  const agentWorld = job.agentPrompt ? await world('agent') : null;
+  const agentWorld = job.agentPrompt ? await world('agent', true) : null;
   const transcript = agentWorld
     ? await superviseAgent({
         runId: job.runId,
@@ -437,6 +524,11 @@ export async function runJob(
   // Nothing the agent started may still be running when the phases begin, and
   // nothing it left in a shared directory may still be there.
   if (agentWorld) {
+    // Extract the commits BEFORE the world is destroyed. Doing it after left
+    // `git bundle` staring at a directory that no longer existed — and the
+    // ordering is the right one regardless: take what may leave, then destroy
+    // everything else.
+    await handOverCommits(agentWorld);
     await clearTheField([], evidence);
     // The agent's world is discarded outright, not scrubbed. ADR-0010 already
     // says its tree does not survive — but the tree, TMPDIR and HOME are all

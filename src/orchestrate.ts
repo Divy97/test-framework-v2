@@ -25,7 +25,8 @@
 // gets its own empty store and the host collects from it afterwards. Blobs are
 // content-addressed, so collecting is a copy that cannot collide meaningfully.
 
-import { spawn } from 'node:child_process';
+import { execFile as execFileCb, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { cp, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,11 +35,20 @@ import { fold } from './fold.js';
 import type { Job } from './runner.js';
 
 /** Output ceiling per container. Matches what the sandbox tests already allow. */
+const execFile = promisify(execFileCb);
+
 const MAX_STREAM_BYTES = 32 * 1024 * 1024;
 /** Tail of a container's diagnostics. The reason is at the end, not the start. */
 const MAX_STDERR_CHARS = 8 * 1024;
 
-export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only'> & {
+export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef'> & {
+  /**
+   * The commit the fix is judged at. Omitted when an agent is writing it: the
+   * orchestrator then uses whatever the agent committed, which is the only
+   * honest answer — a fix ref chosen in advance would be judging a commit
+   * nobody had made yet.
+   */
+  fixRef?: string;
   /** Host path to the repository. Mounted read-only into every container. */
   repoPath: string;
   /** Host directory holding the evidence. Must pre-exist with its sentinel. */
@@ -57,6 +67,8 @@ export type PhaseResult = {
   phase: 'agent' | 'base' | 'fix';
   events: RunEvent[];
   exitCode: number;
+  /** Host directory the agent container left its commits in, when it had one. */
+  handover?: string;
   /**
    * What the container said on stderr, bounded.
    *
@@ -107,6 +119,14 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
 
   const phases: PhaseResult[] = [];
   const events: RunEvent[] = [];
+  // The agent's commits have to reach the phases, and the user's repository is
+  // never written to — so the orchestrator works from a clone it owns. This is
+  // the only place a commit crosses between containers, and it crosses as a
+  // bundle: objects and refs, no working tree, nothing else.
+  const workspace = await mkdtemp(join(tmpdir(), 'engine-workspace-'));
+  const source = join(workspace, 'source');
+  await execFile('git', ['clone', '--quiet', '--no-local', '--', plan.repoPath, source]);
+
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
   // — the gate folds this run's events, and `fold()` throws on a stream that does
@@ -141,8 +161,16 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   steps.push({ phase: 'base', job: { only: 'base' } });
 
   let ended: RunEvent | null = null;
+  let fixRef = plan.fixRef;
   for (const step of steps) {
-    const result = await runContainer(plan, afterSeq, step.phase, step.job);
+    const result = await runContainer(plan, source, afterSeq, step.phase, step.job);
+    if (step.phase === 'agent' && result.exitCode === 0) {
+      // Whatever the agent committed becomes the fix under judgement. Fetched
+      // into a namespace of its own so it can never be mistaken for a ref the
+      // repository already had.
+      const head = await applyHandover(source, result.handover!);
+      if (head) fixRef = head;
+    }
     phases.push(result);
     events.push(...result.events);
     afterSeq = result.events.at(-1)?.seq ?? afterSeq;
@@ -158,7 +186,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // outcome is a real deliverable, not a failure.
   if (!ended) {
     if (fold(events).shownOnBase) {
-      const fix = await runContainer(plan, afterSeq, 'fix', { only: 'fix' });
+      const fix = await runContainer(plan, source, afterSeq, 'fix', { only: 'fix', fixRef });
       phases.push(fix);
       events.push(...fix.events);
       afterSeq = fix.events.at(-1)?.seq ?? afterSeq;
@@ -193,8 +221,32 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   return { events, phases, complete: phases.every((p) => p.exitCode === 0) };
 }
 
+/**
+ * Fetch the agent's bundle into the workspace and report the commit it left.
+ *
+ * Onto a BRANCH of its own. `refs/agent/*` was the instinct — keep the agent
+ * away from anything existing — but `git clone` fetches only `refs/heads/*` and
+ * tags, so the phase containers cloned a workspace whose agent ref they could
+ * not see, checked out the repository's own commit instead, and verified that.
+ * A run reporting on a commit other than the one under judgement is the failure
+ * this project exists to prevent, and it was silent.
+ *
+ * A distinct branch name still keeps it off `main`: the point was never the ref
+ * namespace, it was not overwriting a ref the repository already had.
+ */
+async function applyHandover(source: string, dir: string): Promise<string | null> {
+  const bundle = join(dir, 'agent.bundle');
+  const exists = await stat(bundle).then(() => true).catch(() => false);
+  if (!exists) return null;
+
+  await execFile('git', ['-C', source, 'fetch', '--quiet', bundle, '+HEAD:refs/heads/engine/agent-work']);
+  const { stdout } = await execFile('git', ['-C', source, 'rev-parse', 'refs/heads/engine/agent-work']);
+  return stdout.trim();
+}
+
 async function runContainer(
   plan: RunPlan,
+  source: string,
   afterSeq: number,
   phase: PhaseResult['phase'],
   overrides: Partial<Job>,
@@ -207,7 +259,8 @@ async function runContainer(
     afterSeq,
     sourcePath: '/src',
     baseRef: plan.baseRef,
-    fixRef: plan.fixRef,
+    // Resolved rather than planned: with an agent, this is the commit it made.
+    fixRef: overrides.fixRef ?? plan.fixRef ?? plan.baseRef,
     repro: plan.repro,
     symptomPattern: plan.symptomPattern,
     ...(plan.flakeRuns === undefined ? {} : { flakeRuns: plan.flakeRuns }),
@@ -220,11 +273,15 @@ async function runContainer(
   // on. Nothing another participant wrote is visible from inside it.
   const store = await mkdtemp(join(tmpdir(), 'engine-phase-store-'));
   await writeFile(join(store, '.evidence-store'), '');
+  // Only the agent gets somewhere to put commits. A phase container with an
+  // output mount could write one, and a phase is supposed to observe, not author.
+  const handover = phase === 'agent' ? await mkdtemp(join(tmpdir(), 'engine-handover-')) : undefined;
 
   const args = [
     'run', '--rm', '-i',
-    '-v', `${plan.repoPath}:/src:ro`,
+    '-v', `${source}:/src:ro`,
     '-v', `${store}:/blobs`,
+    ...(handover ? ['-v', `${handover}:/out`] : []),
     ...(plan.agentImageMount ? ['-v', `${plan.agentImageMount}:/usr/local/bin/claude:ro`] : []),
     plan.image,
   ];
@@ -279,7 +336,7 @@ async function runContainer(
     // fold would reject it anyway on the seq that never arrived.
     throw new Error(`the ${phase} container produced more than ${MAX_STREAM_BYTES} bytes of events`);
   }
-  return { phase, events: parse(stdout), exitCode, stderr: stderr.trim() };
+  return { phase, events: parse(stdout), exitCode, stderr: stderr.trim(), ...(handover ? { handover } : {}) };
 }
 
 const parse = (stdout: string): RunEvent[] =>

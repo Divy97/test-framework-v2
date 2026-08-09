@@ -1267,6 +1267,63 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(state.reproducedAttempt).toBe(1);
   }, 600_000);
 
+  test("the agent's commit reaches the phases, and nothing else does", async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // A repo where the bug is NOT fixed in any commit. The only thing that can
+    // turn it green is a commit the agent makes during this run.
+    const fixture = noOpFix();
+    const blobs = hostBlobs();
+
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      '#!/bin/sh\n' +
+        'git config user.email a@b.c; git config user.name agent\n' +
+        'echo right > src.txt\n' +
+        // Untracked debris beside the commit: the tree is discarded, so only what
+        // is committed can possibly cross.
+        'echo leaked > NOT_COMMITTED.txt\n' +
+        'git add src.txt && git commit -q -m "fix: the actual fix"\n' +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      // No fixRef: there is no fix commit until the agent makes one.
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'fix it',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'fix']);
+
+    const state = fold(outcome.events);
+    // The whole point: red on base, green on a commit that did not exist when
+    // the run started, and the reproduction identical across both.
+    expect(state.shownOnBase).toBe(true);
+    expect(state.reproduced).toBe(true);
+    // The agent commits on top of the repository's HEAD, so the base→agent diff
+    // contains that commit's file as well as the agent's. What matters is that
+    // `src.txt` is in it: nothing in the repository ever fixed it, so its
+    // presence is proof the verified commit is the one the agent made.
+    expect(state.fixDiff!.changed_files).toContain('src.txt');
+
+    // The untracked file never crossed. A bundle carries objects and refs; a
+    // working tree is not a thing it can express.
+    const outputs = await Promise.all(
+      state.testRuns.map((r) => get(blobs, r.stdout_hash).then((b) => b.toString())),
+    );
+    expect(outputs.join('')).not.toContain('leaked');
+  }, 600_000);
+
   test('a hook the repro plants is never executed by the Runner', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = clean();
