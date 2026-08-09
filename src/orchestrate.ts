@@ -288,8 +288,11 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // `n < maxAttempts`, so the ending is allocated, discarded and rolled back on
   // the last iteration and the run stays permanently unended. `Infinity` loops.
   const maxAttempts = plan.maxAttempts ?? 1;
-  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
-    throw new Error(`maxAttempts must be a positive whole number, not ${String(plan.maxAttempts)}`);
+  // An upper bound too: `Number.isInteger(1e21)` is true, so the value the
+  // comment above calls out as looping forever was reachable through a different
+  // number. Ten is far past any useful retry and well short of hanging.
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
+    throw new Error(`maxAttempts must be a whole number from 1 to 10, not ${String(plan.maxAttempts)}`);
   }
   for (let n = 1; n <= maxAttempts; n += 1) {
     ended = null;

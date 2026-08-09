@@ -256,8 +256,18 @@ function notReproducedBecause(state: RunState): string {
   // agent handed over a commit the repository already had" instead. The
   // deliverable is what this projection is for (ADR-0007); describing the wrong
   // attempt makes it worse than terse.
+  //
+  // Tying it to `currentAttempt` alone was too tight and dropped genuine
+  // refusals: attempt 1 refused, attempt 2 starts and its agent container dies
+  // before registering anything, and the run reported "no reproduction was ever
+  // registered" — true, useless, and silent about the agent handing over work it
+  // did not do, which is the sentence this clause exists to prevent. So it also
+  // reports when the LAST attempt produced no diagnosis of its own to displace it.
   const refused = state.aborts.filter((a) => a.cause === 'handover').at(-1);
-  if (refused && refused.attempt === state.currentAttempt) return refused.reason;
+  const lastSpoke =
+    state.registrations.some((r) => r.attempt === state.currentAttempt) ||
+    state.testRuns.some((r) => r.attempt === state.currentAttempt);
+  if (refused && (refused.attempt === state.currentAttempt || !lastSpoke)) return refused.reason;
   if (state.registrations.length === 0) return 'no reproduction was ever registered';
   if (state.testRuns.length === 0) return 'the reproduction was registered but never ran';
 

@@ -380,6 +380,26 @@ describe('a handover that never arrived', () => {
     expect(claim).toMatch(/passed on the base commit/);
   });
 
+  test('keeps a refusal when the attempt after it never spoke', () => {
+    // The mirror of the test above, and the regression that fixing it introduced.
+    // Attempt 1 is refused; attempt 2 starts and its container dies before
+    // registering anything. Tying the clause to `currentAttempt` alone dropped
+    // the refusal and reported "no reproduction was ever registered" — true,
+    // useless, and silent about the finding that most needs auditing.
+    const events: RunEvent[] = [
+      { run_id: 'r', seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 2,
+        ts: 'T',
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'setup', cause: 'handover', reason: 'the agent handed nothing over' },
+      },
+      { run_id: 'r', seq: 3, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+    ];
+    expect(confidence(fold(events)).grounds[0]!.claim).toBe('the agent handed nothing over');
+  });
+
   test('is Tier 3 with no partial credit', () => {
     const score = confidence(fold(refused('no bundle was left at the handover path')));
     expect(score.tier).toBe(3);
