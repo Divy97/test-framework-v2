@@ -32,7 +32,7 @@ const RUN_ID = '2b8e4f61-0c3a-4d7e-9a15-6f8b0c2e4d39';
 const EMPTY: RunState = {
   runId: 'r', status: 'attempting', source: null, threadRef: null, currentAttempt: 1,
   testRuns: [], registeredRepro: null, registrations: [], reproduced: false,
-  reproducedAttempt: null, fixDiff: null, completedAttempts: [], transcript: [],
+  reproducedAttempt: null, shownOnBase: false, fixDiff: null, completedAttempts: [], transcript: [],
   agent: null, pr: null, aborts: [], afterEnd: [], endedReason: null,
   artifactHashes: [], lastSeq: 0,
 };

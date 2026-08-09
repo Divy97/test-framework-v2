@@ -57,10 +57,23 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   `claude` on `PATH`, which is the only way to exercise hostile output — a
   forged event, a line that never ends, ten thousand messages — that a real
   agent will not produce on demand.
-- **3b.2 — the loop.** A real prompt, the agent supplying the `ReproSpec`, the
-  reproduce-first gate, bounded attempts, `RUN_ENDED` finally getting a
-  producer. The image gains a real `claude` here; until then the sandbox test
-  mounts a hostile fake, which proves the boundary without the weight.
+- **3b.2a — the gate.** Landed. The orchestrator emits `ATTEMPT_STARTED` and
+  `RUN_ENDED`, and refuses to run the fix container at all unless the base run
+  demonstrated the bug (ADR-0007). The decision is read off the fold's
+  `shownOnBase` rather than worked out in the producer — a second definition of
+  "did it reproduce" is exactly what ADR-0009 forbids, and this projection has
+  been bitten by that once already.
+
+  It also closed a quiet gap: nothing had ever emitted `ATTEMPT_STARTED`, and
+  the fold refuses to credit runs at attempt 0. Every sandbox test prepended one
+  by hand, which meant real Runner output, folded as-is, could never have been
+  credited at all.
+- **3b.2b — the agent supplying the `ReproSpec`.** Still to come, and the harder
+  half: the agent's tree is discarded, so its reproduction has to arrive as a
+  commit. Bounded attempts belong here too — retrying is only meaningful once a
+  later attempt can propose a different reproduction. The image gains a real
+  `claude` here; until then the sandbox tests mount a hostile fake, which proves
+  the boundary without the weight.
 
 **The isolation is not finished.** Four review rounds on 3b.1 each defeated the
 previous round's fix, and [the M4 scope](milestone-4-isolation.md) is the

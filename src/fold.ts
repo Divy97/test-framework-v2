@@ -75,6 +75,12 @@ export type RunState = {
    * reimplementing the fold).
    */
   reproducedAttempt: number | null;
+  /**
+   * The reproduce-first gate (ADR-0007): some attempt's base run demonstrated the
+   * reported bug. This is what decides whether a fix is attempted at all — no
+   * reproduction, no fix — and it is true well before `reproduced` can be.
+   */
+  shownOnBase: boolean;
   /** What the fix touched. Recorded for the confidence projection; the engine never judges it. */
   fixDiff: { changed_files: string[]; diff_hash: ArtifactRef } | null;
   /**
@@ -139,6 +145,7 @@ const initialState = (runId: string): RunState => ({
   registrations: [],
   reproduced: false,
   reproducedAttempt: null,
+  shownOnBase: false,
   fixDiff: null,
   completedAttempts: [],
   transcript: [],
@@ -244,12 +251,9 @@ export function apply(state: RunState, event: RunEvent): RunState {
       return {
         ...next,
         testRuns,
-        // Passing `aborts` here is defence in depth and knowingly untested: with
-        // the completion witness required, an attempt that aborted in base or fix
-        // has no FIX_DIFF_OBSERVED either, so this argument cannot be the
-        // deciding one on any stream `verify()` can emit. It is kept because the
-        // fold does not get to assume event ordering (ADR-0009) — but no fixture
-        // can make it load-bearing, and pretending otherwise would be decoration.
+        // `aborts` IS load-bearing here, since `shownOnBase` needs no completion
+        // witness: a base-phase abort is the only thing that can shut the gate on
+        // an attempt whose base run otherwise looks clean.
         ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts),
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
@@ -354,71 +358,69 @@ export function apply(state: RunState, event: RunEvent): RunState {
  * costs an info-request (ADR-0007's Tier 3, which the design already treats as a
  * real deliverable); a false positive puts a fabricated verdict on a PR.
  */
-/** `reproduced` and `reproducedAttempt` together, so they can never disagree. */
+/**
+ * Everything the fold concludes about whether the bug was reproduced, computed
+ * once so the parts cannot disagree.
+ *
+ * `shownOnBase` is the reproduce-first gate (ADR-0007): the bug was demonstrated
+ * on the base commit, which is what decides whether a fix is attempted at all.
+ * It is deliberately NOT re-derivable by the orchestrator — a second definition
+ * living in a producer is exactly what ADR-0009 forbids, and this projection has
+ * already been bitten once by exactly that.
+ *
+ * The two differ by the fix half: `shownOnBase` says the bug is real,
+ * `reproducedAttempt` says a fix made it go away and survived the re-runs.
+ */
 function credited(
   testRuns: TestRunRecord[],
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
   completedAttempts: number[],
-): { reproduced: boolean; reproducedAttempt: number | null } {
+): { reproduced: boolean; reproducedAttempt: number | null; shownOnBase: boolean } {
   const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts);
-  return { reproduced: attempt !== null, reproducedAttempt: attempt };
+  return {
+    reproduced: attempt !== null,
+    reproducedAttempt: attempt,
+    shownOnBase: demonstrated(testRuns, registrations, aborts).length > 0,
+  };
 }
 
-function reproducedAttempt(
+/**
+ * The attempts whose BASE run demonstrated the reported bug: it failed, for the
+ * reported reason, running the reproduction it registered, with nothing about
+ * that observation cut short.
+ *
+ * No completion witness here — that vouches for the fix series, which has not
+ * run yet when this question is asked.
+ */
+function demonstrated(
   testRuns: TestRunRecord[],
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
-  completedAttempts: number[],
-): number | null {
-  // An attempt whose base or fix phase stopped being observable is an attempt we
-  // did not finish watching, and the fix series it produced is truncated. Nothing
-  // in the log says how many re-runs there should have been, so `every` below
-  // would really be asking "did every run we managed to see pass" — and the runs
-  // we did not see are exactly the ones an agent would arrange to fail.
+): TestRunRecord[] {
+  // BASE aborts only. A fix-phase abort cuts short a different observation, and
+  // disqualifying on it made this field retro-flip: the orchestrator runs the
+  // fix container only when the gate is open, so an abort in there left the log
+  // saying the gate had been shut — denying the control-flow act recorded inside
+  // it, and making the field unstable under replay.
   //
-  // Concretely: a repro that passes the first fix run and hangs on the re-run
-  // would otherwise be credited off a single green run, handing the agent under
-  // judgement the flake-survival criterion. An incomplete observation is not a
-  // reproduction.
-  //
-  // `diff` and `cleanup` aborts are not disqualifying — they are the opposite.
-  // Reaching either phase proves the flake loop closed, so they COUNT as the
-  // completion witness (see the VERIFICATION_ABORTED case).
+  // It was also agent-choosable, which is the precise objection ADR-0009 raises
+  // against deriving anything from aborts: a repro that hangs in the fix phase
+  // would erase the record that the bug WAS demonstrated on base. And once
+  // attempts are bounded, attempt 2's gate would read false and deny a fix for a
+  // reproduction attempt 1 had genuinely shown.
   const truncated = new Set(
-    aborts.filter((a) => a.phase === 'base' || a.phase === 'fix').map((a) => a.attempt),
+    aborts.filter((a) => a.phase === 'base').map((a) => a.attempt),
   );
-  // Belt and braces, deliberately. The witness check below is the load-bearing
-  // one — it needs no faith in event ordering — while this one catches an
-  // announced truncation even if a producer somehow emitted a diff anyway.
-  const completed = new Set(completedAttempts);
-  // Each attempt is judged against the reproduction IT registered. A run may
-  // register a fresh one per attempt, and comparing every attempt's runs to
-  // whichever registration came last credits runs that never executed the repro
-  // they are measured by — and erases an earlier attempt's honest verdict the
-  // moment a later attempt re-registers.
   const registered = new Map(registrations.map((r) => [r.attempt, r]));
-  const intact = (run: TestRunRecord, repro: RegisteredRepro) =>
-    run.repro_hashes !== undefined &&
-    Object.entries(repro.files).every(([path, hash]) => run.repro_hashes![path] === hash);
-
-  const credit = testRuns.find((base) => {
+  return testRuns.filter((base) => {
     // attempt 0 means no ATTEMPT_STARTED was ever seen, so "within one attempt"
     // is unenforceable and runs from unrelated attempts could be paired.
     if (base.phase !== 'base' || base.attempt === 0) return false;
     if (truncated.has(base.attempt)) return false;
-    // Nothing in the log states how many fix runs there should have been, so
-    // "every run I can see passed" is only meaningful once something vouches
-    // that I can see them all. FIX_DIFF_OBSERVED is that vouching — it is
-    // emitted after the flake loop and nowhere else. A stream that merely stops
-    // early carries no abort to give it away.
-    if (!completed.has(base.attempt)) return false;
-    // Red then green is only evidence if the same thing ran both times. Without a
-    // registered reproduction there is nothing to compare against, and if any
-    // run's repro hashes drifted from the registration, two different tests were
-    // run — which is not weak evidence, it is none.
-    // An empty registration is not an anchor: `.every()` over no files is
-    // vacuously true, so this would degenerate into "repro_hashes was present".
+    // Red then green is only evidence if the same thing ran both times. An empty
+    // registration is not an anchor: `.every()` over no files is vacuously true,
+    // so this would degenerate into "repro_hashes was present".
     const repro = registered.get(base.attempt);
     if (!repro || Object.keys(repro.files).length === 0) return false;
     // A crash is not a test failure. A signalled death records exit_code -1,
@@ -427,14 +429,45 @@ function reproducedAttempt(
     // string would be credited as a reproduction.
     if (base.signal) return false;
     if (base.exit_code === 0 || base.symptom_matched !== true) return false;
-    if (!intact(base, repro)) return false;
+    return intact(base, repro);
+  });
+}
+
+/** The registered bytes and the bytes that ran are the same bytes. */
+const intact = (run: TestRunRecord, repro: RegisteredRepro) =>
+  run.repro_hashes !== undefined &&
+  Object.entries(repro.files).every(([path, hash]) => run.repro_hashes![path] === hash);
+
+function reproducedAttempt(
+  testRuns: TestRunRecord[],
+  registrations: RegisteredRepro[],
+  aborts: RunState['aborts'],
+  completedAttempts: number[],
+): number | null {
+  // The completion witness is the fix half's own guard. Nothing in the log states
+  // how many fix runs there should have been, so "every run I can see passed" is
+  // only meaningful once something vouches that I can see them all.
+  // FIX_DIFF_OBSERVED is that vouching — emitted after the flake loop and nowhere
+  // else — and a stream that merely stops early carries no abort to give it away.
+  const completed = new Set(completedAttempts);
+  const registered = new Map(registrations.map((r) => [r.attempt, r]));
+  // The fix half's own truncation check, which `demonstrated()` deliberately
+  // does not apply: a fix-phase abort says nothing about whether the bug was
+  // shown, but it says the series judging the fix was cut short.
+  const cutShort = new Set(
+    aborts.filter((a) => a.phase === 'fix').map((a) => a.attempt),
+  );
+
+  const credit = demonstrated(testRuns, registrations, aborts).find((base) => {
+    if (cutShort.has(base.attempt)) return false;
+    if (!completed.has(base.attempt)) return false;
+    const repro = registered.get(base.attempt)!;
     const fixes = testRuns.filter((r) => r.phase === 'fix' && r.attempt === base.attempt);
     // `signal` on the fix side for the same reason it is checked on the base: a
     // process killed by a signal records exit_code -1, and nothing else here
     // would notice a fix run that died rather than passed.
     return (
-      fixes.length > 0 &&
-      fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
+      fixes.length > 0 && fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
     );
   });
   return credit ? credit.attempt : null;

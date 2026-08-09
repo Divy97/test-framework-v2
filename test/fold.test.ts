@@ -53,6 +53,7 @@ describe('fold', () => {
       ],
       reproduced: true,
       reproducedAttempt: 1,
+      shownOnBase: true,
       fixDiff: {
         changed_files: ['src/checkout/discount.ts'],
         diff_hash: 'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
@@ -287,6 +288,75 @@ describe('the transcript is testimony', () => {
       },
     ]);
     expect(state.agent).toEqual({ messages: 1, exit_code: 0, stopped: 'line_cap' });
+  });
+});
+
+/**
+ * The reproduce-first gate (ADR-0007). Everything here is about whether a fix
+ * gets attempted at all, which is a decision made long before any verdict — and
+ * a decision the orchestrator must read off the fold rather than re-derive.
+ */
+describe('the gate', () => {
+  const reg = (seq: number): RunEvent => ({
+    run_id: DEMO_RUN_ID, seq, ts: 'T', type: 'REPRO_REGISTERED',
+    payload: { v: 1, command: 'c', files: { f: 'sha256:aa' }, applied: ['f'] },
+  });
+  const baseRun = (seq: number, over: Record<string, unknown> = {}): RunEvent => ({
+    run_id: DEMO_RUN_ID, seq, ts: 'T', type: 'TEST_RUN',
+    payload: {
+      v: 1, phase: 'base', commit_sha: 'a', exit_code: 1, stdout_hash: 'sha256:x',
+      duration_ms: 1, symptom_matched: true, repeat: 0, repro_hashes: { f: 'sha256:aa' },
+      ...over,
+    },
+  } as RunEvent);
+  const abort = (seq: number, phase: VerificationPhase): RunEvent => ({
+    run_id: DEMO_RUN_ID, seq, ts: 'T', type: 'VERIFICATION_ABORTED',
+    payload: { v: 1, phase, reason: 'r' },
+  });
+  const attempt1: RunEvent = {
+    run_id: DEMO_RUN_ID, seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 },
+  };
+
+  it('opens when the base failed for the reported reason', () => {
+    expect(fold([attempt1, reg(2), baseRun(3)]).shownOnBase).toBe(true);
+  });
+
+  it('stays shut when the base passed', () => {
+    expect(fold([attempt1, reg(2), baseRun(3, { exit_code: 0 })]).shownOnBase).toBe(false);
+  });
+
+  it('stays shut when the symptom did not match', () => {
+    expect(fold([attempt1, reg(2), baseRun(3, { symptom_matched: false })]).shownOnBase).toBe(false);
+  });
+
+  it('stays shut on a signalled base — a crash is not a reproduction', () => {
+    // The one the comment in the fold describes and nothing tested: an OOM-killed
+    // base records exit_code -1, which sails through "did it fail", and its
+    // partial output may well contain the symptom string.
+    const killed = fold([attempt1, reg(2), baseRun(3, { exit_code: -1, signal: 'SIGKILL' })]);
+    expect(killed.shownOnBase).toBe(false);
+  });
+
+  it('stays shut with no registration to anchor it', () => {
+    expect(fold([attempt1, baseRun(2)]).shownOnBase).toBe(false);
+  });
+
+  it('stays shut when the run belongs to no declared attempt', () => {
+    expect(fold([reg(1), baseRun(2)]).shownOnBase).toBe(false);
+  });
+
+  it('shuts on a BASE abort — that observation was cut short', () => {
+    expect(fold([attempt1, reg(2), abort(3, 'base'), baseRun(4)]).shownOnBase).toBe(false);
+  });
+
+  it('survives a FIX abort — the bug was still shown', () => {
+    // The retro-flip. The orchestrator runs the fix container only when the gate
+    // is open, so a fix-phase abort left the log denying the very act recorded
+    // inside it — and an agent could shut its own gate with a repro that hangs.
+    const state = fold([attempt1, reg(2), baseRun(3), abort(4, 'fix')]);
+    expect(state.shownOnBase).toBe(true);
+    // Still not a reproduction: the series judging the fix was truncated.
+    expect(state.reproduced).toBe(false);
   });
 });
 
