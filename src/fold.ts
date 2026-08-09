@@ -95,7 +95,7 @@ export type RunState = {
    * Kept in its own field rather than mixed into the run's record so a consumer
    * cannot reach it by accident, and deliberately NOT added to `artifactHashes`:
    * that list feeds the evidence report, and what the agent said is not evidence.
-   * Nothing here is read by `isReproduced`, and nothing here ever should be.
+   * Nothing here is read when crediting a reproduction, and nothing ever should be.
    */
   transcript: { n: number; claimed_type: string | null; raw_hash: ArtifactRef; bytes: number }[];
   /** How supervision ended. This one IS evidence: the Runner watched the process. */
@@ -105,7 +105,7 @@ export type RunState = {
    * Every phase that stopped being observable, in order. Not terminal: an attempt
    * can abort and the next one can still reach a PR, so these are kept out of the
    * status — but a `base` or `fix` abort does disqualify its own attempt from
-   * being credited a reproduction. See `isReproduced`.
+   * being credited a reproduction. See `reproducedAttempt`.
    */
   aborts: { attempt: number; phase: VerificationPhase; reason: string }[];
   /**

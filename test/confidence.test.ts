@@ -28,6 +28,15 @@ import {
 
 const RUN_ID = '2b8e4f61-0c3a-4d7e-9a15-6f8b0c2e4d39';
 
+/** A state with nothing in it, for the incoherent-log cases. */
+const EMPTY: RunState = {
+  runId: 'r', status: 'attempting', source: null, threadRef: null, currentAttempt: 1,
+  testRuns: [], registeredRepro: null, registrations: [], reproduced: false,
+  reproducedAttempt: null, fixDiff: null, completedAttempts: [], transcript: [],
+  agent: null, pr: null, aborts: [], afterEnd: [], endedReason: null,
+  artifactHashes: [], lastSeq: 0,
+};
+
 afterEach(cleanupFixtures);
 
 const observe = (fixture: Fixture, overrides: Partial<VerifyOptions> = {}) =>
@@ -261,6 +270,18 @@ describe('more than one attempt', () => {
     const alone = confidence(await twoAttempts(good, []));
     const withJunk = confidence(await twoAttempts(good, junk));
     expect(withJunk.score).toBe(alone.score);
+  });
+
+  test.each([
+    ['reproduced with no attempt recorded', { reproduced: true, reproducedAttempt: null }],
+    ['an attempt that has no runs', { reproduced: true, reproducedAttempt: 7 }],
+  ])('renders rather than throws: %s', (_name: string, over: Partial<RunState>) => {
+    // A projection must render. `cli.ts` calls this straight after replay, so a
+    // throw on an incoherent log makes the run permanently unviewable — the same
+    // failure the fold was hardened against, one layer up.
+    const state = { ...EMPTY, ...over } as RunState;
+    expect(() => confidence(state)).not.toThrow();
+    expect(confidence(state).tier).toBe(3);
   });
 
   test('renders rather than throws when the credited runs are missing', async () => {
