@@ -298,6 +298,13 @@ async function handOverCommits(world: { tree: string; gitDir: string }): Promise
   // is ever created here.
   await execFileAsync('chown', [`${REPRO_UID}:${REPRO_GID}`, HANDOVER]).catch(() => {});
   const bundle = `${HANDOVER}/agent.bundle`;
+  // `/out` is agent-writable while the agent runs, and `git bundle create` takes
+  // a lock at exactly `<bundle>.lock`. One line — `: > /out/agent.bundle.lock` —
+  // made every subsequent bundle fail. Clearing both is safe here and only here:
+  // the reap has already run, so nothing the agent started is still alive to
+  // recreate them.
+  await rm(`${bundle}.lock`, { recursive: true, force: true }).catch(() => {});
+  await rm(bundle, { recursive: true, force: true }).catch(() => {});
   try {
     // `cwd` as well as GIT_DIR: `git bundle` refuses with "Need a repository"
     // when it is run from outside one, whatever the environment says. The tree
@@ -326,17 +333,30 @@ async function handOverCommits(world: { tree: string; gitDir: string }): Promise
     // fired and an error with no stderr produced a message ending in a colon.
     // The comment above this one calls that the mistake made twice already.
     const detail = (error as { stderr?: string }).stderr ?? '';
-    throw new ObservationFailed(
-      `could not bundle the agent commits: ${detail.trim().split('\n')[0] || String(error)}`,
+    // Reported, not thrown. Throwing here unwound above `flush()` and above the
+    // loop that emits the transcript, so a failure to hand code over discarded
+    // the transcript, `AGENT_FINISHED` — which ADR-0006 calls evidence, the
+    // Runner having watched the process — and every staged blob, and ended the
+    // run `errored`. The agent could trigger it at will, and ADR-0009 is explicit
+    // that a status the agent can choose is not a status.
+    //
+    // A handover that did not happen is a fact ABOUT the agent. The orchestrator
+    // finds no bundle, refuses, and records why; everything observed up to that
+    // point survives, because a run that cannot be trusted is still a run that
+    // observed things.
+    process.stderr.write(
+      `could not bundle the agent commits: ${detail.trim().split('\n')[0] || String(error)}\n`,
     );
+    return;
   }
 
   const { size } = await stat(bundle);
   if (size > MAX_BUNDLE_BYTES) {
     await rm(bundle, { force: true });
-    throw new ObservationFailed(
-      `the agent's commits came to ${size} bytes, past the ${MAX_BUNDLE_BYTES} ceiling`,
+    process.stderr.write(
+      `the agent's commits came to ${size} bytes, past the ${MAX_BUNDLE_BYTES} ceiling\n`,
     );
+    return;
   }
   // The host reads it; the agent user must not be able to rewrite it afterwards.
   await chmod(bundle, 0o444);

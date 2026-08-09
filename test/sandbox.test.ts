@@ -1371,7 +1371,57 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     const state = fold(outcome.events);
     expect(state.handedOver).toBeNull();
     expect(state.reproduced).toBe(false);
-    expect(state.endedReason).toBe('error');
+    // NOT `error`, and not silent. A refusal that emitted only `RUN_ENDED
+    // { error }` made the one finding that most needs auditing — the agent handed
+    // over work it did not do — byte-identical to an OOM kill or a missing image.
+    // And ADR-0009: a status the agent can choose is not a status.
+    expect(state.endedReason).toBe('attempts_exhausted');
+    expect(state.aborts.map((a) => a.phase)).toEqual(['setup']);
+    expect(state.aborts[0]!.reason).toMatch(/handed/);
+    expect(outcome.complete).toBe(false);
+  }, 600_000);
+
+  test('an empty commit over an existing fix is refused', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // Round N+1 of the same bug. The previous check asked whether the agent had
+    // created a new SHA, which is not the question — `--allow-empty` on top of a
+    // fix the repository already carried produces a fresh sha over a byte-identical
+    // tree. The pre-existing fix becomes an ancestor, so the diff even names the
+    // right files, and the record is indistinguishable from a real success.
+    //
+    // Content is the invariant, not commit identity.
+    const fixture = clean();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        `git commit -q --allow-empty -m "chore: my hard work" >/dev/null 2>&1\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'claim credit for work you did not do',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent']);
+    const state = fold(outcome.events);
+    expect(state.handedOver).toBeNull();
+    expect(state.reproduced).toBe(false);
+    expect(state.aborts[0]!.reason).toMatch(/content the repository already had/);
   }, 600_000);
 
   test('the log records what the agent authored, not only what was verified', async () => {

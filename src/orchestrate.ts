@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
 import type { Job } from './runner.js';
+import { MAX_REASON_CHARS } from './verify.js';
 
 /** Output ceiling per container. Matches what the sandbox tests already allow. */
 const execFile = promisify(execFileCb);
@@ -132,10 +133,34 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // resolving. A mirror keeps them all as local refs.
   await execFile('git', ['clone', '--quiet', '--no-local', '--mirror', '--', plan.repoPath, source]);
 
-  // Every commit the repository already had. What the agent hands over must not
-  // be one of these — that is the whole check, and it was missing.
-  const { stdout: existing } = await execFile('git', ['-C', source, 'rev-list', '--all']);
-  const before = new Set(existing.split('\n').filter(Boolean));
+  // Everything the repository already had — both the commits and the CONTENT
+  // those commits pointed at.
+  //
+  // The commit set alone was the previous round's check, and it was the same
+  // mistake in new clothes: it tested whether the agent had created a new sha,
+  // not whether it had written anything. `git commit --allow-empty` on top of a
+  // fix the repository already carried produces a fresh sha over a byte-identical
+  // tree, and the run then credited the agent with work it inherited — the
+  // pre-existing fix became an ancestor, so even the diff named the right files.
+  // `--amend`, `cherry-pick` and `merge` all did the same.
+  //
+  // Content is the invariant. A tree that already existed is not a fix the agent
+  // wrote, however new the commit wrapped around it is.
+  //
+  // `--no-replace-objects` because `--mirror` copies `refs/replace/*` and the
+  // phase containers' plain clone does not: without it this set can be computed
+  // over a different history than base and fix actually see.
+  const { stdout: existing } = await execFile('git', [
+    // `--no-replace-objects` is a top-level git option and has to precede the
+    // subcommand; rev-list rejects it outright as one of its own.
+    '-C', source, '--no-replace-objects', 'rev-list', '--all', '--format=%H %T',
+  ]);
+  const before = new Set<string>();
+  for (const line of existing.split('\n')) {
+    // `--format` emits a `commit <sha>` header line before each formatted line;
+    // both shas land in one set because either one recurring is disqualifying.
+    for (const sha of line.split(' ')) if (/^[0-9a-f]{40}$/.test(sha)) before.add(sha);
+  }
 
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
@@ -200,11 +225,39 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       // So: refuse loudly. A commit that already existed is not a fix the agent
       // wrote, whether it got there by doing nothing, committing on a branch and
       // checking out another, resetting back, or swapping the bundle afterwards.
-      const head = await applyHandover(source, result.handover);
-      if (!head || before.has(head)) {
-        ended = own(plan.runId, ++afterSeq, { type: 'RUN_ENDED', payload: { v: 1, reason: 'error' } });
+      const handover = await applyHandover(source, plan.runId, result.handover);
+      const stale =
+        handover.commit === null
+          ? handover.why
+          : before.has(handover.commit)
+            ? `the agent handed over ${handover.commit}, which the repository already had`
+            : before.has(handover.tree)
+              ? `the agent handed over ${handover.commit}, whose content the repository already had`
+              : null;
+      if (handover.commit === null || stale) {
+        // Refused, and SAID SO. This used to emit `RUN_ENDED { error }` and
+        // nothing else, so the one finding that most needs auditing — the agent
+        // handed over work it did not do — was byte-identical in the log to an
+        // OOM kill or a missing image.
+        //
+        // `attempts_exhausted`, not `error`: ADR-0009 is explicit that a status
+        // the agent can choose is not a status, and `errored` is the single thing
+        // the fold takes on trust. An agent that hands over nothing usable has
+        // exhausted its attempt; the fold renders that `unresolved`, which is
+        // ADR-0007's Tier 3 deliverable rather than an infrastructure fault.
+        events.push(
+          own(plan.runId, ++afterSeq, {
+            type: 'VERIFICATION_ABORTED',
+            payload: { v: 1, phase: 'setup', reason: (stale ?? 'the agent handed nothing over').slice(0, MAX_REASON_CHARS) },
+          }),
+        );
+        ended = own(plan.runId, ++afterSeq, {
+          type: 'RUN_ENDED',
+          payload: { v: 1, reason: 'attempts_exhausted' },
+        });
         break;
       }
+      const head = handover.commit;
       // Recorded before it is used, so the log says what was authored and not
       // only what was verified.
       const handed = own(plan.runId, ++afterSeq, {
@@ -258,12 +311,22 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // chose to leave in `/out`. Left behind, that is unbounded host-disk growth
   // per run — and the handover dirs are agent-writable, which is not something
   // to accumulate.
-  await rm(workspace, { recursive: true, force: true });
+  //
+  // Never at the cost of the evidence, though: `force` suppresses ENOENT and
+  // nothing else, and `/out` is chowned to the repro user on a bind mount — so on
+  // Linux an orchestrator running as neither root nor uid 1000 cannot unlink the
+  // bundle, and a throw here would discard every event from every container for
+  // the sake of disk hygiene.
+  await rm(workspace, { recursive: true, force: true }).catch(() => {});
   for (const phase of phases) {
-    if (phase.handover) await rm(phase.handover, { recursive: true, force: true });
+    if (phase.handover) await rm(phase.handover, { recursive: true, force: true }).catch(() => {});
   }
 
-  return { events, phases, complete: phases.every((p) => p.exitCode === 0) };
+  // `ended === null` as well: a refusal breaks out with the agent container at
+  // exit 0 and no base or fix phase run at all, and `every` over that one entry
+  // is vacuously true — so the field documented as "every container completed its
+  // phases" reported success for a run that never reached a phase.
+  return { events, phases, complete: ended === null && phases.every((p) => p.exitCode === 0) };
 }
 
 /**
@@ -277,25 +340,38 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
  * this project exists to prevent, and it was silent.
  *
  * A distinct branch name still keeps it off `main`: the point was never the ref
- * namespace, it was not overwriting a ref the repository already had.
+ * namespace, it was not overwriting a ref the repository already had. It is
+ * per-run because a two-level name IS a namespace and namespaces collide: any
+ * repository with a branch called `engine` D/F-conflicts with `engine/agent-work`
+ * and every agent run against it failed with no diagnosis at all.
+ *
+ * Returns why it failed rather than just that it did. Three unrelated causes —
+ * corrupt bundle, failed fetch, nothing handed over — used to arrive as one
+ * indistinguishable null, which is the "drops git's own words" mistake this file
+ * complains about elsewhere.
  */
-async function applyHandover(source: string, dir: string | undefined): Promise<string | null> {
-  if (!dir) return null;
+type Handover = { commit: string; tree: string } | { commit: null; why: string };
+
+async function applyHandover(source: string, runId: string, dir: string | undefined): Promise<Handover> {
+  if (!dir) return { commit: null, why: 'the agent container handed nothing over' };
   const bundle = join(dir, 'agent.bundle');
   // lstat: the agent owns `/out` and can leave a symlink where the bundle should
   // be. Following one would fetch from wherever it points.
   const kind = await lstat(bundle).catch(() => null);
-  if (!kind?.isFile()) return null;
+  if (!kind?.isFile()) return { commit: null, why: 'no bundle was left at the handover path' };
 
+  const ref = `refs/heads/engine-agent-work-${runId.replace(/[^A-Za-z0-9_-]/g, '')}`;
   try {
-    await execFile('git', ['-C', source, 'fetch', '--quiet', bundle, '+HEAD:refs/heads/engine/agent-work']);
-    const { stdout } = await execFile('git', ['-C', source, 'rev-parse', 'refs/heads/engine/agent-work']);
-    return stdout.trim();
-  } catch {
+    await execFile('git', ['-C', source, 'fetch', '--quiet', bundle, `+HEAD:${ref}`]);
+    const { stdout } = await execFile('git', ['-C', source, 'rev-parse', ref]);
+    const { stdout: tree } = await execFile('git', ['-C', source, 'rev-parse', `${ref}^{tree}`]);
+    return { commit: stdout.trim(), tree: tree.trim() };
+  } catch (error) {
     // A corrupt or hostile bundle is a handover that did not happen, not a
     // reason to lose the run. Letting this throw discarded the attempt, the
     // transcript and the agent container's whole stream.
-    return null;
+    const detail = (error as { stderr?: string }).stderr ?? '';
+    return { commit: null, why: detail.trim().split('\n')[0] || String(error) };
   }
 }
 
