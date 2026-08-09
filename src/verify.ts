@@ -760,7 +760,16 @@ async function observe(
     // split exists to prevent.
     await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv).catch(() => {});
     await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv).catch(() => {});
-    await applyRepro();
+    // No `applyRepro()` here. It was the one line the C1 fix ADDED that could
+    // still end the run — outside the catch, uncaught, and throwing while
+    // `progress.phase` is still `base`, so `demonstrated()` read it as a
+    // truncated base observation and SHUT THE GATE. The identical defect one line
+    // below the block written to remove it, with a worse blast radius: a
+    // recoverable cleanup failure became a discarded reproduction.
+    //
+    // Dead as well as dangerous. Every successor re-applies: `only: 'base'`
+    // resets, cleans and returns without running anything else, and the full path
+    // checks out the fix commit and calls `applyRepro()` itself.
   }
 
   // The base container's work ends here. It leaves the tree as it found it, and

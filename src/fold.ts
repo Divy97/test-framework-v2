@@ -296,6 +296,13 @@ export function apply(state: RunState, event: RunEvent): RunState {
       return {
         ...next,
         testRuns,
+        // A control run is POSITIVE PROOF the agent authored the reproduction:
+        // the engine only asks for one when `reproPrompt` was set. Keying the cap
+        // on the handover alone left it open exactly where the handover was
+        // ABSENT — a flag that fails closed only when an optional event is
+        // present is not fail-closed. This is the signal that exists whenever the
+        // fact is true, which is what the cap needed and did not have.
+        reproAuthoredByAgent: state.reproAuthoredByAgent || event.payload.phase === 'control',
         // `aborts` IS load-bearing here, since `shownOnBase` needs no completion
         // witness: a base-phase abort is the only thing that can shut the gate on
         // an attempt whose base run otherwise looks clean.
