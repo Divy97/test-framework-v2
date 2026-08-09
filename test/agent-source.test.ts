@@ -101,22 +101,54 @@ describe("the agent's source", () => {
     expect(objects(out)).toHaveLength(3);
   });
 
-  test('ignores a global push.followTags', async () => {
-    // `push` reads ambient config; the `clone` it replaced did not. With this set,
-    // annotated tags reachable from base come along, and the postcondition then
-    // reports an ordinary repository as a violation.
+  // One table, not three near-identical tests. Each of these is a single flag on
+  // the push, indistinguishable from noise to a future reader, and a tidy-up that
+  // drops one would otherwise go green everywhere.
+  test.each([
+    ['push.followTags', '[push]\n\tfollowTags = true\n'],
+    ['push.gpgSign', '[push]\n\tgpgSign = true\n'],
+    ['core.hooksPath with a pre-push hook', null],
+  ])('ignores an ambient %s', async (_label, contents) => {
     const fixture = repo();
     execFileSync('git', ['-C', fixture.path, 'tag', '-a', 'v1', '-m', 'v1', fixture.base]);
     const out = join(dir('agent'), 'a');
 
     const home = dir('home');
-    writeFileSync(join(home, '.gitconfig'), '[push]\n\tfollowTags = true\n');
-    const previous = process.env.HOME;
+    const config = join(home, '.gitconfig');
+    if (contents === null) {
+      const hooks = dir('hooks');
+      writeFileSync(join(hooks, 'pre-push'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+      writeFileSync(config, `[core]\n\thooksPath = ${hooks}\n`);
+    } else {
+      writeFileSync(config, contents);
+    }
+
+    // `GIT_CONFIG_GLOBAL`, not `HOME` alone. Git resolves global config through
+    // that variable INSTEAD of `$HOME/.gitconfig` when it is set, and it is the
+    // standard way tooling isolates git — so a test that only sets `HOME` stops
+    // injecting anything on such a machine, and then passes whether or not the
+    // flag that makes it pass is there at all. Review demonstrated exactly that:
+    // guard removed, ambient GIT_CONFIG_GLOBAL, all four green.
+    const before = { ...process.env };
     process.env.HOME = home;
+    process.env.GIT_CONFIG_GLOBAL = config;
+    process.env.GIT_CONFIG_SYSTEM = '/dev/null';
     try {
+      // The test proves its own premise. Without this it can pass for the reason
+      // it is meant to detect — a safety net that cannot fail is worse than none,
+      // because it is read as one.
+      expect(
+        execFileSync('git', ['config', '--get', _label.split(' ')[0]!], { encoding: 'utf8' }).trim(),
+      ).not.toBe('');
       await buildAgentSource(mirror(fixture.path), fixture.base, out);
     } finally {
-      process.env.HOME = previous;
+      // Restoring from a captured value writes the literal string "undefined"
+      // when the variable was unset, poisoning it for every later test in this
+      // worker.
+      if (before.HOME === undefined) delete process.env.HOME;
+      else process.env.HOME = before.HOME;
+      delete process.env.GIT_CONFIG_GLOBAL;
+      delete process.env.GIT_CONFIG_SYSTEM;
     }
 
     expect(refs(out)).toEqual(['refs/heads/main']);

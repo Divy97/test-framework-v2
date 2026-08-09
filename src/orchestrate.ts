@@ -614,61 +614,65 @@ const parse = (stdout: string): RunEvent[] =>
  * verifying it in the one place it is slowest and least legible.
  */
 export async function buildAgentSource(source: string, base: string, agentSource: string): Promise<void> {
-// The source's own hash algorithm, not this git's default. `init` always makes
-// a SHA-1 repository, and pushing a SHA-256 repository into one fails outright
-// — a repo class that worked before this construction replaced the previous
-// one. The comment deleted from the check above was the record of the LAST
-// time SHA-256 silently broke this, which is precisely why it should not have
-// been deleted.
-const { stdout: format } = await execFile('git', ['-C', source, 'rev-parse', '--show-object-format']);
-await execFile('git', ['init', '--quiet', '--bare', `--object-format=${format.trim()}`, agentSource]);
-// PUSH by sha, rather than clone-then-strip-then-prune. The objects off base's
-// ancestry are never written at all, so no gc, cruft pack, prune grace, reflog
-// or git-version question can resurrect them — the earlier construction leaned
-// on `reflog expire` whose failure was swallowed, and with
-// `core.logAllRefUpdates` inherited from a global config the fix survived the
-// prune with `git fsck --unreachable` reporting nothing at all.
-//
-// It also does not care WHICH ref holds base. `clone --bare` fetches only
-// `refs/heads/*` and tags, so a base reachable solely from `refs/remotes/*` —
-// any repository that is itself a clone — left the object out and the strip
-// died on a bare exception where the run used to produce an evented abort.
-//
-// The flags are not decoration. `push` reads the user's ambient config and the
-// `clone` it replaced did not, so three ordinary global settings each reach a
-// construction that is supposed to depend on nothing: `push.followTags` brings
-// annotated tag objects the postcondition below then reports as a violation,
-// `push.gpgSign` fails the push outright, and a global `core.hooksPath` with a
-// `pre-push` hook refuses it. A repository build must not vary with whoever's
-// machine the host happens to be.
-await execFile('git', [
-  '-C', source, 'push', '--quiet', '--no-follow-tags', '--no-verify', '--no-signed',
-  agentSource, `${base}:refs/heads/main`,
-]);
-await execFile('git', ['-C', agentSource, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
+  // The source's own hash algorithm, not this git's default. `init` always makes
+  // a SHA-1 repository, and pushing a SHA-256 repository into one fails outright
+  // — a repo class that worked before this construction replaced the previous
+  // one. The comment deleted from the check above was the record of the LAST
+  // time SHA-256 silently broke this, which is precisely why it should not have
+  // been deleted.
+  const { stdout: format } = await execFile('git', ['-C', source, 'rev-parse', '--show-object-format']);
+  await execFile('git', ['init', '--quiet', '--bare', `--object-format=${format.trim()}`, agentSource]);
+  // PUSH by sha, rather than clone-then-strip-then-prune. The objects off base's
+  // ancestry are never written at all, so no gc, cruft pack, prune grace, reflog
+  // or git-version question can resurrect them — the earlier construction leaned
+  // on `reflog expire` whose failure was swallowed, and with
+  // `core.logAllRefUpdates` inherited from a global config the fix survived the
+  // prune with `git fsck --unreachable` reporting nothing at all.
+  //
+  // It does not apply replace refs either — `push` by sha sends the real object,
+  // so the enclosing `--no-replace-objects` that the other traversals carry is not
+  // needed here. Said rather than left for the next reader to re-derive.
+  //
+  // It also does not care WHICH ref holds base. `clone --bare` fetches only
+  // `refs/heads/*` and tags, so a base reachable solely from `refs/remotes/*` —
+  // any repository that is itself a clone — left the object out and the strip
+  // died on a bare exception where the run used to produce an evented abort.
+  //
+  // The flags are not decoration. `push` reads the user's ambient config and the
+  // `clone` it replaced did not, so three ordinary global settings each reach a
+  // construction that is supposed to depend on nothing: `push.followTags` brings
+  // annotated tag objects the postcondition below then reports as a violation,
+  // `push.gpgSign` fails the push outright, and a global `core.hooksPath` with a
+  // `pre-push` hook refuses it. A repository build must not vary with whoever's
+  // machine the host happens to be.
+  await execFile('git', [
+    '-C', source, 'push', '--quiet', '--no-follow-tags', '--no-verify', '--no-signed',
+    agentSource, `${base}:refs/heads/main`,
+  ]);
+  await execFile('git', ['-C', agentSource, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
 
-// The postcondition the comment above used to merely promise.
-//
-// "Verified by the object store, not by the ref listing" has to be something
-// the code does, not something the prose asserts — a ref listing is exactly
-// what every earlier round of this check kept believing. Cheap: one batch read
-// over a repository that holds base's ancestry and nothing else.
-const objects = await execFile('git', [
-  '-C', agentSource, 'cat-file', '--batch-all-objects', '--batch-check=%(objectname)',
-]);
-const reachable = await execFile('git', ['-C', agentSource, 'rev-list', '--objects', 'refs/heads/main']);
-const want = new Set(reachable.stdout.split('\n').filter(Boolean).map((line) => line.split(' ')[0]!));
-const extra = objects.stdout.split('\n').filter(Boolean).filter((o) => !want.has(o));
-if (extra.length > 0) {
-  throw new Error(
-    `the agent's source holds ${extra.length} objects off the base's ancestry; refusing to run`,
-  );
-}
-// And the ref set, which the object check does not cover: `push.followTags` is
-// exactly a ref-set surprise, and it is how the object check first fired.
-const { stdout: built } = await execFile('git', ['-C', agentSource, 'for-each-ref', '--format=%(refname)']);
-const refs = built.split('\n').filter(Boolean);
-if (refs.length !== 1 || refs[0] !== 'refs/heads/main') {
-  throw new Error(`the agent's source carries refs beyond base: ${refs.join(', ')}; refusing to run`);
-}
+  // The postcondition the comment above used to merely promise.
+  //
+  // "Verified by the object store, not by the ref listing" has to be something
+  // the code does, not something the prose asserts — a ref listing is exactly
+  // what every earlier round of this check kept believing. Cheap: one batch read
+  // over a repository that holds base's ancestry and nothing else.
+  const objects = await execFile('git', [
+    '-C', agentSource, 'cat-file', '--batch-all-objects', '--batch-check=%(objectname)',
+  ]);
+  const reachable = await execFile('git', ['-C', agentSource, 'rev-list', '--objects', 'refs/heads/main']);
+  const want = new Set(reachable.stdout.split('\n').filter(Boolean).map((line) => line.split(' ')[0]!));
+  const extra = objects.stdout.split('\n').filter(Boolean).filter((o) => !want.has(o));
+  if (extra.length > 0) {
+    throw new Error(
+      `the agent's source holds ${extra.length} objects off the base's ancestry; refusing to run`,
+    );
+  }
+  // And the ref set, which the object check does not cover: `push.followTags` is
+  // exactly a ref-set surprise, and it is how the object check first fired.
+  const { stdout: built } = await execFile('git', ['-C', agentSource, 'for-each-ref', '--format=%(refname)']);
+  const refs = built.split('\n').filter(Boolean);
+  if (refs.length !== 1 || refs[0] !== 'refs/heads/main') {
+    throw new Error(`the agent's source carries refs beyond base: ${refs.join(', ')}; refusing to run`);
+  }
 }
