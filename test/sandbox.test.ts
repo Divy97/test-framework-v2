@@ -1638,6 +1638,49 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(state.reproduced).toBe(true);
   }, 900_000);
 
+  test('the phases have no network, so a reproduction cannot be told what to answer', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // Egress is the last isolation this milestone owes, and the phases are the
+    // half that needs none at all. A reproduction that can reach the network is
+    // one that can be TOLD what to answer — the identity-oracle channel ADR-0008
+    // is about, over a wire instead of over the tree — and the code under
+    // judgement could otherwise exfiltrate the repository it was handed.
+    const fixture = clean();
+    const blobs = hostBlobs();
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      flakeRuns: 0,
+      symptomPattern: 'no route|unreachable|not resolve|failed|refused',
+      repro: {
+        command: 'sh repro.sh',
+        // Two shapes: a name that must not resolve, and a literal address that
+        // must not route. DNS alone would pass on a host that resolves anything.
+        files: {
+          'repro.sh':
+            'getent hosts api.anthropic.com && echo RESOLVED\n' +
+            '(exec 3<>/dev/tcp/1.1.1.1/53) 2>&1 && echo ROUTED\n' +
+            'echo done\n',
+        },
+      },
+    });
+
+    const said = await Promise.all(
+      outcome.events
+        .filter((e) => e.type === 'TEST_RUN')
+        .map((e) => get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash)),
+    );
+    const output = said.map((b) => b.toString()).join('\n');
+    expect(output).not.toMatch(/RESOLVED/);
+    expect(output).not.toMatch(/ROUTED/);
+    // And the phases still RAN — the point is no network, not no container.
+    expect(output).toMatch(/done/);
+  }, 600_000);
+
   test('the agent cannot reach a fix the repository already has', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     // The hole the authorship check could not close. Content is all that check can

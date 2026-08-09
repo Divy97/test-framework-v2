@@ -132,15 +132,31 @@ previous round's fix, and [the M4 scope](milestone-4-isolation.md) is the
 structural answer — it has to land before 3b.2 hands the agent authorship of the
 `ReproSpec`.
 
-**The container has unrestricted network until 3c.** The agent needs to reach
-the model API and nothing stops it reaching anything else. Said plainly rather
-than implied away: the isolation this milestone has built is filesystem and
-privilege isolation, not egress.
+**The PHASE containers have no network at all; the agent's is still
+unrestricted.** The half that needs nothing is closed: `--network none` on base
+and fix, so the code under judgement can neither exfiltrate the repository it was
+handed nor be TOLD what to answer — a reproduction that can reach the network is
+an identity oracle over a wire instead of over the tree, which is ADR-0008's
+amendment in another medium. It also forecloses dependency install, which M3
+already refuses; a `setupCommand` will need its own network decision rather than
+inheriting this one.
+
+The agent still reaches anything it likes, because it needs the model API and
+nothing yet distinguishes that from the rest of the internet. That is the
+remaining half of 3c and it is the harder one: it wants an authenticated proxy
+the container is forced through, not a flag.
 
 **3c · egress control**
 One authenticated channel out, the model API and nothing else. Deliberately last
 because it is the easiest to verify once the first two exist and the hardest to
 develop against.
+
+- **3c.1 — the phases have no network.** Landed. `--network none` on every
+  container that is not the agent's, asserted by a test that fails when the flag
+  is removed (the phase container resolves `api.anthropic.com` without it).
+- **3c.2 — the agent's one channel.** Still to come. A flag cannot express "the
+  model API and nothing else"; it needs a proxy the container is forced through,
+  holding the credential the agent never sees.
 
 ## Decisions this milestone must make
 
