@@ -1382,6 +1382,56 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(outcome.complete).toBe(false);
   }, 600_000);
 
+  test('the agent cannot reach a fix the repository already has', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // The hole the authorship check could not close. Content is all that check can
+    // see, so byte-identical inheritance is caught and one extra byte is not:
+    // check out the fix the repo already carries, add an unrelated file, commit,
+    // and the content is genuinely new while the work is entirely inherited.
+    //
+    // So the agent's source has base's ancestry and nothing else. This agent asks
+    // for every commit it can see and tries to reach the fix by sha; both must
+    // fail, because the object is not there to reach.
+    const fixture = clean();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `echo "REACHABLE:$(git rev-list --all | wc -l | tr -d ' ')"\n` +
+        `git cat-file -t ${fixture.fix} >/dev/null 2>&1 && echo "REACHED-FIX" || echo "NO-FIX"\n` +
+        `git checkout ${fixture.fix} >/dev/null 2>&1 && echo "CHECKED-OUT" || echo "NO-CHECKOUT"\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'try to inherit the fix',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    const said = (
+      await Promise.all(
+        outcome.events
+          .filter((e) => e.type === 'AGENT_MESSAGE')
+          .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+      )
+    ).map((b) => b.toString().trim());
+    // Exactly one commit — base. Not base plus the fix the fixture carries.
+    expect(said).toContain('REACHABLE:1');
+    expect(said).toContain('NO-FIX');
+    expect(said).toContain('NO-CHECKOUT');
+  }, 600_000);
+
   test('a revert to an earlier good state is a real fix, not inherited work', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     // The cost side of the authorship check, and it nearly shipped. `git revert`
@@ -1469,7 +1519,11 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     const state = fold(outcome.events);
     expect(state.handedOver).toBeNull();
     expect(state.reproduced).toBe(false);
-    expect(state.aborts[0]!.reason).toMatch(/content already exists elsewhere/);
+    // `changes nothing against the base`, not `content exists elsewhere`: the
+    // agent's source now holds base's ancestry only, so it cannot even reach the
+    // repository's fix to sit an empty commit on top of it. The refusal that
+    // fires is the stronger one.
+    expect(state.aborts[0]!.reason).toMatch(/changes nothing against the base/);
   }, 600_000);
 
   test('the log records what the agent authored, not only what was verified', async () => {

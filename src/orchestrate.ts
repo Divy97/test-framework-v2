@@ -198,8 +198,9 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // these sets are read that yields shas the rest of the engine does not agree
   // with. If base itself is not in `before`, `before` is not this repository's
   // history and no refusal computed from it means anything.
-  const { stdout: baseSha } = await execFile('git', [...git, 'rev-parse', `${plan.baseRef}^{commit}`]);
-  if (!before.has(baseSha.trim())) {
+  const { stdout: baseShaOut } = await execFile('git', [...git, 'rev-parse', `${plan.baseRef}^{commit}`]);
+  const base = baseShaOut.trim();
+  if (!before.has(base)) {
     // Take the mirror with it. Every throw between the clone and the cleanup at
     // the end leaves a full clone of the repository in `tmpdir()` forever, and
     // fail-closed paths are exactly the ones that run repeatedly while someone
@@ -209,6 +210,43 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       'the base commit is not in the history this check reads; refusing to run an unenforceable check',
     );
   }
+
+  // The agent's source: base's ancestry, and NOTHING else.
+  //
+  // The authorship check can only ever see content, so it catches byte-identical
+  // inheritance and stops there — check out a fix the repository already carries,
+  // add one unrelated file, commit, and the result is genuinely new content built
+  // on work the agent did not do. No content-based check can separate that from a
+  // real fix, because the fix IS in the tree and the agent DID author the commit
+  // on top of it.
+  //
+  // So remove the thing being inherited rather than trying to recognise it. The
+  // agent clones this, and a fix commit that is not in its object store cannot be
+  // checked out, cherry-picked, merged or reset to. Every refusal in the check
+  // above stays as a second line for the cases this cannot cover — a repository
+  // whose base ancestry already contains the fix, say — but the hole itself is
+  // closed by construction rather than by recognition.
+  //
+  // Built by clone-then-strip rather than a targeted fetch: fetching a bare sha
+  // needs `uploadpack.allowAnySHA1InWant` on the far side, and fetching the
+  // branch that CONTAINS base would bring the branch tip, which is exactly the
+  // fix. Deleting every ref, pointing HEAD at base and pruning leaves base's
+  // ancestry as the only reachable history — verified by the object store, not by
+  // the ref listing.
+  const agentSource = join(workspace, 'agent-source');
+  await execFile('git', ['clone', '--quiet', '--no-local', '--bare', source, agentSource]);
+  const { stdout: strays } = await execFile('git', [
+    '-C', agentSource, 'for-each-ref', '--format=%(refname)',
+  ]);
+  for (const ref of strays.split('\n').filter(Boolean)) {
+    await execFile('git', ['-C', agentSource, 'update-ref', '-d', ref]);
+  }
+  await execFile('git', ['-C', agentSource, 'update-ref', 'refs/heads/main', base]);
+  await execFile('git', ['-C', agentSource, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
+  // A bare clone has no reflogs, but an expire costs nothing and a retained
+  // reflog would keep the fix commit reachable through the prune.
+  await execFile('git', ['-C', agentSource, 'reflog', 'expire', '--all', '--expire=now']).catch(() => {});
+  await execFile('git', ['-C', agentSource, 'gc', '--prune=now', '--quiet']);
 
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
@@ -233,21 +271,27 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // becomes when the world is a container: it is not scrubbed, it ceases to
   // exist. Note it runs BEFORE the base container, so the gate cannot prevent
   // spawning it — the gate decides whether a FIX is attempted.
-  const steps: { phase: PhaseResult['phase']; job: Partial<Job> }[] = [];
+  const steps: { phase: PhaseResult['phase']; job: Partial<Job>; source: string }[] = [];
   // `only: 'agent'` matters: without it the agent container ran the agent AND
   // both phases, so the fix phase started on the very machine the agent had been
   // working in. It stayed invisible because the duplicate registrations made the
   // fold stricter rather than wrong.
   if (plan.agentPrompt) {
-    steps.push({ phase: 'agent', job: { agentPrompt: plan.agentPrompt, only: 'agent' } });
+    // `baseRef` resolved: the stripped source has one branch and none of the
+    // names the plan may have used.
+    steps.push({
+      phase: 'agent',
+      job: { agentPrompt: plan.agentPrompt, only: 'agent', baseRef: base },
+      source: agentSource,
+    });
   }
-  steps.push({ phase: 'base', job: { only: 'base' } });
+  steps.push({ phase: 'base', job: { only: 'base' }, source });
 
   let ended: RunEvent | null = null;
   let refused = false;
   let fixRef = plan.fixRef;
   for (const step of steps) {
-    const result = await runContainer(plan, source, afterSeq, step.phase, step.job);
+    const result = await runContainer(plan, step.source, afterSeq, step.phase, step.job);
     // Record what the container reported BEFORE judging any of it. Checking
     // first and breaking discarded the transcript and the container's own
     // stream — the same mistake the abort path made: a run that could not be
