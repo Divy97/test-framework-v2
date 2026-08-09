@@ -83,7 +83,7 @@ The full decision record from the founding design session: [SHARED-UNDERSTANDING
 adversarial review rounds each defeated the previous round's fix, because each
 fix enumerated a channel — `/tmp`, then surviving processes, then gitignored
 paths, then `/home/node` — and the set that matters ("writable by the repro
-user") cannot be enumerated with confidence. One of those rounds landed a false
+user") had never been checked against the image. One of those rounds landed a false
 `reproduced: true` against a *maintainer-authored, pinned, hashed* test — the
 strongest provenance the design recognises — with a fix commit that changed one
 unrelated file.
@@ -92,7 +92,10 @@ The residual channels [ADR-0010](docs/adr/0010-the-environment-is-part-of-the-ev
 lists are latent rather than open, because exploiting them needs an
 attacker-influenced reproduction and the reproduction currently comes from the
 caller. That stops being true the moment the agent authors it, so
-[the M4 scope](docs/milestone-4-isolation.md) has to land first.
+[the M4 scope](docs/milestone-4-isolation.md) is the direction — though the
+enumeration itself is now an enforced invariant rather than a standing guess:
+the sandbox image is scanned as the repro user and asserted to expose exactly
+the paths the scrub cleans.
 
 ## Status
 

@@ -124,13 +124,21 @@ was false within a day.
   the thing they exist to catch. So a repro can differ between re-run 0 and
   re-run 1. That is survivable only because one red run in the series is already
   enough for the fold to refuse.
-- **Enumeration, still.** The scrub names `/tmp`, `/var/tmp`, `/dev/shm` and
-  `/home/node`. That last one is the tell: it is not world-writable, it is
-  uid-1000-owned because the image ships it that way. The set that matters is
-  "writable by the repro user", which is strictly larger than "world-writable"
-  and cannot be enumerated confidently. The reap is what makes the list
-  survivable, because state with no process to place it at the right moment is
-  present in both phases and credited in neither.
+- ~~**Enumeration, still.**~~ **Closed by making the list check itself.** Four
+  rounds each added an entry — `/tmp`, then `/home/node`, then `/dev/mqueue`,
+  which nothing had ever considered — and every time the suite went green on a
+  list that was still wrong. What was missing was never a longer list; it was a
+  way to know when the list is complete. The image is now enumerated as the
+  repro user and asserted to be *exactly* the scrubbed set, so a base image that
+  gains a writable path fails the suite instead of waiting for the next review.
+  The answer to "the set cannot be enumerated with confidence" turned out to be
+  that it can — it is five directories — and that the confidence has to come
+  from a test rather than from care.
+- **procfs is out of scope, deliberately.** The enumeration covers real
+  filesystems. Extending it to `/proc` turns up `/proc/sys/kernel/ns_last_pid`,
+  writable by uid 1000 — a kernel tunable rather than a place to leave a file.
+  It cannot be scrubbed by removing anything and every process creation rewrites
+  it, so it is a different threat class and is recorded rather than swept in.
 - **The reap assumes PID 1.** It is gated on it, so outside a container it does
   nothing at all — which is correct, and means the in-process engine used by the
   unit tests has none of this protection. That is acceptable only because the

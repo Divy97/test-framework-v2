@@ -84,6 +84,22 @@ const EXIT = {
  */
 const SENTINEL = '.evidence-store';
 
+/**
+ * Every directory in the sandbox image a participant can write, and therefore
+ * every place one of them can leave state for another to read.
+ *
+ * This list was three guesses long and kept being wrong — `/home/node` is not
+ * world-writable, it is uid-1000-owned because the image ships it that way, and
+ * `/dev/mqueue` was simply never thought of. What was missing was not a longer
+ * list but a way to know when the list is complete.
+ *
+ * `test/sandbox.test.ts` enumerates the image as the repro user and asserts the
+ * result is exactly this array, so the guessing is over: change the base image
+ * and add a writable path, and the suite says so instead of the next review
+ * round finding it. The entry that matters is whichever one is not here yet.
+ */
+export const SHARED_WRITABLE = ['/tmp', '/var/tmp', '/dev/shm', '/dev/mqueue', '/home/node'];
+
 async function hostStoreIsMounted(path: string): Promise<boolean> {
   try {
     const [here, root] = await Promise.all([stat(path), stat('/')]);
@@ -129,10 +145,7 @@ async function clearTheField(extra: string[] = []): Promise<void> {
       // Already gone, or not ours to signal. Either way there is nothing to do.
     }
   }
-  // `/home/node` is in the list because the image ships it owned by uid 1000 —
-  // a reminder that "world-writable" is the wrong set. The set that matters is
-  // "writable by the repro user", and it is strictly larger.
-  for (const dir of ['/tmp', '/var/tmp', '/dev/shm', '/home/node', ...extra]) {
+  for (const dir of [...SHARED_WRITABLE, ...extra]) {
     // The repro owns its own TMPDIR and HOME, so it can replace either with a
     // symlink and have this root-privileged delete follow it. Pointed at
     // /blobs that empties the host evidence store — every earlier run's

@@ -1,7 +1,18 @@
 # Milestone 4 (proposed) — one container per participant
 
-**Status: scoped, not started.** It carries a real cost and a real architectural
-commitment, so it is written down rather than begun.
+**Status: scoped, and less urgent than when it was written.** The enumeration
+problem this milestone existed to solve has since been closed a cheaper way —
+the writable set is asserted against the image by a test, so the list can no
+longer silently fall behind
+([ADR-0010](adr/0010-the-environment-is-part-of-the-evidence.md)). What remains
+below is still worth doing, but for what it buys rather than as a rescue.
+
+Measured, not assumed: `unshare --user --map-root-user` **is** blocked under
+Docker's default seccomp profile in this image (`unshare(0x30020000): Operation
+not permitted`) and succeeds under `seccomp=unconfined`. So candidate A costs a
+seccomp change after all — a narrower one than `CAP_SYS_ADMIN`, but a
+container-wide relaxation nonetheless, and a custom profile means shipping a copy
+of Docker's default that will drift.
 
 ## Why
 

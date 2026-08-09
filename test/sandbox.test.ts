@@ -16,6 +16,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { fold } from '../src/fold.js';
+import { SHARED_WRITABLE } from '../src/runner.js';
 import {
   APPLIED_REPRO,
   cleanupFixtures,
@@ -93,6 +94,42 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     cleanupFixtures();
     for (const dir of stores.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
+
+  test('the image has exactly the writable paths the scrub knows about', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+
+    // The invariant that ends the guessing. Four review rounds each found one
+    // more place a participant could leave state for another to read — /tmp,
+    // then a gitignored directory, then /home/node, then /dev/mqueue — and each
+    // time the fix was a longer list and a green suite. What was missing was not
+    // a longer list but a way to know when it is complete.
+    //
+    // Enumerated as the repro user, across every mount rather than one, because
+    // /dev/shm and /dev/mqueue are separate filesystems and `-xdev` is exactly
+    // how /dev/mqueue stayed hidden.
+    // Real filesystems only. procfs is deliberately out of scope and the
+    // exclusion is informed rather than convenient: enumerating it turns up
+    // `/proc/sys/kernel/ns_last_pid`, writable by uid 1000. That is a kernel
+    // tunable, not a place to leave a file — it cannot be scrubbed by removing
+    // anything, and every process creation rewrites it. A different threat
+    // class, recorded in ADR-0010 rather than papered over here.
+    const roots = ['/', '/dev', '/dev/shm', '/dev/mqueue', '/run'];
+    const found = execFileSync(
+      'docker',
+      ['run', '--rm', '--user', '1000:1000', '--entrypoint', 'sh', IMAGE, '-c',
+        `for m in ${roots.join(' ')}; do ` +
+          "for t in d f; do find $m -xdev -type $t -exec test -w {} ';' -print 2>/dev/null; done; " +
+          'done | sort -u'],
+      { encoding: 'utf8' },
+    )
+      .split('\n')
+      .filter(Boolean);
+
+    // Exactly — not a superset. A path the scrub cleans that the image does not
+    // have is dead weight; a path the image has that the scrub misses is the
+    // next fabricated verdict.
+    expect([...found].sort()).toEqual([...SHARED_WRITABLE].sort());
+  }, 300_000);
 
   test('a run executes in the container and the host tree is untouched', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
