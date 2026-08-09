@@ -36,8 +36,11 @@ const dockerAvailable = () => {
 /** Saying "I know the containment boundary is unverified" — the only way to skip it. */
 const ACKNOWLEDGED = 'ENGINE_SANDBOX_UNVERIFIED';
 const haveDocker = dockerAvailable();
+// Not `!!`: that treats `=0` and `=false` as acknowledgement, which reads as the
+// exact opposite of what it does. Only an affirmative value counts.
+const acknowledged = ['1', 'true', 'yes'].includes((process.env[ACKNOWLEDGED] ?? '').toLowerCase());
 
-describe.skipIf(haveDocker || !!process.env[ACKNOWLEDGED])('the containment boundary', () => {
+describe.skipIf(haveDocker || acknowledged)('the containment boundary', () => {
   test('was NOT verified: no Docker daemon', () => {
     // Deliberately a failure rather than a skip. Everything else in the suite
     // runs the engine in-process, so without this the security properties M3

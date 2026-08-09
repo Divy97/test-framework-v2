@@ -62,6 +62,11 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   producer. The image gains a real `claude` here; until then the sandbox test
   mounts a hostile fake, which proves the boundary without the weight.
 
+**The isolation is not finished.** Four review rounds on 3b.1 each defeated the
+previous round's fix, and [the M4 scope](milestone-4-isolation.md) is the
+structural answer — it has to land before 3b.2 hands the agent authorship of the
+`ReproSpec`.
+
 **The container has unrestricted network until 3c.** The agent needs to reach
 the model API and nothing stops it reaching anything else. Said plainly rather
 than implied away: the isolation this milestone has built is filesystem and
