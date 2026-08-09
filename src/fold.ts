@@ -208,7 +208,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // Ordinarily a no-op — registration precedes the runs it anchors — but it
         // keeps the value derived from the current inputs rather than left over
         // from the last TEST_RUN.
-        ...credited(state.testRuns, registrations, state.aborts, state.completedAttempts),
+        ...credited(state.testRuns, registrations, state.aborts, state.completedAttempts, state.handedOver),
       };
     }
     case 'AGENT_MESSAGE':
@@ -259,7 +259,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // `aborts` IS load-bearing here, since `shownOnBase` needs no completion
         // witness: a base-phase abort is the only thing that can shut the gate on
         // an attempt whose base run otherwise looks clean.
-        ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts),
+        ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts, state.handedOver),
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
     }
@@ -274,7 +274,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         completedAttempts,
         // The completion witness arrives after the runs it vouches for, so a fold
         // that only recomputed on TEST_RUN would never see it.
-        ...credited(state.testRuns, state.registrations, state.aborts, completedAttempts),
+        ...credited(state.testRuns, state.registrations, state.aborts, completedAttempts, state.handedOver),
         artifactHashes: [...state.artifactHashes, event.payload.diff_hash],
       };
     }
@@ -310,7 +310,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         ...next,
         aborts,
         completedAttempts: completed,
-        ...credited(state.testRuns, state.registrations, aborts, completed),
+        ...credited(state.testRuns, state.registrations, aborts, completed, state.handedOver),
       };
     }
     case 'RUN_ENDED':
@@ -381,8 +381,9 @@ function credited(
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
   completedAttempts: number[],
+  handedOver: string | null,
 ): { reproduced: boolean; reproducedAttempt: number | null; shownOnBase: boolean } {
-  const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts);
+  const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts, handedOver);
   return {
     reproduced: attempt !== null,
     reproducedAttempt: attempt,
@@ -448,6 +449,7 @@ function reproducedAttempt(
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
   completedAttempts: number[],
+  handedOver: string | null,
 ): number | null {
   // The completion witness is the fix half's own guard. Nothing in the log states
   // how many fix runs there should have been, so "every run I can see passed" is
@@ -471,6 +473,18 @@ function reproducedAttempt(
     // `signal` on the fix side for the same reason it is checked on the base: a
     // process killed by a signal records exit_code -1, and nothing else here
     // would notice a fix run that died rather than passed.
+    // The fix runs have to be judging the commit the AGENT handed over.
+    //
+    // Without this the invariant lived in a test rather than in the fold that
+    // ADR-0009 says owns interpretation: a producer could hand over commit A,
+    // verify commit B, and still fold to `reproduced: true` with the log's own
+    // record of the discrepancy sitting inert beside it.
+    //
+    // Only when there IS a handover — a run with no agent has nothing to tie to.
+    // Scalar for now, which is only sound while there is one attempt; the 3b.2
+    // attempt loop has to make it per-attempt, exactly as `RegisteredRepro`
+    // already is.
+    if (handedOver && fixes.some((r) => r.commit_sha !== handedOver)) return false;
     return (
       fixes.length > 0 && fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
     );

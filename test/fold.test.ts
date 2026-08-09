@@ -475,6 +475,41 @@ describe('an attempt that could not be observed', () => {
     expect(truncated.reproduced).toBe(false);
   });
 
+  it('will not credit fix runs that judged a commit other than the one handed over', () => {
+    // ADR-0009: the fold owns interpretation. Without this the invariant lived in
+    // a sandbox test — a producer could hand over commit A, verify commit B, and
+    // still fold to `reproduced: true` with the log's own record of the
+    // discrepancy sitting inert beside it.
+    const handed = (commit: string, seq: number): RunEvent => ({
+      run_id: DEMO_RUN_ID,
+      seq,
+      ts: 'T',
+      type: 'AGENT_HANDED_OVER',
+      payload: { v: 1, commit },
+    });
+
+    const fixSha = demoRunEvents.find(
+      (e) => e.type === 'TEST_RUN' && e.payload.phase === 'fix',
+    )!.payload as { commit_sha: string };
+
+    // Handing over the very commit the fix runs judged changes nothing.
+    const honest = fold([
+      demoRunEvents[0]!,
+      handed(fixSha.commit_sha, 2),
+      ...demoRunEvents.slice(1, 7).map((e) => ({ ...e, seq: e.seq + 1 })),
+    ]);
+    expect(honest.handedOver).toBe(fixSha.commit_sha);
+    expect(honest.reproduced).toBe(true);
+
+    // Handing over a different one is not a reproduction of the agent's fix.
+    const swapped = fold([
+      demoRunEvents[0]!,
+      handed('f'.repeat(40), 2),
+      ...demoRunEvents.slice(1, 7).map((e) => ({ ...e, seq: e.seq + 1 })),
+    ]);
+    expect(swapped.reproduced).toBe(false);
+  });
+
   it('leaves a fully observed attempt alone when a LATER attempt aborts', () => {
     const state = fold([
       ...demoRunEvents.slice(0, 7), // attempt 1, fully observed, red -> green -> diff
