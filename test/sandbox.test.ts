@@ -1383,6 +1383,80 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(outcome.complete).toBe(false);
   }, 600_000);
 
+  test('a second attempt runs, and each is recorded as its own', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // Retrying only became meaningful once a later attempt could propose a
+    // DIFFERENT reproduction — before that, every attempt ran the same spec
+    // against the same commits and got the same answer.
+    //
+    // The agent fails to reproduce on its first go and succeeds on its second, so
+    // the run has two attempts, two repro handovers, and a verdict that belongs
+    // to attempt 2. The point is that attempt 1's failure does not follow it.
+    const fixture = regression();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    // A marker in HOME survives between containers for the same run only because
+    // this fake agent is mounted from the host; a real agent would simply write a
+    // better reproduction the second time.
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        `case "$*" in\n` +
+        `  *reproduce*)\n` +
+        `  mkdir -p .engine\n` +
+        // Never reproduces. A fake agent cannot remember an earlier attempt —
+        // every container gets a fresh `/out` and a fresh world, which is the
+        // isolation working — so what is asserted here is the LOOP: two attempts
+        // declared, two reproductions registered under their own attempt numbers,
+        // and an honest `attempts_exhausted` at the end.
+        `  printf 'exit 0\\n' > repro.sh\n` +
+        `  printf '{"command":"sh repro.sh","files":["repro.sh"]}' > .engine/repro.json\n` +
+        `  git add .engine repro.sh >/dev/null 2>&1\n` +
+        `  git commit -q -m "reproduce it" >/dev/null 2>&1\n` +
+        `  ;;\n` +
+        `  *)\n` +
+        `  echo right > src.txt\n` +
+        `  git add src.txt >/dev/null 2>&1\n` +
+        `  git commit -q -m "fix it" >/dev/null 2>&1\n` +
+        `  ;;\n` +
+        `esac\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      maxAttempts: 2,
+      reproPrompt: 'reproduce the bug with a failing test',
+      agentPrompt: 'now fix it',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    const state = fold(outcome.events);
+    // The loop ran, and each attempt is its own: two declarations, and two
+    // reproductions recorded against attempt 1 and attempt 2 rather than one
+    // overwriting the other.
+    expect(outcome.events.filter((e) => e.type === 'ATTEMPT_STARTED')).toHaveLength(2);
+    expect(state.registrations.map((r) => r.attempt)).toEqual([1, 2]);
+    expect(state.currentAttempt).toBe(2);
+    // `not_reproduced`, NOT `attempts_exhausted`. The reason records the CAUSE of
+    // stopping (ADR-0009), and the cause here is that the bug was never shown —
+    // across two attempts rather than one. `attempts_exhausted` would claim the
+    // tries ran out on something still in progress. Neither is `error`: a status
+    // the agent must not be able to choose.
+    expect(state.reproduced).toBe(false);
+    expect(state.endedReason).toBe('not_reproduced');
+  }, 1_200_000);
+
   test('a reproduction that tests which commit this is, not whether the bug is present', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     // The hole that arrives WITH agent-authored reproductions, and the only one

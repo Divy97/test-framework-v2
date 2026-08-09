@@ -83,6 +83,16 @@ export type RunState = {
    * reproduction, no fix — and it is true well before `reproduced` can be.
    */
   shownOnBase: boolean;
+  /**
+   * Which attempts demonstrated the bug, so the gate can be asked per attempt.
+   *
+   * `shownOnBase` is a run-level fact and stays one — "the bug is real, some
+   * attempt showed it". But ADR-0007's gate is a decision about whether to spend
+   * a fix on THIS attempt, and reading the run-level flag let attempt 2 get a fix
+   * agent and a fix container off attempt 1's reproduction, for a bug attempt 2
+   * had just failed to show. "The gate never bends."
+   */
+  shownAttempts: number[];
   /** What the fix touched. Recorded for the confidence projection; the engine never judges it. */
   fixDiff: { changed_files: string[]; diff_hash: ArtifactRef } | null;
   /**
@@ -110,6 +120,16 @@ export type RunState = {
   agent: Omit<AgentFinishedV1, 'v'> | null;
   /** The commit the agent authored, if it authored one. Evidence, not testimony. */
   handedOver: string | null;
+  /**
+   * Every handover, with the attempt that produced it.
+   *
+   * `handedOver` is a scalar and was sound only while there was one attempt —
+   * `RegisteredRepro.attempt` exists because exactly this went wrong for the
+   * reproduction, and the note has sat beside it since. Attempt 2's fix handover
+   * would otherwise be compared against attempt 1's fix runs, which is the
+   * commit-swap accusation this fold already learned to avoid once.
+   */
+  handovers: { attempt: number; kind: 'repro' | 'fix'; commit: string }[];
   /**
    * The reproduction was written by the agent under judgement, not by a caller.
    *
@@ -161,11 +181,13 @@ const initialState = (runId: string): RunState => ({
   reproduced: false,
   reproducedAttempt: null,
   shownOnBase: false,
+  shownAttempts: [],
   fixDiff: null,
   completedAttempts: [],
   transcript: [],
   agent: null,
   handedOver: null,
+  handovers: [],
   reproAuthoredByAgent: false,
   pr: null,
   aborts: [],
@@ -222,7 +244,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // Ordinarily a no-op — registration precedes the runs it anchors — but it
         // keeps the value derived from the current inputs rather than left over
         // from the last TEST_RUN.
-        ...credited(state.testRuns, registrations, state.aborts, state.completedAttempts, state.handedOver),
+        ...credited(state.testRuns, registrations, state.aborts, state.completedAttempts, state.handovers),
       };
     }
     case 'AGENT_MESSAGE':
@@ -254,6 +276,14 @@ export function apply(state: RunState, event: RunEvent): RunState {
       // wrote an accusation of a commit swap into a log where nothing was
       // swapped.
       const handedOver = event.payload.kind === 'repro' ? state.handedOver : event.payload.commit;
+      const handovers = [
+        ...state.handovers,
+        {
+          attempt: state.currentAttempt,
+          kind: event.payload.kind === 'repro' ? ('repro' as const) : ('fix' as const),
+          commit: event.payload.commit,
+        },
+      ];
       // `!== 'fix'`, not `=== 'repro'`. This flag is now the ONLY thing
       // withholding a Tier 1 claim from an agent-authored reproduction — the
       // sham control is advisory and decides nothing — so it must fail CLOSED.
@@ -265,8 +295,9 @@ export function apply(state: RunState, event: RunEvent): RunState {
       return {
         ...next,
         handedOver,
+        handovers,
         reproAuthoredByAgent,
-        ...credited(state.testRuns, state.registrations, state.aborts, state.completedAttempts, handedOver),
+        ...credited(state.testRuns, state.registrations, state.aborts, state.completedAttempts, handovers),
       };
     }
     case 'AGENT_FINISHED': {
@@ -306,7 +337,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // `aborts` IS load-bearing here, since `shownOnBase` needs no completion
         // witness: a base-phase abort is the only thing that can shut the gate on
         // an attempt whose base run otherwise looks clean.
-        ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts, state.handedOver),
+        ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts, state.handovers),
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
     }
@@ -321,7 +352,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         completedAttempts,
         // The completion witness arrives after the runs it vouches for, so a fold
         // that only recomputed on TEST_RUN would never see it.
-        ...credited(state.testRuns, state.registrations, state.aborts, completedAttempts, state.handedOver),
+        ...credited(state.testRuns, state.registrations, state.aborts, completedAttempts, state.handovers),
         artifactHashes: [...state.artifactHashes, event.payload.diff_hash],
       };
     }
@@ -370,7 +401,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         ...next,
         aborts,
         completedAttempts: completed,
-        ...credited(state.testRuns, state.registrations, aborts, completed, state.handedOver),
+        ...credited(state.testRuns, state.registrations, aborts, completed, state.handovers),
       };
     }
     case 'RUN_ENDED':
@@ -441,13 +472,19 @@ function credited(
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
   completedAttempts: number[],
-  handedOver: string | null,
-): { reproduced: boolean; reproducedAttempt: number | null; shownOnBase: boolean } {
-  const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts, handedOver);
+  handovers: RunState['handovers'],
+): {
+  reproduced: boolean;
+  reproducedAttempt: number | null;
+  shownOnBase: boolean;
+  shownAttempts: number[];
+} {
+  const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts, handovers);
   return {
     reproduced: attempt !== null,
     reproducedAttempt: attempt,
     shownOnBase: demonstrated(testRuns, registrations, aborts).length > 0,
+    shownAttempts: [...new Set(demonstrated(testRuns, registrations, aborts).map((r) => r.attempt))],
   };
 }
 
@@ -509,7 +546,7 @@ function reproducedAttempt(
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
   completedAttempts: number[],
-  handedOver: string | null,
+  handovers: RunState['handovers'],
 ): number | null {
   // The completion witness is the fix half's own guard. Nothing in the log states
   // how many fix runs there should have been, so "every run I can see passed" is
@@ -544,7 +581,25 @@ function reproducedAttempt(
     // Scalar for now, which is only sound while there is one attempt; the 3b.2
     // attempt loop has to make it per-attempt, exactly as `RegisteredRepro`
     // already is.
-    if (handedOver && fixes.some((r) => r.commit_sha !== handedOver)) return false;
+    // THIS attempt's fix handover, not the run's last one. Comparing attempt 2's
+    // commit against attempt 1's fix runs is the same off-by-one that
+    // `RegisteredRepro.attempt` was introduced to fix.
+    // `|| h.attempt === 0` is the fail-closed half. A handover that arrives before
+    // any ATTEMPT_STARTED is attributed to attempt 0, and keying strictly on the
+    // attempt made the check VANISH for those streams rather than apply — the
+    // guard silently absent is worse than the scalar it replaced. An
+    // unattributed handover is checked against every attempt.
+    // `filter`, not `find`. `find` returns the FIRST match and an attempt-0
+    // handover always precedes an attempt's own, so it did not get checked
+    // ALONGSIDE the attempt's — it REPLACED it, and the guard failed open on
+    // exactly the swap it exists to catch: hand over Y before the attempt is
+    // declared, verify X inside it, credited. Strictly weaker than the scalar.
+    // Every handover that could belong to this attempt has to agree with every
+    // fix run in it.
+    const handed = handovers.filter(
+      (h) => (h.attempt === base.attempt || h.attempt === 0) && h.kind === 'fix',
+    );
+    if (handed.some((h) => fixes.some((r) => r.commit_sha !== h.commit))) return false;
     return (
       fixes.length > 0 && fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
     );

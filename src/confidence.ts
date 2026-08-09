@@ -250,8 +250,24 @@ function notReproducedBecause(state: RunState): string {
   // documented `Display it; never parse it` (events.ts), which quotes
   // agent-influenced text: a repro named `./handed over` short-circuited this
   // whole ladder, and 3b.2b hands the agent authorship of that spec.
-  const refused = state.aborts.find((a) => a.cause === 'handover');
-  if (refused) return refused.reason;
+  // The LAST attempt's refusal, not the run's first. With attempts bounded, an
+  // early refusal became every later attempt's Tier 3 explanation — so a run
+  // whose second attempt honestly failed to reproduce reported attempt 1's "the
+  // agent handed over a commit the repository already had" instead. The
+  // deliverable is what this projection is for (ADR-0007); describing the wrong
+  // attempt makes it worse than terse.
+  //
+  // Tying it to `currentAttempt` alone was too tight and dropped genuine
+  // refusals: attempt 1 refused, attempt 2 starts and its agent container dies
+  // before registering anything, and the run reported "no reproduction was ever
+  // registered" — true, useless, and silent about the agent handing over work it
+  // did not do, which is the sentence this clause exists to prevent. So it also
+  // reports when the LAST attempt produced no diagnosis of its own to displace it.
+  const refused = state.aborts.filter((a) => a.cause === 'handover').at(-1);
+  const lastSpoke =
+    state.registrations.some((r) => r.attempt === state.currentAttempt) ||
+    state.testRuns.some((r) => r.attempt === state.currentAttempt);
+  if (refused && (refused.attempt === state.currentAttempt || !lastSpoke)) return refused.reason;
   if (state.registrations.length === 0) return 'no reproduction was ever registered';
   if (state.testRuns.length === 0) return 'the reproduction was registered but never ran';
 
@@ -293,9 +309,19 @@ function notReproducedBecause(state: RunState): string {
   // asserting otherwise while concealing the real finding. That is exactly the
   // "a second definition is free to disagree" failure this file's header
   // commemorates; a clause has to land here whenever one lands in the fold.
-  const wrong = state.handedOver && fixes.find((r) => r.commit_sha !== state.handedOver);
+  // THIS attempt's handovers, not the run's last one. The scalar meant a later
+  // attempt's commit was reported as a swap against an earlier clean attempt —
+  // a fabricated accusation that also CONCEALED the real finding below it. The
+  // fold gained a per-attempt rule and this projection did not, which is the
+  // failure the comment above warns about, one commit later.
+  const handed = state.handovers.filter(
+    (h) => (h.attempt === base.attempt || h.attempt === 0) && h.kind === 'fix',
+  );
+  const wrong = handed
+    .flatMap((h) => fixes.filter((r) => r.commit_sha !== h.commit).map((r) => ({ r, h })))
+    .at(0);
   if (wrong) {
-    return `the fix runs judged ${wrong.commit_sha}, but the agent handed over ${state.handedOver}: the commit verified is not the commit authored`;
+    return `the fix runs judged ${wrong.r.commit_sha}, but the agent handed over ${wrong.h.commit}: the commit verified is not the commit authored`;
   }
   return 'the reproduction that ran was not the one registered: two different tests were compared';
 }

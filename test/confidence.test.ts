@@ -33,8 +33,8 @@ const RUN_ID = '2b8e4f61-0c3a-4d7e-9a15-6f8b0c2e4d39';
 const EMPTY: RunState = {
   runId: 'r', status: 'attempting', source: null, threadRef: null, currentAttempt: 1,
   testRuns: [], registeredRepro: null, registrations: [], reproduced: false,
-  reproducedAttempt: null, shownOnBase: false, fixDiff: null, completedAttempts: [], transcript: [],
-  agent: null, handedOver: null, reproAuthoredByAgent: false, pr: null, aborts: [], afterEnd: [], endedReason: null,
+  reproducedAttempt: null, shownOnBase: false, shownAttempts: [], fixDiff: null, completedAttempts: [], transcript: [],
+  agent: null, handedOver: null, handovers: [], reproAuthoredByAgent: false, pr: null, aborts: [], afterEnd: [], endedReason: null,
   artifactHashes: [], lastSeq: 0,
 };
 
@@ -333,6 +333,71 @@ describe('a handover that never arrived', () => {
     // doing the work, not something incidental in the fixture.
     const plain = fold(control().slice(0, -1));
     expect(confidence(plain).tier).toBe(1);
+  });
+
+  test('describes the attempt that ended the run, not an earlier one', () => {
+    // With attempts bounded, an early refusal became every later attempt's Tier 3
+    // explanation: a run whose second attempt honestly failed to reproduce
+    // reported attempt 1's "handed over a commit the repository already had".
+    // The deliverable is what this projection exists for, so describing the wrong
+    // attempt is worse than saying less.
+    const events: RunEvent[] = [
+      { run_id: 'r', seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 2,
+        ts: 'T',
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'setup', cause: 'handover', reason: 'attempt one was refused' },
+      },
+      { run_id: 'r', seq: 3, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      {
+        run_id: 'r',
+        seq: 4,
+        ts: 'T',
+        type: 'REPRO_REGISTERED',
+        payload: { v: 1, command: 'x', files: { f: 'sha256:aa' }, applied: ['f'] },
+      },
+      {
+        run_id: 'r',
+        seq: 5,
+        ts: 'T',
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'base',
+          commit_sha: 'a',
+          exit_code: 0, // green on base: it simply did not reproduce
+          stdout_hash: 'sha256:aa',
+          duration_ms: 1,
+          symptom_matched: false,
+          repro_hashes: { f: 'sha256:aa' },
+        },
+      },
+    ];
+    const claim = confidence(fold(events)).grounds[0]!.claim;
+    expect(claim).not.toMatch(/attempt one was refused/);
+    expect(claim).toMatch(/passed on the base commit/);
+  });
+
+  test('keeps a refusal when the attempt after it never spoke', () => {
+    // The mirror of the test above, and the regression that fixing it introduced.
+    // Attempt 1 is refused; attempt 2 starts and its container dies before
+    // registering anything. Tying the clause to `currentAttempt` alone dropped
+    // the refusal and reported "no reproduction was ever registered" — true,
+    // useless, and silent about the finding that most needs auditing.
+    const events: RunEvent[] = [
+      { run_id: 'r', seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 2,
+        ts: 'T',
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'setup', cause: 'handover', reason: 'the agent handed nothing over' },
+      },
+      { run_id: 'r', seq: 3, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+    ];
+    expect(confidence(fold(events)).grounds[0]!.claim).toBe('the agent handed nothing over');
   });
 
   test('is Tier 3 with no partial credit', () => {

@@ -82,6 +82,8 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * image ships no agent yet, and a hostile fake is how the supervision boundary
    * is exercised without one.
    */
+  /** How many attempts before the run gives up. One, unless a caller asks for more. */
+  maxAttempts?: number;
   agentImageMount?: string;
 } & (
   | { repro: Job['repro']; reproPrompt?: never }
@@ -268,253 +270,313 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // fold refuses to pair runs at attempt 0, because runs from unrelated attempts
   // could otherwise be matched up. Nothing emitted this before, which is why the
   // tests had to prepend it by hand.
-  const attempt = own(plan.runId, ++afterSeq, { type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } });
-  events.push(attempt);
-
-  // The agent, if there is one, in a container torn down before the first phase
-  // is ever cloned. This is what ADR-0010's "the agent's world is discarded"
-  // becomes when the world is a container: it is not scrubbed, it ceases to
-  // exist. Note it runs BEFORE the base container, so the gate cannot prevent
-  // spawning it — the gate decides whether a FIX is attempted.
-  const steps: { phase: PhaseResult['phase']; job: Partial<Job>; source: string; kind?: 'repro' | 'fix' }[] = [];
-  // `only: 'agent'` matters: without it the agent container ran the agent AND
-  // both phases, so the fix phase started on the very machine the agent had been
-  // working in. It stayed invisible because the duplicate registrations made the
-  // fold stricter rather than wrong.
-  // The repro agent, when there is one, runs before everything: base cannot be
-  // judged against a reproduction that does not exist yet.
-  if (plan.reproPrompt) {
-    steps.push({
-      phase: 'agent',
-      job: { agentPrompt: plan.reproPrompt, only: 'agent', baseRef: base },
-      source: agentSource,
-      kind: 'repro',
-    });
-  }
-  // The FIX agent. With a repro agent present it is DEFERRED to after the base
-  // container has registered the reproduction, so ADR-0008's ordering invariant
-  // becomes a fact about the log rather than an intention: `REPRO_REGISTERED`
-  // provably precedes this agent's first message by seq, so it cannot have
-  // written the fix against a reproduction it had already watched fail. It also
-  // means the gate now stops the agent being spawned at all on a bug that was
-  // never shown — which the earlier ordering explicitly could not do.
+  // BOUNDED ATTEMPTS. Retrying is only meaningful now that a later attempt can
+  // propose a different REPRODUCTION — before 3b.2b every attempt would have run
+  // the same caller-supplied spec against the same commits and got the same
+  // answer, so the loop would have been a way to spend money.
   //
-  // Without a repro agent it stays ahead of base, where every M3.1 and 3b.1 test
-  // exercises it. The caller supplied the repro there, so there is no ordering
-  // between authoring and registration to prove.
-  if (plan.agentPrompt && !plan.reproPrompt) {
-    // `baseRef` resolved: the stripped source has one branch and none of the
-    // names the plan may have used.
-    steps.push({
-      phase: 'agent',
-      // `baseRef` resolved, and DEAD today: the Runner returns on `only: 'agent'`
-      // before `verify()` ever reads it. Kept because a future agent path should
-      // get the sha rather than a name the stripped source no longer carries.
-      // `fixRef` on this same job is dead for the identical reason and is NOT
-      // resolved — said here rather than left as a silent asymmetry two lines
-      // apart.
-      job: { agentPrompt: plan.agentPrompt, only: 'agent', baseRef: base },
-      source: agentSource,
-      kind: 'fix',
-    });
-  }
-  steps.push({ phase: 'base', job: { only: 'base' }, source });
-
+  // Per-attempt state is declared inside the loop on purpose. Carrying `fixRef`
+  // or `resolvedRepro` across an attempt boundary would judge attempt 2 against
+  // attempt 1's commit or anchor it to attempt 1's reproduction, which is the
+  // cross-attempt confusion the fold spent two PRs learning to refuse.
   let ended: RunEvent | null = null;
   let refused = false;
-  let fixRef = plan.fixRef;
-  let resolvedRepro = plan.repro;
-
-  /**
-   * How a container's exit ends the run.
-   *
-   * `EXIT.partial` (2) means observation stopped and the stream IS on the
-   * channel — a finding about this run. Collapsing it into `error` handed the
-   * agent the status ADR-0009 exists to deny it: a reproduction of `sleep 600`,
-   * or one naming a path the fix commit tracks, aborts a phase container and the
-   * run then reported `errored` rather than `unresolved`. A status the agent can
-   * choose is not a status, and `errored` is the single thing the fold takes on
-   * trust. Only 1 (an engine bug) and 3 (nothing on the channel at all) are ours.
-   */
-  const endedBy = (exitCode: number): RunEvent =>
-    own(plan.runId, ++afterSeq, {
-      type: 'RUN_ENDED',
-      payload: { v: 1, reason: exitCode === 2 ? 'attempts_exhausted' : 'error' },
-    });
-
-  /**
-   * Take the commit an agent handed over, or refuse the run and say why.
-   *
-   * One rule for both agents. The repro agent's commit is under exactly the same
-   * suspicion as the fix agent's: an agent that hands back a commit the
-   * repository already had has authored no reproduction either.
-   */
-  const accept = async (result: PhaseResult, kind: 'repro' | 'fix'): Promise<string | null> => {
-    const handover = await applyHandover(source, plan.runId, result.handover);
-    const stale =
-      handover.commit === null
-        ? handover.why
-        : before.has(handover.commit)
-          ? `the agent handed over ${handover.commit}, a commit the repository already had`
-          : handover.tree === baseTree
-            ? `the agent handed over ${handover.commit}, which changes nothing against the base`
-            : null;
-    if (handover.commit === null || stale) {
-      events.push(
-        own(plan.runId, ++afterSeq, {
-          type: 'VERIFICATION_ABORTED',
-          payload: {
-            v: 1,
-            phase: 'setup',
-            cause: 'handover',
-            reason: (stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS),
-          },
-        }),
-      );
-      ended = own(plan.runId, ++afterSeq, {
-        type: 'RUN_ENDED',
-        payload: { v: 1, reason: 'attempts_exhausted' },
-      });
-      refused = true;
-      return null;
-    }
-    events.push(
-      own(plan.runId, ++afterSeq, {
-        type: 'AGENT_HANDED_OVER',
-        payload: { v: 1, commit: handover.commit, kind },
-      }),
-    );
-    return handover.commit;
-  };
-
-  /** Read the reproduction out of the commit the repro agent authored. */
-  const registerRepro = async (head: string): Promise<boolean> => {
-    try {
-      resolvedRepro = await readReproFromCommit(source, head);
-      return true;
-    } catch (error) {
-      events.push(
-        own(plan.runId, ++afterSeq, {
-          type: 'VERIFICATION_ABORTED',
-          payload: {
-            v: 1,
-            phase: 'setup',
-            cause: 'handover',
-            reason: String((error as Error).message).slice(0, MAX_REASON_CHARS),
-          },
-        }),
-      );
-      ended = own(plan.runId, ++afterSeq, {
-        type: 'RUN_ENDED',
-        payload: { v: 1, reason: 'attempts_exhausted' },
-      });
-      refused = true;
-      return false;
-    }
-  };
-  for (const step of steps) {
-    const result = await runContainer(plan, step.source, afterSeq, step.phase, {
-      ...step.job,
-      ...(resolvedRepro ? { repro: resolvedRepro } : {}),
-      // The sham-fix control, on exactly when the AGENT wrote the reproduction.
-      // A caller-supplied repro has no oracle to be: whoever wrote it did not
-      // see the tree it would judge.
-      ...(plan.reproPrompt ? { controlRun: true } : {}),
-    });
-    // Record what the container reported BEFORE judging any of it. Checking
-    // first and breaking discarded the transcript and the container's own
-    // stream — the same mistake the abort path made: a run that could not be
-    // trusted is still a run that observed things.
-    phases.push(result);
-    events.push(...result.events);
-    afterSeq = result.events.at(-1)?.seq ?? afterSeq;
-
-    if (result.exitCode !== 0) {
-      ended = endedBy(result.exitCode);
-      break;
-    }
-
-    if (step.phase === 'agent') {
-      const head = await accept(result, step.kind === 'repro' ? 'repro' : 'fix');
-      if (head === null) break;
-      // The repro agent's commit is the TEST, not the repair — so it is read, not
-      // set as `fixRef`.
-      if (step.kind === 'repro') {
-        if (!(await registerRepro(head))) break;
-      } else {
-        fixRef = head;
-      }
-    }
+  // Validated, because every unusual value fails in a way that reads as success.
+  // `0` returned `complete: true` on an EMPTY log that `fold()` then refuses —
+  // no attempt declared, no container run, and an outcome claiming it went fine.
+  // `2.5` never satisfies `n === maxAttempts` while still satisfying
+  // `n < maxAttempts`, so the ending is allocated, discarded and rolled back on
+  // the last iteration and the run stays permanently unended. `Infinity` loops.
+  const maxAttempts = plan.maxAttempts ?? 1;
+  // An upper bound too: `Number.isInteger(1e21)` is true, so the value the
+  // comment above calls out as looping forever was reachable through a different
+  // number. Ten is far past any useful retry and well short of hanging.
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
+    throw new Error(`maxAttempts must be a whole number from 1 to 10, not ${String(plan.maxAttempts)}`);
   }
+  for (let n = 1; n <= maxAttempts; n += 1) {
+    ended = null;
+    refused = false;
+    let fixRef = plan.fixRef;
+    let resolvedRepro = plan.repro;
+    // An attempt has to be declared before anything can be credited to it: the
+    // fold refuses to pair runs at attempt 0, because runs from unrelated
+    // attempts could otherwise be matched up.
+    events.push(own(plan.runId, ++afterSeq, { type: 'ATTEMPT_STARTED', payload: { v: 1, n } }));
 
-  // THE GATE (ADR-0007). No reproduction, no fix — and the decision is read off
-  // the fold rather than worked out here, because a second definition of "did it
-  // reproduce" living in a producer is exactly what ADR-0009 forbids. A Tier 3
-  // outcome is a real deliverable, not a failure.
-  if (!ended) {
-    if (fold(events).shownOnBase) {
-      // The fix agent, deferred to here so the log can PROVE it never saw the
-      // reproduction before that reproduction was registered.
-      if (plan.reproPrompt && plan.agentPrompt) {
-        const author = await runContainer(plan, agentSource, afterSeq, 'agent', {
-          agentPrompt: plan.agentPrompt,
-          only: 'agent',
-          baseRef: base,
-          ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+    // The agent, if there is one, in a container torn down before the first phase
+    // is ever cloned. This is what ADR-0010's "the agent's world is discarded"
+    // becomes when the world is a container: it is not scrubbed, it ceases to
+    // exist. Note it runs BEFORE the base container, so the gate cannot prevent
+    // spawning it — the gate decides whether a FIX is attempted.
+    const steps: { phase: PhaseResult['phase']; job: Partial<Job>; source: string; kind?: 'repro' | 'fix' }[] = [];
+    // `only: 'agent'` matters: without it the agent container ran the agent AND
+    // both phases, so the fix phase started on the very machine the agent had been
+    // working in. It stayed invisible because the duplicate registrations made the
+    // fold stricter rather than wrong.
+    // The repro agent, when there is one, runs before everything: base cannot be
+    // judged against a reproduction that does not exist yet.
+    if (plan.reproPrompt) {
+      steps.push({
+        phase: 'agent',
+        job: { agentPrompt: plan.reproPrompt, only: 'agent', baseRef: base },
+        source: agentSource,
+        kind: 'repro',
+      });
+    }
+    // The FIX agent. With a repro agent present it is DEFERRED to after the base
+    // container has registered the reproduction, so ADR-0008's ordering invariant
+    // becomes a fact about the log rather than an intention: `REPRO_REGISTERED`
+    // provably precedes this agent's first message by seq, so it cannot have
+    // written the fix against a reproduction it had already watched fail. It also
+    // means the gate now stops the agent being spawned at all on a bug that was
+    // never shown — which the earlier ordering explicitly could not do.
+    //
+    // Without a repro agent it stays ahead of base, where every M3.1 and 3b.1 test
+    // exercises it. The caller supplied the repro there, so there is no ordering
+    // between authoring and registration to prove.
+    if (plan.agentPrompt && !plan.reproPrompt) {
+      // `baseRef` resolved: the stripped source has one branch and none of the
+      // names the plan may have used.
+      steps.push({
+        phase: 'agent',
+        // `baseRef` resolved, and DEAD today: the Runner returns on `only: 'agent'`
+        // before `verify()` ever reads it. Kept because a future agent path should
+        // get the sha rather than a name the stripped source no longer carries.
+        // `fixRef` on this same job is dead for the identical reason and is NOT
+        // resolved — said here rather than left as a silent asymmetry two lines
+        // apart.
+        job: { agentPrompt: plan.agentPrompt, only: 'agent', baseRef: base },
+        source: agentSource,
+        kind: 'fix',
+      });
+    }
+    steps.push({ phase: 'base', job: { only: 'base' }, source });
+
+
+    /**
+     * How a container's exit ends the run.
+     *
+     * `EXIT.partial` (2) means observation stopped and the stream IS on the
+     * channel — a finding about this run. Collapsing it into `error` handed the
+     * agent the status ADR-0009 exists to deny it: a reproduction of `sleep 600`,
+     * or one naming a path the fix commit tracks, aborts a phase container and the
+     * run then reported `errored` rather than `unresolved`. A status the agent can
+     * choose is not a status, and `errored` is the single thing the fold takes on
+     * trust. Only 1 (an engine bug) and 3 (nothing on the channel at all) are ours.
+     */
+    const endedBy = (exitCode: number): RunEvent =>
+      own(plan.runId, ++afterSeq, {
+        type: 'RUN_ENDED',
+        payload: { v: 1, reason: exitCode === 2 ? 'attempts_exhausted' : 'error' },
+      });
+
+    /**
+     * Take the commit an agent handed over, or refuse the run and say why.
+     *
+     * One rule for both agents. The repro agent's commit is under exactly the same
+     * suspicion as the fix agent's: an agent that hands back a commit the
+     * repository already had has authored no reproduction either.
+     */
+    const accept = async (result: PhaseResult, kind: 'repro' | 'fix'): Promise<string | null> => {
+      const handover = await applyHandover(source, plan.runId, result.handover);
+      const stale =
+        handover.commit === null
+          ? handover.why
+          : before.has(handover.commit)
+            ? `the agent handed over ${handover.commit}, a commit the repository already had`
+            : handover.tree === baseTree
+              ? `the agent handed over ${handover.commit}, which changes nothing against the base`
+              : null;
+      if (handover.commit === null || stale) {
+        events.push(
+          own(plan.runId, ++afterSeq, {
+            type: 'VERIFICATION_ABORTED',
+            payload: {
+              v: 1,
+              phase: 'setup',
+              cause: 'handover',
+              reason: (stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS),
+            },
+          }),
+        );
+        ended = own(plan.runId, ++afterSeq, {
+          type: 'RUN_ENDED',
+          payload: { v: 1, reason: 'attempts_exhausted' },
         });
-        phases.push(author);
-        events.push(...author.events);
-        afterSeq = author.events.at(-1)?.seq ?? afterSeq;
-        if (author.exitCode !== 0) {
-          ended = endedBy(author.exitCode);
+        refused = true;
+        return null;
+      }
+      events.push(
+        own(plan.runId, ++afterSeq, {
+          type: 'AGENT_HANDED_OVER',
+          payload: { v: 1, commit: handover.commit, kind },
+        }),
+      );
+      return handover.commit;
+    };
+
+    /** Read the reproduction out of the commit the repro agent authored. */
+    const registerRepro = async (head: string): Promise<boolean> => {
+      try {
+        resolvedRepro = await readReproFromCommit(source, head);
+        return true;
+      } catch (error) {
+        events.push(
+          own(plan.runId, ++afterSeq, {
+            type: 'VERIFICATION_ABORTED',
+            payload: {
+              v: 1,
+              phase: 'setup',
+              cause: 'handover',
+              reason: String((error as Error).message).slice(0, MAX_REASON_CHARS),
+            },
+          }),
+        );
+        ended = own(plan.runId, ++afterSeq, {
+          type: 'RUN_ENDED',
+          payload: { v: 1, reason: 'attempts_exhausted' },
+        });
+        refused = true;
+        return false;
+      }
+    };
+    for (const step of steps) {
+      const result = await runContainer(plan, step.source, afterSeq, step.phase, {
+        ...step.job,
+        ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+        // The sham-fix control, on exactly when the AGENT wrote the reproduction.
+        // A caller-supplied repro has no oracle to be: whoever wrote it did not
+        // see the tree it would judge.
+        ...(plan.reproPrompt ? { controlRun: true } : {}),
+      });
+      // Record what the container reported BEFORE judging any of it. Checking
+      // first and breaking discarded the transcript and the container's own
+      // stream — the same mistake the abort path made: a run that could not be
+      // trusted is still a run that observed things.
+      phases.push(result);
+      events.push(...result.events);
+      afterSeq = result.events.at(-1)?.seq ?? afterSeq;
+
+      if (result.exitCode !== 0) {
+        ended = endedBy(result.exitCode);
+        break;
+      }
+
+      if (step.phase === 'agent') {
+        const head = await accept(result, step.kind === 'repro' ? 'repro' : 'fix');
+        if (head === null) break;
+        // The repro agent's commit is the TEST, not the repair — so it is read, not
+        // set as `fixRef`.
+        if (step.kind === 'repro') {
+          if (!(await registerRepro(head))) break;
         } else {
-          const head = await accept(author, 'fix');
-          if (head !== null) fixRef = head;
+          fixRef = head;
         }
       }
-      // Nested inside `shownOnBase`, NOT a second top-level branch. Flattening it
-      // put the `not_reproduced` else on the wrong condition, so a fix agent that
-      // was refused had its `attempts_exhausted` overwritten with
-      // `not_reproduced` — a run claiming the bug never reproduced when the base
-      // container had just shown that it did.
-      if (ended) {
-        // A refused or failed fix agent has already said why.
+    }
+
+    // THE GATE (ADR-0007). No reproduction, no fix — and the decision is read off
+    // the fold rather than worked out here, because a second definition of "did it
+    // reproduce" living in a producer is exactly what ADR-0009 forbids. A Tier 3
+    // outcome is a real deliverable, not a failure.
+    if (!ended) {
+      // THIS attempt's reproduction, not the run's. Reading the run-level flag let
+    // attempt 2 spend a fix agent and a fix container on a bug it had just failed
+    // to show, off attempt 1's evidence — ADR-0007 says the gate never bends. The
+    // decision is still read off the fold rather than worked out here (ADR-0009);
+    // what changed is which question the fold is asked.
+    if (fold(events).shownAttempts.includes(n)) {
+        // The fix agent, deferred to here so the log can PROVE it never saw the
+        // reproduction before that reproduction was registered.
+        if (plan.reproPrompt && plan.agentPrompt) {
+          const author = await runContainer(plan, agentSource, afterSeq, 'agent', {
+            agentPrompt: plan.agentPrompt,
+            only: 'agent',
+            baseRef: base,
+            ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+          });
+          phases.push(author);
+          events.push(...author.events);
+          afterSeq = author.events.at(-1)?.seq ?? afterSeq;
+          if (author.exitCode !== 0) {
+            ended = endedBy(author.exitCode);
+          } else {
+            const head = await accept(author, 'fix');
+            if (head !== null) fixRef = head;
+          }
+        }
+        // Nested inside `shownOnBase`, NOT a second top-level branch. Flattening it
+        // put the `not_reproduced` else on the wrong condition, so a fix agent that
+        // was refused had its `attempts_exhausted` overwritten with
+        // `not_reproduced` — a run claiming the bug never reproduced when the base
+        // container had just shown that it did.
+        if (ended) {
+          // A refused or failed fix agent has already said why.
+        } else {
+        // `resolvedRepro`, not `plan.repro`. The fix container was the one call
+        // site that did not carry it, so with an agent-authored reproduction it
+        // ran anchored to nothing and aborted AFTER a perfectly good base phase —
+        // the ordering was right and the spec never reached the container judging
+        // the fix.
+        const fix = await runContainer(plan, source, afterSeq, 'fix', {
+          only: 'fix',
+          fixRef,
+          ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+        });
+        phases.push(fix);
+        events.push(...fix.events);
+        afterSeq = fix.events.at(-1)?.seq ?? afterSeq;
+        // Only a failed fix container ends the run here. A SUCCESSFUL one is not
+        // an ending: nothing is exhausted (there is one attempt and no cap), and
+        // the fold maps every non-`error` reason without a PR to `unresolved` —
+        // ADR-0007's not-reproduced deliverable. Emitting one rendered every
+        // credited red-then-green run as UNRESOLVED, indistinguishable on a
+        // dashboard from "we could not reproduce it".
+        //
+        // So the run stays `attempting` until the PR step exists to end it. An
+        // unended run is incomplete; a run ended with the wrong reason is a lie in
+        // an immutable log.
+        if (fix.exitCode !== 0) {
+          ended = endedBy(fix.exitCode);
+        }
+        }
       } else {
-      // `resolvedRepro`, not `plan.repro`. The fix container was the one call
-      // site that did not carry it, so with an agent-authored reproduction it
-      // ran anchored to nothing and aborted AFTER a perfectly good base phase —
-      // the ordering was right and the spec never reached the container judging
-      // the fix.
-      const fix = await runContainer(plan, source, afterSeq, 'fix', {
-        only: 'fix',
-        fixRef,
-        ...(resolvedRepro ? { repro: resolvedRepro } : {}),
-      });
-      phases.push(fix);
-      events.push(...fix.events);
-      afterSeq = fix.events.at(-1)?.seq ?? afterSeq;
-      // Only a failed fix container ends the run here. A SUCCESSFUL one is not
-      // an ending: nothing is exhausted (there is one attempt and no cap), and
-      // the fold maps every non-`error` reason without a PR to `unresolved` —
-      // ADR-0007's not-reproduced deliverable. Emitting one rendered every
-      // credited red-then-green run as UNRESOLVED, indistinguishable on a
-      // dashboard from "we could not reproduce it".
-      //
-      // So the run stays `attempting` until the PR step exists to end it. An
-      // unended run is incomplete; a run ended with the wrong reason is a lie in
-      // an immutable log.
-      if (fix.exitCode !== 0) {
-        ended = endedBy(fix.exitCode);
+        // The bug was never shown, so no fix was attempted and none should be. The
+        // reason records the CAUSE of stopping, never the verdict — the fold keeps
+        // deriving that from the runs (ADR-0009).
+        ended = own(plan.runId, ++afterSeq, {
+          type: 'RUN_ENDED',
+          payload: { v: 1, reason: 'not_reproduced' },
+        });
       }
-      }
-    } else {
-      // The bug was never shown, so no fix was attempted and none should be. The
-      // reason records the CAUSE of stopping, never the verdict — the fold keeps
-      // deriving that from the runs (ADR-0009).
+    }
+
+    // Read off the fold, never re-derived here: a second definition of "did it
+    // reproduce" living in a producer is what ADR-0009 forbids, and this
+    // projection has been bitten by that already.
+    if (fold(events).reproduced) break;
+    // Out of attempts. `attempts_exhausted` is the honest cause — the run stopped
+    // because it ran out of tries, not because anything errored — unless an
+    // attempt already recorded a harder reason for stopping.
+    if (n === maxAttempts && !ended) {
       ended = own(plan.runId, ++afterSeq, {
         type: 'RUN_ENDED',
-        payload: { v: 1, reason: 'not_reproduced' },
+        payload: { v: 1, reason: 'attempts_exhausted' },
       });
+    }
+    // A run that ERRORED stops; one that merely failed to reproduce or was
+    // refused tries again, which is the whole point of bounding attempts rather
+    // than allowing one.
+    if (ended?.type === 'RUN_ENDED' && ended.payload.reason === 'error') break;
+    if (n < maxAttempts) {
+      // Discarding the event means giving back its seq. `++afterSeq` allocated
+      // one for a RUN_ENDED that is now not being emitted, and the next attempt
+      // then started one past the last event in the log — a gap, which `fold()`
+      // refuses outright. `events` is what was actually emitted, so the counter
+      // follows it rather than the other way round.
+      ended = null;
+      afterSeq = events.at(-1)?.seq ?? afterSeq;
     }
   }
   if (ended) events.push(ended);
