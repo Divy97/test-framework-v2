@@ -168,7 +168,7 @@ export type VerificationPhase = 'setup' | 'base' | 'fix' | 'diff' | 'cleanup';
  *
  * What it DOES do is disqualify its own attempt from being credited a
  * reproduction when it lands in `base` or `fix`: the run series is truncated,
- * and an incomplete observation is not a reproduction. See `isReproduced`.
+ * and an incomplete observation is not a reproduction. See `reproducedAttempt`.
  */
 export type VerificationAbortedV1 = {
   v: 1;
