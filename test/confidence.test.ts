@@ -296,6 +296,45 @@ describe('a handover that never arrived', () => {
     }
   });
 
+  test('a control run caps the tier even with no handover in the log', () => {
+    // The cap used to key only on the handover, so it failed open wherever that
+    // event was ABSENT. A control run is positive proof of agent authorship —
+    // the engine asks for one only when `reproPrompt` was set — so it caps too.
+    //
+    // The risk of the new rule is the opposite one: over-capping. `verify()` is a
+    // public export and a caller can pass `controlRun: true` with its OWN
+    // reproduction. That combination does cap, and it is the honest reading:
+    // whoever asked for a sham-fix control asked for the reproduction to be
+    // treated as one the engine cannot vouch for.
+    const control = (): RunEvent[] => [
+      ...demoRunEvents,
+      {
+        run_id: DEMO_RUN_ID,
+        seq: demoRunEvents.length + 1,
+        ts: 'T',
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'control',
+          commit_sha: 'c'.repeat(40),
+          exit_code: 1,
+          stdout_hash: 'sha256:cc',
+          duration_ms: 1,
+          repeat: 0,
+        },
+      },
+    ];
+    const state = fold(control());
+    expect(state.reproAuthoredByAgent).toBe(true);
+    expect(state.reproduced).toBe(true);
+    expect(confidence(state).tier).toBe(2);
+
+    // Without the control run, the same stream is Tier 1 — so the control run is
+    // doing the work, not something incidental in the fixture.
+    const plain = fold(control().slice(0, -1));
+    expect(confidence(plain).tier).toBe(1);
+  });
+
   test('is Tier 3 with no partial credit', () => {
     const score = confidence(fold(refused('no bundle was left at the handover path')));
     expect(score.tier).toBe(3);

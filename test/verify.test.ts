@@ -1043,6 +1043,23 @@ describe('the sham-fix control', () => {
     expect(controls.every((r) => r.exit_code !== 0)).toBe(true);
   });
 
+  test('leaves the base container a clean tree with nothing re-applied after it', async () => {
+    // `applyRepro()` after the control block was deleted because it could end the
+    // run. It was verified dead against the code as it stood — so the risk is the
+    // mirror image: a path that NEEDED the repro present after the control and
+    // now finds it gone. Both shapes are checked here.
+    const baseOnly = await observe(clean(), { controlRun: true, only: 'base', flakeRuns: 0 });
+    expect(baseOnly.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
+    expect(testRuns(baseOnly).filter((r) => r.phase === 'base')).toHaveLength(1);
+    expect(testRuns(baseOnly).filter((r) => r.phase === 'control')).toHaveLength(2);
+
+    // And the full path, where the fix phase does its own checkout and re-apply.
+    const full = await observe(clean(), { controlRun: true, flakeRuns: 0 });
+    expect(full.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
+    expect(testRuns(full).find((r) => r.phase === 'fix')?.exit_code).toBe(0);
+    expect(full.some((e) => e.type === 'FIX_DIFF_OBSERVED')).toBe(true);
+  });
+
   test('records what the control ran, so a silent sham is not the same as an honest one', () => {
     // Without this the engine's strongest anti-gaming mechanism was invisible:
     // "the sham stayed red because the reproduction is honest" and "the sham
