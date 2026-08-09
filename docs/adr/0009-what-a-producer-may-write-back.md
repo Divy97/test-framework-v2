@@ -26,7 +26,7 @@ disagree in the record.
 - **A producer may state a cause it acted on; it may never assert a
   conclusion.** `RUN_ENDED { not_reproduced }` means "I stopped, and what I
   acted on was the reproduce-first gate" — a control-flow act with consequences
-  in the world (no agent was spawned). It does not mean "nothing was
+  in the world (no fix was attempted). It does not mean "nothing was
   reproduced," and the fold never reads it to answer that. A stream claiming
   `pr_opened` with no `PR_OPENED` in it folds to `unresolved`; one claiming
   `not_reproduced` after a real `PR_OPENED` still shows the PR.

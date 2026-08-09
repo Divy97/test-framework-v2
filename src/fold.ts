@@ -251,12 +251,9 @@ export function apply(state: RunState, event: RunEvent): RunState {
       return {
         ...next,
         testRuns,
-        // Passing `aborts` here is defence in depth and knowingly untested: with
-        // the completion witness required, an attempt that aborted in base or fix
-        // has no FIX_DIFF_OBSERVED either, so this argument cannot be the
-        // deciding one on any stream `verify()` can emit. It is kept because the
-        // fold does not get to assume event ordering (ADR-0009) — but no fixture
-        // can make it load-bearing, and pretending otherwise would be decoration.
+        // `aborts` IS load-bearing here, since `shownOnBase` needs no completion
+        // witness: a base-phase abort is the only thing that can shut the gate on
+        // an attempt whose base run otherwise looks clean.
         ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts),
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
@@ -401,8 +398,19 @@ function demonstrated(
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
 ): TestRunRecord[] {
+  // BASE aborts only. A fix-phase abort cuts short a different observation, and
+  // disqualifying on it made this field retro-flip: the orchestrator runs the
+  // fix container only when the gate is open, so an abort in there left the log
+  // saying the gate had been shut — denying the control-flow act recorded inside
+  // it, and making the field unstable under replay.
+  //
+  // It was also agent-choosable, which is the precise objection ADR-0009 raises
+  // against deriving anything from aborts: a repro that hangs in the fix phase
+  // would erase the record that the bug WAS demonstrated on base. And once
+  // attempts are bounded, attempt 2's gate would read false and deny a fix for a
+  // reproduction attempt 1 had genuinely shown.
   const truncated = new Set(
-    aborts.filter((a) => a.phase === 'base' || a.phase === 'fix').map((a) => a.attempt),
+    aborts.filter((a) => a.phase === 'base').map((a) => a.attempt),
   );
   const registered = new Map(registrations.map((r) => [r.attempt, r]));
   return testRuns.filter((base) => {
@@ -443,8 +451,15 @@ function reproducedAttempt(
   // else — and a stream that merely stops early carries no abort to give it away.
   const completed = new Set(completedAttempts);
   const registered = new Map(registrations.map((r) => [r.attempt, r]));
+  // The fix half's own truncation check, which `demonstrated()` deliberately
+  // does not apply: a fix-phase abort says nothing about whether the bug was
+  // shown, but it says the series judging the fix was cut short.
+  const cutShort = new Set(
+    aborts.filter((a) => a.phase === 'fix').map((a) => a.attempt),
+  );
 
   const credit = demonstrated(testRuns, registrations, aborts).find((base) => {
+    if (cutShort.has(base.attempt)) return false;
     if (!completed.has(base.attempt)) return false;
     const repro = registered.get(base.attempt)!;
     const fixes = testRuns.filter((r) => r.phase === 'fix' && r.attempt === base.attempt);

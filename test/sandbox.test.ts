@@ -989,15 +989,20 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       'TEST_RUN',
       'TEST_RUN',
       'FIX_DIFF_OBSERVED',
-      'RUN_ENDED',
     ]);
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
+    // No RUN_ENDED on the success path. Nothing was exhausted, and the fold maps
+    // every non-`error` reason without a PR to `unresolved` — so ending here
+    // rendered a credited red-then-green run as the not-reproduced deliverable.
+    // The run stays `attempting` until the PR step exists to end it.
+    expect(outcome.events.some((e) => e.type === 'RUN_ENDED')).toBe(false);
 
     // Folded as it stands. Prepending an ATTEMPT_STARTED by hand — which every
     // one of these tests used to do — hid the fact that real Runner output could
     // never be credited at all.
     const state = fold(outcome.events);
     expect(state.reproduced).toBe(true);
+    expect(state.status).toBe('attempting');
 
     // Every artifact still crosses to the host, from both containers.
     const refs = [...new Set(JSON.stringify(outcome.events).match(/sha256:[0-9a-f]{64}/g) ?? [])];
@@ -1140,7 +1145,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(agent.events.map((e) => e.type)).toEqual(['AGENT_MESSAGE', 'AGENT_FINISHED']);
     expect(outcome.events.filter((e) => e.type === 'REPRO_REGISTERED')).toHaveLength(1);
     expect(outcome.events.filter((e) => e.type === 'FIX_DIFF_OBSERVED')).toHaveLength(1);
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7]);
     // The transcript sits inside the attempt, before any observation of it.
     expect(outcome.events[0]!.type).toBe('ATTEMPT_STARTED');
     expect(fold(outcome.events).transcript).toHaveLength(1);
@@ -1248,11 +1253,10 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     });
 
     expect(outcome.phases.map((p) => p.phase)).toEqual(['base', 'fix']);
-    // The orchestrator now supplies both events the log could never produce for
-    // itself: the attempt it all belongs to, and the fact that it stopped.
+    // The orchestrator supplies the attempt everything belongs to, which no
+    // container can know about.
     expect(outcome.events[0]!.type).toBe('ATTEMPT_STARTED');
-    expect(outcome.events.at(-1)!.type).toBe('RUN_ENDED');
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
 
     // Folded straight from the stream — no hand-prepended ATTEMPT_STARTED, which
     // every earlier test needed and which quietly meant the real Runner output

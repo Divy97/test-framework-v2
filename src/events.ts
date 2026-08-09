@@ -191,7 +191,7 @@ export type VerificationAbortedV1 = {
  * The run stopped, and what stopped it.
  *
  * `reason` records the *cause of the process halting* — a control-flow act with
- * consequences in the world, such as an agent that was never spawned because the
+ * consequences in the world, such as a fix that was never attempted because the
  * reproduce-first gate held. It is not a verdict on the evidence, and the fold
  * pointedly does not read it to decide whether anything was reproduced: that
  * stays derived from the TEST_RUNs.
