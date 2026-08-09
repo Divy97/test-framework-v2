@@ -199,6 +199,21 @@ export type VerificationAbortedV1 = {
    * ahead of its only consumer would be guessing at the taxonomy.
    */
   reason: string;
+  /**
+   * What CLASS of thing went wrong, for the one consumer that must not guess.
+   *
+   * `reason` is prose and says so; a projection that regexed it for
+   * `/handed over/` matched three of the six strings this abort can carry and
+   * missed every one produced when the agent hands over no bundle at all —
+   * including the failure the Runner records precisely so it would be readable.
+   * The tier deliverable then reported `no reproduction was ever registered` for
+   * a run that was refused, which is the shadowing bug the refusal clause was
+   * added to close.
+   *
+   * Prose cannot be a discriminator. This can: it is set by the producer, not
+   * inferred, and `reason` stays display-only as documented.
+   */
+  cause?: 'handover';
 };
 
 /**

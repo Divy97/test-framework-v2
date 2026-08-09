@@ -224,6 +224,44 @@ describe('the gate holds, with no partial credit', () => {
   });
 });
 
+describe('a handover that never arrived', () => {
+  const refused = (reason: string): RunEvent[] => [
+    { run_id: 'r', seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+    {
+      run_id: 'r',
+      seq: 2,
+      ts: 'T',
+      type: 'VERIFICATION_ABORTED',
+      payload: { v: 1, phase: 'setup', cause: 'handover', reason },
+    },
+    { run_id: 'r', seq: 3, ts: 'T', type: 'RUN_ENDED', payload: { v: 1, reason: 'attempts_exhausted' } },
+  ];
+
+  test('says so, whatever words the reason happens to use', () => {
+    // The clause this replaces regexed the reason for /handed over/. It matched
+    // only the three strings a SUCCESSFUL bundle can produce — so every run that
+    // handed over NO bundle, including the bundling failure the Runner records
+    // precisely so it would be readable, fell through to 'no reproduction was
+    // ever registered'. Both strings the regex did match for a null handover
+    // were dead code. The discriminator is `cause`; the reason is prose.
+    for (const reason of [
+      'could not bundle the agent commits: fatal: ambiguous argument HEAD',
+      'no bundle was left at the handover path',
+      "the agent's commits came to 300000000 bytes, past the ceiling",
+      'the agent handed over abc123, a commit the repository already had',
+    ]) {
+      const claim = confidence(fold(refused(reason))).grounds[0]!.claim;
+      expect(claim).toBe(reason);
+    }
+  });
+
+  test('is Tier 3 with no partial credit', () => {
+    const score = confidence(fold(refused('no bundle was left at the handover path')));
+    expect(score.tier).toBe(3);
+    expect(score.score).toBe(0);
+  });
+});
+
 describe('more than one attempt', () => {
   /** Two real runs folded as consecutive attempts, sharing a blob store so every ref resolves. */
   const twoAttempts = async (first: RunEvent[], second: RunEvent[]): Promise<RunState> =>

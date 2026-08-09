@@ -186,8 +186,28 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // and the whole authorship check silently evaporated — a do-nothing agent back
   // to Tier 1 with no error and no abort. A check that can quietly become a
   // no-op is worse than no check, because the log still reads as verified.
-  if (existing.trim() && before.size === 0) {
-    throw new Error('could not read the repository history; refusing to run an unenforceable check');
+  // The base commit must be IN the history this check was computed over.
+  //
+  // The first attempt at a fail-closed guard here — `existing.trim() &&
+  // before.size === 0` — was a tautology: `filter(Boolean)` leaves the set empty
+  // only when every line was empty, which makes `existing.trim()` falsy too. It
+  // could never fire. A safety net that cannot fail is worse than none, because
+  // it is read as one.
+  //
+  // This can fail, and catches the class that mattered: any future change to how
+  // these sets are read that yields shas the rest of the engine does not agree
+  // with. If base itself is not in `before`, `before` is not this repository's
+  // history and no refusal computed from it means anything.
+  const { stdout: baseSha } = await execFile('git', [...git, 'rev-parse', `${plan.baseRef}^{commit}`]);
+  if (!before.has(baseSha.trim())) {
+    // Take the mirror with it. Every throw between the clone and the cleanup at
+    // the end leaves a full clone of the repository in `tmpdir()` forever, and
+    // fail-closed paths are exactly the ones that run repeatedly while someone
+    // is diagnosing why they fire.
+    await rm(workspace, { recursive: true, force: true }).catch(() => {});
+    throw new Error(
+      'the base commit is not in the history this check reads; refusing to run an unenforceable check',
+    );
   }
 
   // Starts at zero because this function owns the whole run: it emits the first
@@ -280,10 +300,17 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         events.push(
           own(plan.runId, ++afterSeq, {
             type: 'VERIFICATION_ABORTED',
-            payload: { v: 1, phase: 'setup', // `||`, not `??`: an empty `why` is not nullish, so `??` would pass it
-            // through and emit a blank reason — verbatim the bug runner.ts already
-            // carries a three-line comment about.
-            reason: (stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS) },
+            payload: {
+              v: 1,
+              phase: 'setup',
+              // The discriminator the Tier 3 projection reads. `reason` is prose
+              // and stays display-only.
+              cause: 'handover',
+              // `||`, not `??`: an empty `why` is not nullish, so `??` would pass
+              // it through and emit a blank reason — verbatim the bug runner.ts
+              // already carries a three-line comment about.
+              reason: (stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS),
+            },
           }),
         );
         ended = own(plan.runId, ++afterSeq, {
@@ -509,7 +536,7 @@ async function runContainer(
       await cp(join(store, entry), join(plan.blobRoot, entry), { recursive: true, force: true });
     }
   } catch (error) {
-    collection = `\ncould not collect this container's artifacts: ${String(error)}`;
+    collection = `could not collect this container's artifacts: ${String(error)}`;
   }
   await rm(store, { recursive: true, force: true }).catch(() => {});
 
@@ -518,7 +545,23 @@ async function runContainer(
     // fold would reject it anyway on the seq that never arrived.
     throw new Error(`the ${phase} container produced more than ${MAX_STREAM_BYTES} bytes of events`);
   }
-  return { phase, events: parse(stdout), exitCode, stderr: (stderr + collection).trim(), ...(handover ? { handover } : {}) };
+  const events = parse(stdout);
+  // As an EVENT, not on `PhaseResult.stderr`. This PR condemned that field by
+  // name three files over — the orchestrator keeps it and never persists it, so
+  // nothing folds it and no projection reads it. A half-copied store otherwise
+  // folds to `reproduced: true`, scores 85, and cites `stdout_hash` refs that
+  // were never written to the real store, with nothing anywhere saying the
+  // evidence is missing. `cleanup`, because every phase had already been
+  // observed when this failed: it is a tidy-up failure, not a failure to look.
+  if (collection) {
+    events.push(
+      own(plan.runId, (events.at(-1)?.seq ?? afterSeq) + 1, {
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'cleanup', reason: collection.slice(0, MAX_REASON_CHARS) },
+      }),
+    );
+  }
+  return { phase, events, exitCode, stderr: stderr.trim(), ...(handover ? { handover } : {}) };
 }
 
 const parse = (stdout: string): RunEvent[] =>

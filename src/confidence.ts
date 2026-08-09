@@ -193,7 +193,17 @@ function notReproducedBecause(state: RunState): string {
   // clause below would otherwise shadow it with 'no reproduction was ever
   // registered' — true, useless, and silent about the one finding that most
   // needs auditing: the agent handed over work it did not do.
-  const refused = state.aborts.find((a) => a.phase === 'setup' && /handed over|handed nothing/.test(a.reason));
+  //
+  // On `cause`, never on `reason`. The regex that stood here matched only the
+  // three strings a SUCCESSFUL bundle can produce and missed every one from a
+  // run that handed over no bundle — so the Runner's newly recorded bundling
+  // failure reached no projection either, and the clause's own headline case
+  // still reported 'no reproduction was ever registered'. Both strings it did
+  // match for a null handover turned out to be dead code. It also parsed a field
+  // documented `Display it; never parse it` (events.ts), which quotes
+  // agent-influenced text: a repro named `./handed over` short-circuited this
+  // whole ladder, and 3b.2b hands the agent authorship of that spec.
+  const refused = state.aborts.find((a) => a.cause === 'handover');
   if (refused) return refused.reason;
   if (state.registrations.length === 0) return 'no reproduction was ever registered';
   if (state.testRuns.length === 0) return 'the reproduction was registered but never ran';

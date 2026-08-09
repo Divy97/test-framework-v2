@@ -562,7 +562,12 @@ export async function runJob(
         seq: (transcript.at(-1)?.seq ?? job.afterSeq) + 1,
         ts: new Date().toISOString(),
         type: 'VERIFICATION_ABORTED',
-        payload: { v: 1, phase: 'setup', reason: failed.slice(0, MAX_REASON_CHARS) },
+        payload: {
+          v: 1,
+          phase: 'setup',
+          cause: 'handover',
+          reason: failed.slice(0, MAX_REASON_CHARS),
+        },
       });
     }
     // The agent's world is discarded outright, not scrubbed. ADR-0010 already

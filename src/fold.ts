@@ -115,7 +115,7 @@ export type RunState = {
    * status — but a `base` or `fix` abort does disqualify its own attempt from
    * being credited a reproduction. See `reproducedAttempt`.
    */
-  aborts: { attempt: number; phase: VerificationPhase; reason: string }[];
+  aborts: { attempt: number; phase: VerificationPhase; reason: string; cause?: 'handover' }[];
   /**
    * Event types that arrived after RUN_ENDED, recorded and NOT applied.
    *
@@ -297,6 +297,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
           attempt: state.currentAttempt,
           phase: event.payload.phase,
           reason: event.payload.reason,
+          ...(event.payload.cause ? { cause: event.payload.cause } : {}),
         },
       ];
       // An abort in `diff` or `cleanup` witnesses completion just as
