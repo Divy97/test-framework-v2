@@ -55,6 +55,8 @@ import {
   LOCKS_THE_TREE_ON_FIX,
   REPRO_PLANTING_SYMLINK,
   type Fixture,
+  eofBug,
+  EOF_REPRO,
 } from './fixtures/repo.js';
 
 const RUN_ID = '7c2e1b90-4a3d-4f88-b1e2-90d5a6c3f014';
@@ -910,5 +912,44 @@ describe('the symptom observation cannot depend on call order', () => {
 
     expect(basePhase(first).symptom_matched).toBe(true);
     expect(basePhase(second).symptom_matched).toBe(true);
+  });
+});
+
+describe('the sham-fix control', () => {
+  test('refuses a reproduction that tests which commit it is running on', async () => {
+    // The oracle: green unless the tree is exactly base's. Every anchor is
+    // satisfied — same bytes both phases, deterministic, no abort — and it is red
+    // on base and green on any change at all, which is what the control exists to
+    // notice.
+    const fixture = clean();
+    const events = await observe(fixture, {
+      controlRun: true,
+      repro: {
+        command: 'sh repro.sh',
+        files: {
+          // Base is the root commit, so "am I at depth 1" IS "am I on base" — an
+          // identity oracle needing no precomputed hash. Red on base, green on
+          // anything built on top of it, including a fix that changes nothing.
+          'repro.sh':
+            'cat src.txt\n' +
+            '[ "$(git -c safe.directory=* rev-list --count HEAD)" = 1 ] && exit 1\n' +
+            'exit 0\n',
+        },
+      },
+    }).catch((error: Error) => error);
+    expect(String(events)).toMatch(/which commit this is/);
+  });
+
+  test('does not accuse an honest reproduction of a missing-newline bug', async () => {
+    // The false positive that made one sham unsafe: appending to a tracked file
+    // IS the fix for an EOF-conformance bug, so a single sham turned a correct
+    // agent into an accusation. Two independent draws disagree, and disagreement
+    // is inconclusive rather than a finding.
+    const fixture = eofBug();
+    const events = await observe(fixture, { controlRun: true, repro: EOF_REPRO, flakeRuns: 0 });
+    const runs = testRuns(events);
+    expect(runs.find((r) => r.phase === 'base')?.exit_code).not.toBe(0);
+    expect(runs.find((r) => r.phase === 'fix')?.exit_code).toBe(0);
+    expect(events.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
   });
 });

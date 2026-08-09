@@ -16,7 +16,7 @@
 
 import { execFile } from 'node:child_process';
 import { randomBytes, randomInt } from 'node:crypto';
-import { constants, lstat, mkdir, open, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { constants, lstat, mkdir, open, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
@@ -619,51 +619,69 @@ async function observe(
   // one over tracked content.
   if (options.controlRun && options.only !== 'fix' && baseRed) {
     progress.phase = 'base';
-    // MODIFY a tracked file; do not add one. Adding gave the oracle two channels
-    // at once — "a file appeared" and the added name's SHAPE — and randomising
-    // the name while leaving `.` + 24 hex in place is the same mistake as
-    // randomising the suffix and leaving the stem. A newline on the end of a file
-    // the repository already tracks has no shape to match on.
+    // TWO independent shams, and an accusation only if both go green.
     //
-    // Safe in the direction that matters: if the append breaks something, the
-    // reproduction fails on the sham, and a failing reproduction is what this
-    // control expects. Only a PASS is a finding.
+    // One was not enough, and the failure was not theoretical: the sham appends
+    // to a tracked file, and for an EOF-conformance bug — `eol-last`,
+    // `insert_final_newline`, a golden-file or checksum test — that append IS the
+    // fix. An honest reproduction then goes green on the sham and was told, in an
+    // immutable log, that it was testing which commit it was standing on. Two
+    // draws pick different victims and different perturbations, so a repro that
+    // is genuinely about one file's ending survives the one that does not touch
+    // it. Disagreement is inconclusive, and inconclusive is not an accusation.
     const tracked = (await git(['ls-files', '-z'], repoPath, gitEnv)).split('\0').filter(Boolean);
     if (tracked.length === 0) {
       throw new ObservationFailed('the base commit tracks no files, so the reproduction cannot be controlled');
     }
-    const victim = tracked[randomInt(tracked.length)]!;
-    const handle = await open(join(repoPath, victim), 'a');
-    try {
-      await handle.write('\n');
-    } finally {
-      await handle.close();
+    let greens = 0;
+    for (let draw = 0; draw < 2; draw += 1) {
+      const victim = tracked[randomInt(tracked.length)]!;
+      // Random length and content, at the end or as a fresh line — the previous
+      // sham always added exactly one empty line, and `diff --numstat HEAD^ HEAD`
+      // reading `1 0` with an empty added line is a signature no real fix has.
+      const filler = randomBytes(randomInt(4, 40)).toString('hex');
+      // Draw 0 appends; draw 1 PREPENDS. The difference is the whole point: an
+      // append changes a file's final byte, which for an EOF-conformance bug is
+      // the fix itself, so two appends agree with each other and convict an
+      // honest reproduction. A prepend changes the content and leaves the ending
+      // exactly as it was, so a repro that is genuinely about the ending stays
+      // red on it — while an oracle reading identity goes green on both.
+      const body = await readFile(join(repoPath, victim));
+      await writeFile(
+        join(repoPath, victim),
+        draw === 0 ? Buffer.concat([body, Buffer.from(`\n${filler}\n`)])
+                   : Buffer.concat([Buffer.from(`${filler}\n`), body]),
+      );
+      // Author, name and message drawn SEPARATELY. One nonce feeding all three
+      // made `%an === %s` a constant relation, and `@example.invalid` was a
+      // literal in this file the agent reads — randomising the value while fixing
+      // the relation is the same mistake as randomising a suffix and keeping the
+      // stem.
+      const who = randomBytes(6).toString('hex');
+      const where = randomBytes(4).toString('hex');
+      const what = randomBytes(7).toString('hex');
+      await git(['add', '--', victim], repoPath, gitEnv);
+      await git(
+        [
+          '-c', `user.email=${who}@${where}.example`,
+          '-c', `user.name=${what}`,
+          'commit', '--quiet', '-m', randomBytes(9).toString('hex'),
+        ],
+        repoPath,
+        gitEnv,
+      );
+      const control = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+      await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
+      await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+      if (control.exitCode === 0) greens += 1;
+      await applyRepro();
     }
-    // The author and the message are drawn too. They were `engine@local` and
-    // `sham` — constants in this file, which the agent reads, and each one a
-    // single `git log -1 --format=%ae` away from telling the reproduction exactly
-    // which commit it was standing on. Review demonstrated all three channels.
-    const nonce = randomBytes(8).toString('hex');
-    await git(['add', '--', victim], repoPath, gitEnv);
-    await git(
-      [
-        '-c', `user.email=${nonce}@example.invalid`,
-        '-c', `user.name=${nonce}`,
-        'commit', '--quiet', '-m', nonce,
-      ],
-      repoPath,
-      gitEnv,
-    );
-    const control = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
-    await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
-    await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
-    if (control.exitCode === 0) {
+    if (greens === 2) {
       throw new ObservationFailed(
-        'the reproduction passes once the commit changes at all, so it is testing which commit ' +
+        'the reproduction passes whenever the commit changes at all, so it is testing which commit ' +
           'this is rather than whether the bug is present',
       );
     }
-    await applyRepro();
   }
 
   // The base container's work ends here. It leaves the tree as it found it, and
