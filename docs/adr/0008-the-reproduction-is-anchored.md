@@ -95,3 +95,87 @@ disproved each of them in turn.
 
 **Revisit when** coverage instrumentation makes diff-coverage real, or when Tier 2
 forces a binary-capable artifact channel.
+
+---
+
+## Amendment — the reproduction's COMMAND is attacker-controlled (M3.2b)
+
+This ADR anchors what the reproduction is MADE OF: `applied` bytes the engine
+writes over both checkouts, `pinned` paths it hashes. That was sufficient while
+the reproduction came from a caller. It is not sufficient now the agent authors
+it, and the gap is a different class rather than a bigger version of the same one.
+
+A command can read which commit it is running on. The repro agent knows base's
+tree exactly — it is the tree in its own clone — so it can write a reproduction
+that hashes the tree and fails only when that hash is base's. Red on base, green
+on a fix that changes nothing. Every guarantee above still holds while it happens:
+the bytes are identical in both phases, the hashes match at every point, no
+cross-phase state is used, and repeated runs agree. No abort, no tampering, no
+anomaly of any kind — and the sentence three paragraphs up, "Tier 1 now means:
+the same reproduction ran both times, it failed on base with output matching the
+reported symptom, and it passed on the fix every time", is satisfied in full by a
+run that reproduced nothing and fixed nothing.
+
+**The countermeasure is a negative control, not another anchor.** Anchoring
+compares the reproduction to itself, and an identity oracle cheats with no byte
+out of place. So the engine commits an unrelated file on top of base and runs the
+reproduction again: the bug is untouched, so a reproduction OF THE BUG must still
+fail. One that turns green has told us what it was reading. It runs only when the
+agent wrote the reproduction — a caller-supplied one has no oracle to be — and it
+records each draw as `TEST_RUN { phase: 'control' }`. It ENDS NOTHING: see below,
+where a control that ended runs turned out to end honest ones.
+
+**What it does not cover — and this section has now overclaimed twice, which is
+itself the finding.** Version one said an unpredictable name defeats
+pattern-filtering oracles; a pattern filter on the name's SHAPE beat it. Version
+two said there was no metadata left to compare; the committer email's domain, the
+equality of author-name and subject, and the diff's shape (exactly one added
+blank line) each beat it in one line. Both versions reasoned from the previous
+defeat instead of stating an invariant. The invariant: **the sham must hold
+nothing constant that an oracle can match — content, metadata, diff shape, or the
+class of perturbation — and even a perfect sham cannot catch an oracle that keys
+on the FIX rather than on base.**
+
+That clause was itself wrong, and this is the third correction to this section.
+The residual is NOT fix-keyed-only. Review defeated the control with five oracles
+keyed on BASE — the sham's committer TLD (`.example`, a literal in the engine's
+source, which is H1 reopened verbatim), the fixed LENGTHS of its author name and
+subject, the pure-hex shape of its inserted line, and the fact that its diff is
+always a modification and never an add, delete, rename or mode change. One of
+them needs no git at all: `grep -rlE "^[0-9a-f]{8,78}$"` finds the sham's own
+filler. Each time this section has been rewritten it has generalised from the
+last defeat; six successive versions of the sham have been defeated, and the correct conclusion
+is not a seventh sham.
+
+**So the control no longer draws a verdict.** It was ending runs, and it convicted
+honest reproductions: for any bug whose honest assertion is monotone in file
+content — non-empty, minimum size, minimum line count, must-differ-from-template —
+both draws satisfy it, and review measured an honest agent accused in 6 of 12
+identical runs. A permanent, immutable accusation decided by `randomInt` is worse
+than the hole it guards. The control records what it saw as `TEST_RUN
+{ phase: 'control' }` and ends nothing. A human reads it; the engine draws
+nothing from it.
+
+**What withholds the claim is the tier, not the control.** A run whose
+reproduction the agent authored is capped at Tier 2 — reproduced, independence
+unverified — rather than Tier 1. That is a statement about what this engine can
+demonstrate, and it does not depend on any sham working.
+
+Two things are still open and are recorded here rather than implied away. ADR-0007
+defines Tier 1 as "an agent-authored test that fails on the base commit" and Tier
+2 as a scripted scenario; this amendment makes an agent-authored test ineligible
+for Tier 1 and borrows Tier 2 for a different meaning, so ADR-0007 needs amending
+or a new label needs choosing. And the cap moves the tier without moving the
+score: review measured a no-op fix at Tier 2, score 80, still reaching the fix
+container. Whether the tier is the right lever is undecided.
+
+Diff-coverage is the real answer here too: an identity oracle does not execute
+the lines the fix changed, and a reproduction of the bug does. That is the same
+instrumentation this ADR already defers, now load-bearing for a second reason.
+
+Fixtures demonstrate the attacks and assert what actually happens to each: three
+oracles are asserted as flagged by a green sham, and the collusion oracle is
+asserted as SURVIVING — red base, green fix that repaired nothing, control
+silent. Asserting a defeated defence as passing is this ADR's own convention, and
+an assertion that the control "refuses" would have been the comfortable claim
+rather than the true one.

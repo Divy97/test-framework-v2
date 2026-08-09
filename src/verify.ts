@@ -15,7 +15,8 @@
 // same repo must not trip the dirty-tree refusal on this run's leftovers.
 
 import { execFile } from 'node:child_process';
-import { constants, lstat, mkdir, open, readdir, realpath, rm } from 'node:fs/promises';
+import { randomBytes, randomInt } from 'node:crypto';
+import { constants, lstat, mkdir, open, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
@@ -67,6 +68,7 @@ export class ObservationFailed extends Error {
  * per line. An unbounded reason is an unbounded line.
  */
 export const MAX_REASON_CHARS = 2000;
+
 
 const abortReason = (error: Error): string => {
   const text = `${error.name}: ${error.message}`;
@@ -177,6 +179,23 @@ export type VerifyOptions = {
    * bytes hash the same, and a `pinned` path the fix commit rewrote does not.
    */
   only?: 'base' | 'fix';
+  /**
+   * Prove the reproduction is testing the BUG and not the commit's identity.
+   *
+   * Only needed when the agent wrote the reproduction, which is also when it
+   * knows base's tree exactly — it is the tree in its own clone. A repro that
+   * hashes the tree and fails only when that hash matches base passes every
+   * defence this engine has: it is byte-identical across phases, so ADR-0008's
+   * anchor holds; it needs no cross-phase state, so ADR-0010's reap and the
+   * container split are irrelevant to it; and it is deterministic, so the flake
+   * re-runs agree. Red on base, green on the fix, no abort — and the fix changed
+   * nothing. Review demonstrated exactly that: Tier 1, score 80.
+   *
+   * The control is a sham fix. Commit an unrelated file on top of base and run
+   * the reproduction again: the bug is still there, so a reproduction OF THE BUG
+   * must still fail. One that went green has told us it was reading identity.
+   */
+  controlRun?: boolean;
 };
 
 type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
@@ -559,8 +578,15 @@ async function observe(
     });
   }
 
+  // Whether the base run actually showed the bug. The control below is about a
+  // reproduction that is CHEATING, and a reproduction that simply does not
+  // reproduce is green on the sham for the honest reason — so running the control
+  // on it turned ADR-0007's Tier 3 deliverable into an accusation of gaming, in
+  // an immutable log. The gate already handles a bug that was never shown.
+  let baseRed = false;
   if (options.only !== 'fix') {
     const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+    baseRed = base.exitCode !== 0 && !base.signal;
     emit({
       type: 'TEST_RUN',
       payload: {
@@ -576,6 +602,197 @@ async function observe(
         repro_hashes: await hashRepro(),
       },
     });
+  }
+
+  // THE SHAM FIX. A negative control, and the only defence here that is about
+  // what the reproduction MEANS rather than about what it is made of.
+  //
+  // Everything else anchors the repro's bytes, its environment, or its
+  // provenance. None of that can tell a test of the bug from a test of the
+  // commit's identity, because the identity test cheats with no byte out of
+  // place. So: put an unrelated file on top of base and ask again. The bug is
+  // untouched, so a reproduction of the bug must still fail. One that turns
+  // green has just announced it was reading the tree, not the behaviour.
+  //
+  // Deliberately a COMMIT, not an untracked file: a repro hashing `git ls-tree
+  // HEAD` would not notice a stray file, and the cheapest oracle to write is the
+  // one over tracked content.
+  if (options.controlRun && options.only !== 'fix' && baseRed) {
+    // ADVISORY MEANS ADVISORY. The previous version removed the accusation and
+    // left every other throwing path standing — `run()` on timeout or overflow,
+    // six `git()` calls, `applyRepro()`, and the no-tracked-files refusal. The
+    // control executes attacker-controlled code two extra times, so review
+    // measured an HONEST reproduction aborted in 5 of 10 identical runs, and
+    // earlier than the accusation would have: before the fix phase ran at all.
+    // That is worse than the defect the advisory change was made to remove.
+    //
+    // Nothing inside this block may end the run. Whatever it learns, it learns as
+    // evidence; whatever goes wrong, goes wrong quietly and the run proceeds as
+    // though the control had not been asked for.
+    //
+    // Declared out here so the catch can see how many draws actually happened.
+    let controls = 0;
+    try {
+    progress.phase = 'base';
+    // TWO independent shams, and an accusation only if both go green.
+    //
+    // One was not enough, and the failure was not theoretical: the sham appends
+    // to a tracked file, and for an EOF-conformance bug — `eol-last`,
+    // `insert_final_newline`, a golden-file or checksum test — that append IS the
+    // fix. An honest reproduction then goes green on the sham and was told, in an
+    // immutable log, that it was testing which commit it was standing on. Two
+    // draws pick different victims and different perturbations, so a repro that
+    // is genuinely about one file's ending survives the one that does not touch
+    // it. Disagreement is inconclusive, and inconclusive is not an accusation.
+    const tracked = (await git(['ls-files', '-z'], repoPath, gitEnv)).split('\0').filter(Boolean);
+    // Not a refusal, and not a return: an empty root commit is unusual rather
+    // than hostile, and `return events` here would skip the FIX PHASE — ending
+    // the run in the one branch written to avoid ending runs.
+    if (tracked.length > 0) {
+    for (let draw = 0; draw < 2; draw += 1) {
+      // Through the same guard every other path in this file uses. This was the
+      // ONE write in `verify()` that did not: `victim` is committed data chosen
+      // by the repository under test, and `readFile`/`writeFile` follow symlinks,
+      // so a tracked `link.conf -> /anywhere` had the engine rewrite a file
+      // outside the repository — in the sandbox, as root, including into the
+      // gitdir that `--separate-git-dir` exists to withhold.
+      const victim = tracked[randomInt(tracked.length)]!;
+      // Not `resolveInside`: that walks symlinked components against a
+      // non-realpath'd root, which is right for a path being CREATED and wrong
+      // for one that already exists under a symlinked tmpdir. The property needed
+      // here is narrower — a regular file whose real path is inside the repo's
+      // real path — so it is checked directly.
+      const target = join(repoPath, victim);
+      const kind = await lstat(target).catch(() => null);
+      const inside = await realpath(target)
+        .then(async (real) => real.startsWith((await realpath(repoPath)) + sep))
+        .catch(() => false);
+      // `nlink > 1` too. A hardlink is a second NAME for the same inode: it is a
+      // regular file and realpath does not resolve it away, so it satisfied both
+      // checks while pointing outside the repository — and the repro can create
+      // one DURING the base run. `hashRepro` in this same file already refuses
+      // exactly this and says why; the guard was rewritten instead of reused.
+      if (!kind?.isFile() || kind.nlink > 1 || !inside) {
+        // Recorded, not silent. A repository of symlinks quietly produced ZERO
+        // control runs — no abort, no marker — so coverage degraded to nothing
+        // while the log looked exactly like a clean one. That is the failure
+        // `phase: 'control'` was introduced to prevent, reappearing in the branch
+        // that skips it. `exit_code: -1` is the same "no status to report"
+        // convention TEST_RUN already uses for a signalled process.
+        emit({
+          type: 'TEST_RUN',
+          payload: {
+            v: 1,
+            phase: 'control',
+            commit_sha: baseSha,
+            exit_code: -1,
+            stdout_hash: await put(blobRoot, `no sham: ${victim} is not a plain file inside the repo\n`),
+            duration_ms: 0,
+            repeat: draw,
+          },
+        });
+        continue;
+      }
+      // `lstat`, so a symlink is refused rather than followed, and a dangling
+      // link, a directory and a submodule gitlink are all skipped — each of those
+      // threw a raw ENOENT/EISDIR out of `verify()`, past the ObservationFailed
+      // wrapper, losing REPRO_REGISTERED and the base TEST_RUN with it. All three
+      // are ordinary shapes in real repositories.
+      // Random length and content, at the end or as a fresh line — the previous
+      // sham always added exactly one empty line, and `diff --numstat HEAD^ HEAD`
+      // reading `1 0` with an empty added line is a signature no real fix has.
+      const filler = randomBytes(randomInt(4, 40)).toString('hex');
+      // Draw 0 appends; draw 1 PREPENDS. The difference is the whole point: an
+      // append changes a file's final byte, which for an EOF-conformance bug is
+      // the fix itself, so two appends agree with each other and convict an
+      // honest reproduction. A prepend changes the content and leaves the ending
+      // exactly as it was, so a repro that is genuinely about the ending stays
+      // red on it — while an oracle reading identity goes green on both.
+      const body = await readFile(target);
+      await writeFile(
+        target,
+        draw === 0 ? Buffer.concat([body, Buffer.from(`\n${filler}\n`)])
+                   : Buffer.concat([Buffer.from(`${filler}\n`), body]),
+      );
+      // Author, name and message drawn SEPARATELY. One nonce feeding all three
+      // made `%an === %s` a constant relation, and `@example.invalid` was a
+      // literal in this file the agent reads — randomising the value while fixing
+      // the relation is the same mistake as randomising a suffix and keeping the
+      // stem.
+      const who = randomBytes(6).toString('hex');
+      const where = randomBytes(4).toString('hex');
+      const what = randomBytes(7).toString('hex');
+      await git(['add', '--', victim], repoPath, gitEnv);
+      await git(
+        [
+          '-c', `user.email=${who}@${where}.example`,
+          '-c', `user.name=${what}`,
+          'commit', '--quiet', '-m', randomBytes(9).toString('hex'),
+        ],
+        repoPath,
+        gitEnv,
+      );
+      const control = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+      emit({
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'control',
+          // The sham's own sha: what actually ran, not what was intended.
+          commit_sha: (await git(['rev-parse', 'HEAD'], repoPath, gitEnv)).trim(),
+          exit_code: control.exitCode,
+          ...(control.signal ? { signal: control.signal } : {}),
+          stdout_hash: await put(blobRoot, control.output),
+          duration_ms: control.durationMs,
+          repeat: draw,
+        },
+      });
+      await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
+      await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+      controls += 1;
+      await applyRepro();
+      }
+    }
+    } catch {
+      // Recorded before it is swallowed. A `catch` that fires mid-loop takes the
+      // remaining draws with it, and without this the log showed one control run
+      // where two were asked for — indistinguishable from an honest single-draw
+      // run. That is the exact silence the skip marker above exists to break,
+      // reappearing in the branch that handles failure.
+      for (let draw = controls; draw < 2; draw += 1) {
+        emit({
+          type: 'TEST_RUN',
+          payload: {
+            v: 1,
+            phase: 'control',
+            commit_sha: baseSha,
+            exit_code: -1,
+            stdout_hash: await put(blobRoot, 'the control could not complete this draw\n'),
+            duration_ms: 0,
+            repeat: draw,
+          },
+        });
+      }
+      // Deliberately swallowed, and deliberately not re-raised as an abort: this
+      // is a diagnostic the engine chose to run, not an observation the caller
+      // asked for. A control that cannot complete tells us nothing, and telling
+      // nothing must not cost the run its verdict.
+    }
+    // The tree, whatever happened above. A control that died mid-perturbation
+    // must not hand the fix phase a dirty tree — the contamination the container
+    // split exists to prevent.
+    await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv).catch(() => {});
+    await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv).catch(() => {});
+    // No `applyRepro()` here. It was the one line the C1 fix ADDED that could
+    // still end the run — outside the catch, uncaught, and throwing while
+    // `progress.phase` is still `base`, so `demonstrated()` read it as a
+    // truncated base observation and SHUT THE GATE. The identical defect one line
+    // below the block written to remove it, with a worse blast radius: a
+    // recoverable cleanup failure became a discarded reproduction.
+    //
+    // Dead as well as dangerous. Every successor re-applies: `only: 'base'`
+    // resets, cleans and returns without running anything else, and the full path
+    // checks out the fix commit and calls `applyRepro()` itself.
   }
 
   // The base container's work ends here. It leaves the tree as it found it, and

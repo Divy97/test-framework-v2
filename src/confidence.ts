@@ -13,11 +13,14 @@ import type { ArtifactRef } from './events.js';
 import type { RunState } from './fold.js';
 
 /**
- * ADR-0007's ladder. Tier 2 — reproduced by a scripted scenario — is
- * deliberately unreachable: no event in the vocabulary represents a browser
- * script or an API sequence, so nothing in a log could distinguish one from a
- * test. Inventing a tier the evidence cannot support is exactly the vibes this
- * projection exists to refuse; it arrives when the events for it do.
+ * ADR-0007's ladder, as amended by that ADR's own M3.2b note.
+ *
+ * Tier 2 is REACHABLE now, and this comment said the opposite 180 lines above
+ * the line that returns it. It has widened from "reproduced by a scripted
+ * scenario" to "reproduced, but the reproduction's independence is unverified" —
+ * a scripted scenario is one case of that, and a reproduction the agent under
+ * judgement wrote is another. The scripted-scenario case is still unreachable
+ * for the original reason: no event distinguishes a browser script from a test.
  */
 export type Tier = 1 | 2 | 3;
 
@@ -59,7 +62,8 @@ export function confidence(state: RunState): Confidence {
   const unmeasured = [
     `diff-coverage of the fix against the reproduction path (worth ${DIFF_COVERAGE_POINTS})` +
       ' — retired as a filename check by ADR-0008 and not yet rebuilt with instrumentation',
-    'whether a scripted scenario was used: ADR-0007 Tier 2 has no event to record it',
+    'whether a scripted scenario was used: no event distinguishes one from a test, so that ' +
+      "case of ADR-0007's Tier 2 stays unrecordable",
   ];
 
   // The gate, first and alone. Everything below is quality ABOVE the bar, so a
@@ -173,6 +177,49 @@ export function confidence(state: RunState): Confidence {
     // unevidenced point is the vibe ADR-0004 forbids, whatever it is scoring.
     evidence: state.fixDiff ? [state.fixDiff.diff_hash] : [],
   });
+
+  // Tier 1 is not available when the AGENT wrote the reproduction.
+  //
+  // Not a penalty for the agent's work — a statement about what this engine can
+  // and cannot show. A reproduction supplied by a caller is a fixed artifact; one
+  // authored by the agent is a COMMAND the agent chose, and a command can test
+  // which commit it is standing on rather than whether the bug is present. Red on
+  // base, green on a fix that changes nothing, with every anchor satisfied.
+  //
+  // Six versions of the sham-fix control were defeated — by oracles keyed on the
+  // FIX, which it is blind to by construction, and by oracles keyed on BASE that
+  // simply out-guessed it. It is advisory now: it records what it saw and decides
+  // nothing, so this cap is what withholds the claim, and it does not depend on
+  // any sham working.
+  //
+  // So the engine stops claiming what it cannot demonstrate. These runs are Tier
+  // 2 — reproduced, with the reproduction's independence unverified — until
+  // diff-coverage exists, which is the one measurement that separates a
+  // reproduction of the bug from a test of the commit's identity, because an
+  // identity oracle executes none of the lines the fix changed.
+  if (state.reproAuthoredByAgent) {
+    return {
+      scoring: 1,
+      tier: 2,
+      score: grounds.reduce((total, ground) => total + ground.points, 0),
+      grounds: [
+        ...grounds,
+        {
+          claim:
+            'the reproduction was written by the agent under judgement, so it cannot be shown to ' +
+            'test the bug rather than which commit it is running on',
+          points: 0,
+          evidence: [],
+        },
+      ],
+      unmeasured: [
+        ...unmeasured,
+        'the independence of an agent-authored reproduction: nothing here shows it tests the bug ' +
+          'rather than which commit it is running on, and the sham-fix control is advisory — it ' +
+          'records what it saw and decides nothing (ADR-0008 amendment)',
+      ],
+    };
+  }
 
   return {
     scoring: 1,

@@ -36,3 +36,44 @@ every point traceable to a content-addressed artifact.
 label. It converts the confidence score from a measurement into a disclaimer,
 and one waved-through guess costs more trust than a hundred honest
 UNRESOLVEDs.
+
+---
+
+## Amendment — Tier 1 is not available to a reproduction the agent wrote (M3.2b)
+
+This ADR defines Tier 1 as "**an agent-authored test** that fails on the base
+commit … Highest confidence". That was written when the reproduction came from a
+caller and the agent merely ran against it. It is no longer true, and the code
+now refuses it, so the definition is amended here rather than contradicted
+silently from another document.
+
+A reproduction is a COMMAND, and once the agent writes it, the command can test
+which commit it is running on instead of whether the bug is present. The repro
+agent knows base's tree exactly — it is the tree in its own clone. Red on base,
+green on a fix that repairs nothing, with every anchor in
+[ADR-0008](0008-the-reproduction-is-anchored.md) satisfied and no anomaly
+anywhere in the log. Six versions of a negative control failed to catch it, and
+one class provably cannot be caught by any control of that shape.
+
+**So Tier 1 now additionally requires that nothing in the log shows the engine
+took the reproduction from the party under judgement.** Stated as what the code
+checks rather than as the ideal: the fold caps the tier when it sees a repro
+handover, a handover whose `kind` is anything but `fix`, or a sham-control run —
+that last one being positive proof, since the engine asks for a control only when
+the agent authored the reproduction. A caller-supplied reproduction reaches Tier
+1 as before.
+
+**Tier 2 widens accordingly**, and this is a deliberate reuse rather than an
+oversight: it was "reproduced by scripted scenario — weaker assertion than a
+test, still independently re-executable", and it becomes **"reproduced, but the
+reproduction's independence is unverified"**, of which a scripted scenario is one
+case and an agent-authored test is another. Both are re-executable; neither is
+known to test the thing it claims to test.
+
+Tier 3 is unchanged.
+
+**Revisit when** diff-coverage instrumentation exists. Showing that the lines the
+fix changed are the lines the reproduction exercises is what separates a
+reproduction of the bug from a test of the commit's identity — an identity oracle
+executes none of them. At that point an agent-authored reproduction can earn Tier
+1 again, on evidence rather than on trust.

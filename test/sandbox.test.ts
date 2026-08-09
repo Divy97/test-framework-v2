@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
+import { confidence } from '../src/confidence.js';
 import { fold } from '../src/fold.js';
 import { orchestrate } from '../src/orchestrate.js';
 import { SHARED_WRITABLE } from '../src/runner.js';
@@ -1381,6 +1382,187 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(state.aborts[0]!.reason).toMatch(/handed/);
     expect(outcome.complete).toBe(false);
   }, 600_000);
+
+  test('a reproduction that tests which commit this is, not whether the bug is present', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // The hole that arrives WITH agent-authored reproductions, and the only one
+    // in this engine that no amount of anchoring can close.
+    //
+    // The repro agent knows base's tree exactly — it is the tree in its own
+    // clone. So it writes a reproduction that hashes the tree and fails only when
+    // that hash is base's. Every defence holds and none is about this: the bytes
+    // are identical across phases so ADR-0008's anchor is satisfied, no
+    // cross-phase state is needed so ADR-0010 and the container split are
+    // irrelevant, and it is deterministic so the flake re-runs agree. Red on
+    // base, green on a fix that changes nothing. Review measured Tier 1, score 80.
+    //
+    // The sham-fix control is what catches it: an unrelated file committed on top
+    // of base leaves the bug exactly where it was, so a reproduction OF THE BUG
+    // must still fail. This one goes green and says what it really was.
+    const fixture = regression();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    // No single quotes anywhere: this string is embedded inside a single-quoted
+    // `printf`, and `cut -d' '` closes it — the first version of this attack was
+    // a shell syntax error exiting 2 on both phases, which reads as red-then-not
+    // -green and proved nothing at all.
+    // `-c safe.directory=*`: the repro runs as uid 1000 against a root-owned
+    // repo, so a bare `git` dies on "detected dubious ownership" — which made the
+    // three previous versions of this fixture UNCONDITIONALLY GREEN. The oracle
+    // then aborted for the trivial reason that an always-green repro passes on
+    // the sham, and the test would have passed with no oracle in it at all.
+    // safe.directory is a speed bump, not a boundary, and an attacker sets it.
+    //
+    // No single quotes: this string is embedded in a single-quoted `printf`.
+    const treeHash = `git -c safe.directory=* ls-tree -r HEAD | grep -v repro.sh | grep -v engine | sha256sum | cut -c1-64`;
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        `case "$*" in\n` +
+        `  *reproduce*)\n` +
+        `  mkdir -p .engine\n` +
+        `  h=$(${treeHash})\n` +
+        `  printf 'cat src.txt\\n' > repro.sh\n` +
+        `  printf 't=$(${treeHash})\\n' >> repro.sh\n` +
+        `  printf '[ "$t" = "%s" ] && exit 1\\n' "$h" >> repro.sh\n` +
+        `  printf 'exit 0\\n' >> repro.sh\n` +
+        // Review defeated the first control through three channels the sham
+        // advertised about itself, not through the tree hash: the committer email
+        // (`engine@local`), the message (`sham`), and the NAME SHAPE (`.` plus 24
+        // hex at the root). Each is one line, so each is asserted here — the sham
+        // now modifies a tracked file and draws its author and message, so none
+        // of the three has anything constant left to match.
+        `  printf 'a=$(git -c safe.directory=* log -1 --format=%%ae HEAD)\\n' >> repro.sh\n` +
+        `  printf 'case "$a" in *engine*|*local*) exit 1 ;; esac\\n' >> repro.sh\n` +
+        `  printf 's=$(git -c safe.directory=* log -1 --format=%%s HEAD)\\n' >> repro.sh\n` +
+        `  printf '[ "$s" = sham ] && exit 1\\n' >> repro.sh\n` +
+        `  printf 'git -c safe.directory=* ls-tree -r --name-only HEAD | grep -qE "^[.][0-9a-f]{24}$" && exit 1\\n' >> repro.sh\n` +
+        `  printf '{"command":"sh repro.sh","files":["repro.sh"]}' > .engine/repro.json\n` +
+        `  git add .engine repro.sh >/dev/null 2>&1\n` +
+        `  git commit -q -m "reproduce it" >/dev/null 2>&1\n` +
+        `  ;;\n` +
+        `  *)\n` +
+        `  echo "an unrelated note" > NOTES.md\n` +
+        `  git add NOTES.md >/dev/null 2>&1\n` +
+        `  git commit -q -m "fix nothing" >/dev/null 2>&1\n` +
+        `  ;;\n` +
+        `esac\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      reproPrompt: 'reproduce the bug with a failing test',
+      agentPrompt: 'now fix it',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    const state = fold(outcome.events);
+    // FIRST: the attack has to BE an attack. Without this the test cannot tell an
+    // identity oracle from a broken script, which is how four versions of it
+    // shipped — a red base is the thing a forgery needs and a syntax error does
+    // not produce on purpose.
+    const base = state.testRuns.find((r) => r.phase === 'base');
+    expect(base?.exit_code).toBe(1);
+    expect(base?.symptom_matched).toBe(true);
+
+    // The forgery SUCCEEDS at red-then-green. That is the honest record: the
+    // control is advisory and no longer ends a run, because ending runs meant
+    // convicting honest reproductions on a random draw.
+    expect(state.reproduced).toBe(true);
+    // What withholds the claim is the tier, and it does not depend on any sham
+    // working: the agent wrote the reproduction, so Tier 1 is unavailable.
+    expect(confidence(state).tier).toBe(2);
+    // And the control left evidence a human can read — a sham that went green is
+    // exactly the signal, even though the engine draws nothing from it.
+    expect(state.testRuns.some((r) => r.phase === 'control' && r.exit_code === 0)).toBe(true);
+  }, 900_000);
+
+  test('the agent authors the reproduction, and the log proves it came first', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // ADR-0008's ordering invariant, made real. The repro agent writes the test
+    // as a commit; the base container registers it; only then does the FIX agent
+    // start. So `REPRO_REGISTERED` precedes the fix agent's first message BY SEQ,
+    // and nobody has to trust that the fix was not written against a reproduction
+    // its author had already watched fail.
+    const fixture = regression();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    // One fake agent for both phases: it writes a repro when there is none, and
+    // fixes the bug once one exists. Which phase it is in, it reads off the tree.
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        // Branches on the PROMPT, not on the tree. The fix agent's world is cloned
+        // from the base-only source, so the repro commit is not in it — checking
+        // for the file made both phases write a reproduction and neither fix
+        // anything.
+        `case "$*" in\n` +
+        `  *reproduce*)\n` +
+        `  mkdir -p .engine\n` +
+        // `cat` first: a repro that prints nothing cannot match the reported
+        // symptom, and the gate then holds — correctly — on a reproduction that
+        // fails for reasons nobody can see.
+        `  printf 'cat src.txt\\ngrep -q right src.txt\\n' > repro.sh\n` +
+        `  printf '{"command":"sh repro.sh","files":["repro.sh"]}' > .engine/repro.json\n` +
+        `  git add .engine repro.sh >/dev/null 2>&1\n` +
+        `  git commit -q -m "reproduce it" >/dev/null 2>&1\n` +
+        `  ;;\n` +
+        `  *)\n` +
+        `  echo right > src.txt\n` +
+        `  git add src.txt >/dev/null 2>&1\n` +
+        `  git commit -q -m "fix it" >/dev/null 2>&1\n` +
+        `  ;;\n` +
+        `esac\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      reproPrompt: 'reproduce the bug with a failing test',
+      agentPrompt: 'now fix it',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.refused).toBe(false);
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'agent', 'fix']);
+
+    const registered = outcome.events.find((e) => e.type === 'REPRO_REGISTERED');
+    expect(registered).toBeDefined();
+    // The invariant, read straight off the log: the LAST agent message before the
+    // fix is authored comes after registration. Two handovers, and the second —
+    // the fix — is the commit the fix phase judged.
+    const handovers = outcome.events.filter((e) => e.type === 'AGENT_HANDED_OVER');
+    expect(handovers).toHaveLength(2);
+    expect(handovers[0]!.seq).toBeLessThan(registered!.seq);
+    expect(handovers[1]!.seq).toBeGreaterThan(registered!.seq);
+
+    const state = fold(outcome.events);
+    // The repro the engine registered is the one the agent COMMITTED, read by the
+    // engine out of that commit rather than taken on the manifest's word.
+    expect(state.registeredRepro?.applied).toEqual(['repro.sh']);
+    expect(state.reproduced).toBe(true);
+  }, 900_000);
 
   test('the agent cannot reach a fix the repository already has', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
