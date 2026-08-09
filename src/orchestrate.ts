@@ -190,6 +190,20 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   const base = baseShaOut.trim();
   const { stdout: baseTreeOut } = await execFile('git', [...git, 'rev-parse', `${plan.baseRef}^{tree}`]);
   const baseTree = baseTreeOut.trim();
+  // The base commit must be IN the history this check was computed over.
+  //
+  // The first fail-closed guard here was `existing.trim() && before.size === 0`,
+  // a tautology: `filter(Boolean)` leaves the set empty only when every line was
+  // empty, which makes `trim()` falsy too. It could never fire. A safety net that
+  // cannot fail is worse than none, because it is read as one.
+  //
+  // What it was meant to catch: the set was once parsed with `/^[0-9a-f]{40}$/`,
+  // the only hard-coded object-ID length in the engine, so on a SHA-256
+  // repository not one token matched, `before` came out EMPTY, and every handover
+  // passed with no error and no abort. This guard is the record of that, and it
+  // is kept written down because deleting it is not free — the very commit that
+  // removed this paragraph broke SHA-256 repositories again, one construction
+  // over, within a day.
   if (!before.has(base)) {
     throw new Error(
       'the base commit is not in the history this check reads; refusing to run an unenforceable check',
@@ -212,38 +226,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // that used to stand beside it is gone rather than kept as a second line.
   //
   const agentSource = join(workspace, 'agent-source');
-  await execFile('git', ['init', '--quiet', '--bare', agentSource]);
-  // PUSH by sha, rather than clone-then-strip-then-prune. The objects off base's
-  // ancestry are never written at all, so no gc, cruft pack, prune grace, reflog
-  // or git-version question can resurrect them — the earlier construction leaned
-  // on `reflog expire` whose failure was swallowed, and with
-  // `core.logAllRefUpdates` inherited from a global config the fix survived the
-  // prune with `git fsck --unreachable` reporting nothing at all.
-  //
-  // It also does not care WHICH ref holds base. `clone --bare` fetches only
-  // `refs/heads/*` and tags, so a base reachable solely from `refs/remotes/*` —
-  // any repository that is itself a clone — left the object out and the strip
-  // died on a bare exception where the run used to produce an evented abort.
-  await execFile('git', ['-C', source, 'push', '--quiet', agentSource, `${base}:refs/heads/main`]);
-  await execFile('git', ['-C', agentSource, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
-
-  // The postcondition the comment above used to merely promise.
-  //
-  // "Verified by the object store, not by the ref listing" has to be something
-  // the code does, not something the prose asserts — a ref listing is exactly
-  // what every earlier round of this check kept believing. Cheap: one batch read
-  // over a repository that holds base's ancestry and nothing else.
-  const objects = await execFile('git', [
-    '-C', agentSource, 'cat-file', '--batch-all-objects', '--batch-check=%(objectname)',
-  ]);
-  const reachable = await execFile('git', ['-C', agentSource, 'rev-list', '--objects', 'refs/heads/main']);
-  const want = new Set(reachable.stdout.split('\n').filter(Boolean).map((line) => line.split(' ')[0]!));
-  const extra = objects.stdout.split('\n').filter(Boolean).filter((o) => !want.has(o));
-  if (extra.length > 0) {
-    throw new Error(
-      `the agent's source holds ${extra.length} objects off the base's ancestry; refusing to run`,
-    );
-  }
+  await buildAgentSource(source, base, agentSource);
 
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
@@ -278,6 +261,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // names the plan may have used.
     steps.push({
       phase: 'agent',
+      // `baseRef` resolved, and DEAD today: the Runner returns on `only: 'agent'`
+      // before `verify()` ever reads it. Kept because a future agent path should
+      // get the sha rather than a name the stripped source no longer carries.
+      // `fixRef` on this same job is dead for the identical reason and is NOT
+      // resolved — said here rather than left as a silent asymmetry two lines
+      // apart.
       job: { agentPrompt: plan.agentPrompt, only: 'agent', baseRef: base },
       source: agentSource,
     });
@@ -615,3 +604,71 @@ const parse = (stdout: string): RunEvent[] =>
     .split('\n')
     .filter(Boolean)
     .map((line) => JSON.parse(line) as RunEvent);
+
+/**
+ * The agent's source: base's ancestry, and nothing else.
+ *
+ * Exported because both regressions this has had were invisible to the container
+ * suite and provable in milliseconds here — a SHA-256 repository, and a global
+ * `push.followTags`. Verifying a repository build by running a container is
+ * verifying it in the one place it is slowest and least legible.
+ */
+export async function buildAgentSource(source: string, base: string, agentSource: string): Promise<void> {
+// The source's own hash algorithm, not this git's default. `init` always makes
+// a SHA-1 repository, and pushing a SHA-256 repository into one fails outright
+// — a repo class that worked before this construction replaced the previous
+// one. The comment deleted from the check above was the record of the LAST
+// time SHA-256 silently broke this, which is precisely why it should not have
+// been deleted.
+const { stdout: format } = await execFile('git', ['-C', source, 'rev-parse', '--show-object-format']);
+await execFile('git', ['init', '--quiet', '--bare', `--object-format=${format.trim()}`, agentSource]);
+// PUSH by sha, rather than clone-then-strip-then-prune. The objects off base's
+// ancestry are never written at all, so no gc, cruft pack, prune grace, reflog
+// or git-version question can resurrect them — the earlier construction leaned
+// on `reflog expire` whose failure was swallowed, and with
+// `core.logAllRefUpdates` inherited from a global config the fix survived the
+// prune with `git fsck --unreachable` reporting nothing at all.
+//
+// It also does not care WHICH ref holds base. `clone --bare` fetches only
+// `refs/heads/*` and tags, so a base reachable solely from `refs/remotes/*` —
+// any repository that is itself a clone — left the object out and the strip
+// died on a bare exception where the run used to produce an evented abort.
+//
+// The flags are not decoration. `push` reads the user's ambient config and the
+// `clone` it replaced did not, so three ordinary global settings each reach a
+// construction that is supposed to depend on nothing: `push.followTags` brings
+// annotated tag objects the postcondition below then reports as a violation,
+// `push.gpgSign` fails the push outright, and a global `core.hooksPath` with a
+// `pre-push` hook refuses it. A repository build must not vary with whoever's
+// machine the host happens to be.
+await execFile('git', [
+  '-C', source, 'push', '--quiet', '--no-follow-tags', '--no-verify', '--no-signed',
+  agentSource, `${base}:refs/heads/main`,
+]);
+await execFile('git', ['-C', agentSource, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
+
+// The postcondition the comment above used to merely promise.
+//
+// "Verified by the object store, not by the ref listing" has to be something
+// the code does, not something the prose asserts — a ref listing is exactly
+// what every earlier round of this check kept believing. Cheap: one batch read
+// over a repository that holds base's ancestry and nothing else.
+const objects = await execFile('git', [
+  '-C', agentSource, 'cat-file', '--batch-all-objects', '--batch-check=%(objectname)',
+]);
+const reachable = await execFile('git', ['-C', agentSource, 'rev-list', '--objects', 'refs/heads/main']);
+const want = new Set(reachable.stdout.split('\n').filter(Boolean).map((line) => line.split(' ')[0]!));
+const extra = objects.stdout.split('\n').filter(Boolean).filter((o) => !want.has(o));
+if (extra.length > 0) {
+  throw new Error(
+    `the agent's source holds ${extra.length} objects off the base's ancestry; refusing to run`,
+  );
+}
+// And the ref set, which the object check does not cover: `push.followTags` is
+// exactly a ref-set surprise, and it is how the object check first fired.
+const { stdout: built } = await execFile('git', ['-C', agentSource, 'for-each-ref', '--format=%(refname)']);
+const refs = built.split('\n').filter(Boolean);
+if (refs.length !== 1 || refs[0] !== 'refs/heads/main') {
+  throw new Error(`the agent's source carries refs beyond base: ${refs.join(', ')}; refusing to run`);
+}
+}
