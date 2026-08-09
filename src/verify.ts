@@ -15,7 +15,7 @@
 // same repo must not trip the dirty-tree refusal on this run's leftovers.
 
 import { execFile } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 import { constants, lstat, mkdir, open, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
@@ -69,22 +69,6 @@ export class ObservationFailed extends Error {
  */
 export const MAX_REASON_CHARS = 2000;
 
-/**
- * The sham fix's payload, named unpredictably.
- *
- * A fixed name is filterable, and the first two versions of this control were
- * defeated by the attack they were written against. The oracle hashed the tree
- * through `grep -v .engine`, which excluded `.engine-control` — and then still
- * excluded `.engine-control-<hex>`, because a random SUFFIX leaves the stem to
- * match on. The agent reads this source, so any constant here is a constant it
- * can filter by.
- *
- * Nothing recognisable survives in the name. An oracle can still beat this by
- * hashing a hardcoded list of base's files rather than filtering the tree — said
- * plainly rather than implied away, and the reason the real answer is
- * diff-coverage instrumentation rather than a cleverer sham.
- */
-const controlFile = () => `.${randomBytes(12).toString('hex')}`;
 
 const abortReason = (error: Error): string => {
   const text = `${error.name}: ${error.message}`;
@@ -594,8 +578,15 @@ async function observe(
     });
   }
 
+  // Whether the base run actually showed the bug. The control below is about a
+  // reproduction that is CHEATING, and a reproduction that simply does not
+  // reproduce is green on the sham for the honest reason — so running the control
+  // on it turned ADR-0007's Tier 3 deliverable into an accusation of gaming, in
+  // an immutable log. The gate already handles a bug that was never shown.
+  let baseRed = false;
   if (options.only !== 'fix') {
     const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+    baseRed = base.exitCode !== 0 && !base.signal;
     emit({
       type: 'TEST_RUN',
       payload: {
@@ -626,13 +617,40 @@ async function observe(
   // Deliberately a COMMIT, not an untracked file: a repro hashing `git ls-tree
   // HEAD` would not notice a stray file, and the cheapest oracle to write is the
   // one over tracked content.
-  if (options.controlRun && options.only !== 'fix') {
+  if (options.controlRun && options.only !== 'fix' && baseRed) {
     progress.phase = 'base';
-    const sham = controlFile();
-    await writeFile(join(repoPath, sham), 'a sham fix: this changes no behaviour\n');
-    await git(['add', '--force', '--', sham], repoPath, gitEnv);
+    // MODIFY a tracked file; do not add one. Adding gave the oracle two channels
+    // at once — "a file appeared" and the added name's SHAPE — and randomising
+    // the name while leaving `.` + 24 hex in place is the same mistake as
+    // randomising the suffix and leaving the stem. A newline on the end of a file
+    // the repository already tracks has no shape to match on.
+    //
+    // Safe in the direction that matters: if the append breaks something, the
+    // reproduction fails on the sham, and a failing reproduction is what this
+    // control expects. Only a PASS is a finding.
+    const tracked = (await git(['ls-files', '-z'], repoPath, gitEnv)).split('\0').filter(Boolean);
+    if (tracked.length === 0) {
+      throw new ObservationFailed('the base commit tracks no files, so the reproduction cannot be controlled');
+    }
+    const victim = tracked[randomInt(tracked.length)]!;
+    const handle = await open(join(repoPath, victim), 'a');
+    try {
+      await handle.write('\n');
+    } finally {
+      await handle.close();
+    }
+    // The author and the message are drawn too. They were `engine@local` and
+    // `sham` — constants in this file, which the agent reads, and each one a
+    // single `git log -1 --format=%ae` away from telling the reproduction exactly
+    // which commit it was standing on. Review demonstrated all three channels.
+    const nonce = randomBytes(8).toString('hex');
+    await git(['add', '--', victim], repoPath, gitEnv);
     await git(
-      ['-c', 'user.email=engine@local', '-c', 'user.name=engine', 'commit', '--quiet', '-m', 'sham'],
+      [
+        '-c', `user.email=${nonce}@example.invalid`,
+        '-c', `user.name=${nonce}`,
+        'commit', '--quiet', '-m', nonce,
+      ],
       repoPath,
       gitEnv,
     );

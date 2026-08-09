@@ -1406,7 +1406,15 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // `printf`, and `cut -d' '` closes it — the first version of this attack was
     // a shell syntax error exiting 2 on both phases, which reads as red-then-not
     // -green and proved nothing at all.
-    const treeHash = `git ls-tree -r HEAD | grep -v repro.sh | grep -v engine | sha256sum | cut -c1-64`;
+    // `-c safe.directory=*`: the repro runs as uid 1000 against a root-owned
+    // repo, so a bare `git` dies on "detected dubious ownership" — which made the
+    // three previous versions of this fixture UNCONDITIONALLY GREEN. The oracle
+    // then aborted for the trivial reason that an always-green repro passes on
+    // the sham, and the test would have passed with no oracle in it at all.
+    // safe.directory is a speed bump, not a boundary, and an attacker sets it.
+    //
+    // No single quotes: this string is embedded in a single-quoted `printf`.
+    const treeHash = `git -c safe.directory=* ls-tree -r HEAD | grep -v repro.sh | grep -v engine | sha256sum | cut -c1-64`;
     writeFileSync(
       join(agentDir, 'claude'),
       `#!/bin/sh\n` +
@@ -1420,6 +1428,17 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
         `  printf 't=$(${treeHash})\\n' >> repro.sh\n` +
         `  printf '[ "$t" = "%s" ] && exit 1\\n' "$h" >> repro.sh\n` +
         `  printf 'exit 0\\n' >> repro.sh\n` +
+        // Review defeated the first control through three channels the sham
+        // advertised about itself, not through the tree hash: the committer email
+        // (`engine@local`), the message (`sham`), and the NAME SHAPE (`.` plus 24
+        // hex at the root). Each is one line, so each is asserted here — the sham
+        // now modifies a tracked file and draws its author and message, so none
+        // of the three has anything constant left to match.
+        `  printf 'a=$(git -c safe.directory=* log -1 --format=%%ae HEAD)\\n' >> repro.sh\n` +
+        `  printf 'case "$a" in *engine*|*local*) exit 1 ;; esac\\n' >> repro.sh\n` +
+        `  printf 's=$(git -c safe.directory=* log -1 --format=%%s HEAD)\\n' >> repro.sh\n` +
+        `  printf '[ "$s" = sham ] && exit 1\\n' >> repro.sh\n` +
+        `  printf 'git -c safe.directory=* ls-tree -r --name-only HEAD | grep -qE "^[.][0-9a-f]{24}$" && exit 1\\n' >> repro.sh\n` +
         `  printf '{"command":"sh repro.sh","files":["repro.sh"]}' > .engine/repro.json\n` +
         `  git add .engine repro.sh >/dev/null 2>&1\n` +
         `  git commit -q -m "reproduce it" >/dev/null 2>&1\n` +
@@ -1448,6 +1467,13 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     });
 
     const state = fold(outcome.events);
+    // FIRST: the attack has to BE an attack. Without this the test cannot tell an
+    // identity oracle from a broken script, which is how four versions of it
+    // shipped — a red base is the thing a forgery needs and a syntax error does
+    // not produce on purpose.
+    const base = state.testRuns.find((r) => r.phase === 'base');
+    expect(base?.exit_code).toBe(1);
+    expect(base?.symptom_matched).toBe(true);
     // Refused at the base container, before a fix was ever judged — and SAID why,
     // rather than failing as some anonymous infrastructure fault.
     expect(state.reproduced).toBe(false);

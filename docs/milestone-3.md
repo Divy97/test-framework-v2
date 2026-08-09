@@ -94,12 +94,15 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   the bug is untouched, so a reproduction of the bug must still fail. It runs
   only when the agent authored the reproduction.
 
-  **Its limit, stated rather than implied:** the sham's name carries nothing
-  recognisable, because two earlier versions were filtered out by the attack's
-  own `grep`. That defeats pattern-filtering oracles. An oracle that hashes a
-  hardcoded list of base's files instead of filtering the tree still survives it.
-  The real answer is diff-coverage instrumentation — showing that the lines the
-  fix changed are the lines the reproduction exercises — and it is not built.
+  **Its limit, stated rather than implied.** Three versions of this control were
+  defeated by constants it advertised about itself — the sham's name, then its
+  name's shape, then its committer email and commit message. It now modifies a
+  file the repository already tracks and draws its author and message randomly,
+  so there is nothing constant left to match. An oracle that hashes a hardcoded
+  list of base's file contents still survives, and no sham closes that: the trees
+  genuinely differ between phases. The real answer is diff-coverage
+  instrumentation — showing that the lines the fix changed are the lines the
+  reproduction exercises — and it is not built. See ADR-0008's amendment.
 
   Bounded attempts remain, and `handedOver` must become per-attempt with them.
 

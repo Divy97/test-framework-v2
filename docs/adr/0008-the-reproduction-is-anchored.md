@@ -124,15 +124,32 @@ fail. One that turns green has told us what it was reading. It runs only when th
 agent wrote the reproduction — a caller-supplied one has no oracle to be — and it
 aborts the base phase with a reason that names the finding.
 
-**What it does not cover, stated plainly.** The sham file's name carries nothing
-recognisable, because the first two versions of this control were defeated by the
-attack they were written against: the oracle filtered the tree through `grep -v
-.engine`, which excluded `.engine-control`, and then still excluded
-`.engine-control-<hex>` because a random suffix leaves the stem to match on. An
-unpredictable name defeats pattern-filtering oracles. It does NOT defeat an
-oracle that hashes a hardcoded list of base's files rather than filtering, and no
-cleverer sham will — the tree genuinely differs between the phases, so a
-sufficiently determined test can always tell them apart.
+**What it does not cover, stated plainly — and this section has been wrong once
+already.** Its previous version claimed "an unpredictable name defeats
+pattern-filtering oracles" and named the hardcoded-file-list bypass as the only
+survivor. Review then defeated the control through three channels in six lines,
+and one of them was a pattern filter: the sham's name was random but its SHAPE
+was not — `.` followed by exactly 24 lowercase hex at the repository root is as
+matchable as `.engine-control` was. The other two were the committer email and
+the commit message, both constants in the engine's own source, each one
+`git log -1 --format=%ae` away from telling the reproduction which commit it
+stood on. That sentence is what let the hole ship, so it is worth being precise
+about why it was wrong: three earlier versions had each been defeated by a
+constant in the sham's NAME, and the lesson generalised to "randomise the name"
+rather than to "the sham must have no constant an oracle can match".
+
+The sham therefore modifies a file the repository already tracks rather than
+adding one, and draws its author and message from the same CSPRNG as everything
+else. There is no added file to notice, no name to shape-match, and no metadata
+to compare.
+
+What still defeats it: an oracle that hashes a hardcoded list of base's file
+CONTENTS. The sham perturbs one tracked file chosen at random, so such an oracle
+survives whenever the sham misses the files it hardcoded — and no cleverer sham
+closes this, because the trees genuinely differ between the phases and a
+sufficiently determined test can always tell them apart. Review confirmed the
+bypass is real but narrower than it sounds: the oracle must ALSO stay red on the
+fix, so it only pays off when the fix modifies a file on its hardcoded list.
 
 Diff-coverage is the real answer here too: an identity oracle does not execute
 the lines the fix changed, and a reproduction of the bug does. That is the same
