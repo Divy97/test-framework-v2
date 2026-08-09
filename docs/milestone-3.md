@@ -70,7 +70,18 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   credited at all.
 - **3b.2b — the agent supplying the `ReproSpec`.** Still to come, and the harder
   half: the agent's tree is discarded, so its reproduction has to arrive as a
-  commit. Bounded attempts belong here too — retrying is only meaningful once a
+  commit.
+
+  **It also owns the last hole in the authorship check.** The agent's container
+  clones the whole repository, so wherever a fix already exists — another branch,
+  the repo's own HEAD, `plan.fixRef` — the agent can check it out, add one
+  whitespace byte and hand over a commit whose content is genuinely new and whose
+  work is entirely inherited. Base red, fix green, Tier 1, and the diff names the
+  right files. No content-based check can see this: the fix IS in the tree, and
+  the agent did author the commit on top of it. The structural answer is that the
+  agent's container must start from `baseRef` with nothing else reachable, so
+  there is nothing to inherit — which is a change to what the agent container is
+  given, and belongs here rather than to the check. Bounded attempts belong here too — retrying is only meaningful once a
   later attempt can propose a different reproduction. The image gains a real
   `claude` here; until then the sandbox tests mount a hostile fake, which proves
   the boundary without the weight.

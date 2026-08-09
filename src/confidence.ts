@@ -189,6 +189,22 @@ export function confidence(state: RunState): Confidence {
  * failed, because that is what a follow-up would have to change.
  */
 function notReproducedBecause(state: RunState): string {
+  // First, because a refused handover leaves no registration at all and the
+  // clause below would otherwise shadow it with 'no reproduction was ever
+  // registered' — true, useless, and silent about the one finding that most
+  // needs auditing: the agent handed over work it did not do.
+  //
+  // On `cause`, never on `reason`. The regex that stood here matched only the
+  // three strings a SUCCESSFUL bundle can produce and missed every one from a
+  // run that handed over no bundle — so the Runner's newly recorded bundling
+  // failure reached no projection either, and the clause's own headline case
+  // still reported 'no reproduction was ever registered'. Both strings it did
+  // match for a null handover turned out to be dead code. It also parsed a field
+  // documented `Display it; never parse it` (events.ts), which quotes
+  // agent-influenced text: a repro named `./handed over` short-circuited this
+  // whole ladder, and 3b.2b hands the agent authorship of that spec.
+  const refused = state.aborts.find((a) => a.cause === 'handover');
+  if (refused) return refused.reason;
   if (state.registrations.length === 0) return 'no reproduction was ever registered';
   if (state.testRuns.length === 0) return 'the reproduction was registered but never ran';
 
@@ -222,6 +238,17 @@ function notReproducedBecause(state: RunState): string {
   }
   if (!state.completedAttempts.includes(base.attempt)) {
     return 'the run stopped before the fix series finished, so the passes that were seen prove nothing about the ones that were not';
+  }
+  // The fold gained a reason to withhold credit and this was not taught it, so
+  // every such run fell through to the last line and accused the reproduction of
+  // tampering that had not happened — repro hashes byte-identical across both
+  // phases, and the Tier 3 deliverable, the artifact a human actually reads,
+  // asserting otherwise while concealing the real finding. That is exactly the
+  // "a second definition is free to disagree" failure this file's header
+  // commemorates; a clause has to land here whenever one lands in the fold.
+  const wrong = state.handedOver && fixes.find((r) => r.commit_sha !== state.handedOver);
+  if (wrong) {
+    return `the fix runs judged ${wrong.commit_sha}, but the agent handed over ${state.handedOver}: the commit verified is not the commit authored`;
   }
   return 'the reproduction that ran was not the one registered: two different tests were compared';
 }

@@ -8,6 +8,7 @@ import type {
   RunEndedV1,
   RunEvent,
   VerificationPhase,
+  VerificationAbortedV1,
 } from './events.js';
 
 /**
@@ -106,6 +107,8 @@ export type RunState = {
   transcript: { n: number; claimed_type: string | null; raw_hash: ArtifactRef; bytes: number }[];
   /** How supervision ended. This one IS evidence: the Runner watched the process. */
   agent: Omit<AgentFinishedV1, 'v'> | null;
+  /** The commit the agent authored, if it authored one. Evidence, not testimony. */
+  handedOver: string | null;
   pr: { repo: string; pr_number: number; head_sha: string } | null;
   /**
    * Every phase that stopped being observable, in order. Not terminal: an attempt
@@ -113,7 +116,7 @@ export type RunState = {
    * status — but a `base` or `fix` abort does disqualify its own attempt from
    * being credited a reproduction. See `reproducedAttempt`.
    */
-  aborts: { attempt: number; phase: VerificationPhase; reason: string }[];
+  aborts: { attempt: number; phase: VerificationPhase; reason: string; cause?: VerificationAbortedV1['cause'] }[];
   /**
    * Event types that arrived after RUN_ENDED, recorded and NOT applied.
    *
@@ -150,6 +153,7 @@ const initialState = (runId: string): RunState => ({
   completedAttempts: [],
   transcript: [],
   agent: null,
+  handedOver: null,
   pr: null,
   aborts: [],
   afterEnd: [],
@@ -205,7 +209,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // Ordinarily a no-op — registration precedes the runs it anchors — but it
         // keeps the value derived from the current inputs rather than left over
         // from the last TEST_RUN.
-        ...credited(state.testRuns, registrations, state.aborts, state.completedAttempts),
+        ...credited(state.testRuns, registrations, state.aborts, state.completedAttempts, state.handedOver),
       };
     }
     case 'AGENT_MESSAGE':
@@ -224,6 +228,18 @@ export function apply(state: RunState, event: RunEvent): RunState {
           },
         ],
       };
+    case 'AGENT_HANDED_OVER': {
+      // Recomputes like every other input to the verdict. It is emitted before
+      // any TEST_RUN today, so nothing changes — but "safe because of the order
+      // the producer happens to use" is precisely the assumption this file has
+      // been bitten by, and the fold is meant to be order-robust.
+      const handedOver = event.payload.commit;
+      return {
+        ...next,
+        handedOver,
+        ...credited(state.testRuns, state.registrations, state.aborts, state.completedAttempts, handedOver),
+      };
+    }
     case 'AGENT_FINISHED': {
       const { v, ...finished } = event.payload;
       return { ...next, agent: finished };
@@ -254,7 +270,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // `aborts` IS load-bearing here, since `shownOnBase` needs no completion
         // witness: a base-phase abort is the only thing that can shut the gate on
         // an attempt whose base run otherwise looks clean.
-        ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts),
+        ...credited(testRuns, state.registrations, state.aborts, state.completedAttempts, state.handedOver),
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
     }
@@ -269,7 +285,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         completedAttempts,
         // The completion witness arrives after the runs it vouches for, so a fold
         // that only recomputed on TEST_RUN would never see it.
-        ...credited(state.testRuns, state.registrations, state.aborts, completedAttempts),
+        ...credited(state.testRuns, state.registrations, state.aborts, completedAttempts, state.handedOver),
         artifactHashes: [...state.artifactHashes, event.payload.diff_hash],
       };
     }
@@ -282,6 +298,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
           attempt: state.currentAttempt,
           phase: event.payload.phase,
           reason: event.payload.reason,
+          ...(event.payload.cause ? { cause: event.payload.cause } : {}),
         },
       ];
       // An abort in `diff` or `cleanup` witnesses completion just as
@@ -294,8 +311,20 @@ export function apply(state: RunState, event: RunEvent): RunState {
       // diff-phase abort always lacks FIX_DIFF_OBSERVED. A genuine Tier 1
       // reproduction — red base, every fix run green, all observed — would be
       // thrown away because git could not describe two unrelated histories.
+      //
+      // `cause === undefined` is what makes "same producer" true rather than
+      // merely intended. The host emits `cleanup` for EVERY container, including
+      // the agent's and the base's — written before the fix series has run at
+      // all — so without this gate a failed blob copy in an early container
+      // handed the fold the one witness that exists to stop a truncated fix
+      // series being credited. Red base, one green fix run, no
+      // FIX_DIFF_OBSERVED, and the run folded to Tier 1.
+      //
+      // The phase label is prose to a second producer. The discriminator has to
+      // be explicit — the same lesson as `cause` itself.
       const completed =
-        event.payload.phase === 'diff' || event.payload.phase === 'cleanup'
+        event.payload.cause === undefined &&
+        (event.payload.phase === 'diff' || event.payload.phase === 'cleanup')
           ? [...state.completedAttempts, state.currentAttempt]
           : state.completedAttempts;
       // Recomputed here, not only on TEST_RUN: the abort arrives *after* the runs
@@ -305,7 +334,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         ...next,
         aborts,
         completedAttempts: completed,
-        ...credited(state.testRuns, state.registrations, aborts, completed),
+        ...credited(state.testRuns, state.registrations, aborts, completed, state.handedOver),
       };
     }
     case 'RUN_ENDED':
@@ -376,8 +405,9 @@ function credited(
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
   completedAttempts: number[],
+  handedOver: string | null,
 ): { reproduced: boolean; reproducedAttempt: number | null; shownOnBase: boolean } {
-  const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts);
+  const attempt = reproducedAttempt(testRuns, registrations, aborts, completedAttempts, handedOver);
   return {
     reproduced: attempt !== null,
     reproducedAttempt: attempt,
@@ -443,6 +473,7 @@ function reproducedAttempt(
   registrations: RegisteredRepro[],
   aborts: RunState['aborts'],
   completedAttempts: number[],
+  handedOver: string | null,
 ): number | null {
   // The completion witness is the fix half's own guard. Nothing in the log states
   // how many fix runs there should have been, so "every run I can see passed" is
@@ -466,6 +497,18 @@ function reproducedAttempt(
     // `signal` on the fix side for the same reason it is checked on the base: a
     // process killed by a signal records exit_code -1, and nothing else here
     // would notice a fix run that died rather than passed.
+    // The fix runs have to be judging the commit the AGENT handed over.
+    //
+    // Without this the invariant lived in a test rather than in the fold that
+    // ADR-0009 says owns interpretation: a producer could hand over commit A,
+    // verify commit B, and still fold to `reproduced: true` with the log's own
+    // record of the discrepancy sitting inert beside it.
+    //
+    // Only when there IS a handover — a run with no agent has nothing to tie to.
+    // Scalar for now, which is only sound while there is one attempt; the 3b.2
+    // attempt loop has to make it per-attempt, exactly as `RegisteredRepro`
+    // already is.
+    if (handedOver && fixes.some((r) => r.commit_sha !== handedOver)) return false;
     return (
       fixes.length > 0 && fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
     );

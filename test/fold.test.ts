@@ -61,6 +61,7 @@ describe('fold', () => {
       completedAttempts: [1],
       transcript: [],
       agent: null,
+      handedOver: null,
       pr: {
         repo: 'demo-org/demo-app',
         pr_number: 42,
@@ -472,6 +473,74 @@ describe('an attempt that could not be observed', () => {
 
     const truncated = fold([...demoRunEvents.slice(0, 7), aborted('fix', 8)]);
     expect(truncated.reproduced).toBe(false);
+  });
+
+  it('will not take a completion witness from a producer that has no phase machine', () => {
+    // The witness rule reads a `diff` or `cleanup` abort as proof the flake loop
+    // closed. That holds for `verify()`, whose phase advances past `fix` only when
+    // the loop ends — and for nothing else. The HOST emits `cleanup` for every
+    // container, agent and base included, written before the fix series has run
+    // at all, so a failed blob copy in an early container handed the fold the one
+    // witness that exists to stop a truncated fix series being credited.
+    // Through the fix run — 5 stops one short, which made the `reproduced`
+    // assertion below vacuously true for want of a fix run rather than because
+    // of the gate, and the filter a no-op.
+    const truncated = demoRunEvents
+      .slice(0, 6)
+      .filter((e) => e.type !== 'FIX_DIFF_OBSERVED');
+
+    const hostAbort = (cause: 'collection' | undefined): RunEvent => ({
+      run_id: DEMO_RUN_ID,
+      seq: truncated.length + 1,
+      ts: 'T',
+      type: 'VERIFICATION_ABORTED',
+      payload: { v: 1, phase: 'cleanup', reason: 'blobs went missing', ...(cause ? { cause } : {}) },
+    });
+
+    // The control: without the abort at all, the series is plainly incomplete.
+    expect(fold(truncated).reproduced).toBe(false);
+    // The engine's own cleanup abort still vouches for the series, as it must —
+    // that is why the rule exists.
+    expect(fold([...truncated, hostAbort(undefined)]).completedAttempts).toContain(1);
+    // The host's does not.
+    const host = fold([...truncated, hostAbort('collection')]);
+    expect(host.completedAttempts).not.toContain(1);
+    expect(host.reproduced).toBe(false);
+  });
+
+  it('will not credit fix runs that judged a commit other than the one handed over', () => {
+    // ADR-0009: the fold owns interpretation. Without this the invariant lived in
+    // a sandbox test — a producer could hand over commit A, verify commit B, and
+    // still fold to `reproduced: true` with the log's own record of the
+    // discrepancy sitting inert beside it.
+    const handed = (commit: string, seq: number): RunEvent => ({
+      run_id: DEMO_RUN_ID,
+      seq,
+      ts: 'T',
+      type: 'AGENT_HANDED_OVER',
+      payload: { v: 1, commit },
+    });
+
+    const fixSha = demoRunEvents.find(
+      (e) => e.type === 'TEST_RUN' && e.payload.phase === 'fix',
+    )!.payload as { commit_sha: string };
+
+    // Handing over the very commit the fix runs judged changes nothing.
+    const honest = fold([
+      demoRunEvents[0]!,
+      handed(fixSha.commit_sha, 2),
+      ...demoRunEvents.slice(1, 7).map((e) => ({ ...e, seq: e.seq + 1 })),
+    ]);
+    expect(honest.handedOver).toBe(fixSha.commit_sha);
+    expect(honest.reproduced).toBe(true);
+
+    // Handing over a different one is not a reproduction of the agent's fix.
+    const swapped = fold([
+      demoRunEvents[0]!,
+      handed('f'.repeat(40), 2),
+      ...demoRunEvents.slice(1, 7).map((e) => ({ ...e, seq: e.seq + 1 })),
+    ]);
+    expect(swapped.reproduced).toBe(false);
   });
 
   it('leaves a fully observed attempt alone when a LATER attempt aborts', () => {

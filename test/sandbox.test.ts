@@ -25,6 +25,7 @@ import {
   HANGS_ON_FIX,
   irreproducible,
   noOpFix,
+  regression,
   survivorGamed,
 } from './fixtures/repo.js';
 
@@ -1113,13 +1114,23 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
 
   test('the agent container observes nothing', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
-    const fixture = clean();
+    // `noOpFix()`, not `clean()`: in clean() the fix is already at HEAD, so the
+    // agent has nothing to commit, git says so on stdout — four more transcript
+    // lines — and the run is correctly refused for authoring nothing.
+    const fixture = noOpFix();
     const blobs = hostBlobs();
     const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
     stores.push(agentDir);
     writeFileSync(
       join(agentDir, 'claude'),
-      `#!/bin/sh\nprintf '{"type":"result","subtype":"success"}\\n'\n`,
+      // It has to author SOMETHING now: an agent that hands over a commit the
+      // repository already had is refused, so a genuinely silent one would never
+      // reach the phases this test is about.
+      '#!/bin/sh\n' +
+        'git config user.email a@b.c; git config user.name agent\n' +
+        'echo right > src.txt\n' +
+        'git add src.txt && git commit -q -m "fix"\n' +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
       { mode: 0o755 },
     );
 
@@ -1129,11 +1140,10 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       blobRoot: blobs,
       image: IMAGE,
       baseRef: fixture.base,
-      fixRef: fixture.fix,
       repro: APPLIED_REPRO,
       symptomPattern: 'wrong',
       flakeRuns: 0,
-      agentPrompt: 'say nothing',
+      agentPrompt: 'fix it',
       agentImageMount: join(agentDir, 'claude'),
     });
 
@@ -1145,7 +1155,9 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(agent.events.map((e) => e.type)).toEqual(['AGENT_MESSAGE', 'AGENT_FINISHED']);
     expect(outcome.events.filter((e) => e.type === 'REPRO_REGISTERED')).toHaveLength(1);
     expect(outcome.events.filter((e) => e.type === 'FIX_DIFF_OBSERVED')).toHaveLength(1);
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    // One more than before: the orchestrator now records what the agent
+    // authored, so the log says that as well as what was verified.
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     // The transcript sits inside the attempt, before any observation of it.
     expect(outcome.events[0]!.type).toBe('ATTEMPT_STARTED');
     expect(fold(outcome.events).transcript).toHaveLength(1);
@@ -1265,6 +1277,239 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(state.shownOnBase).toBe(true);
     expect(state.reproduced).toBe(true);
     expect(state.reproducedAttempt).toBe(1);
+  }, 600_000);
+
+  test("the agent's commit reaches the phases, and nothing else does", async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // A repo where the bug is NOT fixed in any commit. The only thing that can
+    // turn it green is a commit the agent makes during this run.
+    const fixture = noOpFix();
+    const blobs = hostBlobs();
+
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      '#!/bin/sh\n' +
+        'git config user.email a@b.c; git config user.name agent\n' +
+        'echo right > src.txt\n' +
+        // Untracked debris beside the commit: the tree is discarded, so only what
+        // is committed can possibly cross.
+        'echo leaked > NOT_COMMITTED.txt\n' +
+        'git add src.txt && git commit -q -m "fix: the actual fix"\n' +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      // No fixRef: there is no fix commit until the agent makes one.
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'fix it',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'fix']);
+
+    const state = fold(outcome.events);
+    // The whole point: red on base, green on a commit that did not exist when
+    // the run started, and the reproduction identical across both.
+    expect(state.shownOnBase).toBe(true);
+    expect(state.reproduced).toBe(true);
+    // The agent commits on top of the repository's HEAD, so the base→agent diff
+    // contains that commit's file as well as the agent's. What matters is that
+    // `src.txt` is in it: nothing in the repository ever fixed it, so its
+    // presence is proof the verified commit is the one the agent made.
+    expect(state.fixDiff!.changed_files).toContain('src.txt');
+
+    // The untracked file never crossed. A bundle carries objects and refs; a
+    // working tree is not a thing it can express.
+    const outputs = await Promise.all(
+      state.testRuns.map((r) => get(blobs, r.stdout_hash).then((b) => b.toString())),
+    );
+    expect(outputs.join('')).not.toContain('leaked');
+  }, 600_000);
+
+  test('an agent that authors nothing is refused, not credited', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // The failure four separate bug-fixes walked past. `clean()` DOES contain a
+    // real fix commit, so a bundle carrying the repository's own HEAD verifies
+    // green — red base, green fix, Tier 1 — while the agent did nothing at all.
+    // Every cause was fixed and the run stayed silently wrong, because nothing
+    // compared the resolved ref to what existed before the agent ran.
+    const fixture = clean();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\necho "I did nothing"\nprintf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'do nothing',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    // Refused loudly, before any phase ran. Nothing was verified, so nothing can
+    // have been credited to an agent that wrote no code.
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent']);
+    const state = fold(outcome.events);
+    expect(state.handedOver).toBeNull();
+    expect(state.reproduced).toBe(false);
+    // NOT `error`, and not silent. A refusal that emitted only `RUN_ENDED
+    // { error }` made the one finding that most needs auditing — the agent handed
+    // over work it did not do — byte-identical to an OOM kill or a missing image.
+    // And ADR-0009: a status the agent can choose is not a status.
+    expect(state.endedReason).toBe('attempts_exhausted');
+    expect(state.aborts.map((a) => a.phase)).toEqual(['setup']);
+    expect(state.aborts[0]!.reason).toMatch(/handed/);
+    expect(outcome.complete).toBe(false);
+  }, 600_000);
+
+  test('a revert to an earlier good state is a real fix, not inherited work', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // The cost side of the authorship check, and it nearly shipped. `git revert`
+    // of the commit that caused a regression reproduces the earlier good tree
+    // EXACTLY — applied repro paths are additive (ADR-0008), so nothing perturbs
+    // it away — and a check that refuses any previously-seen tree tells a correct
+    // agent, in an immutable record, that it handed over work it did not do.
+    //
+    // What distinguishes the two is where the content came from: base's own
+    // ancestry is history the agent may return to; content living only OFF that
+    // ancestry is a fix it would be inheriting.
+    const fixture = regression();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        `git revert --no-edit HEAD >/dev/null 2>&1\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'revert the regression',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.refused).toBe(false);
+    const state = fold(outcome.events);
+    expect(state.handedOver).not.toBeNull();
+    // It reached the phases at all, which is the whole point: the old check
+    // stopped this run dead before the base container ever started.
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'fix']);
+    expect(state.reproduced).toBe(true);
+  }, 600_000);
+
+  test('an empty commit over an existing fix is refused', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // Round N+1 of the same bug. The previous check asked whether the agent had
+    // created a new SHA, which is not the question — `--allow-empty` on top of a
+    // fix the repository already carried produces a fresh sha over a byte-identical
+    // tree. The pre-existing fix becomes an ancestor, so the diff even names the
+    // right files, and the record is indistinguishable from a real success.
+    //
+    // Content is the invariant, not commit identity.
+    const fixture = clean();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `git config user.email a@b.c >/dev/null 2>&1\n` +
+        `git config user.name agent >/dev/null 2>&1\n` +
+        `git commit -q --allow-empty -m "chore: my hard work" >/dev/null 2>&1\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'claim credit for work you did not do',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['agent']);
+    const state = fold(outcome.events);
+    expect(state.handedOver).toBeNull();
+    expect(state.reproduced).toBe(false);
+    expect(state.aborts[0]!.reason).toMatch(/content already exists elsewhere/);
+  }, 600_000);
+
+  test('the log records what the agent authored, not only what was verified', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = noOpFix();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      '#!/bin/sh\n' +
+        'git config user.email a@b.c; git config user.name agent\n' +
+        'echo right > src.txt\n' +
+        'git add src.txt && git commit -q -m "fix"\n' +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'fix it',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    const state = fold(outcome.events);
+    expect(state.reproduced).toBe(true);
+    // The commit the agent authored is IN the log, and it is the commit that was
+    // verified. Without this the record said only what ran, so a run judging the
+    // repository's own commit was unauditable after the fact.
+    expect(state.handedOver).toMatch(/^[0-9a-f]{40}$/);
+    expect(state.fixDiff!.changed_files).toContain('src.txt');
+    const fixRun = state.testRuns.find((r) => r.phase === 'fix')!;
+    expect(fixRun.commit_sha).toBe(state.handedOver);
   }, 600_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {

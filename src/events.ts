@@ -143,6 +143,20 @@ export type AgentFinishedV1 = {
 };
 
 /**
+ * The commit an agent handed over, observed by the orchestrator at its own
+ * boundary (ADR-0006) — not claimed by the agent.
+ *
+ * Without this the log said what was VERIFIED and never what the agent
+ * AUTHORED, so a run that judged the repository's own commit while crediting
+ * the agent was not merely unchecked at the time: it was unauditable afterwards
+ * from the immutable record, which is the artifact this project sells.
+ */
+export type AgentHandedOverV1 = {
+  v: 1;
+  commit: string;
+};
+
+/**
  * Where the engine was standing when it stopped.
  *
  * `cleanup` is separate from `diff` because the distinction is not cosmetic: the
@@ -185,6 +199,29 @@ export type VerificationAbortedV1 = {
    * ahead of its only consumer would be guessing at the taxonomy.
    */
   reason: string;
+  /**
+   * What CLASS of thing went wrong, for the one consumer that must not guess.
+   *
+   * `reason` is prose and says so; a projection that regexed it for
+   * `/handed over/` matched three of the six strings this abort can carry and
+   * missed every one produced when the agent hands over no bundle at all —
+   * including the failure the Runner records precisely so it would be readable.
+   * The tier deliverable then reported `no reproduction was ever registered` for
+   * a run that was refused, which is the shadowing bug the refusal clause was
+   * added to close.
+   *
+   * Prose cannot be a discriminator. This can: it is set by the producer, not
+   * inferred, and `reason` stays display-only as documented.
+   *
+   * Absent means `verify()` itself — the engine with the phase machine. That
+   * distinction is load-bearing: the fold reads a `diff` or `cleanup` abort as
+   * PROOF the flake loop closed, and that inference holds only for the producer
+   * whose phase advances past `fix` when the loop ends. A second producer
+   * emitting the same phase label hands the fold a completion witness it has no
+   * standing to assert (ADR-0009), which is exactly what happened when the host
+   * started recording collection failures as `cleanup`.
+   */
+  cause?: 'handover' | 'collection';
 };
 
 /**
@@ -213,6 +250,7 @@ export type EventPayload =
   | { type: 'ATTEMPT_STARTED'; payload: AttemptStartedV1 }
   | { type: 'AGENT_MESSAGE'; payload: AgentMessageV1 }
   | { type: 'AGENT_FINISHED'; payload: AgentFinishedV1 }
+  | { type: 'AGENT_HANDED_OVER'; payload: AgentHandedOverV1 }
   | { type: 'TEST_RUN'; payload: TestRunV1 }
   | { type: 'FIX_DIFF_OBSERVED'; payload: FixDiffObservedV1 }
   | { type: 'VERIFICATION_ABORTED'; payload: VerificationAbortedV1 }
