@@ -61,7 +61,7 @@ describe('fold', () => {
       completedAttempts: [1],
       transcript: [],
       agent: null,
-      handedOver: null,
+      handedOver: null, handovers: [],
       reproAuthoredByAgent: false,
       pr: {
         repo: 'demo-org/demo-app',
@@ -542,6 +542,39 @@ describe('an attempt that could not be observed', () => {
       ...demoRunEvents.slice(1, 7).map((e) => ({ ...e, seq: e.seq + 1 })),
     ]);
     expect(swapped.reproduced).toBe(false);
+  });
+
+  it('checks each attempt against its OWN handover, not the run\'s last one', () => {
+    // `handedOver` was a scalar, and `RegisteredRepro.attempt` exists because
+    // exactly this went wrong for the reproduction. With attempts bounded there
+    // are several handovers per run, so attempt 1's fix runs would be compared
+    // against attempt 2's commit — a commit-swap accusation against a clean
+    // attempt, which this fold has already had to learn once.
+    const fixSha = (demoRunEvents.find(
+      (e) => e.type === 'TEST_RUN' && e.payload.phase === 'fix',
+    )!.payload as { commit_sha: string }).commit_sha;
+
+    const handed = (commit: string, seq: number): RunEvent => ({
+      run_id: DEMO_RUN_ID,
+      seq,
+      ts: 'T',
+      type: 'AGENT_HANDED_OVER',
+      payload: { v: 1, commit, kind: 'fix' },
+    });
+
+    // Attempt 1 is honest and complete. Attempt 2 hands over something else and
+    // never finishes — its handover must not reach back and disqualify attempt 1.
+    const state = fold([
+      ...demoRunEvents.slice(0, 3).map((e) => ({ ...e })), // through ATTEMPT_STARTED n=1
+      handed(fixSha, 4),
+      ...demoRunEvents.slice(3, 8).map((e) => ({ ...e, seq: e.seq + 1 })),
+      { run_id: DEMO_RUN_ID, seq: 10, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      handed('f'.repeat(40), 11),
+    ]);
+
+    expect(state.handovers.map((h) => h.attempt)).toEqual([1, 2]);
+    expect(state.reproduced).toBe(true);
+    expect(state.reproducedAttempt).toBe(1);
   });
 
   it('leaves a fully observed attempt alone when a LATER attempt aborts', () => {

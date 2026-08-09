@@ -34,7 +34,7 @@ const EMPTY: RunState = {
   runId: 'r', status: 'attempting', source: null, threadRef: null, currentAttempt: 1,
   testRuns: [], registeredRepro: null, registrations: [], reproduced: false,
   reproducedAttempt: null, shownOnBase: false, fixDiff: null, completedAttempts: [], transcript: [],
-  agent: null, handedOver: null, reproAuthoredByAgent: false, pr: null, aborts: [], afterEnd: [], endedReason: null,
+  agent: null, handedOver: null, handovers: [], reproAuthoredByAgent: false, pr: null, aborts: [], afterEnd: [], endedReason: null,
   artifactHashes: [], lastSeq: 0,
 };
 
