@@ -48,6 +48,10 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * The reproduction, when the caller supplies it. Omitted when `reproPrompt` is
    * set: the agent authors it, and a spec chosen in advance would be anchoring a
    * test nobody had written yet.
+   *
+   * Exactly one of the two — see `RunPlan` below. Making both optional turned a
+   * compile error into a run that reached a container and aborted there, which is
+   * a worse way to learn the plan was incomplete.
    */
   repro?: Job['repro'];
   /**
@@ -79,7 +83,10 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * is exercised without one.
    */
   agentImageMount?: string;
-};
+} & (
+  | { repro: Job['repro']; reproPrompt?: never }
+  | { reproPrompt: string; repro?: never }
+);
 
 /** What one container reported, and how it exited. */
 export type PhaseResult = {
@@ -601,9 +608,11 @@ async function runContainer(
     // Resolved rather than planned: with an agent, this is the commit it made.
     fixRef: overrides.fixRef ?? plan.fixRef ?? plan.baseRef,
     // Resolved by the caller: with a repro agent it is the spec read out of that
-    // agent's commit, and there is nothing to run before it exists. The agent
-    // container never runs a repro at all, which is why an empty one is honest
-    // there rather than a placeholder standing in for a real spec.
+    // agent's commit, and there is nothing to run before it exists. The empty
+    // fallback reaches ONLY the agent container, which returns before `verify()`
+    // (runner.ts, `only: 'agent'`) and so never runs a reproduction — the plan
+    // type now makes `repro` or `reproPrompt` mandatory, so a phase container
+    // cannot arrive here without one.
     repro: overrides.repro ?? plan.repro ?? { command: '' },
     symptomPattern: plan.symptomPattern,
     ...(plan.flakeRuns === undefined ? {} : { flakeRuns: plan.flakeRuns }),

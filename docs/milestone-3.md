@@ -68,9 +68,40 @@ Split in two once the supervision mechanics turned out to be a whole subject:
   the fold refuses to credit runs at attempt 0. Every sandbox test prepended one
   by hand, which meant real Runner output, folded as-is, could never have been
   credited at all.
-- **3b.2b — the agent supplying the `ReproSpec`.** Still to come, and the harder
-  half: the agent's tree is discarded, so its reproduction has to arrive as a
-  commit.
+- **3b.2b — the agent supplying the `ReproSpec`.** Landed, bar bounded attempts.
+  The agent's tree is discarded, so its reproduction arrives as a commit: a
+  manifest at `.engine/repro.json` NAMES a command and paths, and the engine
+  reads those bytes out of the commit itself and applies them over both
+  checkouts. A manifest hash would be testimony wearing an evidence event's
+  shape (ADR-0006), so the format has nowhere to put one.
+
+  ADR-0008's ordering invariant is now a fact about the log rather than an
+  intention: the fix agent is deferred until after the base container emits
+  `REPRO_REGISTERED`, so registration provably precedes the fix agent's first
+  message by seq. It also means the gate stops the fix agent being spawned at all
+  on a bug that was never shown, which the earlier ordering could not do.
+
+  **The reproduction's COMMAND is now attacker-controlled, and that is a new
+  class.** Everything before it anchored what the reproduction is made of; a
+  command can read what commit it is running on. The repro agent knows base's
+  tree exactly — it is the tree in its own clone — so it can write a test that
+  hashes the tree and fails only when that hash is base's: red on base, green on
+  a fix that changes nothing, byte-identical across phases, deterministic, no
+  abort. Tier 1 for a no-op fix, measured.
+
+  The countermeasure is a negative control, not another anchor: a sham fix. An
+  unrelated file is committed on top of base and the reproduction runs again —
+  the bug is untouched, so a reproduction of the bug must still fail. It runs
+  only when the agent authored the reproduction.
+
+  **Its limit, stated rather than implied:** the sham's name carries nothing
+  recognisable, because two earlier versions were filtered out by the attack's
+  own `grep`. That defeats pattern-filtering oracles. An oracle that hashes a
+  hardcoded list of base's files instead of filtering the tree still survives it.
+  The real answer is diff-coverage instrumentation — showing that the lines the
+  fix changed are the lines the reproduction exercises — and it is not built.
+
+  Bounded attempts remain, and `handedOver` must become per-attempt with them.
 
   **The last hole in the authorship check is closed, and not by the check.** The
   agent's container used to clone the whole repository, so wherever a fix already
