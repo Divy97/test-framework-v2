@@ -482,10 +482,12 @@ describe('an attempt that could not be observed', () => {
     // container, agent and base included, written before the fix series has run
     // at all, so a failed blob copy in an early container handed the fold the one
     // witness that exists to stop a truncated fix series being credited.
-    const upTo = (n: number) => demoRunEvents.slice(0, n);
-    const truncated = [
-      ...upTo(5), // repro registered, base red, one fix run green
-    ].filter((e) => e.type !== 'FIX_DIFF_OBSERVED');
+    // Through the fix run — 5 stops one short, which made the `reproduced`
+    // assertion below vacuously true for want of a fix run rather than because
+    // of the gate, and the filter a no-op.
+    const truncated = demoRunEvents
+      .slice(0, 6)
+      .filter((e) => e.type !== 'FIX_DIFF_OBSERVED');
 
     const hostAbort = (cause: 'collection' | undefined): RunEvent => ({
       run_id: DEMO_RUN_ID,
