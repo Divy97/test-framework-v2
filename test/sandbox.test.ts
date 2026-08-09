@@ -2,8 +2,11 @@
 // untouched? Everything else in the suite runs the engine in-process; this is
 // the only test that proves the containment M3 exists to provide.
 //
-// Skipped when Docker is unavailable rather than failing: a machine without a
-// daemon should report "not verified", never a false green.
+// Without a Docker daemon these cannot run — and a suite that reports 135 green
+// while its entire containment boundary went unexercised IS the false green this
+// file exists to refuse. So the skip is opt-in: no daemon and no explicit
+// acknowledgement fails the run. Set ENGINE_SANDBOX_UNVERIFIED=1 to say out loud
+// that this boundary is not being checked.
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -29,6 +32,23 @@ const dockerAvailable = () => {
     return false;
   }
 };
+
+/** Saying "I know the containment boundary is unverified" — the only way to skip it. */
+const ACKNOWLEDGED = 'ENGINE_SANDBOX_UNVERIFIED';
+const haveDocker = dockerAvailable();
+
+describe.skipIf(haveDocker || !!process.env[ACKNOWLEDGED])('the containment boundary', () => {
+  test('was NOT verified: no Docker daemon', () => {
+    // Deliberately a failure rather than a skip. Everything else in the suite
+    // runs the engine in-process, so without this the security properties M3
+    // exists to provide — the event channel, the uid drop, the agent isolation —
+    // are asserted nowhere and nothing says so.
+    expect.fail(
+      `Docker is unavailable, so nothing here proved containment. ` +
+        `Start a daemon, or set ${ACKNOWLEDGED}=1 to accept an unverified boundary.`,
+    );
+  });
+});
 
 const IMAGE = 'test-framework-v2-sandbox:test';
 const RUN_ID = '5a1d0c37-9e42-4b16-8f0a-2c7d3e9b1450';
@@ -65,7 +85,7 @@ const runExpectingFailure = (repoDir: string, blobs: string, job: object) => {
 const parse = (stdout: string) =>
   stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as RunEvent);
 
-describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => {
+describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
   afterEach(() => {
     cleanupFixtures();
     for (const dir of stores.splice(0)) rmSync(dir, { recursive: true, force: true });

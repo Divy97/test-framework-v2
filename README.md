@@ -77,6 +77,18 @@ Confidence score = tier + deterministic evidence quality. Every point traceable 
 
 The full decision record from the founding design session: [SHARED-UNDERSTANDING.md](SHARED-UNDERSTANDING.md).
 
+## Honest limitations
+
+The verification gate is **not yet sound against a reproduction the agent wrote
+itself.** Four adversarial review rounds each defeated the previous round's
+isolation fix, because each fix enumerated a channel — `/tmp`, then surviving
+processes, then gitignored paths, then `/home/node` — and the set that matters
+("writable by the repro user") cannot be enumerated with confidence.
+[ADR-0010](docs/adr/0010-the-environment-is-part-of-the-evidence.md) lists what
+still leaks; [the M4 scope](docs/milestone-4-isolation.md) is the structural
+answer. This is latent today, because the reproduction comes from the caller
+rather than the agent — and it must be closed before that changes.
+
 ## Status
 
 Early — docs-first founding commit. v1 scope is frozen:
