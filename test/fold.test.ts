@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { RunEvent } from '../src/events.js';
+import type { RunEndedV1, RunEvent, VerificationPhase } from '../src/events.js';
 import { fold } from '../src/fold.js';
 import { DEMO_RUN_ID, demoRunEvents } from '../src/fixtures/demo-run.js';
 
@@ -38,23 +38,40 @@ describe('fold', () => {
         },
       ],
       registeredRepro: {
+        attempt: 1,
         command: 'npm test -- checkout-discount',
         files: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
         applied: ['tests/checkout-discount.test.ts'],
       },
+      registrations: [
+        {
+          attempt: 1,
+          command: 'npm test -- checkout-discount',
+          files: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
+          applied: ['tests/checkout-discount.test.ts'],
+        },
+      ],
       reproduced: true,
-      fixDiff: null, // the demo run predates FIX_DIFF_OBSERVED
+      fixDiff: {
+        changed_files: ['src/checkout/discount.ts'],
+        diff_hash: 'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
+      },
+      completedAttempts: [1],
       pr: {
         repo: 'demo-org/demo-app',
         pr_number: 42,
         head_sha: 'f3a9d1c7e5b2048a6c1d9e7f3b5a2c8d0e4f6a1b',
       },
+      aborts: [],
+      afterEnd: [],
+      endedReason: null, // the demo run predates RUN_ENDED
       artifactHashes: [
         'sha256:5b7a1de2c3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0',
         'sha256:9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b',
         'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
+        'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
       ],
-      lastSeq: 7,
+      lastSeq: 8,
     });
   });
 
@@ -65,7 +82,9 @@ describe('fold', () => {
       { status: 'attempting', currentAttempt: 1, reproduced: false },
       { status: 'attempting', reproduced: false }, // repro registered — still nothing proven
       { status: 'attempting', reproduced: false }, // base failed — nothing proven yet
-      { status: 'attempting', reproduced: true }, // fix passed — red→green
+      // The fix passed, but nothing yet vouches the flake series ran to the end.
+      { status: 'attempting', reproduced: false },
+      { status: 'attempting', reproduced: true }, // diff observed — the series is complete
       { status: 'pr_opened', reproduced: true },
     ];
     expected.forEach((partial, i) => {
@@ -116,6 +135,55 @@ describe('fold', () => {
           duration_ms: 1,
           repro_hashes: {},
         },
+      },
+      // The completion witness, so this reaches the guard under test instead of
+      // being rejected earlier for a truncated series and passing for the wrong
+      // reason.
+      {
+        run_id: 'r',
+        seq: 5,
+        ts: 'T',
+        type: 'FIX_DIFF_OBSERVED',
+        payload: { v: 1, base_sha: 'a', fix_sha: 'b', changed_files: [], diff_hash: 'sha256:cc' },
+      },
+    ];
+    expect(fold(events).reproduced).toBe(false);
+  });
+
+  it('refuses an attempt whose series is vouched for but ran no fix at all', () => {
+    // Witness present, zero fix runs. `.every()` over nothing is vacuously true,
+    // so without the length guard this reads as "the fix passed every time".
+    const events: RunEvent[] = [
+      { run_id: 'r', seq: 1, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 2,
+        ts: 'T',
+        type: 'REPRO_REGISTERED',
+        payload: { v: 1, command: 'x', files: { f: 'sha256:aa' }, applied: ['f'] },
+      },
+      {
+        run_id: 'r',
+        seq: 3,
+        ts: 'T',
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'base',
+          commit_sha: 'a',
+          exit_code: 1,
+          stdout_hash: 'sha256:aa',
+          duration_ms: 1,
+          symptom_matched: true,
+          repro_hashes: { f: 'sha256:aa' },
+        },
+      },
+      {
+        run_id: 'r',
+        seq: 4,
+        ts: 'T',
+        type: 'FIX_DIFF_OBSERVED',
+        payload: { v: 1, base_sha: 'a', fix_sha: 'b', changed_files: [], diff_hash: 'sha256:cc' },
       },
     ];
     expect(fold(events).reproduced).toBe(false);
@@ -169,7 +237,210 @@ describe('fold', () => {
       demoRunEvents[3]!, // attempt 1: base fails
       { ...demoRunEvents[4]!, seq: 5, type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
       { ...demoRunEvents[4]!, seq: 6 }, // attempt 2: fix passes, but its base never ran
+      { ...demoRunEvents[6]!, seq: 7 }, // and its series is vouched for
     ];
     expect(fold(events).reproduced).toBe(false);
+  });
+});
+
+/**
+ * A run's ending is a control-flow act, not a verdict. These fix the line: the
+ * fold records WHY the process stopped and derives WHAT that means from the
+ * facts, so a producer cannot talk the log into a conclusion it did not earn.
+ */
+describe('a run that ends', () => {
+  const end = (reason: RunEndedV1['reason'], seq: number): RunEvent => ({
+    run_id: DEMO_RUN_ID,
+    seq,
+    ts: 'T',
+    type: 'RUN_ENDED',
+    payload: { v: 1, reason },
+  });
+  /** The shortest honest run: it was requested, and then it stopped. */
+  const ended = (reason: RunEndedV1['reason']): RunEvent[] => [demoRunEvents[0]!, end(reason, 2)];
+
+  it('is unresolved when nothing reproduced — a deliverable, not a failure', () => {
+    const state = fold(ended('not_reproduced'));
+    expect(state.status).toBe('unresolved');
+    expect(state.endedReason).toBe('not_reproduced');
+  });
+
+  it('is unresolved, not errored, when the attempts ran out', () => {
+    expect(fold(ended('attempts_exhausted')).status).toBe('unresolved');
+  });
+
+  it('separates an infrastructure failure from a finding about the bug', () => {
+    // Reporting "we could not reproduce it" when the truth is "the sandbox fell
+    // over" is a lie about the bug, told by a status field.
+    expect(fold(ended('error')).status).toBe('errored');
+  });
+
+  it('will not show a PR on a stream that only claims one', () => {
+    // The reason says pr_opened; no PR_OPENED event exists. The fold reports what
+    // the log can support, and keeps the claim visible beside it.
+    const state = fold(ended('pr_opened'));
+    expect(state.status).toBe('unresolved');
+    expect(state.pr).toBeNull();
+    expect(state.endedReason).toBe('pr_opened');
+  });
+
+  it('will not hide a PR the log actually contains', () => {
+    // The mirror image: a real PR_OPENED, and a reason claiming nothing was
+    // reproduced. Facts win in both directions.
+    const state = fold([...demoRunEvents, end('not_reproduced', demoRunEvents.length + 1)]);
+    expect(state.status).toBe('pr_opened');
+    expect(state.endedReason).toBe('not_reproduced');
+  });
+
+  it('records events that arrive after the end without applying them', () => {
+    // The store enforces unique (run_id, seq); nothing enforces terminality at
+    // write. Throwing would let one racing append make the run permanently
+    // unrenderable, and events are immutable — there is no repair path. So the
+    // fold renders the truth plus "this log is malformed".
+    const past = fold([...ended('not_reproduced'), { ...demoRunEvents[1]!, seq: 3 }]);
+    expect(past.afterEnd).toEqual(['SANDBOX_CREATED']);
+    expect(past.status).toBe('unresolved'); // NOT advanced by the late event
+    expect(past.lastSeq).toBe(3);
+  });
+
+  it('does not let a late PR_OPENED rewrite the outcome', () => {
+    const late = fold([
+      ...ended('not_reproduced'),
+      { ...demoRunEvents[7]!, seq: 3 },
+    ]);
+    expect(late.status).toBe('unresolved');
+    expect(late.pr).toBeNull();
+    expect(late.afterEnd).toEqual(['PR_OPENED']);
+  });
+
+  it('reports pr_opened when a run that opened a PR then errored', () => {
+    // Deliberate precedence, and the one case the ternary decides by ordering:
+    // the PR is the deliverable and it exists. The fault stays visible in aborts.
+    const state = fold([...demoRunEvents, end('error', demoRunEvents.length + 1)]);
+    expect(state.status).toBe('pr_opened');
+    expect(state.endedReason).toBe('error');
+  });
+});
+
+describe('an attempt that could not be observed', () => {
+  const REASON = 'ObservationFailed: repro command exceeded 100ms';
+  const aborted = (phase: VerificationPhase, seq: number): RunEvent => ({
+    run_id: DEMO_RUN_ID,
+    seq,
+    ts: 'T',
+    type: 'VERIFICATION_ABORTED',
+    payload: { v: 1, phase, reason: REASON },
+  });
+
+  it('is recorded without ending the run — the next attempt may still succeed', () => {
+    const state = fold([
+      demoRunEvents[0]!,
+      demoRunEvents[1]!,
+      demoRunEvents[2]!, // ATTEMPT_STARTED n=1
+      aborted('fix', 4),
+    ]);
+    expect(state.status).toBe('attempting');
+    expect(state.aborts).toEqual([{ attempt: 1, phase: 'fix', reason: REASON }]);
+  });
+
+  it('never credits a reproduction on its own', () => {
+    expect(fold([demoRunEvents[0]!, aborted('base', 2)]).reproduced).toBe(false);
+  });
+
+  it('revokes a reproduction the truncated runs had already earned', () => {
+    // The abort arrives AFTER the runs it truncates, so a fold that only
+    // recomputed on TEST_RUN would leave the verdict standing.
+    const complete = fold(demoRunEvents.slice(0, 7));
+    expect(complete.reproduced).toBe(true);
+
+    const truncated = fold([...demoRunEvents.slice(0, 7), aborted('fix', 8)]);
+    expect(truncated.reproduced).toBe(false);
+  });
+
+  it('leaves a fully observed attempt alone when a LATER attempt aborts', () => {
+    const state = fold([
+      ...demoRunEvents.slice(0, 7), // attempt 1, fully observed, red -> green -> diff
+      { run_id: DEMO_RUN_ID, seq: 8, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      aborted('fix', 9), // attempt 2 dies
+    ]);
+    // Disqualification is scoped to its own attempt, or one bad attempt would
+    // erase a good one — `reproduced` scans the whole history.
+    expect(state.aborts).toEqual([{ attempt: 2, phase: 'fix', reason: REASON }]);
+    expect(state.reproduced).toBe(true);
+  });
+
+  it('will not credit a series that simply stops, with no abort to give it away', () => {
+    // The dangerous shape, and the reason the fold needs the log's own completion
+    // witness rather than the abort record. The Runner emits its events in one
+    // loop at the end and a host may append them as they arrive, so a container
+    // killed mid-stream writes exactly this: a red base, one green fix run, and
+    // nothing else. No abort. Counting passes cannot tell it from a full series.
+    const cutShort = fold(demoRunEvents.slice(0, 6));
+    expect(cutShort.testRuns.filter((r) => r.phase === 'fix')).toHaveLength(1);
+    expect(cutShort.aborts).toEqual([]);
+    expect(cutShort.completedAttempts).toEqual([]);
+    expect(cutShort.reproduced).toBe(false);
+  });
+
+  it('disqualifies on a base abort even when the runs themselves look clean', () => {
+    // Pins `base` in the truncation filter: without real runs beside it, a lone
+    // base abort is already false for want of anything to credit.
+    const events = [
+      ...demoRunEvents.slice(0, 7),
+      aborted('base', 8),
+    ];
+    expect(fold(events).reproduced).toBe(false);
+  });
+
+  it('does not disqualify on a setup abort — no observation had begun', () => {
+    // Pins the other side of the same line. A setup abort means the attempt never
+    // started looking, so it cannot have truncated anything.
+    expect(fold([...demoRunEvents.slice(0, 7), aborted('setup', 8)]).reproduced).toBe(true);
+  });
+
+  it('judges each attempt against the reproduction IT registered', () => {
+    // A second registration must not retroactively judge the first attempt's
+    // runs — that both credits runs which never executed the repro they are
+    // measured by, and erases an honestly earned verdict when a later attempt
+    // merely re-registers.
+    const other: RunEvent = {
+      run_id: DEMO_RUN_ID,
+      seq: 9,
+      ts: 'T',
+      type: 'REPRO_REGISTERED',
+      payload: { v: 1, command: 'different', files: { 'other.test.ts': 'sha256:ff' }, applied: [] },
+    };
+    const state = fold([
+      ...demoRunEvents.slice(0, 7), // attempt 1: complete, and genuinely reproduced
+      { run_id: DEMO_RUN_ID, seq: 8, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      other,
+    ]);
+    expect(state.registrations).toHaveLength(2);
+    expect(state.reproduced).toBe(true);
+  });
+
+  it('attaches the completion witness to the attempt that earned it', () => {
+    // Attempt 1 runs red -> green but never reaches its diff; attempt 2 emits one.
+    // Nothing may carry attempt 2's proof back to attempt 1.
+    const state = fold([
+      ...demoRunEvents.slice(0, 6), // attempt 1, cut short before the witness
+      { run_id: DEMO_RUN_ID, seq: 7, ts: 'T', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 2 } },
+      { ...demoRunEvents[6]!, seq: 8 }, // FIX_DIFF_OBSERVED, now inside attempt 2
+    ]);
+    expect(state.completedAttempts).toEqual([2]);
+    expect(state.reproduced).toBe(false);
+  });
+
+  it('treats a diff or cleanup abort as the completion witness itself', () => {
+    // Deliberately WITHOUT FIX_DIFF_OBSERVED, because that is the stream the
+    // engine really emits here: the phase advances to `diff` before the diff is
+    // computed, so a diff-phase abort never carries the event. Reaching either
+    // phase already proves the flake loop closed, which is the same evidence.
+    // Folding a witness-bearing stream would assert nothing about that.
+    for (const phase of ['diff', 'cleanup'] as const) {
+      const state = fold([...demoRunEvents.slice(0, 6), aborted(phase, 7)]);
+      expect(state.completedAttempts).toEqual([1]);
+      expect(state.reproduced).toBe(true);
+    }
   });
 });

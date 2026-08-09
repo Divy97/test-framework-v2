@@ -1,5 +1,6 @@
 // Hand-authored synthetic event stream for one fake run:
-// intake -> sandbox -> attempt -> TEST_RUN base fail -> TEST_RUN fix pass -> PR_OPENED.
+// intake -> sandbox -> attempt -> TEST_RUN base fail -> TEST_RUN fix pass ->
+// FIX_DIFF_OBSERVED -> PR_OPENED.
 // Permanent test fixture for the fold and every future projection.
 // Typed against src/events.ts so the fixture is compile-time checked.
 
@@ -90,6 +91,22 @@ export const demoRunEvents: RunEvent[] = [
   {
     run_id: DEMO_RUN_ID,
     seq: 7,
+    ts: t(228),
+    // Emitted only once the fix series has run to completion, which makes it the
+    // log's own witness that nothing was cut short. Without it the stream cannot
+    // be told apart from one that died after a single green fix run.
+    type: 'FIX_DIFF_OBSERVED',
+    payload: {
+      v: 1,
+      base_sha: '8d41c6b2a09f7e5d3c1b0a98765432104f6e2d1c',
+      fix_sha: 'f3a9d1c7e5b2048a6c1d9e7f3b5a2c8d0e4f6a1b',
+      changed_files: ['src/checkout/discount.ts'],
+      diff_hash: 'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
+    },
+  },
+  {
+    run_id: DEMO_RUN_ID,
+    seq: 8,
     ts: t(241),
     type: 'PR_OPENED',
     payload: {

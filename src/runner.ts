@@ -12,6 +12,7 @@ import { closeSync, openSync, writeSync } from 'node:fs';
 import { chmod, mkdir, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import type { RunEvent } from './events.js';
 import { ObservationFailed, verify, type ReproSpec } from './verify.js';
 
 const execFileAsync = promisify(execFile);
@@ -41,6 +42,25 @@ const BLOBS = '/blobs';
 /** Matches the `repro` user created in the Dockerfile. */
 const REPRO_UID = 1000;
 const REPRO_GID = 1000;
+
+/**
+ * What the exit status tells a caller, and specifically whether there is
+ * anything on the channel worth reading.
+ *
+ * `partial` and `silent` were one code until a stream could survive an abort.
+ * They demand opposite things — fold the channel, or ignore it and read stderr —
+ * so collapsing them would leave a caller unable to tell evidence from nothing.
+ */
+const EXIT = {
+  /** Every phase observed; the stream is complete. */
+  complete: 0,
+  /** An engine or Runner bug. Nothing on the channel. */
+  bug: 1,
+  /** Observation stopped, and a partial stream IS on the channel. Fold it. */
+  partial: 2,
+  /** Observation stopped with nothing on the channel — including a failed flush. */
+  silent: 3,
+} as const;
 
 /**
  * Proof the store outlives the container — which `st_dev` alone cannot give.
@@ -110,35 +130,74 @@ export async function runJob(
   // the run write back out through it.
   // `--` so a sourcePath cannot be read as an option: `--upload-pack=…` and
   // `ext::sh -c …` are both command execution.
-  await execFileAsync('git', [
-    'clone', '--quiet', '--no-local', `--separate-git-dir=${gitDir}`, '--', job.sourcePath, repoPath,
-  ]);
+  // Standing the sandbox up is not the Runner working correctly or incorrectly —
+  // it is the difference between being able to look and not. An unreachable
+  // sourcePath or a chown that fails is exactly as much a failure to observe as a
+  // repro that times out, and reporting it as a Runner bug sends whoever reads
+  // the exit code to the wrong place entirely.
+  const setUp = async (what: string, run: Promise<unknown>) => {
+    try {
+      await run;
+    } catch (error) {
+      throw new ObservationFailed(`could not ${what}`, { cause: error });
+    }
+  };
+
+  await setUp(
+    `clone ${job.sourcePath}`,
+    execFileAsync('git', [
+      'clone', '--quiet', '--no-local', `--separate-git-dir=${gitDir}`, '--', job.sourcePath, repoPath,
+    ]),
+  );
 
   // The repro runs as this user, not as the Runner. Root in the Runner's own
   // namespace can reach the event channel through /proc/1/fd/N whatever the
   // Runner does with its own descriptors.
   const runAs = { uid: REPRO_UID, gid: REPRO_GID };
   // The worktree only. Not the blob store, and not the git dir.
-  await execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, repoPath]);
+  await setUp(
+    'hand the worktree to the repro user',
+    execFileAsync('chown', ['-R', `${REPRO_UID}:${REPRO_GID}`, repoPath]),
+  );
   // The Runner stays root, so git now sees a tree owned by someone else and
   // refuses it as "dubious ownership". Scoped to this path, inside a container
   // built for exactly one run.
-  await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]);
+  await setUp(
+    'mark the worktree safe for git',
+    execFileAsync('git', ['config', '--global', '--add', 'safe.directory', repoPath]),
+  );
 
-  const events = await verify({
-    runId: job.runId,
-    afterSeq: job.afterSeq,
-    repoPath,
-    baseRef: job.baseRef,
-    fixRef: job.fixRef,
-    repro: job.repro,
-    symptomPattern: new RegExp(job.symptomPattern),
-    blobRoot: staging,
-    gitEnv,
-    runAs,
-    ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
-    ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
-  });
+  let events: RunEvent[];
+  // A run that could not be observed to the end is still a run that observed
+  // things. Losing the base phase because the fix phase died would leave no
+  // record at all of the one part that worked — so the partial stream goes out,
+  // closed by the VERIFICATION_ABORTED that says where it stopped.
+  let exitCode: number = EXIT.complete;
+  try {
+    events = await verify({
+      runId: job.runId,
+      afterSeq: job.afterSeq,
+      repoPath,
+      baseRef: job.baseRef,
+      fixRef: job.fixRef,
+      repro: job.repro,
+      symptomPattern: new RegExp(job.symptomPattern),
+      blobRoot: staging,
+      gitEnv,
+      runAs,
+      ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
+      ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
+    });
+  } catch (error) {
+    // `verify()` always attaches at least its own VERIFICATION_ABORTED, so today
+    // the length check cannot fire. It is kept because the whole partial/silent
+    // split rests on setup failures being thrown ABOVE this try: move one inside
+    // and the run would emit an empty stream with exit 2, telling a caller to
+    // fold nothing — and `fold()` throws on an empty stream.
+    if (!(error instanceof ObservationFailed) || error.observed.length === 0) throw error;
+    events = error.observed;
+    exitCode = EXIT.partial;
+  }
 
   // The repro has run for the last time, so the evidence can cross into the
   // shared mount now. Ownership follows the host directory, or a non-root host
@@ -165,7 +224,7 @@ export async function runJob(
   // One event per line: the channel is append-only in shape as well as intent,
   // and a consumer can fold it as it arrives without waiting for the run to end.
   for (const event of events) emit(`${JSON.stringify(event)}\n`);
-  return 0;
+  return exitCode;
 }
 
 // Only run when executed directly, so the tests can import runJob.
@@ -193,6 +252,9 @@ if (process.argv[1]?.endsWith('runner.ts') || process.argv[1]?.endsWith('runner.
     // it can never be mistaken for an event on the channel.
     const failed = error instanceof ObservationFailed;
     process.stderr.write(`${failed ? 'ObservationFailed' : 'RunnerError'}: ${String(error)}\n`);
-    process.exitCode = failed ? 2 : 1;
+    // Nothing reached the channel on this path — a flush that failed takes the
+    // whole stream with it, deliberately, since refs nothing can resolve are
+    // worse than no refs. `silent`, not `partial`: there is nothing to fold.
+    process.exitCode = failed ? EXIT.silent : EXIT.bug;
   }
 }

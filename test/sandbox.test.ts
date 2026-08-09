@@ -13,7 +13,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { fold } from '../src/fold.js';
-import { APPLIED_REPRO, cleanupFixtures, clean } from './fixtures/repo.js';
+import { APPLIED_REPRO, cleanupFixtures, clean, HANGS_ON_FIX } from './fixtures/repo.js';
 
 const dockerAvailable = () => {
   try {
@@ -44,6 +44,17 @@ const runInSandbox = (repoDir: string, blobs: string, job: object) =>
     ['run', '--rm', '-i', '-v', `${repoDir}:/src:ro`, '-v', `${blobs}:/blobs`, IMAGE],
     { input: JSON.stringify(job), encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
   );
+
+/** The same run, expecting a non-zero exit: execFileSync throws, and the stream is on the error. */
+const runExpectingFailure = (repoDir: string, blobs: string, job: object) => {
+  try {
+    runInSandbox(repoDir, blobs, job);
+  } catch (error) {
+    const failure = error as { status?: number; stdout?: string };
+    return { status: failure.status, stdout: failure.stdout ?? '' };
+  }
+  throw new Error('the run was expected to fail and did not');
+};
 
 const parse = (stdout: string) =>
   stdout.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as RunEvent);
@@ -213,7 +224,7 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
 
     // No -v for /blobs. mkdir would happily create it in the container layer and
     // the run would look perfect while every artifact died with --rm.
-    expect(() =>
+    const attempt = () =>
       execFileSync('docker', ['run', '--rm', '-i', '-v', `${fixture.repo}:/src:ro`, IMAGE], {
         input: JSON.stringify({
           runId: RUN_ID,
@@ -226,8 +237,21 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
           flakeRuns: 0,
         }),
         encoding: 'utf8',
-      }),
-    ).toThrow(/not a host store/);
+      });
+
+    expect(attempt).toThrow(/not a host store/);
+    // Exit 3, not 2: nothing reached the channel, so there is nothing to fold.
+    // Sharing a code with the partial-stream case would leave a caller unable to
+    // tell evidence from silence.
+    let status: number | undefined;
+    let stdout = '';
+    try {
+      attempt();
+    } catch (error) {
+      ({ status, stdout } = error as { status?: number; stdout: string });
+    }
+    expect(status).toBe(3);
+    expect(stdout).toBe('');
   }, 300_000);
 
   test('an anonymous volume is refused: it dies with --rm like the container layer', () => {
@@ -299,6 +323,45 @@ describe.skipIf(!dockerAvailable())('the engine runs inside the sandbox', () => 
     await expect(get(blobs, 'sha256:OWNED' as ArtifactRef)).rejects.toThrow(
       /not a content-addressed reference/,
     );
+  }, 300_000);
+
+  test('a run that could not be finished still ships the evidence it did gather', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // Fails fast on base for the reported reason, then hangs on the fix until the
+    // timeout kills it. Before this, the base-phase observation died with the
+    // exception and the run left no record at all — the container exited non-zero
+    // with an empty channel, which is indistinguishable from never having run.
+    const outcome = runExpectingFailure(fixture.repo, blobs, {
+      runId: RUN_ID,
+      afterSeq: 0,
+      sourcePath: '/src',
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro: HANGS_ON_FIX,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      timeoutMs: 5_000,
+    });
+
+    expect(outcome.status).toBe(2);
+    const events = parse(outcome.stdout);
+    expect(events.map((e) => e.type)).toEqual([
+      'REPRO_REGISTERED',
+      'TEST_RUN',
+      'VERIFICATION_ABORTED',
+    ]);
+
+    // The point of emitting at all: the artifacts crossed into the host store on
+    // the abort path too. A stream whose refs die with the container is worse than
+    // no stream, because it reads as a complete record.
+    const refs = [...new Set(JSON.stringify(events).match(/sha256:[0-9a-f]{64}/g) ?? [])];
+    expect(refs.length).toBeGreaterThan(1);
+    for (const ref of refs) {
+      await expect(get(blobs, ref as ArtifactRef)).resolves.toBeInstanceOf(Buffer);
+    }
   }, 300_000);
 
   test('a hook the repro plants is never executed by the Runner', async () => {

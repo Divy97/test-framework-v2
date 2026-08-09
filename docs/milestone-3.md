@@ -90,8 +90,12 @@ develop against.
 ## Not in this milestone
 
 Adapters (Slack, GitHub, CLI) · SSE · the dashboard · cloud runners · the
-Next.js demo app · `RUN_ENDED`/tier/confidence, which stay as M2's 3b and 3c and
-land whenever they are convenient.
+Next.js demo app · tier/confidence, which stay as M2's 3c.
+
+M2's 3b landed after M3.1 rather than before it: the abort path only became
+worth building once a run could die inside a container, where an empty channel
+is all a caller sees. `RUN_ENDED` itself is vocabulary until the attempt loop in
+3b below emits it.
 
 ## What "done" looks like
 

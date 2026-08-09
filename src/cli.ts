@@ -26,7 +26,7 @@ try {
     for (const event of events) {
       state = state ? apply(state, event) : fold([event]);
       console.log(
-        `  #${String(event.seq).padStart(2)}  ${event.ts}  ${event.type.padEnd(16)} → status=${state.status} attempt=${state.currentAttempt} reproduced=${state.reproduced}`,
+        `  #${String(event.seq).padStart(2)}  ${event.ts}  ${event.type.padEnd(20)} → status=${state.status} attempt=${state.currentAttempt} reproduced=${state.reproduced}`,
       );
     }
     console.log('\nfinal RunState:');
