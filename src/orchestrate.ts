@@ -704,7 +704,20 @@ async function runContainer(
     // a reproduction needing a package the base commit lacks is unrunnable today.
     // When a `setupCommand` arrives it will need its own network decision rather
     // than inheriting this one.
-    ...(phase === 'agent' ? [] : ['--network', 'none']),
+    // NO NETWORK, for every container including the agent's.
+    //
+    // The phases need none. The agent needs the model API — and the transport for
+    // that is NOT built: `--add-host <name>:host-gateway` requires a network, and
+    // `--network none` removes every interface, so the two cannot coexist. An
+    // earlier version of this line tried to and silently dropped the seal, which
+    // would have handed an untrusted agent the open bridge; `HTTPS_PROXY` is an
+    // environment variable and an agent that ignores it is just on the internet.
+    //
+    // Sealed until the transport exists. An agent that cannot reach the model API
+    // cannot do its job, and a caller who needs one will notice immediately —
+    // which is the failure this project wants, rather than a boundary that reads
+    // as enforced and is not.
+    ...['--network', 'none'],
     '-v', `${source}:/src:ro`,
     '-v', `${store}:/blobs`,
     ...(handover ? ['-v', `${handover}:/out`] : []),

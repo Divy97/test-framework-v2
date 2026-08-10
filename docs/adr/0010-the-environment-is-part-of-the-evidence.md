@@ -120,8 +120,13 @@ first version of this ADR claimed "only a commit crosses between them" and that
 was false within a day.
 
 - **A shared kernel and clock.** What a container is.
-- **The AGENT's network.** Unrestricted: it needs the model API and nothing yet
-  distinguishes that from the rest of the internet (M3.3's 3c.2). The PHASE
+- **The AGENT's network.** Sealed — `--network none`, like the phases — because
+  the transport for "sealed plus one allowlisted route" is not built and the
+  version that claimed to be dropped the seal. What leaks once it IS built is
+  what the channel carries: a CONNECT proxy authorises a tunnel and never reads
+  it, so an agent can exfiltrate through the one host it may reach. Closing that
+  means terminating TLS inside the component built to keep the agent away from
+  credentials, which is a worse trade. The PHASE
   containers no longer share a network with anything — `--network none`, since a
   reproduction that can reach the network is an identity oracle over a wire, and
   the code under judgement should not be able to exfiltrate the repository it was

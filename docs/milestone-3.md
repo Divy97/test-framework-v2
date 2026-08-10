@@ -154,9 +154,28 @@ develop against.
 - **3c.1 — the phases have no network.** Landed. `--network none` on every
   container that is not the agent's, asserted by a test that fails when the flag
   is removed (the phase container resolves `api.anthropic.com` without it).
-- **3c.2 — the agent's one channel.** Still to come. A flag cannot express "the
-  model API and nothing else"; it needs a proxy the container is forced through,
-  holding the credential the agent never sees.
+- **3c.2 — the agent's one channel.** NOT built, and the transport it needs is
+  not what this milestone assumed. `--network none` and
+  `--add-host <name>:host-gateway` are mutually exclusive — the first removes
+  every interface, the second needs one — so "sealed plus one route" cannot be
+  expressed that way. An attempt to do it silently dropped the seal, which would
+  have handed an untrusted agent the open bridge; `HTTPS_PROXY` is an environment
+  variable, and an agent that ignores it is simply on the internet.
+
+  What it actually needs is an `--internal` docker network with the proxy
+  reachable on it, or a bind-mounted unix socket. Both are real work.
+
+  Until then EVERY container is sealed, the agent's included. An agent that
+  cannot reach the model API cannot do its job, and a caller will notice at once
+  — the failure this project wants, rather than a boundary that reads as enforced
+  and is not.
+
+  The proxy itself exists and is tested (`src/egress.ts`): CONNECT only, exact
+  host matching, malformed targets refused. It is groundwork, wired to nothing.
+  Known gaps before it can be: it binds every interface rather than loopback and
+  has no authentication, `close()` hangs on a live tunnel, the allowlist is
+  host-only so every port on an allowed host is open, and its record of attempts
+  reaches no event and no projection.
 
 ## Decisions this milestone must make
 
