@@ -31,7 +31,7 @@ itself, so a green suite cannot read as a verified boundary.
 | 5a · the loop moves out | **landed** — PR #22 | 307 passed, 2 skipped |
 | 5b · the environment recipe | **landed** | see below |
 | 5c · the two prompts | **landed**, except the live run | no `ANTHROPIC_API_KEY` |
-| 5d · one container per phase | not started | mostly already built; the assertions are what is missing |
+| 5d · one container per phase | **landed** | the code was already there; the assertions were not |
 | 5e · GitHub in and out | written, not committed | unit half done; live install skipped |
 | 5f · the browser | not started | |
 | 5g · status out | written, not committed | `src/sse.ts` + tests pass |
@@ -196,6 +196,39 @@ scripted model that writes `.engine/repro.json`, commits it, and the engine acce
 it **without a retry** and registers `sh repro.sh`. That is 5c's done-when minus the
 model, and the prompt-versus-code assertions cover the part a live run would have
 exercised least reliably.
+
+## 5d · one container per phase
+
+**Nothing was built. Four tests were.** `Job.only`, `orchestrate()`'s
+container-per-phase sequencing and `verify()`'s split along the base→fix seam all
+landed with the M4 isolation work, and the suite has asserted for two milestones that
+the cross-phase-state fixtures are not credited.
+
+What it never asserted is **why**, and the milestone's done-when is specifically about
+the reason: those fixtures must now fail "for a *different* reason than before: the
+file is not there because the container is not the same one." A verdict cannot
+distinguish "the flag was wiped by the phase-boundary scrub" from "the flag's world
+does not exist", so the reproduction was made to report what it observed and where.
+
+| Test | What it pins |
+|---|---|
+| *a flag left in `$TMPDIR` / `/tmp` is absent in the fix phase because the machine is not the same one* (two tests, because ADR-0010 enumerated the two locations separately) | The base phase writes the flag and goes red — so the attack still lands. The fix phase reports `FLAG-ABSENT`. And `hostname` **differs** between the phases: docker's own per-container random name, which the engine never hands to a phase and a reproduction cannot forge. The flag is not missing because something removed it. |
+| | The same test asserts the flake re-runs **do** share a machine — the second re-run finds the first's flag — because isolating them would hide the order-dependent flake they exist to catch. |
+| *the phases share no tree, no `TMPDIR`, no `HOME` and no process namespace* | ADR-0014's table, one observation per row: different hostname, different PID-1 start time (so a surviving process *cannot* exist rather than *was swept*), different tree inode. Plus a clean red-then-green is still credited, so the isolation did not break the ordinary case. |
+| *the reap is still there, and still gated on PID 1* | ADR-0014 demotes the reap and explicitly keeps it, because "its absence would be a silent regression if a future change ever collapses two phases back into one container". A demoted defence with no test is one somebody deletes while tidying. |
+
+The existing in-process test that an *unscrubbed* run credits a README-only "fix" is
+untouched. It is what stops the scrub quietly ceasing to be the reason the
+single-container path is safe.
+
+## A note on branch shape
+
+The rules ask for one branch per phase off `main`. These are a **stack** instead —
+5b/5c branches off 5a, 5d off 5b/5c — because each phase's code genuinely depends on
+the last: 5b's recipe replay runs inside the `serveTools` container 5a introduced, and
+5d's assertions are about containers 5b gave a network to. Branching each off `main`
+would either duplicate the earlier commits into every PR or produce conflicts that
+make the diffs unreadable. Each PR names the one below it.
 
 ## Blockers and how each was routed around
 

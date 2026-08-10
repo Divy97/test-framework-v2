@@ -30,6 +30,7 @@ import {
   survivorGamed,
   demoRepo,
   demoRecipe,
+  ORDER_DEPENDENT_REPORTING,
 } from './fixtures/repo.js';
 import { call, fakeModel } from './fixtures/model.js';
 
@@ -2423,6 +2424,156 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       await model.close();
     }
   }, 900_000);
+
+  // ── 5d: the phases are different machines ───────────────────────────────────
+  //
+  // `runJob` splitting and `verify()` splitting along the base→fix seam already
+  // landed with the container-per-phase work, and the suite has asserted for two
+  // milestones that the cross-phase-state fixtures are not credited. What it never
+  // asserted is WHY — and the milestone's done-when is specifically about the
+  // reason: these fixtures must now fail "for a *different* reason than before: the
+  // file is not there because the container is not the same one."
+  //
+  // A verdict cannot distinguish "the flag was wiped by the scrub" from "the flag's
+  // world does not exist". So these two tests make the reproduction report what it
+  // observed and which machine it observed it on.
+
+  for (const [where, flag] of [
+    ['$TMPDIR', '${TMPDIR:-/tmp}/.seen'],
+    ['/tmp', '/tmp/.seen'],
+  ] as const) {
+    test(`a flag left in ${where} is absent in the fix phase because the machine is not the same one`, async () => {
+      execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+      const fixture = noOpFix();
+      const blobs = hostBlobs();
+
+      const outcome = await orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: blobs,
+        image: IMAGE,
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        // Two, so the flake re-runs share a container with each other — which they
+        // must, deliberately, since isolating them would hide the order-dependent
+        // flake they exist to catch (ADR-0010, and unchanged by ADR-0014).
+        flakeRuns: 2,
+        symptomPattern: 'wrong',
+        repro: ORDER_DEPENDENT_REPORTING(flag),
+      });
+
+      const runs = outcome.events.filter((e) => e.type === 'TEST_RUN');
+      const outputs = await Promise.all(
+        runs.map((e) => get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash).then((b) => b.toString())),
+      );
+      const phases = runs.map((e) => (e.payload as { phase: string }).phase);
+      const base = outputs[phases.indexOf('base')]!;
+      const firstFix = outputs[phases.indexOf('fix')]!;
+
+      // The attack lands as designed on the base side: nothing was there, so it
+      // wrote the flag and went red. If this stopped being true the fixture would
+      // have stopped being an attack and everything below would be vacuous.
+      expect(base).toMatch(/FLAG-ABSENT/);
+      expect(base).not.toMatch(/FLAG-PRESENT/);
+
+      // And the fix phase — the one the flag was planted for — never sees it.
+      expect(firstFix).toMatch(/FLAG-ABSENT/);
+      expect(firstFix).not.toMatch(/FLAG-PRESENT/);
+
+      // THE REASON, stated by the log rather than inferred from the verdict: the two
+      // phases ran on different machines. `hostname` is docker's own per-container
+      // random name — the engine never hands it to a phase, and a reproduction
+      // cannot forge it. So the flag is not missing because something removed it;
+      // it is missing because the world it was written in no longer exists.
+      const host = (output: string) => /HOST:(\S+)/.exec(output)?.[1];
+      expect(host(base)).toBeTruthy();
+      expect(host(firstFix)).toBeTruthy();
+      expect(host(firstFix)).not.toBe(host(base));
+
+      // The flake re-runs, by contrast, DO share a machine with each other — and so
+      // the second re-run finds the flag the first left. That is deliberate and it
+      // is what makes one red run in the series enough for the fold to refuse.
+      const fixOutputs = outputs.filter((_, i) => phases[i] === 'fix');
+      expect(fixOutputs).toHaveLength(3);
+      expect(fixOutputs.slice(1).join('\n')).toMatch(/FLAG-PRESENT/);
+      for (const output of fixOutputs.slice(1)) expect(host(output)).toBe(host(firstFix));
+
+      // And the verdict is still the right one: a no-op fix credited nothing.
+      const state = fold(outcome.events);
+      expect(state.reproduced).toBe(false);
+      expect(confidence(state).tier).toBe(3);
+    }, 600_000);
+  }
+
+  test('the phases share no tree, no TMPDIR, no HOME and no process namespace', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // ADR-0014's table, asserted as one observation per row rather than as prose.
+    // Every entry in ADR-0010's residual list was an instance of "these two
+    // participants share a world", and this is the claim that they no longer do.
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      flakeRuns: 0,
+      symptomPattern: 'wrong',
+      repro: {
+        command: 'sh repro.sh',
+        files: {
+          'repro.sh':
+            'echo "HOST:$(hostname)"\n' +
+            'echo "PID1:$(cat /proc/1/comm 2>/dev/null):$(cat /proc/1/stat 2>/dev/null | cut -d" " -f22)"\n' +
+            'echo "TMPDIR:$TMPDIR"\n' +
+            'echo "HOME:$HOME"\n' +
+            'echo "TREE:$(ls -di . | cut -d" " -f1)"\n' +
+            'cat src.txt\n' +
+            'grep -q right src.txt\n',
+        },
+      },
+    });
+
+    const runs = outcome.events.filter((e) => e.type === 'TEST_RUN');
+    const outputs = await Promise.all(
+      runs.map((e) => get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash).then((b) => b.toString())),
+    );
+    expect(runs.map((e) => (e.payload as { phase: string }).phase)).toEqual(['base', 'fix']);
+    const field = (output: string, name: string) => new RegExp(`${name}:(\\S*)`).exec(output)?.[1];
+
+    // A different container.
+    expect(field(outputs[1]!, 'HOST')).not.toBe(field(outputs[0]!, 'HOST'));
+    // A different PID namespace: PID 1's own start time differs, so the process the
+    // base phase might have left behind cannot exist here — "cannot", not "was
+    // swept". This is the row the reap used to be the only answer to.
+    expect(field(outputs[1]!, 'PID1')).not.toBe(field(outputs[0]!, 'PID1'));
+    // A different tree, by inode. The clone is per container, so ADR-0010's retired
+    // sentence — "they must share the clone" — is retired in fact and not only in
+    // prose.
+    expect(field(outputs[1]!, 'TREE')).not.toBe(field(outputs[0]!, 'TREE'));
+    // The private directories are still private, which is the belt to the braces.
+    expect(field(outputs[0]!, 'TMPDIR')).toBeTruthy();
+    expect(field(outputs[0]!, 'HOME')).toBeTruthy();
+
+    // The verdict is unaffected: a clean red-then-green is still credited. An
+    // isolation change that also broke the ordinary case would be a regression
+    // dressed as a hardening.
+    expect(fold(outcome.events).reproduced).toBe(true);
+  }, 600_000);
+
+  test('the reap is still there, and still gated on PID 1', () => {
+    // ADR-0014 demotes the reap to belt-and-braces and explicitly keeps it: "its
+    // absence would be a silent regression if a future change ever collapses two
+    // phases back into one container". A demoted defence with no test is a defence
+    // someone deletes while tidying.
+    const runner = readFileSync(join(process.cwd(), 'src/runner.ts'), 'utf8');
+    expect(runner).toMatch(/if \(process\.pid !== 1\) return;/);
+    expect(runner).toMatch(/SIGSTOP/);
+    expect(runner).toMatch(/SIGKILL/);
+  });
 
   test('the deleted egress proxy is not referenced anywhere', () => {
     // ADR-0011 deletes `src/egress.ts` rather than deprecating it: "a sealed
