@@ -29,6 +29,7 @@ import {
   regression,
   survivorGamed,
 } from './fixtures/repo.js';
+import { call, fakeModel } from './fixtures/model.js';
 
 const dockerAvailable = () => {
   try {
@@ -2034,4 +2035,182 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     for (const output of outputs) expect(output).toContain('MARKER: ls:');
     expect(existsSync(join(blobs, 'OWNED'))).toBe(false);
   }, 300_000);
+
+  // ── 5a: the loop moved out ─────────────────────────────────────────────────
+  //
+  // The agent no longer runs in here. A scripted model on the host drives our own
+  // tools, each call travels down the pipe the host already holds, and the
+  // container has no interface at all. These are the tests that make that a fact
+  // about the running system rather than a claim about the design.
+
+  test('the host drives the tools and the container never has a network', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // The whole 5a shape: the model asks for a shell, probes for a way out, writes
+    // a reproduction and a manifest, and commits. Every one of those is a tool call
+    // executed inside the container by a worker that dials nowhere.
+    const probe =
+      'getent hosts api.anthropic.com >/dev/null 2>&1 && echo AGENT-RESOLVED || echo AGENT-NO-DNS; ' +
+      'nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo AGENT-ROUTED || echo AGENT-NO-ROUTE';
+    const model = await fakeModel([
+      { content: [call('shell_create', { name: 'probe' })], stop_reason: 'tool_use' },
+      { content: [call('shell_write', { name: 'probe', input: probe }, 'toolu_probe')], stop_reason: 'tool_use' },
+      {
+        content: [
+          call('write', { path: 'repro.sh', content: 'cat src.txt\ngrep -q right src.txt\n' }, 'toolu_w1'),
+        ],
+        stop_reason: 'tool_use',
+      },
+      {
+        content: [
+          call(
+            'write',
+            {
+              path: '.engine/repro.json',
+              content: JSON.stringify({ command: 'sh repro.sh', files: ['repro.sh', '.engine/repro.json'] }),
+            },
+            'toolu_w2',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      { content: [call('git_commit', { message: 'test: reproduce it' }, 'toolu_c')], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'reproduced' }], stop_reason: 'end_turn' },
+    ]);
+
+    try {
+      const outcome = await orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: blobs,
+        image: IMAGE,
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        reproPrompt: 'reproduce the bug',
+        symptomPattern: 'wrong',
+        flakeRuns: 0,
+        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 120_000 },
+      });
+
+      const said = await Promise.all(
+        outcome.events
+          .filter((e) => e.type === 'AGENT_MESSAGE')
+          .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+      );
+      // RESULTS only, not the recorded tool inputs. The transcript necessarily
+      // contains the probe's own command text, and `AGENT-RESOLVED` is a literal in
+      // it — asserting over the whole transcript tests the echo rather than the
+      // seal, which is the vacuous version of this test.
+      const results = said
+        .map((b) => JSON.parse(b.toString()) as { ok?: boolean; output?: string })
+        .filter((line) => typeof line.ok === 'boolean')
+        .map((line) => line.output ?? '')
+        .join('\n');
+
+      // The tools ran, in the container: the shell answered, and its answer is the
+      // seal. Positive assertions first, so the negatives cannot pass by the whole
+      // thing having silently done nothing.
+      expect(results).toMatch(/AGENT-NO-DNS/);
+      expect(results).toMatch(/AGENT-NO-ROUTE/);
+      expect(results).not.toMatch(/AGENT-RESOLVED/);
+      expect(results).not.toMatch(/AGENT-ROUTED/);
+
+      // And the run went the whole way: the agent's commit crossed as a bundle, the
+      // engine read the manifest out of it, and the base phase ran what it named.
+      const state = fold(outcome.events);
+      expect(state.handovers.map((h) => h.kind)).toContain('repro');
+      expect(state.registeredRepro?.command).toBe('sh repro.sh');
+      expect(state.shownOnBase).toBe(true);
+      // Tier 2 at best, whatever else happened: the party under judgement wrote the
+      // reproduction, and no amount of tooling changes that (ADR-0007's amendment).
+      expect(state.reproAuthoredByAgent).toBe(true);
+      // The container is not a writer in this mode, and two things show it.
+      //
+      // It REPORTED its handover on the channel instead of writing the event —
+      // `handoverReport` is present at all only for a container that spoke the
+      // worker protocol, and null because the bundle was made.
+      const agentPhase = outcome.phases.find((p) => p.phase === 'agent')!;
+      expect(agentPhase.handoverReport).toBeNull();
+      // And the transcript's claimed types are ones only the HOST can produce: the
+      // in-sandbox supervisor records what `claude`'s own stream claimed, and it has
+      // never claimed `tool_use` — it never saw a tool call, because there were none
+      // to see.
+      const types = outcome.events
+        .filter((e) => e.type === 'AGENT_MESSAGE')
+        .map((e) => (e.payload as { claimed_type: string }).claimed_type);
+      expect(types).toContain('tool_use');
+      expect(types).toContain('tool_result');
+    } finally {
+      await model.close();
+    }
+  }, 600_000);
+
+  test('a write outside the workspace is refused inside the container too', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    // Path confinement is load-bearing now and was not before: the container used
+    // to be the fence. `/work` is root-owned and holds the verification clone, so a
+    // tool that accepted an absolute path would let the agent write the tree it is
+    // about to be judged in — and `/blobs` outlives the run.
+    const model = await fakeModel([
+      { content: [call('write', { path: '/work/OWNED', content: 'x' })], stop_reason: 'tool_use' },
+      { content: [call('write', { path: '../../blobs/OWNED', content: 'x' }, 'toolu_2')], stop_reason: 'tool_use' },
+      { content: [call('read', { path: '/etc/shadow' }, 'toolu_3')], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'all refused' }], stop_reason: 'end_turn' },
+    ]);
+
+    try {
+      const outcome = await orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: blobs,
+        image: IMAGE,
+        baseRef: fixture.base,
+        fixRef: fixture.fix,
+        reproPrompt: 'try to escape',
+        symptomPattern: 'wrong',
+        flakeRuns: 0,
+        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 120_000 },
+      });
+
+      const said = await Promise.all(
+        outcome.events
+          .filter((e) => e.type === 'AGENT_MESSAGE')
+          .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+      );
+      const transcript = said.map((b) => b.toString()).join('\n');
+
+      // Three refusals, and the agent was told each time — the boundary holding is
+      // a result it can read, not a run it can end.
+      expect(transcript.match(/refused: path/g)?.length).toBe(3);
+      expect(existsSync(join(blobs, 'OWNED'))).toBe(false);
+    } finally {
+      await model.close();
+    }
+  }, 600_000);
+
+  test('the deleted egress proxy is not referenced anywhere', () => {
+    // ADR-0011 deletes `src/egress.ts` rather than deprecating it: "a sealed
+    // container with an unused proxy beside it is a boundary that reads as
+    // enforced and is not". A deletion nothing asserts is a deletion a later
+    // refactor undoes by restoring a file from history.
+    //
+    // Over the IMPORTS, not the prose. The milestone's own done-when says `grep -rn
+    // egress src test` returns nothing, and taken literally it cannot: "regression"
+    // contains the substring, the word still belongs in comments — ADR-0011's whole
+    // argument is about egress — and a test asserting the absence has to be allowed
+    // to name the thing it is asserting about. What must return nothing is anything
+    // that DEPENDS on the module, which is what a deletion actually means.
+    const hits = execFileSync('sh', ['-c', `grep -rnE "from '[^']*egress" src test || true`], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    });
+    expect(hits.trim()).toBe('');
+    expect(existsSync(join(process.cwd(), 'src/egress.ts'))).toBe(false);
+    expect(existsSync(join(process.cwd(), 'test/egress.test.ts'))).toBe(false);
+  });
 });

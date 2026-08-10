@@ -32,7 +32,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
-import type { Job } from './runner.js';
+import { runAgentLoop, type AgentTranscript } from './loop.js';
+import { isWorkerReply, type Job, type WorkerRequest } from './runner.js';
+import { put } from './blobs.js';
 import type { ReproSpec } from './verify.js';
 import { MAX_REASON_CHARS } from './verify.js';
 
@@ -85,6 +87,24 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   /** How many attempts before the run gives up. One, unless a caller asks for more. */
   maxAttempts?: number;
   agentImageMount?: string;
+  /**
+   * Drive the agent from the HOST, with tool calls travelling into the container
+   * (ADR-0011). Set, and no agent binary runs in the sandbox at all.
+   *
+   * Absent, the M3 path stands: `claude -p` inside the container, which is the
+   * shape the hostile-fake suite exercises and which cannot reach a model because
+   * the container is sealed. Both are honest; only one can do the job.
+   *
+   * `baseURL` is how this is tested without a credential — a local server that
+   * speaks the Messages API scripts the tool calls.
+   */
+  loop?: {
+    apiKey?: string;
+    baseURL?: string;
+    timeoutMs?: number;
+    maxLines?: number;
+    maxIterations?: number;
+  };
 } & (
   | { repro: Job['repro']; reproPrompt?: never }
   | { reproPrompt: string; repro?: never }
@@ -107,6 +127,16 @@ export type PhaseResult = {
    * is the wrong thing to ship.
    */
   stderr: string;
+  /**
+   * What a tool-serving container reported about bundling its commits: null when
+   * it worked, prose when it did not, absent when this was not that kind of
+   * container.
+   *
+   * It arrives as a REPORT rather than an event because in that mode the host is
+   * the only writer (ADR-0006's amendment), and the host turns it into the
+   * VERIFICATION_ABORTED with a seq only the host can allocate.
+   */
+  handoverReport?: string | null;
 };
 
 export type RunOutcome = {
@@ -309,7 +339,89 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // becomes when the world is a container: it is not scrubbed, it ceases to
     // exist. Note it runs BEFORE the base container, so the gate cannot prevent
     // spawning it — the gate decides whether a FIX is attempted.
-    const steps: { phase: PhaseResult['phase']; job: Partial<Job>; source: string; kind?: 'repro' | 'fix' }[] = [];
+    /**
+     * Run one agent container, whichever side the loop is on.
+     *
+     * With `plan.loop`, the container serves tool calls and writes NO events, and
+     * the transcript becomes AGENT_MESSAGE payloads right here — which is
+     * ADR-0006's amendment made literal: the sole writer is the host orchestrator,
+     * and this is the host orchestrator.
+     */
+    const agentContainer = async (
+      prompt: string,
+      at: number,
+      extra: Partial<Job> = {},
+    ): Promise<PhaseResult> => {
+      const shared: Partial<Job> = { only: 'agent', baseRef: base, ...extra };
+      if (!plan.loop) {
+        return await runContainer(plan, agentSource, at, 'agent', { agentPrompt: prompt, ...shared });
+      }
+      let transcript: AgentTranscript = { lines: [], stopped: 'spawn_failed', exitCode: -1 };
+      const result = await runContainer(
+        plan,
+        agentSource,
+        at,
+        'agent',
+        { serveTools: true, ...shared },
+        async ({ invoke }) => {
+          transcript = await runAgentLoop({ prompt, invoke, ...plan.loop });
+        },
+      );
+      let seq = at;
+      const written: RunEvent[] = [];
+      for (const [n, line] of transcript.lines.entries()) {
+        written.push(
+          own(plan.runId, ++seq, {
+            type: 'AGENT_MESSAGE',
+            payload: {
+              v: 1,
+              n,
+              claimed_type: line.claimed_type,
+              // Re-serialised on its way into a payload, exactly as the in-sandbox
+              // supervisor did: a tool result shaped like a RunEvent lands inside a
+              // string field and stays there.
+              raw_hash: await put(plan.blobRoot, line.raw),
+              bytes: Buffer.byteLength(line.raw),
+            },
+          }),
+        );
+      }
+      written.push(
+        own(plan.runId, ++seq, {
+          type: 'AGENT_FINISHED',
+          payload: {
+            v: 1,
+            messages: transcript.lines.length,
+            exit_code: transcript.exitCode,
+            stopped: transcript.stopped,
+          },
+        }),
+      );
+      // The container reported this rather than writing it, because it is not a
+      // writer in this mode. `handoverReport === null` means the bundle was made.
+      if (result.handoverReport) {
+        written.push(
+          own(plan.runId, ++seq, {
+            type: 'VERIFICATION_ABORTED',
+            payload: {
+              v: 1,
+              phase: 'setup',
+              cause: 'handover',
+              reason: result.handoverReport.slice(0, MAX_REASON_CHARS),
+            },
+          }),
+        );
+      }
+      return { ...result, events: [...result.events, ...written] };
+    };
+
+    const steps: {
+      phase: PhaseResult['phase'];
+      job: Partial<Job>;
+      source: string;
+      kind?: 'repro' | 'fix';
+      prompt?: string;
+    }[] = [];
     // `only: 'agent'` matters: without it the agent container ran the agent AND
     // both phases, so the fix phase started on the very machine the agent had been
     // working in. It stayed invisible because the duplicate registrations made the
@@ -317,12 +429,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // The repro agent, when there is one, runs before everything: base cannot be
     // judged against a reproduction that does not exist yet.
     if (plan.reproPrompt) {
-      steps.push({
-        phase: 'agent',
-        job: { agentPrompt: plan.reproPrompt, only: 'agent', baseRef: base },
-        source: agentSource,
-        kind: 'repro',
-      });
+      steps.push({ phase: 'agent', job: {}, source: agentSource, kind: 'repro', prompt: plan.reproPrompt });
     }
     // The FIX agent. With a repro agent present it is DEFERRED to after the base
     // container has registered the reproduction, so ADR-0008's ordering invariant
@@ -338,18 +445,11 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     if (plan.agentPrompt && !plan.reproPrompt) {
       // `baseRef` resolved: the stripped source has one branch and none of the
       // names the plan may have used.
-      steps.push({
-        phase: 'agent',
-        // `baseRef` resolved, and DEAD today: the Runner returns on `only: 'agent'`
-        // before `verify()` ever reads it. Kept because a future agent path should
-        // get the sha rather than a name the stripped source no longer carries.
-        // `fixRef` on this same job is dead for the identical reason and is NOT
-        // resolved — said here rather than left as a silent asymmetry two lines
-        // apart.
-        job: { agentPrompt: plan.agentPrompt, only: 'agent', baseRef: base },
-        source: agentSource,
-        kind: 'fix',
-      });
+      // `baseRef` is resolved by `agentContainer`, and DEAD today: the Runner
+      // returns on `only: 'agent'` before `verify()` ever reads it. Passed anyway
+      // because a future agent path should get the sha rather than a name the
+      // stripped source no longer carries.
+      steps.push({ phase: 'agent', job: {}, source: agentSource, kind: 'fix', prompt: plan.agentPrompt });
     }
     steps.push({ phase: 'base', job: { only: 'base' }, source });
 
@@ -442,14 +542,18 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       }
     };
     for (const step of steps) {
-      const result = await runContainer(plan, step.source, afterSeq, step.phase, {
+      const overrides: Partial<Job> = {
         ...step.job,
         ...(resolvedRepro ? { repro: resolvedRepro } : {}),
         // The sham-fix control, on exactly when the AGENT wrote the reproduction.
         // A caller-supplied repro has no oracle to be: whoever wrote it did not
         // see the tree it would judge.
         ...(plan.reproPrompt ? { controlRun: true } : {}),
-      });
+      };
+      const result =
+        step.phase === 'agent'
+          ? await agentContainer(step.prompt!, afterSeq, overrides)
+          : await runContainer(plan, step.source, afterSeq, step.phase, overrides);
       // Record what the container reported BEFORE judging any of it. Checking
       // first and breaking discarded the transcript and the container's own
       // stream — the same mistake the abort path made: a run that could not be
@@ -490,10 +594,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         // The fix agent, deferred to here so the log can PROVE it never saw the
         // reproduction before that reproduction was registered.
         if (plan.reproPrompt && plan.agentPrompt) {
-          const author = await runContainer(plan, agentSource, afterSeq, 'agent', {
-            agentPrompt: plan.agentPrompt,
-            only: 'agent',
-            baseRef: base,
+          const author = await agentContainer(plan.agentPrompt, afterSeq, {
             ...(resolvedRepro ? { repro: resolvedRepro } : {}),
           });
           phases.push(author);
@@ -652,12 +753,26 @@ async function applyHandover(source: string, runId: string, dir: string | undefi
   }
 }
 
+/**
+ * Drives a tool-serving container from out here.
+ *
+ * The whole of ADR-0011 in one function type: something on the host is handed a
+ * way to execute a tool inside the container, and what it does with that — talk to
+ * the model API, replay a script — is not this file's business. The container
+ * never learns which.
+ */
+export type ContainerDriver = (io: {
+  invoke: (tool: string, input: Record<string, unknown>) => Promise<{ ok: boolean; output: string }>;
+}) => Promise<void>;
+
 async function runContainer(
   plan: RunPlan,
   source: string,
   afterSeq: number,
   phase: PhaseResult['phase'],
   overrides: Partial<Job>,
+  /** Present only for a `serveTools` container: what to run while it serves. */
+  driver?: ContainerDriver,
 ): Promise<PhaseResult> {
   // The agent container gets no repro to run; the phase containers get no agent.
   // Passing both would put an agent beside the phase it is meant to be isolated
@@ -733,17 +848,74 @@ async function runContainer(
   // A non-zero exit is an outcome here, not a crash: the Runner's exit codes say
   // whether there is a stream worth reading, and a partial stream is evidence.
   const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
-  child.stdin.end(JSON.stringify(job));
+  // The Job on its own LINE, and stdin left open when something out here is going
+  // to keep writing to it. Without the newline the container's line reader waits
+  // for EOF, which is precisely the deadlock the tool protocol would otherwise
+  // introduce: the host waiting for a result, the container waiting for the end of
+  // the job it already has.
+  if (driver) child.stdin.write(`${JSON.stringify(job)}\n`);
+  else child.stdin.end(JSON.stringify(job));
 
+  // What is on the channel, split as it arrives.
+  //
+  // Incremental rather than parsed at the end, because a tool-serving container
+  // interleaves REPLIES with its events and the driver needs each reply the moment
+  // it lands. A non-driving container behaves exactly as before: every line is an
+  // event and nothing is looked at until the container exits.
+  const eventLines: string[] = [];
+  const pending = new Map<string, (result: { ok: boolean; output: string }) => void>();
+  let ready = () => {};
+  const readied = new Promise<void>((resolve) => (ready = resolve));
+  let handoverReport: string | null | undefined;
   let stdout = '';
+  // Counted separately, because `stdout` is now DRAINED per line. Measuring the
+  // ceiling against it would measure the current partial line, and the guard would
+  // silently never fire — a stream cut mid-line reaching the fold is precisely what
+  // it exists to refuse.
+  let totalBytes = 0;
   let truncated = false;
+  const take = (line: string) => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      // Not JSON at all. Kept as an event line so `parse` fails loudly rather
+      // than silently dropping something that was supposed to be a fact.
+      eventLines.push(line);
+      return;
+    }
+    if (!isWorkerReply(parsed)) {
+      eventLines.push(line);
+      return;
+    }
+    if ('ready' in parsed) ready();
+    else if ('finished' in parsed) handoverReport = parsed.finished.handover;
+    else {
+      const settle = pending.get(parsed.result.id);
+      // A reply for a call nobody is waiting on is dropped rather than thrown:
+      // the only writer on this pipe is our own Runner, and a duplicate would be
+      // an engine bug that must not cost the run its transcript.
+      if (settle) {
+        pending.delete(parsed.result.id);
+        settle({ ok: parsed.result.ok, output: parsed.result.output });
+      }
+    }
+  };
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk: string) => {
-    if (stdout.length + chunk.length > MAX_STREAM_BYTES) {
+    if (totalBytes + chunk.length > MAX_STREAM_BYTES) {
       truncated = true;
       return;
     }
+    totalBytes += chunk.length;
     stdout += chunk;
+    let newline = stdout.indexOf('\n');
+    while (newline !== -1) {
+      const line = stdout.slice(0, newline).trim();
+      stdout = stdout.slice(newline + 1);
+      if (line !== '') take(line);
+      newline = stdout.indexOf('\n');
+    }
   });
   // Kept, not just drained. Draining is still required — a container that says
   // a lot on stderr blocks writing to it and never reaches its own exit, the
@@ -755,10 +927,41 @@ async function runContainer(
     stderr = (stderr + chunk).slice(-MAX_STDERR_CHARS);
   });
 
-  const exitCode = await new Promise<number>((resolve) => {
+  const closed = new Promise<number>((resolve) => {
     child.on('close', (code) => resolve(code ?? 1));
     child.on('error', () => resolve(1));
   });
+
+  if (driver) {
+    let calls = 0;
+    const invoke = async (tool: string, input: Record<string, unknown>) => {
+      const id = `h${++calls}`;
+      return await new Promise<{ ok: boolean; output: string }>((resolve, reject) => {
+        pending.set(id, resolve);
+        // Races the container's own exit. A container that dies mid-loop would
+        // otherwise leave the driver awaiting a reply forever, and a hung host
+        // process is the one failure mode with no diagnosis at all.
+        closed.then(() => {
+          if (pending.delete(id)) reject(new Error('the container exited before answering'));
+        });
+        child.stdin.write(`${JSON.stringify({ call: { id, tool, input } } satisfies WorkerRequest)}\n`);
+      });
+    };
+    // Wait for the world. `Promise.race` against the exit, because a container
+    // that fails to stand up never sends `ready` and the driver must not block on
+    // a message that is not coming.
+    await Promise.race([readied, closed]);
+    try {
+      await driver({ invoke });
+    } finally {
+      // Always, however the driver ended. Without this the container serves
+      // forever and the run hangs on a loop that has already finished.
+      child.stdin.write(`${JSON.stringify({ done: true } satisfies WorkerRequest)}\n`);
+      child.stdin.end();
+    }
+  }
+
+  const exitCode = await closed;
 
   // Collect the artifacts into the real store, from the host, once the container
   // is gone. Whatever a participant planted in its own store comes along, but it
@@ -787,7 +990,10 @@ async function runContainer(
     // fold would reject it anyway on the seq that never arrived.
     throw new Error(`the ${phase} container produced more than ${MAX_STREAM_BYTES} bytes of events`);
   }
-  const events = parse(stdout);
+  // The tail, if the container's last line had no newline. Then the events, which
+  // is every line that was not a reply.
+  if (stdout.trim() !== '') take(stdout.trim());
+  const events = parse(eventLines);
   // As an EVENT, not on `PhaseResult.stderr`. This PR condemned that field by
   // name three files over — the orchestrator keeps it and never persists it, so
   // nothing folds it and no projection reads it. A half-copied store otherwise
@@ -810,15 +1016,17 @@ async function runContainer(
       }),
     );
   }
-  return { phase, events, exitCode, stderr: stderr.trim(), ...(handover ? { handover } : {}) };
+  return {
+    phase,
+    events,
+    exitCode,
+    stderr: stderr.trim(),
+    ...(handover ? { handover } : {}),
+    ...(handoverReport === undefined ? {} : { handoverReport }),
+  };
 }
 
-const parse = (stdout: string): RunEvent[] =>
-  stdout
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as RunEvent);
+const parse = (lines: string[]): RunEvent[] => lines.map((line) => JSON.parse(line) as RunEvent);
 
 /**
  * The agent's source: base's ancestry, and nothing else.
@@ -894,9 +1102,15 @@ export async function buildAgentSource(source: string, base: string, agentSource
 
 /** Where the agent leaves its reproduction. Fixed: a configurable path is a path the agent chooses. */
 export const REPRO_MANIFEST = '.engine/repro.json';
-/** Enough for a reproduction; far short of shipping a payload through the manifest. */
-const MAX_REPRO_FILES = 32;
-const MAX_REPRO_BYTES = 256 * 1024;
+/**
+ * Enough for a reproduction; far short of shipping a payload through the manifest.
+ *
+ * Exported because the repro PROMPT quotes both numbers, and a prompt that promises
+ * a limit the engine does not enforce is worse than no prompt: it produces a
+ * confident agent and a refused run. `test/prompts.test.ts` reads them from here.
+ */
+export const MAX_REPRO_FILES = 32;
+export const MAX_REPRO_BYTES = 256 * 1024;
 
 /**
  * The reproduction the agent authored, read out of its commit.

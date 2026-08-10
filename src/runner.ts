@@ -15,6 +15,7 @@ import { basename } from 'node:path';
 import { promisify } from 'node:util';
 import type { RunEvent } from './events.js';
 import { superviseAgent } from './agent.js';
+import { ToolHost } from './tools.js';
 import { MAX_REASON_CHARS, ObservationFailed, verify, type ReproSpec } from './verify.js';
 
 const execFileAsync = promisify(execFile);
@@ -40,6 +41,24 @@ export type Job = {
    */
   agentPrompt?: string;
   agentTimeoutMs?: number;
+  /**
+   * Serve tool calls from the host instead of running an agent in here at all
+   * (ADR-0011). Implies `only: 'agent'`.
+   *
+   * The loop is outside; this container executes what it is told and returns
+   * results. Two consequences, both deliberate:
+   *
+   *   - **No agent binary.** Nothing in here talks to the model API, which is why
+   *     the container needs no egress and why `--network none` stops being a
+   *     stopgap and becomes correct.
+   *   - **No events.** ADR-0006's amendment moves the pen to the host
+   *     orchestrator, and this is where that stops being a claim: in this mode the
+   *     container writes tool results and a closing report on the channel and not
+   *     one event, so there is nothing to trust about it. `agentPrompt`'s path
+   *     still emits its own transcript, because there the Runner is the only thing
+   *     that watched the process.
+   */
+  serveTools?: boolean;
   /**
    * Observe one phase and stop. Omitted, this container runs the whole run, as
    * M3 did.
@@ -359,10 +378,85 @@ async function handOverCommits(world: { tree: string; gitDir: string }): Promise
   return null;
 }
 
-async function readStdin(): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks).toString();
+/**
+ * Execute the host's tool calls until it says it is finished.
+ *
+ * One at a time, in arrival order. The model's loop is sequential by construction
+ * — it waits for each result before deciding the next call — so concurrency here
+ * would buy nothing and would make two `shell_write`s into one session a race.
+ *
+ * A tool that throws is answered, never rethrown: `ToolHost.run` already turns
+ * every failure into a result, and a serving loop that dies on a bad call hands
+ * the agent a way to end its own run.
+ */
+async function serveToolCalls(
+  host: ToolHost,
+  requests: AsyncIterable<string>,
+  emit: (line: string) => void,
+): Promise<void> {
+  for await (const line of requests) {
+    let request: WorkerRequest;
+    try {
+      request = JSON.parse(line) as WorkerRequest;
+    } catch {
+      continue; // Not ours. The host is the only writer on this pipe; ignore noise.
+    }
+    if ('done' in request) return;
+    if (!('call' in request)) continue;
+    const result = await host.run(request.call);
+    emit(`${JSON.stringify({ result } satisfies WorkerReply)}\n`);
+  }
+}
+
+/**
+ * The stdio protocol, when the host drives the tools from outside (ADR-0011).
+ *
+ * The worker "dials out" and nothing dials in: with `--network none` there is no
+ * interface to listen on, and the pipe the host already holds to this container's
+ * stdin and stdout is the only channel. That is not a workaround for the seal —
+ * it is why the seal costs nothing.
+ *
+ * Deliberately three message shapes and no framing beyond one JSON object per
+ * line, matching the event channel. A protocol with a length prefix would be a
+ * second parser to get wrong.
+ */
+export type WorkerRequest =
+  | { call: { id: string; tool: string; input: Record<string, unknown> } }
+  | { done: true };
+
+export type WorkerReply =
+  /** The world is built and the tools will answer. The host waits for this. */
+  | { ready: true }
+  | { result: { id: string; ok: boolean; output: string } }
+  /**
+   * Setup, and then teardown, as the Runner observed them — never as events.
+   * `handover` is null when the commits were bundled, and prose when they were
+   * not; the HOST turns that into a VERIFICATION_ABORTED, because in this mode the
+   * host is the only writer there is.
+   */
+  | { finished: { handover: string | null } };
+
+export const isWorkerReply = (line: unknown): line is WorkerReply =>
+  typeof line === 'object' &&
+  line !== null &&
+  ('ready' in line || 'result' in line || 'finished' in line);
+
+/** One JSON object per line, and a trailing fragment at EOF is a whole line. */
+async function* readLines(stream: AsyncIterable<Buffer | string>): AsyncGenerator<string> {
+  let buffer = '';
+  for await (const chunk of stream) {
+    buffer += chunk.toString();
+    let newline = buffer.indexOf('\n');
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line.trim() !== '') yield line;
+      newline = buffer.indexOf('\n');
+    }
+  }
+  // The Job has historically arrived with no trailing newline — `stdin.end(json)`
+  // — and still may. At EOF the remainder is a complete line by definition.
+  if (buffer.trim() !== '') yield buffer;
 }
 
 export async function runJob(
@@ -370,6 +464,8 @@ export async function runJob(
   workDir = WORK,
   blobRoot = BLOBS,
   emit: (line: string) => void = (line) => process.stdout.write(line),
+  /** Tool calls from the host, when the loop is out there. Required by `serveTools`. */
+  requests?: AsyncIterable<string>,
 ): Promise<number> {
   // Git's own state lives outside every worktree. Inside one, the repro owns
   // .git and plants a post-checkout hook that `git clean` never descends into,
@@ -527,9 +623,25 @@ export async function runJob(
   // TMPDIR nor HOME is shared. Separation is not the whole answer, though —
   // `clearTheField` below is, because a process that outlives the agent runs as
   // the same uid and can write the phases' private directories anyway.
-  const agentWorld = job.agentPrompt ? await world('agent', true) : null;
-  const transcript = agentWorld
-    ? await superviseAgent({
+  const agentWorld = job.agentPrompt || job.serveTools ? await world('agent', true) : null;
+  // Set when the host drove the tools from outside, so the teardown below reports
+  // the handover on the channel instead of writing an event: in that mode this
+  // container is not a writer (ADR-0006's amendment) and must not look like one.
+  let served: ToolHost | null = null;
+  const transcript: RunEvent[] = [];
+  if (agentWorld && job.serveTools) {
+    if (!requests) {
+      throw new ObservationFailed('serveTools was set with no request stream; nothing would drive the tools');
+    }
+    served = new ToolHost({ root: agentWorld.tree, gitDir: agentWorld.gitDir, runAs, env: agentWorld.env });
+    // Announced only once the world exists. The host blocks on this rather than
+    // guessing: a tool call that arrives before the clone lands would be refused
+    // for a path that is about to exist, and the model would plan around a lie.
+    emit(`${JSON.stringify({ ready: true } satisfies WorkerReply)}\n`);
+    await serveToolCalls(served, requests, emit);
+  } else if (agentWorld) {
+    transcript.push(
+      ...(await superviseAgent({
         runId: job.runId,
         afterSeq: job.afterSeq,
         prompt: job.agentPrompt!,
@@ -538,12 +650,19 @@ export async function runJob(
         runAs,
         env: agentWorld.env,
         ...(job.agentTimeoutMs === undefined ? {} : { timeoutMs: job.agentTimeoutMs }),
-      })
-    : [];
+      })),
+    );
+  }
 
   // Nothing the agent started may still be running when the phases begin, and
   // nothing it left in a shared directory may still be there.
   if (agentWorld) {
+    // Sessions first, and by handle. ADR-0014's part one: a service the recipe
+    // declared lives in a session this process started and holds, so teardown
+    // closes what it owns instead of discovering it in `/proc`. The reap below
+    // stays — demoted to belt-and-braces, and still the only thing that reaches a
+    // process no session ever knew about.
+    await served?.close();
     // Reap FIRST, then extract, then destroy. Bundling before the reap left the
     // agent's surviving processes alive and owning the finished bundle: one
     // could wait for it, chmod it back and overwrite it with a bundle of a
@@ -558,7 +677,12 @@ export async function runJob(
     // cause, while the true one lived somewhere no projection reads. The Runner
     // is the sole event writer and is standing right here.
     const failed = await handOverCommits(agentWorld);
-    if (failed) {
+    if (served) {
+      // On the channel, as a report. The host is the sole writer in this mode, so
+      // an event here would be exactly the second producer ADR-0009 warns about —
+      // and the host cannot know the seq this container would have used anyway.
+      emit(`${JSON.stringify({ finished: { handover: failed } } satisfies WorkerReply)}\n`);
+    } else if (failed) {
       transcript.push({
         run_id: job.runId,
         seq: (transcript.at(-1)?.seq ?? job.afterSeq) + 1,
@@ -663,13 +787,23 @@ if (process.argv[1]?.endsWith('runner.ts') || process.argv[1]?.endsWith('runner.
   openSync('/dev/null', 'w'); // reuses fd 1, so /proc/1/fd/1 now goes nowhere
 
   try {
-    const job = JSON.parse(await readStdin()) as Job;
+    // Line by line now, not drained to EOF. The Job is the FIRST line and the
+    // stream stays open, because with the loop outside the container the host
+    // keeps writing tool calls down the same pipe — and a `readStdin()` that
+    // waits for EOF would deadlock against a host waiting for a result.
+    //
+    // A Job written with no trailing newline still arrives whole: `readLines`
+    // yields the remainder at EOF, which is what every existing caller does.
+    const stdin = readLines(process.stdin);
+    const first = await stdin.next();
+    if (first.done) throw new ObservationFailed('no job arrived on stdin');
+    const job = JSON.parse(first.value) as Job;
     // Set the code, never call process.exit: stdout on a pipe is asynchronous,
     // and exiting discards whatever is still queued. A large FIX_DIFF_OBSERVED
     // was being cut mid-JSON while the run reported success — silent evidence
     // loss presented as a clean record, which is the worst failure this project
     // has.
-    process.exitCode = await runJob(job, WORK, BLOBS, (line) => writeSync(channel, line));
+    process.exitCode = await runJob(job, WORK, BLOBS, (line) => writeSync(channel, line), stdin);
   } catch (error) {
     // A failure to observe is not a verification result. It leaves on stderr so
     // it can never be mistaken for an event on the channel.

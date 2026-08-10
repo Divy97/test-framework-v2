@@ -10,6 +10,7 @@
     "replay": "tsx --env-file=.env src/cli.ts replay"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.116.0",
     "pg": "^8.13.1"
   },
   "devDependencies": {
