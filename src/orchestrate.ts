@@ -34,6 +34,7 @@ import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
 import type { Job } from './runner.js';
 import type { ReproSpec } from './verify.js';
+import { startEgressProxy } from './egress.js';
 import { MAX_REASON_CHARS } from './verify.js';
 
 /** Output ceiling per container. Matches what the sandbox tests already allow. */
@@ -82,6 +83,14 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * image ships no agent yet, and a hostile fake is how the supervision boundary
    * is exercised without one.
    */
+  /**
+   * The one host the agent may reach. Omitted, it reaches nothing at all.
+   *
+   * Sealed by default on purpose: an engine that silently grants the open
+   * internet when a field is missing has made the safe case the one you have to
+   * remember. A caller who needs the model API names it.
+   */
+  egress?: readonly string[];
   /** How many attempts before the run gives up. One, unless a caller asks for more. */
   maxAttempts?: number;
   agentImageMount?: string;
@@ -165,13 +174,22 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // repository in tmpdir() forever" — and then grew six more throw sites inside
   // that window, plus a fail-closed check whose whole job is to fire repeatedly
   // while somebody diagnoses why. A comment is not a `finally`.
+  // One proxy per run, in this process. Its allowlist and the record of what the
+  // agent tried live where the run's other evidence does.
+  const proxy = plan.egress?.length ? await startEgressProxy(plan.egress) : null;
   try {
     return await run();
   } finally {
+    await proxy?.close();
     await rm(workspace, { recursive: true, force: true }).catch(() => {});
   }
 
   async function run(): Promise<RunOutcome> {
+  // Where the agent's one channel lives, if it has one. `host.docker.internal`
+  // is not used: `--add-host <name>:host-gateway` makes the ALLOWLISTED name
+  // resolve to the host, so the agent's client asks for the host it means and
+  // the proxy checks the name it was given.
+  const channel = proxy ? { host: 'egress.invalid', port: proxy.port } : undefined;
   const source = join(workspace, 'source');
   // `--mirror`, not a plain clone. A plain clone puts the source's other
   // branches under `refs/remotes/origin/*`, and the container's own clone
@@ -658,6 +676,7 @@ async function runContainer(
   afterSeq: number,
   phase: PhaseResult['phase'],
   overrides: Partial<Job>,
+  egress?: { host: string; port: number },
 ): Promise<PhaseResult> {
   // The agent container gets no repro to run; the phase containers get no agent.
   // Passing both would put an agent beside the phase it is meant to be isolated
@@ -704,7 +723,30 @@ async function runContainer(
     // a reproduction needing a package the base commit lacks is unrunnable today.
     // When a `setupCommand` arrives it will need its own network decision rather
     // than inheriting this one.
-    ...(phase === 'agent' ? [] : ['--network', 'none']),
+    // The phases get nothing. The agent gets one channel, or nothing — never the
+    // open internet by default. `--add-host` points the allowlisted name at the
+    // host loopback the proxy is bound to, and `HTTPS_PROXY` sends the client
+    // through it; with no `egress` configured the agent is as sealed as a phase.
+    //
+    // `host-gateway` rather than a container-to-container network: the proxy runs
+    // in THIS process, where its allowlist and its record live, so there is no
+    // second image to keep honest and no sidecar that could be replaced.
+    ...(phase !== 'agent' || egress === undefined
+      ? ['--network', 'none']
+      : [
+          '--add-host',
+          `${egress.host}:host-gateway`,
+          '-e',
+          `HTTPS_PROXY=http://${egress.host}:${egress.port}`,
+          // `HTTP_PROXY` too, so a plain-HTTP client is pointed at the proxy
+          // rather than at the open network — where it is answered 405, because
+          // this proxy speaks CONNECT and an absolute-URI GET is the other
+          // protocol. That is a refusal either way, but it is worth being plain:
+          // the allowlist is enforced for https, and plain http to the ALLOWED
+          // host does not work at all. The model API is https.
+          '-e',
+          `HTTP_PROXY=http://${egress.host}:${egress.port}`,
+        ]),
     '-v', `${source}:/src:ro`,
     '-v', `${store}:/blobs`,
     ...(handover ? ['-v', `${handover}:/out`] : []),

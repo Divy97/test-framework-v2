@@ -1638,6 +1638,50 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(state.reproduced).toBe(true);
   }, 900_000);
 
+  test('the agent is sealed too, unless a channel is named for it', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    // Sealed by DEFAULT. An engine that grants the open internet when a field is
+    // missing has made the safe case the one you have to remember, and this
+    // project has been bitten repeatedly by defaults that fail open. A caller
+    // who needs the model API names it; this plan does not.
+    const fixture = clean();
+    const blobs = hostBlobs();
+    const agentDir = mkdtempSync(join(tmpdir(), 'engine-fakeagent-'));
+    stores.push(agentDir);
+    writeFileSync(
+      join(agentDir, 'claude'),
+      `#!/bin/sh\n` +
+        `getent hosts api.anthropic.com >/dev/null 2>&1 && echo AGENT-RESOLVED || echo AGENT-NO-DNS\n` +
+        `nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo AGENT-ROUTED || echo AGENT-NO-ROUTE\n` +
+        `printf '{"type":"result","subtype":"success"}\\n'\n`,
+      { mode: 0o755 },
+    );
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      repro: APPLIED_REPRO,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      agentPrompt: 'try to reach the internet',
+      agentImageMount: join(agentDir, 'claude'),
+    });
+
+    const said = await Promise.all(
+      outcome.events
+        .filter((e) => e.type === 'AGENT_MESSAGE')
+        .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+    );
+    const transcript = said.map((b) => b.toString()).join('\n');
+    expect(transcript).toMatch(/AGENT-NO-DNS/);
+    expect(transcript).toMatch(/AGENT-NO-ROUTE/);
+    expect(transcript).not.toMatch(/AGENT-RESOLVED/);
+    expect(transcript).not.toMatch(/AGENT-ROUTED/);
+  }, 600_000);
+
   test('the phases have no network, so a reproduction cannot be told what to answer', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     // Egress is the last isolation this milestone owes, and the phases are the

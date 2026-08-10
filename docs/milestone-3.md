@@ -154,9 +154,26 @@ develop against.
 - **3c.1 — the phases have no network.** Landed. `--network none` on every
   container that is not the agent's, asserted by a test that fails when the flag
   is removed (the phase container resolves `api.anthropic.com` without it).
-- **3c.2 — the agent's one channel.** Still to come. A flag cannot express "the
-  model API and nothing else"; it needs a proxy the container is forced through,
-  holding the credential the agent never sees.
+- **3c.2 — the agent's one channel.** Landed. A flag cannot express "the model
+  API and nothing else", so the agent gets `--network none` plus an
+  `--add-host <allowlisted-name>:host-gateway` pointing at a CONNECT proxy in the
+  orchestrator process, and `HTTPS_PROXY` sends its client through it. The proxy
+  knows one host, matched exactly — `api.anthropic.com.evil.test` ends in nothing
+  suspicious, so a suffix rule would pass it.
+
+  **Sealed by default.** With no `egress` named the agent reaches nothing, like a
+  phase. An engine that grants the open internet when a field is missing has made
+  the safe case the one you have to remember, and this project has been bitten
+  more than once by a default that failed open.
+
+  Two limits, stated rather than found later. It is an ALLOWLIST, NOT AN AUDIT:
+  it records that a tunnel opened, never what crossed it, because what crosses it
+  is TLS and reading that means terminating it — a credential-bearing man in the
+  middle inside the thing built to keep the agent away from credentials. And it
+  speaks CONNECT only, so plain `http://` to the allowed host is answered 405
+  rather than proxied. The model API is https; a future allowlisted host that is
+  not would need the other half of a proxy, with its own URL parser and its own
+  surface.
 
 ## Decisions this milestone must make
 
