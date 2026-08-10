@@ -17,10 +17,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import type { RunEvent } from '../src/events.js';
+import { confidence } from '../src/confidence.js';
 import { intake, startWebhookReceiver } from '../src/github.js';
 import { runFromIssue, symptomFrom } from '../src/run.js';
 import { call, fakeModel, type FakeModel } from './fixtures/model.js';
-import { cleanupFixtures, demoRepo } from './fixtures/repo.js';
+import { cleanupFixtures, demoRecipe, demoRepo } from './fixtures/repo.js';
+import { get } from '../src/blobs.js';
+import type { ArtifactRef } from '../src/events.js';
 
 const IMAGE = 'test-framework-v2-sandbox:test';
 const SECRET = 'a-webhook-secret';
@@ -279,5 +282,299 @@ describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no h
     const log = JSON.stringify(events);
     expect(log).not.toContain('ghs_minted');
     expect(existsSync(join(blobs, '.evidence-store'))).toBe(true);
+  }, 900_000);
+});
+
+describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs that must not produce a fix', () => {
+  // `demo/README.md` claims an expected outcome for each of its four seeded bugs.
+  // Two of them are exercised elsewhere; these are the other two, and they are the
+  // ones that matter most — a claim in a README with no run behind it is exactly what
+  // this project refuses everywhere else.
+  //
+  // Both must end in a Tier 3 deliverable and NO fix. ADR-0007: "the gate never
+  // bends", and a demo of the Tier-3 flow is part of the demo script "precisely
+  // because refusing to guess is the credibility of every verdict the system does
+  // issue."
+
+  const runIssue = async (options: {
+    title: string;
+    body: string;
+    turns: Parameters<typeof fakeModel>[0];
+  }) => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = demoRepo();
+    const blobs = hostBlobs();
+    const calls: { url: string; body: unknown }[] = [];
+    const recorder = (async (url: string | URL | Request, init?: RequestInit) => {
+      const target = String(url);
+      calls.push({ url: target, body: init?.body ? JSON.parse(String(init.body)) : null });
+      if (target.endsWith('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'ghs_minted' }), { status: 201 });
+      }
+      return new Response('{}', { status: 201 });
+    }) as typeof fetch;
+    const model = await fakeModel(options.turns);
+    models.push(model);
+    const events: RunEvent[] = [];
+    const mapped = intake('issues', { ...delivery(options.body), issue: { ...delivery(options.body).issue, title: options.title } })!;
+    const result = await runFromIssue({
+      intake: mapped,
+      app: { appId: '123456', privateKeyPem: PEM, api: 'https://api.test.invalid', fetch: recorder },
+      recipe: null,
+      image: IMAGE,
+      blobRoot: blobs,
+      append: async (event) => void events.push(event),
+      remote: () => bareRemote(fixture.repo),
+      flakeRuns: 0,
+      loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+    });
+    return { result, events, calls };
+  };
+
+  test('export-button: nothing to reproduce, so a structured info-request and no fix', async () => {
+    // There is no Export button and there never was. The agent looks, finds nothing,
+    // and commits nothing — which is what `prompts/repro.md` tells it to do when it
+    // genuinely cannot reproduce something.
+    const { result, calls } = await runIssue({
+      title: 'Export on the orders page does nothing',
+      body: 'Sometimes when I click Export on the orders page nothing happens. It worked last week.',
+      turns: [
+        { content: [call('grep', { pattern: 'Export' })], stop_reason: 'tool_use' },
+        { content: [call('glob', { pattern: '*.mjs' }, 'toolu_g')], stop_reason: 'tool_use' },
+        {
+          content: [
+            { type: 'text', text: 'There is no Export control anywhere in this project. I cannot reproduce this and am committing nothing.' },
+          ],
+          stop_reason: 'end_turn',
+        },
+      ],
+    });
+
+    // No fix, no PR, and the run is UNRESOLVED rather than errored — "we could not
+    // reproduce it" is a deliverable, not a fault.
+    expect(result.state.reproduced).toBe(false);
+    expect(result.state.shownOnBase).toBe(false);
+    expect(result.state.pr).toBeNull();
+    expect(result.prUrl).toBeUndefined();
+    expect(result.state.status).toBe('unresolved');
+    expect(confidence(result.state).tier).toBe(3);
+
+    // The deliverable is the comment, and it has to be a structured info-request
+    // rather than an apology — a comment that says only "could not reproduce" puts
+    // the work back on the reporter with no direction.
+    const comment = calls.find((c) => c.url.includes('/comments'))!.body as { body: string };
+    expect(comment.body).toContain('**no fix was attempted**');
+    expect(comment.body).toMatch(/1\. The exact steps/);
+    expect(comment.body).toMatch(/label it again to start a new run/);
+    expect(comment.body).not.toMatch(/sorry|apolog/i);
+  }, 900_000);
+
+  test('total-rounding: a reproduction that passes on base shuts the gate, and no fix agent is spawned', async () => {
+    // Order 3 genuinely totals what it says, so an honest reproduction of the report
+    // is GREEN on base. The control shape: the tempting fix is a rounding change that
+    // alters nothing, and a run that credited it would have learned nothing.
+    const repro =
+      "import assert from 'node:assert/strict';\n" +
+      "import { test } from 'node:test';\n" +
+      "import { page } from '../page.mjs';\n" +
+      "test('order 3 shows the right total', () => {\n" +
+      "  assert.match(page([{ id: 3, customer: 'Alan', status: 'shipped', cents: 999 }]), /\\$9\\.99/);\n" +
+      '});\n';
+
+    const { result, events, calls } = await runIssue({
+      title: 'The order total is wrong for order 3',
+      body: 'The order total shown on the orders page is wrong for order 3.',
+      turns: [
+        { content: [call('write', { path: 'test/total.test.mjs', content: repro })], stop_reason: 'tool_use' },
+        {
+          content: [
+            call(
+              'write',
+              {
+                path: '.engine/repro.json',
+                content: JSON.stringify({
+                  command: 'node --test test/total.test.mjs',
+                  files: ['test/total.test.mjs', '.engine/repro.json'],
+                }),
+              },
+              'toolu_w2',
+            ),
+          ],
+          stop_reason: 'tool_use',
+        },
+        { content: [call('git_commit', { message: 'test: the order 3 total' }, 'toolu_c')], stop_reason: 'tool_use' },
+        { content: [{ type: 'text', text: 'registered' }], stop_reason: 'end_turn' },
+      ],
+    });
+
+    // The reproduction WAS registered and the base container DID run it — so this is
+    // the gate closing on evidence, not on the agent having failed to produce
+    // anything.
+    expect(result.state.registeredRepro?.command).toBe('node --test test/total.test.mjs');
+    const base = result.state.testRuns.find((r) => r.phase === 'base');
+    expect(base).toBeDefined();
+    expect(base!.exit_code).toBe(0);
+
+    // Green on base means the bug was never shown. No fix is attempted, and the log
+    // proves it by ABSENCE: no fix container ran, and the run stopped for that reason.
+    expect(result.state.shownOnBase).toBe(false);
+    expect(result.state.reproduced).toBe(false);
+    expect(events.some((e) => e.type === 'TEST_RUN' && (e.payload as { phase: string }).phase === 'fix')).toBe(false);
+    expect(result.state.handovers.some((h) => h.kind === 'fix')).toBe(false);
+    expect(result.state.endedReason).toBe('not_reproduced');
+    expect(result.state.pr).toBeNull();
+    expect(confidence(result.state).tier).toBe(3);
+
+    // And the reason is recorded as a CAUSE of stopping, never as a verdict — the
+    // fold derives `reproduced` from the runs regardless of what the producer claimed
+    // (ADR-0009).
+    const comment = calls.find((c) => c.url.includes('/comments'))!.body as { body: string };
+    expect(comment.body).toContain('**no fix was attempted**');
+  }, 900_000);
+});
+
+describe.skipIf(!dockerAvailable())('shipped-filter: an API bug the agent needs the database to see', () => {
+  test('found against the running service, proved by a test that needs neither', async () => {
+    // The fourth seeded bug, and the one whose shape the recipe exists for: it is
+    // invisible without a booted backend and seeded data. So the agent boots nothing
+    // itself — the recipe already did — queries the live endpoint, sees four orders
+    // where two were asked for, and then commits a reproduction that runs in a sealed
+    // container with no service and no network at all.
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = demoRepo();
+    const remotePath = bareRemote(fixture.repo);
+    const blobs = hostBlobs();
+    const port = 8095;
+
+    const calls: { url: string; body: unknown }[] = [];
+    const recorder = (async (url: string | URL | Request, init?: RequestInit) => {
+      const target = String(url);
+      calls.push({ url: target, body: init?.body ? JSON.parse(String(init.body)) : null });
+      if (target.endsWith('/access_tokens')) return new Response(JSON.stringify({ token: 'ghs_minted' }), { status: 201 });
+      if (target.endsWith('/pulls')) {
+        return new Response(
+          JSON.stringify({ number: 9, head: { sha: 'a'.repeat(40) }, html_url: 'https://github.com/o/r/pull/9' }),
+          { status: 201 },
+        );
+      }
+      return new Response('{}', { status: 201 });
+    }) as typeof fetch;
+
+    // SQLite is a file, so the reproduction migrates and seeds itself. That is what
+    // makes an API bug provable by an exit code in a container with nothing running.
+    const repro =
+      "import assert from 'node:assert/strict';\n" +
+      "import { test } from 'node:test';\n" +
+      "import { migrate, open, seed } from '../db.mjs';\n" +
+      "import { selectOrders } from '../orders.mjs';\n" +
+      "test('status=shipped returns only shipped orders', () => {\n" +
+      '  migrate();\n  seed();\n  const db = open();\n' +
+      "  const rows = selectOrders(db, 'shipped');\n  db.close();\n" +
+      "  assert.deepEqual(rows.map((r) => r.status), ['shipped', 'shipped'],\n" +
+      "    'status=shipped returns every order, including pending ones');\n" +
+      '});\n';
+
+    const model = await fakeModel([
+      { content: [call('shell_create', { name: 'probe' })], stop_reason: 'tool_use' },
+      {
+        content: [
+          call(
+            'shell_write',
+            {
+              name: 'probe',
+              input: `node -e "fetch('http://127.0.0.1:${port}/api/orders?status=shipped').then(r=>r.json()).then(d=>console.log('COUNT:'+d.orders.length))"`,
+            },
+            'toolu_probe',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      { content: [call('write', { path: 'test/filter.test.mjs', content: repro }, 'toolu_w1')], stop_reason: 'tool_use' },
+      {
+        content: [
+          call(
+            'write',
+            {
+              path: '.engine/repro.json',
+              content: JSON.stringify({
+                command: 'node --test test/filter.test.mjs',
+                files: ['test/filter.test.mjs', '.engine/repro.json'],
+              }),
+            },
+            'toolu_w2',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      { content: [call('git_commit', { message: 'test: the shipped filter' }, 'toolu_c1')], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'reproduced against the running API' }], stop_reason: 'end_turn' },
+      // The fix agent, spawned only after the base phase went red.
+      {
+        content: [
+          call(
+            'edit',
+            {
+              path: 'orders.mjs',
+              old_string: "return db.prepare('select id, customer, status, cents from orders order by id').all();",
+              new_string:
+                "if (!status) return db.prepare('select id, customer, status, cents from orders order by id').all();\n" +
+                "  return db.prepare('select id, customer, status, cents from orders where status = ? order by id').all(status);",
+            },
+            'toolu_e',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      { content: [call('git_commit', { message: 'fix: honour the status filter' }, 'toolu_c2')], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'fixed' }], stop_reason: 'end_turn' },
+    ]);
+    models.push(model);
+
+    const events: RunEvent[] = [];
+    const body = '/api/orders?status=shipped returns every order, including pending ones.';
+    const mapped = intake('issues', {
+      ...delivery(body),
+      issue: { ...delivery(body).issue, title: 'The shipped filter returns everything' },
+    })!;
+    const result = await runFromIssue({
+      intake: mapped,
+      app: { appId: '123456', privateKeyPem: PEM, api: 'https://api.test.invalid', fetch: recorder },
+      recipe: demoRecipe(port),
+      image: IMAGE,
+      blobRoot: blobs,
+      append: async (event) => void events.push(event),
+      remote: () => remotePath,
+      flakeRuns: 2,
+      symptomPattern: 'status=shipped returns every order',
+      loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+    });
+
+    // The environment was stood up and OBSERVED — this is the only run in the suite
+    // that drives a recipe through the whole issue-to-PR path.
+    expect(events.some((e) => e.type === 'ENV_READY')).toBe(true);
+
+    // The agent saw the bug live: four orders where two were asked for.
+    const said = await Promise.all(
+      events
+        .filter((e) => e.type === 'AGENT_MESSAGE')
+        .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+    );
+    const results = said
+      .map((b) => JSON.parse(b.toString()) as { ok?: boolean; output?: string })
+      .filter((line) => typeof line.ok === 'boolean')
+      .map((line) => line.output ?? '')
+      .join('\n');
+    expect(results).toMatch(/COUNT:4/);
+
+    // And the judge proved it with neither a service nor a network: red on base for
+    // the reported symptom, green on the fix every time.
+    expect(result.state.registeredRepro?.command).toBe('node --test test/filter.test.mjs');
+    const base = result.state.testRuns.find((r) => r.phase === 'base')!;
+    expect(base.exit_code).not.toBe(0);
+    expect(base.symptom_matched).toBe(true);
+    expect(result.state.testRuns.filter((r) => r.phase === 'fix')).toHaveLength(3);
+    expect(result.state.reproduced).toBe(true);
+    expect(result.state.fixDiff?.changed_files).toContain('orders.mjs');
+    expect(result.prUrl).toBe('https://github.com/o/r/pull/9');
   }, 900_000);
 });

@@ -7,6 +7,7 @@
 import { createServer } from 'node:http';
 import { open } from './db.mjs';
 import { page } from './page.mjs';
+import { selectOrders } from './orders.mjs';
 
 const PORT = Number(process.env.PORT ?? 8080);
 
@@ -26,10 +27,8 @@ const server = createServer((request, response) => {
 
   if (url.pathname === '/api/orders') {
     const db = open();
-    // BUG shipped-filter: the status parameter is read and then ignored, so the
-    // query returns every order. Needs the database seeded to show at all.
     const status = url.searchParams.get('status');
-    const rows = db.prepare('select id, customer, status, cents from orders order by id').all();
+    const rows = selectOrders(db, status);
     db.close();
     json(response, 200, { status, orders: rows });
     return;

@@ -468,20 +468,32 @@ The milestone is built. These are the things a reader should not assume from tha
    append-only by convention rather than construction. v1.5 did not touch it.
 5. **Diff-coverage is still not built**, so an agent-authored reproduction still cannot
    earn Tier 1 and the tier cap is still what withholds the claim.
-6. **The demo's four seeded bugs are not all exercised end to end.** The copy bug is
-   (5f), and the control fixture's *shape* is asserted in the demo's own suite. The API
-   bug and the irreproducible-by-design bug have their issue text written and no run
-   against them.
+6. *(closed)* All four seeded demo bugs now have a run behind their claimed outcome —
+   see below.
+
+## All four seeded bugs, driven
+
+`demo/README.md` claimed an expected outcome for each of its four bugs and only one had
+a run behind it. A claimed tier with no test is the kind of claim this project exists to
+refuse, so all four are now driven end to end.
+
+| Bug | Outcome | What the run pins |
+|---|---|---|
+| `orders-heading` | Tier 2 | The browser reads the rendered `h1`, gets `Ordres`, screenshots it; the committed test runs in a sealed container with no browser (5f). |
+| `shipped-filter` | Tier 2 | **The only run that drives a recipe through the whole issue-to-PR path.** The agent queries the live endpoint and sees four orders where two were asked for; the reproduction it commits migrates and seeds SQLite itself, so it needs neither the service nor the network. `ENV_READY` is in the log, base is red for the reported symptom, three green fix runs, PR opened. |
+| `export-button` | **Tier 3** | Nothing to reproduce, so the agent commits nothing. `unresolved`, not `errored`; no PR; and the comment is asserted down to its wording — it names what would help, in order, and does not apologise. |
+| `total-rounding` | **Tier 3** | The control shape. An honest reproduction *is* registered and the base container *does* run it — and it passes, so the gate closes. Asserted by **absence**: no fix container, no `fix` handover, `endedReason: 'not_reproduced'`. |
+
+The last two matter most. ADR-0007 says a demo of the Tier-3 flow belongs in the demo
+script "precisely because refusing to guess is the credibility of every verdict the
+system does issue" — and until now that flow had never been run.
+
+`demo/orders.mjs` was extracted for the same reason `page.mjs` was: a reproduction has
+to be provable by an exit code in a container with nothing running.
 
 ## The exact next step
 
-Open the 5e/5f/5g pull request, then run the four demo issues through
-`runFromIssue` — the two that are not yet exercised are the interesting ones, because
-`export-button` should reach Tier 3 with a structured info-request and `total-rounding`
-should refuse a fix whose reproduction was never red. Both paths exist and neither has
-been driven by a run.
-
-After that, the honest next milestone is the one thing this cannot fake: a real model.
+The one thing none of this can fake: a real model.
 Set `ANTHROPIC_API_KEY`, run the demo's `orders-heading` issue, and see whether a real
 agent reads `prompts/repro.md` and produces a manifest the engine accepts without a
 retry. Everything up to that boundary is asserted; that boundary is not.
