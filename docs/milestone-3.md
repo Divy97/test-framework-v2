@@ -154,26 +154,28 @@ develop against.
 - **3c.1 — the phases have no network.** Landed. `--network none` on every
   container that is not the agent's, asserted by a test that fails when the flag
   is removed (the phase container resolves `api.anthropic.com` without it).
-- **3c.2 — the agent's one channel.** Landed. A flag cannot express "the model
-  API and nothing else", so the agent gets `--network none` plus an
-  `--add-host <allowlisted-name>:host-gateway` pointing at a CONNECT proxy in the
-  orchestrator process, and `HTTPS_PROXY` sends its client through it. The proxy
-  knows one host, matched exactly — `api.anthropic.com.evil.test` ends in nothing
-  suspicious, so a suffix rule would pass it.
+- **3c.2 — the agent's one channel.** NOT built, and the transport it needs is
+  not what this milestone assumed. `--network none` and
+  `--add-host <name>:host-gateway` are mutually exclusive — the first removes
+  every interface, the second needs one — so "sealed plus one route" cannot be
+  expressed that way. An attempt to do it silently dropped the seal, which would
+  have handed an untrusted agent the open bridge; `HTTPS_PROXY` is an environment
+  variable, and an agent that ignores it is simply on the internet.
 
-  **Sealed by default.** With no `egress` named the agent reaches nothing, like a
-  phase. An engine that grants the open internet when a field is missing has made
-  the safe case the one you have to remember, and this project has been bitten
-  more than once by a default that failed open.
+  What it actually needs is an `--internal` docker network with the proxy
+  reachable on it, or a bind-mounted unix socket. Both are real work.
 
-  Two limits, stated rather than found later. It is an ALLOWLIST, NOT AN AUDIT:
-  it records that a tunnel opened, never what crossed it, because what crosses it
-  is TLS and reading that means terminating it — a credential-bearing man in the
-  middle inside the thing built to keep the agent away from credentials. And it
-  speaks CONNECT only, so plain `http://` to the allowed host is answered 405
-  rather than proxied. The model API is https; a future allowlisted host that is
-  not would need the other half of a proxy, with its own URL parser and its own
-  surface.
+  Until then EVERY container is sealed, the agent's included. An agent that
+  cannot reach the model API cannot do its job, and a caller will notice at once
+  — the failure this project wants, rather than a boundary that reads as enforced
+  and is not.
+
+  The proxy itself exists and is tested (`src/egress.ts`): CONNECT only, exact
+  host matching, malformed targets refused. It is groundwork, wired to nothing.
+  Known gaps before it can be: it binds every interface rather than loopback and
+  has no authentication, `close()` hangs on a live tunnel, the allowlist is
+  host-only so every port on an allowed host is open, and its record of attempts
+  reaches no event and no projection.
 
 ## Decisions this milestone must make
 
