@@ -1,5 +1,14 @@
 # Milestone 4 (proposed) — one container per participant
 
+> **Superseded by [ADR-0014](adr/0014-long-lived-services-and-named-shells.md) and
+> [milestone-5](milestone-5-v1.5.md) §5d.** Candidate B below was adopted, and the
+> "evaluate A first" recommendation was overtaken: v1.5 needs a container boundary
+> between the phases for [ADR-0013](adr/0013-the-environment-recipe.md)'s reasons as
+> well as this document's, so namespaces-within-one-container buys nothing that the
+> boundary does not. Kept because the cost accounting in *What it costs* is still
+> the accurate price of 5d, and the "Do this before 3b.2" warning at the end turned
+> out to be correct and unheeded — 3b.2 landed first.
+
 **Status: candidate B landed for the phases, after review caught it making one
 channel worse.** Mounting the real evidence store into every container defeated
 the premise: the base container flushes before it exits, the fix container

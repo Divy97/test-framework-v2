@@ -4,6 +4,15 @@ status: accepted
 
 # The environment is part of the evidence
 
+> **Read [ADR-0014](0014-long-lived-services-and-named-shells.md) alongside this.**
+> The principle below is intact and is the reason v1.5 is shaped the way it is. Two
+> of its mechanisms are not: the phase-boundary sweep is no longer the reason a
+> timing attack fails (separate containers per phase are), and the sentence "they
+> must share the clone" is retired. The "what still leaks" list at the end is the
+> list that motivated the change — most of it closes structurally rather than by
+> enumeration. Everything here is kept as written, because the four defeated
+> versions are the argument.
+
 [ADR-0008](0008-the-reproduction-is-anchored.md) anchors the reproduction so both
 phases provably run the same thing. [ADR-0006](0006-testimony-vs-evidence.md)
 says the agent cannot write facts. Both hold. Neither was enough.
@@ -185,3 +194,48 @@ was false within a day.
   nothing at all — which is correct, and means the in-process engine used by the
   unit tests has none of this protection. That is acceptable only because the
   agent never runs there.
+
+---
+
+## Amendment — the list above is what argued for a boundary instead (v1.5)
+
+This ADR said it plainly and then kept enumerating: *"The real answer is a mount
+namespace per participant, or running the phases in a container of their own."*
+[ADR-0014](0014-long-lived-services-and-named-shells.md) takes that answer. Which
+entries close and which do not:
+
+**Closed structurally**, because base and fix no longer share a container: the
+writable-filesystem enumeration, surviving processes across the phase boundary, the
+gitignored-path channel, and the meta-problem of not knowing when the list is
+complete. The image scan stays in the suite — it is cheap and it now protects the
+*agent* sandbox, where a browser and booted services make the writable set larger
+than it has ever been.
+
+**Still open, unchanged.** The shared kernel and clock. `/blobs`, which remains a
+bind mount every participant can write and which outlives the run, append-only by
+convention rather than construction — the weakest thing in this document and
+untouched by v1.5. Flake re-runs sharing everything with each other, deliberately.
+
+**Falsified.** The AGENT's-network entry above reasons about "what leaks once it IS
+built." It never gets built —
+[ADR-0011](0011-the-agent-loop-runs-outside-the-sandbox.md) abandons the channel
+rather than deferring it, because the ceiling that entry names (a tunnel we
+authorise and cannot inspect) is the ceiling of the whole shape. The entry is
+right about the leak and wrong about the future, which is the useful half to keep.
+
+**Newly open, and named here rather than discovered later.** The agent sandbox now
+contains booted services, installed dependencies, a package-registry route and a
+browser ([ADR-0013](0013-the-environment-recipe.md)). It is a far richer world than
+the one this ADR fought over. That is affordable only because of what left it: no
+model credential ([ADR-0011](0011-the-agent-loop-runs-outside-the-sandbox.md)), no
+GitHub token ([ADR-0012](0012-the-github-app-and-where-the-token-lives.md)), and no
+event channel. The agent sandbox is now a place where nothing worth stealing lives
+and nothing it produces is trusted — which is why it can be allowed to get messy,
+and the phase containers cannot.
+
+**The sentence this ADR got wrong twice, stated once more.** It claimed a closed
+list, was wrong, claimed a checked list, and was right about the check and wrong
+about what the check bought. What is true in v1.5: the channels between the two
+parties whose comparison decides a verdict are closed by namespace rather than by
+enumeration. What is still not true: that the agent sandbox is contained. It is
+not, and it no longer needs to be.

@@ -154,28 +154,39 @@ develop against.
 - **3c.1 — the phases have no network.** Landed. `--network none` on every
   container that is not the agent's, asserted by a test that fails when the flag
   is removed (the phase container resolves `api.anthropic.com` without it).
-- **3c.2 — the agent's one channel.** NOT built, and the transport it needs is
-  not what this milestone assumed. `--network none` and
-  `--add-host <name>:host-gateway` are mutually exclusive — the first removes
-  every interface, the second needs one — so "sealed plus one route" cannot be
-  expressed that way. An attempt to do it silently dropped the seal, which would
-  have handed an untrusted agent the open bridge; `HTTPS_PROXY` is an environment
-  variable, and an agent that ignores it is simply on the internet.
+- **3c.2 — the agent's one channel. ABANDONED, not deferred.** The agent loop
+  moves out of the sandbox
+  ([ADR-0011](adr/0011-the-agent-loop-runs-outside-the-sandbox.md)), so the
+  container needs no route to the model API and there is no channel left to build.
 
-  What it actually needs is an `--internal` docker network with the proxy
-  reachable on it, or a bind-mounted unix socket. Both are real work.
+  The reason is kept here because it is the argument, and because it was learned
+  the expensive way. A flag cannot express "the model API and nothing else":
+  `--network none` and `--add-host <name>:host-gateway` are mutually exclusive —
+  the first removes every interface, the second needs one — so "sealed plus one
+  route" cannot be stated that way at all. An attempt to do it silently dropped
+  the seal, which would have handed an untrusted agent the open bridge.
+  `HTTPS_PROXY` is an environment variable, and an agent that ignores it is simply
+  on the internet.
 
-  Until then EVERY container is sealed, the agent's included. An agent that
-  cannot reach the model API cannot do its job, and a caller will notice at once
-  — the failure this project wants, rather than a boundary that reads as enforced
-  and is not.
+  What the shape actually needs is an `--internal` docker network with the proxy
+  reachable on it, or a bind-mounted unix socket. Both are real work, and both
+  arrive at the same ceiling: a CONNECT proxy authorises a tunnel and never reads
+  it, so an agent exfiltrates through the one host it may reach. Closing *that*
+  means terminating TLS inside the component built to keep the agent away from
+  credentials.
 
-  The proxy itself exists and is tested (`src/egress.ts`): CONNECT only, exact
-  host matching, malformed targets refused. It is groundwork, wired to nothing.
-  Known gaps before it can be: it binds every interface rather than loopback and
-  has no authentication, `close()` hangs on a live tunnel, the allowlist is
-  host-only so every port on an allowed host is open, and its record of attempts
-  reaches no event and no projection.
+  Until the loop moved out, EVERY container was sealed, the agent's included — an
+  agent that cannot reach the model API cannot do its job, and a caller notices at
+  once, which is the failure this project wants rather than a boundary that reads
+  as enforced and is not.
+
+  The proxy itself exists and is tested (`src/egress.ts`): CONNECT only, exact host
+  matching, malformed targets refused. It is groundwork wired to nothing, and
+  [milestone-5](milestone-5-v1.5.md) §5a deletes it. Its known gaps are why that is
+  the right end for it: it binds every interface rather than loopback and has no
+  authentication, `close()` hangs on a live tunnel, the allowlist is host-only so
+  every port on an allowed host is open, and its record of attempts reaches no
+  event and no projection.
 
 ## Decisions this milestone must make
 

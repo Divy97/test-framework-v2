@@ -37,11 +37,6 @@ Enforcement is structural, not behavioral:
   on base *with output matching the reported symptom*, pass on the fix,
   survive flake re-runs, and the fix diff must overlap the reproduction path.
 
-**Amended by [ADR-0008](0008-the-reproduction-is-anchored.md).** The fourth
-criterion is retired: the reproduction is no longer part of the commit, so
-"the fix diff overlaps the reproduction path" is unsatisfiable by
-construction. It is replaced by anchoring the reproduction so both phases
-provably run the same thing.
   Exit-code-only gating is gameable; symptom-anchored gating is the judge's
   actual job.
 - **Bounded attempts, honest exit.** `ATTEMPT_STARTED {n}`, max 3, each
@@ -51,3 +46,47 @@ provably run the same thing.
 
 The timeline renders testimony and evidence as visually distinct classes, so
 the trust model is legible in the UI itself.
+
+**Amended by [ADR-0008](0008-the-reproduction-is-anchored.md).** The fourth
+anti-gaming criterion is retired: the reproduction is no longer part of the
+commit, so "the fix diff overlaps the reproduction path" is unsatisfiable by
+construction. It is replaced by anchoring the reproduction so both phases
+provably run the same thing.
+
+---
+
+## Amendment — where the pen moved, and what a browser is (v1.5)
+
+Two clauses above describe an arrangement v1.5 replaces. Both are amended in the
+direction of the original decision rather than against it.
+
+**"The Runner is the sole event writer. It runs as PID 1 in the sandbox."** The
+sole writer is now the **host orchestrator**
+([ADR-0011](0011-the-agent-loop-runs-outside-the-sandbox.md)). The sandbox worker
+executes tool calls and returns results; it has no event channel at all, narrow or
+otherwise. This is the same rule with less surface: previously the agent shared a
+container with the process holding the only pen, and the argument for why it could
+not reach it was uid separation plus a `--separate-git-dir` fix for a
+`post-checkout` hook that had already defeated an earlier version. Now the pen is
+on the other side of a boundary the agent cannot address.
+
+**"The sandbox has no egress except the model API and the Runner's event
+channel."** The sandbox has no egress to either. The model credential lives in
+the loop on the host; the agent sandbox reaches a package registry and localhost
+during setup ([ADR-0013](0013-the-environment-recipe.md)) and nothing else. The
+phase containers reach nothing.
+
+**A browser produces testimony.** v1.5 gives the agent a headless browser so it
+can find bugs it cannot find by reading — a wrong string rendered on a page is
+the canonical v1.5 bug. Screenshots, console logs and network traces are stored,
+shown in the pull request, and are **inputs to no verdict**. What the engine
+judges is still a committed command's exit code, run in a container with no
+browser in it. The browser makes the agent better at its job and gives the judge
+nothing new to trust, which is the only way this system can accept a new
+capability.
+
+**"Loose agent, strict judge" survives the move and needs restating.** Owning the
+tool surface is a temptation to constrain the agent's output — typed tools, forced
+schemas, validated arguments. Constrain the tools because we execute them; do not
+constrain the agent's *reasoning or reporting* to make its self-report easier to
+trust. We still do not trust it, so we still do not need it structured.

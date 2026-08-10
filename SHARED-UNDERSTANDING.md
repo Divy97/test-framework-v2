@@ -106,9 +106,65 @@ Corollaries:
 7. Reproduce-first gate and tiered confidence (Tier 3 = no fix)
 8. The reproduction is anchored, not committed (added M2, PR 3a)
 
+## Amended by v1.5 — the shape three decisions turned out to have
+
+Recorded here rather than edited into the Q-sections above, because the reasoning
+that produced those answers is the record and the answers are what moved. The
+target shape is [docs/architecture-v1.5.md](docs/architecture-v1.5.md); the build
+order is [docs/milestone-5-v1.5.md](docs/milestone-5-v1.5.md).
+
+**Q3 — the agent no longer runs inside our sandbox.** The decision to run Claude on
+our own account holds. Where it runs does not: the loop runs on the **host**, and
+tool calls travel into the container
+([ADR-0011](docs/adr/0011-the-agent-loop-runs-outside-the-sandbox.md)). M3 spent a
+milestone trying to give a container in-sandbox exactly one route to the model API
+and the transport does not exist — `--network none` and a host-gateway route are
+mutually exclusive, and the version that claimed to do both silently dropped the
+seal. Moving the loop out deletes the problem rather than solving it: the container
+needs no egress, because nothing inside it talks to Anthropic. Q3's stated payoff —
+the live streamed transcript — survives intact, since every tool call now passes
+through our own process on its way to becoming an event.
+
+It also stops being *Claude Code* specifically. We own the tool surface (named
+shells, edit, grep, browser, commit-only git), which is what
+[ADR-0014](docs/adr/0014-long-lived-services-and-named-shells.md) and the browser
+both require and what a spawned CLI cannot give.
+
+**Q7 — the Runner's three duties redistribute.** Duty 1 (spawn and supervise the
+agent) moves to the host loop. Duty 2 (execute the verification phases) splits, one
+container per phase. Duty 3 (push events through one narrow channel) becomes: the
+**orchestrator** is the sole writer and the sandbox has no event channel at all.
+The rule Q7 was protecting is unchanged and cheaper to hold —
+[ADR-0006](docs/adr/0006-testimony-vs-evidence.md) carries the detail.
+
+**Q8's demo app becomes load-bearing.** It was "the demo target, and explicitly not
+the engine's test fixture." It is now also the only repository with a recipe, so
+5b, 5c and 5f are all tested against it. The Q8 split still holds — the adversarial
+fixtures stay tiny generated git repos — but the demo app has stopped being a
+demo-only artifact.
+
+## v1.5 scope — one connector
+
+The v1 freeze above stands as the eventual target. v1.5 narrows it to the shortest
+path that produces something a person can use:
+
+**In:** GitHub App (issue intake + branch + PR) · environment recipe · agent loop
+outside the sandbox · the two prompts · one container per phase · headless browser
+· SSE tail · issue comments on every terminal outcome.
+
+**Out, deferred not cut:** Slack and CLI adapters · the dashboard · deployment and
+preview URLs · multi-repo runs · LSP tools · diff-coverage.
+
+The dashboard is the painful one, because [Q5](#q5--the-3-minute-demo) made it the
+demo. Deferred on the grounds that v1.5 exists to produce a run worth watching, and
+a timeline over an empty event log demonstrates nothing.
+
 ## Open items
 - [ ] Project name ("test-framework-v2" is a placeholder)
-- [x] Timeline / milestone cut — M1 event core (merged); M2 verification engine, engine-first with no agent and no container ([docs/milestone-2.md](docs/milestone-2.md)); M3 Runner + sandbox
+- [x] Timeline / milestone cut — M1 event core (merged); M2 verification engine, engine-first with no agent and no container ([docs/milestone-2.md](docs/milestone-2.md)); M3 Runner + sandbox; **M5 v1.5** ([docs/milestone-5-v1.5.md](docs/milestone-5-v1.5.md)), which supersedes M3 §3c.2 and the M4 isolation scope
+- [x] **Where the environment recipe lives — decided: on our side, keyed by repository.** Not committed to the user's codebase. A committed `.engine/env.json` is the better engineering artifact and was rejected anyway: onboarding must not be a pull request against someone else's repo before we have delivered anything. [ADR-0013](docs/adr/0013-the-environment-recipe.md)
+- [x] **Which connector first — decided: GitHub App.** One integration carries intake, clone access and delivery. Slack has no repository in its payload and would need resolution logic v1.5 does not have. [ADR-0012](docs/adr/0012-the-github-app-and-where-the-token-lives.md)
 - [ ] Stack detail pass (queue choice, dashboard framework) — blob store settled: content-addressed local directory, S3 as an adapter later
-- [ ] Seeded-bug list for the demo app
+- [ ] Seeded-bug list for the demo app — now blocking, since v1.5's phases are tested against it. Needs at least: one copy/UI bug (browser-findable), one API bug (needs backend + DB), one irreproducible-by-design (Tier 3), one whose obvious fix is a no-op (control fixture)
 - [ ] Which real OSS issue for the recorded run
+- [ ] Bounded attempts, carried from M3 §3b.2b — `handedOver` must become per-attempt with them
