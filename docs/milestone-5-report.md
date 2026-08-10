@@ -13,14 +13,35 @@ happened when it was built.
 | Thing | State | Consequence |
 |---|---|---|
 | Docker daemon | available (29.1.2) | the sandbox suite runs |
-| `ANTHROPIC_API_KEY` | **absent** | 5c's live end-to-end run cannot happen |
+| A model credential | **absent** | 5c's live end-to-end run cannot happen |
 | Registered GitHub App | **absent** | 5e's live install cannot happen |
 | `gh` CLI auth | present (`Divy97`) | PRs can be opened for the phases themselves |
+| Postgres | started by this run | `test/store.test.ts` executes its SQL |
 
 Both absences are anticipated by the milestone document, which says to build up
 to the boundary and skip the integration test with the reason stated. That is
 what was done; every skip below names its missing credential in the skip message
 itself, so a green suite cannot read as a verified boundary.
+
+**"No model credential" was verified, not assumed.** An unset `ANTHROPIC_API_KEY`
+does not mean there are no credentials — the SDK resolves `ANTHROPIC_API_KEY` →
+`ANTHROPIC_AUTH_TOKEN` → an `ant auth login` profile → Workload Identity Federation
+→ the default profile on disk, and a bare `new Anthropic()` works off any of them.
+All five were checked and all five are absent, `ant` is not installed, and there is
+no `~/.config/anthropic` or Claude Code credential file. So 5c's live run is blocked
+by a real absence rather than by one env var nobody looked past.
+
+### Two changes this run made to the machine
+
+Neither is in the repository, and both are worth knowing about:
+
+1. **`.env` was created** with a freshly generated password (it is gitignored, and
+   `.env.example` documents exactly this step).
+2. **The dev Postgres password was changed** to match it, with `ALTER USER` over the
+   container's unix socket. The existing volume had a different password and held six
+   events from the seeded demo run — dropping someone's dev data to make a test pass
+   is not a trade worth making, so the password moved instead of the volume. The
+   container is left running; `docker compose down` stops it.
 
 **Baseline before any change:** 494 passed, 2 skipped, 18 files, 737s.
 
