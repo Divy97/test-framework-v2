@@ -109,7 +109,7 @@ The full decision record from the founding design session: [SHARED-UNDERSTANDING
 
 ## Honest limitations
 
-**No real agent has ever run in this system.** Every sandbox test mounts a hostile fake `claude` on `PATH` — built to forge events, hang, flood the channel, and claim credit for inherited work. It was never built to fix a bug. And **no prompt has ever been authored**: `src/agent.ts` says the prompt's content is the caller's business, so nothing has ever told an agent that the manifest contract at `.engine/repro.json` exists. The engine is a strict judge that has never stated its rules to the party they bind. [Milestone 5 §5c](docs/milestone-5-v1.5.md) is that gap.
+**No real model has ever run in this system.** The prompts now exist — `prompts/repro.md` states the manifest contract, and its tests read the ceilings out of the engine so a prompt cannot promise a limit the code does not enforce — and the tool surface, the containers and the whole issue-to-pull-request path are driven end to end by a **scripted Messages API on a local port**, the successor to the hostile fake `claude`. What that proves is that the engine accepts a well-formed manifest without a retry. What it cannot prove is that a real agent, reading the prompt, produces one.
 
 **An agent-authored reproduction cannot reach Tier 1, and this is measured rather than assumed.** Six successive versions of a negative control were defeated; the sixth fell to six oracles at once, and the same review showed it convicting honest reproductions at a rate that depended on a random draw. So the control is advisory — it records what it saw and ends nothing — and what withholds the claim is the tier cap, which does not depend on any control working. Diff-coverage is the measurement that would settle it and is not built.
 
@@ -121,9 +121,9 @@ The full decision record from the founding design session: [SHARED-UNDERSTANDING
 
 The engine works; the product does not exist yet.
 
-**Built and tested:** event store · fold and projections · tiers and confidence · the verification engine · the reproduce-first gate · the anchored reproduction · the sandbox and its adversarial suite · agent supervision against a hostile fake.
+**Built and tested:** event store · fold and projections · tiers and confidence · the verification engine · the reproduce-first gate · the anchored reproduction · the sandbox and its adversarial suite · agent supervision against a hostile fake · the agent loop outside the sandbox · the environment recipe · the two prompts · one container per phase · the GitHub App in and out · the browser · the SSE tail ([milestone 5](docs/milestone-5-v1.5.md), [report](docs/milestone-5-report.md)).
 
-**Being built ([milestone 5](docs/milestone-5-v1.5.md)):** the agent loop outside the sandbox · the environment recipe · the two prompts and the first real run · one container per phase · the GitHub App in and out · the browser · SSE.
+**Still not true, and this is the honest list:** no real model has ever run — every agent in every test is a scripted Messages API on a local port, and 5c's done-when is met in every part except the word *real*. No GitHub App is registered, so nothing here has been accepted by GitHub; a bare repository on disk stood in for the remote. `/blobs` remains append-only by convention rather than construction. Diff-coverage is still not built, so an agent-authored reproduction still cannot earn Tier 1.
 
 **Deliberately not in v1.5:** Slack and CLI connectors · the dashboard · deployment and preview URLs · multi-repo runs · LSP tools · diff-coverage · observability-triggered runs.
 

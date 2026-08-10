@@ -653,7 +653,16 @@ export async function runJob(
     if (!requests) {
       throw new ObservationFailed('serveTools was set with no request stream; nothing would drive the tools');
     }
-    served = new ToolHost({ root: agentWorld.tree, gitDir: agentWorld.gitDir, runAs, env: agentWorld.env });
+    served = new ToolHost({
+      root: agentWorld.tree,
+      gitDir: agentWorld.gitDir,
+      runAs,
+      env: agentWorld.env,
+      // STAGING, not `/blobs`. A screenshot is banked the moment it is taken, and it
+      // must not be visible to another participant or to the host until the final
+      // flush — the same rule every other artifact follows (ADR-0010).
+      blobRoot: staging,
+    });
     // The recipe, replayed, before the agent can touch anything. A service lives in
     // a NAMED SESSION this ToolHost started and holds a handle to (ADR-0014), so it
     // is still up when the agent arrives and it is torn down by `close()` rather

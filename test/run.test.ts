@@ -165,13 +165,15 @@ describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no h
 
     // A scripted agent that actually does the job: writes a failing unit test over
     // the demo's page template, registers it, and then fixes the heading.
+    // A test over the page TEMPLATE, not over the source text. It runs with no
+    // browser, no service and no network — which is what makes it something a sealed
+    // phase container can judge.
     const repro =
       "import assert from 'node:assert/strict';\n" +
       "import { test } from 'node:test';\n" +
-      "import { readFileSync } from 'node:fs';\n" +
+      "import { page } from '../page.mjs';\n" +
       "test('the orders heading is spelled correctly', () => {\n" +
-      "  const source = readFileSync('server.mjs', 'utf8');\n" +
-      "  assert.ok(source.includes('<h1>Orders</h1>'), 'Ordres: the heading is misspelled');\n" +
+      "  assert.match(page([]), /<h1>Orders<\\/h1>/, 'Ordres: the heading is misspelled');\n" +
       '});\n';
     const model = await fakeModel([
       { content: [call('write', { path: 'test/heading.test.mjs', content: repro })], stop_reason: 'tool_use' },
@@ -196,7 +198,7 @@ describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no h
       // The FIX agent, in a container spawned only after the base phase went red.
       {
         content: [
-          call('edit', { path: 'server.mjs', old_string: '<h1>Ordres</h1>', new_string: '<h1>Orders</h1>' }, 'toolu_e'),
+          call('edit', { path: 'page.mjs', old_string: '<h1>Ordres</h1>', new_string: '<h1>Orders</h1>' }, 'toolu_e'),
         ],
         stop_reason: 'tool_use',
       },
@@ -259,7 +261,7 @@ describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no h
     }
     expect(pr.title).toMatch(/^fix: /);
     expect(pr.body).toContain('node --test test/heading.test.mjs');
-    expect(pr.body).toContain('demo/server.mjs'.replace('demo/', '')); // the file the fix touched
+    expect(pr.body).toContain('page.mjs'); // the file the fix touched
     expect(pr.body).toMatch(/\*\*Tier 2\*\*/);
     expect(pr.body).toContain('Merging is always human.');
     expect(result.prUrl).toBe('https://github.com/o/r/pull/7');

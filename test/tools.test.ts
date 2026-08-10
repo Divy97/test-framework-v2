@@ -199,6 +199,9 @@ describe('the git tool can commit and can do nothing else', () => {
     // allowlist inside a general `git` tool would be a filter someone can widen;
     // a tool that was never written cannot be.
     const names = TOOL_SCHEMAS.map((t) => t.name);
+    // The EXACT list, so adding a tool is a deliberate act rather than a diff nobody
+    // reads. It has already done its job once: the browser tools (5f) landed and this
+    // assertion failed until the list was updated on purpose.
     expect(names).toEqual([
       'shell_create',
       'shell_write',
@@ -207,6 +210,12 @@ describe('the git tool can commit and can do nothing else', () => {
       'edit',
       'grep',
       'glob',
+      'browser_navigate',
+      'browser_click',
+      'browser_type',
+      'browser_text',
+      'browser_screenshot',
+      'browser_console',
       'git_commit',
     ]);
     for (const forbidden of ['push', 'remote', 'checkout', 'fetch', 'clone', 'reset']) {
@@ -327,10 +336,25 @@ describe('every result is bounded', () => {
   });
 
   test('a tool nobody defined is reported, not fatal', async () => {
-    const result = await callTool(host(world()), 'browser_navigate', { url: 'http://example.invalid' });
+    // A name that is not in `TOOL_SCHEMAS`. It used to be `browser_navigate`, which
+    // stopped being undefined when 5f landed — and the test then launched a real
+    // browser instead of asserting the fallback.
+    const result = await callTool(host(world()), 'deploy_to_production', { url: 'http://example.invalid' });
 
     expect(result.ok).toBe(false);
-    expect(result.output).toMatch(/there is no tool called browser_navigate/);
+    expect(result.output).toMatch(/there is no tool called deploy_to_production/);
+  });
+
+  test('a browser that is not in this image is a tool result, not a dead process', async () => {
+    // The phase image has no chromium, and neither does a developer's laptop. `spawn`
+    // fires its failure on the child object, and with nothing listening it escapes as
+    // an UNCAUGHT EXCEPTION — which in production is the Runner dying mid-run, and in
+    // this suite was the whole file dying. Found by the suite, not by review.
+    const result = await callTool(host(world()), 'browser_navigate', { url: 'http://127.0.0.1:1/' });
+
+    expect(result.ok).toBe(false);
+    // And it says which fault it is: a missing binary, not a timeout with no cause.
+    expect(result.output).toMatch(/could not be started|ENOENT/);
   });
 
   test('a non-string argument is a bad call, not a crash', async () => {

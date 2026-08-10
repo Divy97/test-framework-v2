@@ -183,15 +183,38 @@ export async function installationToken(app: GitHubApp, installationId: number):
 }
 
 /**
- * The URL git uses, with the token in it.
+ * The repository URL. **No credential in it.**
  *
- * `x-access-token` is GitHub's documented username for an installation token. This
- * string is a credential: it is built at the call site, passed to one `git`
- * invocation as an argument, and never written to a config file or an environment
- * the sandbox can read.
+ * It used to be `https://x-access-token:<token>@github.com/…`, which works and is
+ * what GitHub documents — and which git then WRITES INTO `.git/config` of the clone
+ * as `remote.origin.url`. A review caught it. Traced, it was not exploitable today:
+ * `orchestrate()` re-clones with `--mirror`, whose origin is the local path, so the
+ * token-bearing config never reached a mounted directory.
+ *
+ * It is fixed anyway, because "not exploitable today" is not the claim ADR-0012
+ * makes. Its claim is that there is *no configuration* under which the container can
+ * read the token, and a claim that holds only because of an incidental property of
+ * `git clone --mirror` is exactly the kind of safe-by-accident this project has been
+ * bitten by before — ADR-0010's whole history is that failure mode. One refactor that
+ * mounted `repoPath` directly would have turned an accident into a leak.
+ *
+ * The credential now travels as an `http.extraHeader` passed with `-c`, which git
+ * does **not** persist: command-line config lives for that invocation only.
  */
-export const cloneUrl = (repo: string, token: string): string =>
-  `https://x-access-token:${token}@github.com/${repo}.git`;
+export const repoUrl = (repo: string): string => `https://github.com/${repo}.git`;
+
+/**
+ * `-c` arguments that authenticate one git invocation and leave nothing behind.
+ *
+ * Scoped to `https://github.com/` rather than set globally, so a git command that
+ * happens to touch a second host cannot be handed our header. Basic auth with
+ * `x-access-token` as the username is GitHub's documented scheme for an installation
+ * token; only the transport differs.
+ */
+export const authConfig = (token: string): string[] => [
+  '-c',
+  `http.https://github.com/.extraHeader=Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`,
+];
 
 const git = (args: string[], cwd?: string) =>
   execFileAsync('git', args, { ...(cwd === undefined ? {} : { cwd }), maxBuffer: 64 * 1024 * 1024 });
@@ -204,17 +227,26 @@ const git = (args: string[], cwd?: string) =>
  * what lets the whole outbound path be tested against a local bare repo, with no
  * GitHub in it.
  */
-export async function cloneRepository(remote: string, into: string): Promise<void> {
-  await git(['clone', '--quiet', '--', remote, into]);
+export async function cloneRepository(remote: string, into: string, token?: string): Promise<void> {
+  await git([...(token ? authConfig(token) : []), 'clone', '--quiet', '--', remote, into]);
 }
 
 /** Push one branch we created. Never a force, never another ref. */
-export async function pushBranch(repoPath: string, remote: string, branch: string, sha: string): Promise<void> {
+export async function pushBranch(
+  repoPath: string,
+  remote: string,
+  branch: string,
+  sha: string,
+  token?: string,
+): Promise<void> {
   // `<sha>:refs/heads/<branch>`, so what is pushed is the commit under judgement
   // and not whatever HEAD happens to be. `--no-verify` and `--no-follow-tags`
   // because a developer's global git config must not decide what a run pushes.
   await git(
-    ['push', '--quiet', '--no-verify', '--no-follow-tags', remote, `${sha}:refs/heads/${branch}`],
+    [
+      ...(token ? authConfig(token) : []),
+      'push', '--quiet', '--no-verify', '--no-follow-tags', remote, `${sha}:refs/heads/${branch}`,
+    ],
     repoPath,
   );
 }

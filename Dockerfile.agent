@@ -1,0 +1,44 @@
+# The AGENT sandbox. The phase containers do not use this image, and that is the
+# whole point of it existing separately.
+#
+# ADR-0006's v1.5 amendment gives the agent a headless browser so it can find bugs
+# it cannot find by reading — a wrong string rendered on a page is the canonical
+# v1.5 bug. What the engine judges is still a committed command's exit code, run in
+# a container with no browser in it, so the browser has to be absent from the image
+# the phases run. Two images makes that structural: the phase containers cannot gain
+# a browser by anyone forgetting a flag, because the binary is not in their image.
+#
+# `chromium` from apk rather than a downloaded build: alpine's package is the one
+# built against this musl, and pulling a glibc Chromium into an alpine image is the
+# classic way to get a binary that exits 127 with no explanation.
+#
+# No puppeteer, no playwright, no websocket library. `src/browser.ts` speaks the
+# DevTools protocol over the WebSocket built into Node 22, which is a few dozen lines
+# and one fewer supply chain in the container that runs untrusted code.
+
+FROM node:22-alpine
+
+RUN apk add --no-cache \
+      git \
+      chromium \
+      nss \
+      freetype \
+      harfbuzz \
+      ca-certificates \
+      ttf-freefont
+
+# Where `src/browser.ts` looks. Named rather than searched for, so a base-image
+# change that moves or drops it fails loudly instead of silently disabling the
+# browser and turning every UI bug into a Tier 3.
+ENV ENGINE_CHROMIUM=/usr/bin/chromium-browser
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+
+# node itself is PID 1, not a wrapper — see the note in `Dockerfile`. Being PID 1 is
+# what makes the reap possible and what keeps /proc/1/fd out of the agent's reach.
+ENTRYPOINT ["node", "--import", "tsx", "src/runner.ts"]

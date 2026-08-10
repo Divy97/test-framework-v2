@@ -33,7 +33,7 @@ itself, so a green suite cannot read as a verified boundary.
 | 5c · the two prompts | **landed**, except the live run | no `ANTHROPIC_API_KEY` |
 | 5d · one container per phase | **landed** | the code was already there; the assertions were not |
 | 5e · GitHub in and out | **landed** | whole path tested against a local remote; live install skipped |
-| 5f · the browser | not started | |
+| 5f · the browser | **landed** | chromium, no browser-automation dependency |
 | 5g · status out | **landed** | and the SQL is now executed, not just compiled |
 
 ---
@@ -338,6 +338,98 @@ Aligned with `ALTER USER` over the container's unix socket rather than by deleti
 volume — it held six events from the seeded demo run, and dropping someone's dev data
 to make a test pass is not a trade worth making.)*
 
+## 5f · the browser
+
+| File | What it is |
+|---|---|
+| `Dockerfile.agent` | A **second image**: the sandbox plus alpine's `chromium`. |
+| `src/browser.ts` | Chromium over the DevTools protocol, with **no browser-automation dependency at all** — Node 22's built-in `WebSocket` and `Runtime.evaluate` are the whole mechanism. |
+| `src/tools.ts` | `browser_navigate`, `browser_click`, `browser_type`, `browser_text`, `browser_screenshot`, `browser_console`. |
+| `demo/page.mjs` | The orders page extracted from `server.mjs`, so the reproduction is runnable without a service. |
+
+### Two images, not a flag
+
+"A test must fail if a phase container ever gains one" is easy to write as a policy
+and easy to forget. It is a fact about the image instead: the phases run `plan.image`,
+which has no chromium binary in it, and *a phase container has no browser in it, and
+that is a property of its image* asserts `command -v chromium-browser chromium
+google-chrome` finds nothing — **and** that the agent's image does find one, so the
+first half cannot pass for the boring reason that nothing anywhere has a browser.
+
+### No puppeteer, no playwright, no `ws`
+
+Chromium speaks CDP over a WebSocket and Node 22 ships a `WebSocket`, so
+`src/browser.ts` is a few dozen lines against a protocol rather than a dependency tree
+inside the container that runs untrusted code. `click` and `type` go through
+`Runtime.evaluate` and the page's own event handlers rather than synthesised input at
+coordinates — what a reproduction cares about is what the application does, not where
+the pixels are.
+
+### The done-when, in one run
+
+> the agent finds a wrong string rendered in the demo app by looking at it, and the
+> reproduction it commits is a test the sealed phase container can run without a
+> browser
+
+*the agent sees the wrong string by looking, and commits a test that needs no
+browser*: the recipe boots the demo, the agent navigates a real Chromium to it, reads
+the rendered text of the `h1` and gets `Ordres`, screenshots it — and the assertion on
+the screenshot is that the **PNG magic bytes** survived the container boundary into
+the host store, banked by `sha256:` ref rather than returned as bytes. Then it commits
+a `node --test` over `page([])`, and the **sealed phase container** — no browser, no
+service, no network — runs it and goes red for the reported symptom.
+
+And the tier is asserted at 2. A browser-driven agent-authored reproduction is Tier 2
+exactly like any other agent-authored one; there is no path by which visual evidence
+raises a tier, because a screenshot is testimony.
+
+`demo/page.mjs` exists for this: a reproduction that had to fetch a URL would need the
+app up in the judging container, and one that grepped the source would be an oracle
+over the tree rather than over the behaviour.
+
+### A bug the exact-tool-list assertion caught, and one it did not
+
+Adding six tools broke *the git tool can commit and can do nothing else*, which
+asserts `TOOL_SCHEMAS` exactly. That is the assertion doing its job — a tool surface
+should not grow in a diff nobody reads — and the list was updated deliberately.
+
+The second failure was a real bug. `a tool nobody defined is reported, not fatal` had
+used `browser_navigate` as its undefined name, so it stopped testing the fallback and
+started launching a browser — on a machine with no chromium. `spawn` fires its failure
+on the child object, nothing was listening, and it escaped as an **uncaught
+exception**: in the suite that killed the whole file, and in production that is the
+Runner dying mid-run in a container.
+
+Fixed with an `error` listener that records the cause so `waitForTarget` reports "the
+browser could not be started: … (is /usr/bin/chromium-browser present?)" instead of
+polling for twenty seconds and saying "never answered" — a missing binary and a
+crashed browser are different operational faults. There is now a test that a browser
+which is not in the image is a **tool result**, not a dead process.
+
+## A security review, and a credential I moved
+
+A background review flagged credential exposure in `src/github.ts`. Traced rather than
+assumed:
+
+`cloneUrl` built `https://x-access-token:<token>@github.com/…`, which is what GitHub
+documents — and which git **writes into `.git/config`** of the clone as
+`remote.origin.url`. **Not exploitable as it stood**: `orchestrate()` re-clones with
+`--mirror`, whose origin is the local path, so the token-bearing config never reached a
+directory any container mounts. Verified by tracing the mount chain, not by reasoning
+about it.
+
+Fixed anyway, because "not exploitable today" is not the claim ADR-0012 makes. Its
+claim is that there is *no configuration* under which the container can read the token,
+and a claim that holds only because of an incidental property of `git clone --mirror`
+is the safe-by-accident this project has been bitten by repeatedly — ADR-0010's entire
+history is that failure mode, and one refactor mounting `repoPath` directly would have
+turned the accident into a leak.
+
+The URL now carries no credential (`repoUrl`), and the token travels as an
+`http.https://github.com/.extraHeader` passed with `-c`, which git does not persist —
+scoped to github.com so a command touching a second host cannot be handed it. Two
+tests keep it that way, including one asserting the source contains no `}@github.com`.
+
 ## A note on branch shape
 
 The rules ask for one branch per phase off `main`. These are a **stack** instead —
@@ -355,11 +447,41 @@ make the diffs unreadable. Each PR names the one below it.
 | No registered GitHub App | 5e's webhook receiver, HMAC verification, intake mapping, JWT minting and the PR/comment calls are tested against recorded payloads, a generated key pair and a recording `fetch`. The live install is a `test.skip` naming the three environment variables that would unskip it. |
 | No Postgres running | `src/recipe.ts`'s `saveRecipe`/`loadRecipe` and `src/store.ts` are the only untested paths, and they are three `client.query` calls each. `replayRecipe`, the schema validator and the SSE tail all take their I/O as injected functions and are tested without a database. Stated rather than glossed: **the recipe store's SQL has not been executed.** |
 
+## What is still not true
+
+The milestone is built. These are the things a reader should not assume from that.
+
+1. **No real model has ever run in this system.** Every agent in every test is a
+   scripted Messages API on a local port. The loop, the SDK's tool runner, our
+   schemas, the dispatch into the container and the transcript are all real; the model
+   is not. 5c's done-when — "a real `claude` produces a commit whose
+   `.engine/repro.json` the engine accepts without a retry, and the run folds to Tier
+   2" — is met in every part except the word *real*.
+2. **No GitHub App exists.** Nothing in this repository has been accepted by GitHub. A
+   bare repository on disk stood in for the remote and a recording `fetch` for the API.
+3. **The fix prompt names the manifest path, not the command.** `orchestrate` defers
+   the fix agent until after registration, so the ordering ADR-0008 wants holds — but
+   the prompt is a string in the plan rather than a function of the fold, so it cannot
+   quote what was registered. One indirection worse than it should be.
+4. **`/blobs` is still the weakest thing in the design**, exactly as ADR-0010 and
+   ADR-0014 say: a bind mount every participant can write, outliving the run,
+   append-only by convention rather than construction. v1.5 did not touch it.
+5. **Diff-coverage is still not built**, so an agent-authored reproduction still cannot
+   earn Tier 1 and the tier cap is still what withholds the claim.
+6. **The demo's four seeded bugs are not all exercised end to end.** The copy bug is
+   (5f), and the control fixture's *shape* is asserted in the demo's own suite. The API
+   bug and the irreproducible-by-design bug have their issue text written and no run
+   against them.
+
 ## The exact next step
 
-Commit 5b and 5c, then 5d — which is mostly already built (`Job.only`,
-`orchestrate()`'s container-per-phase, `verify()`'s split all exist). What 5d owes is
-its *assertions*: the milestone asks that the `/tmp`-marker and `$TMPDIR/.seen`
-fixtures now fail for a **different reason** — the file is not there because the
-container is not the same one — and nothing in the suite currently says which reason
-they fail for.
+Open the 5e/5f/5g pull request, then run the four demo issues through
+`runFromIssue` — the two that are not yet exercised are the interesting ones, because
+`export-button` should reach Tier 3 with a structured info-request and `total-rounding`
+should refuse a fix whose reproduction was never red. Both paths exist and neither has
+been driven by a run.
+
+After that, the honest next milestone is the one thing this cannot fake: a real model.
+Set `ANTHROPIC_API_KEY`, run the demo's `orders-heading` issue, and see whether a real
+agent reads `prompts/repro.md` and produces a manifest the engine accepts without a
+retry. Everything up to that boundary is asserted; that boundary is not.

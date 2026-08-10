@@ -2596,3 +2596,155 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(existsSync(join(process.cwd(), 'test/egress.test.ts'))).toBe(false);
   });
 });
+
+// ── 5f: the browser ──────────────────────────────────────────────────────────
+//
+// The browser is how the agent FINDS a bug it cannot find by reading. What the
+// engine JUDGES is still a committed command's exit code, run in a container with no
+// browser in it. Both halves are asserted here, in one run.
+
+describe('the browser, in the agent sandbox only', () => {
+  const AGENT_IMAGE = 'test-framework-v2-agent:test';
+
+  const agentImageAvailable = () => {
+    try {
+      execFileSync('docker', ['image', 'inspect', AGENT_IMAGE], { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  test('the agent sees the wrong string by looking, and commits a test that needs no browser', async () => {
+    if (!haveDocker) return;
+    if (!agentImageAvailable()) {
+      // Explicit, with the command. A silent pass here would be the false green this
+      // file exists to refuse.
+      console.log(`SKIPPED (browser): ${AGENT_IMAGE} is not built — run \`docker build -f Dockerfile.agent -t ${AGENT_IMAGE} .\``);
+      return;
+    }
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = demoRepo();
+    const blobs = hostBlobs();
+    const port = 8096;
+
+    // The canonical v1.5 bug: a heading that says "Ordres". Nothing in the source
+    // asserts it, so reading the code tells you only that a string exists — it is
+    // rendering the page that shows it is wrong.
+    const repro =
+      "import assert from 'node:assert/strict';\n" +
+      "import { test } from 'node:test';\n" +
+      "import { page } from '../page.mjs';\n" +
+      "test('the orders heading is spelled correctly', () => {\n" +
+      "  assert.match(page([]), /<h1>Orders<\\/h1>/, 'Ordres: the heading is misspelled');\n" +
+      '});\n';
+
+    const model = await fakeModel([
+      { content: [call('browser_navigate', { url: `http://127.0.0.1:${port}/` })], stop_reason: 'tool_use' },
+      { content: [call('browser_text', { selector: 'h1' }, 'toolu_text')], stop_reason: 'tool_use' },
+      { content: [call('browser_screenshot', {}, 'toolu_shot')], stop_reason: 'tool_use' },
+      { content: [call('write', { path: 'test/heading.test.mjs', content: repro }, 'toolu_w1')], stop_reason: 'tool_use' },
+      {
+        content: [
+          call(
+            'write',
+            {
+              path: '.engine/repro.json',
+              content: JSON.stringify({
+                command: 'node --test test/heading.test.mjs',
+                files: ['test/heading.test.mjs', '.engine/repro.json'],
+              }),
+            },
+            'toolu_w2',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      { content: [call('git_commit', { message: 'test: the heading is misspelled' }, 'toolu_c')], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'reproduced by looking at it' }], stop_reason: 'end_turn' },
+    ]);
+
+    try {
+      const outcome = await orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: blobs,
+        image: IMAGE,
+        agentImage: AGENT_IMAGE,
+        baseRef: fixture.base,
+        reproPrompt: 'the orders page title is misspelled',
+        symptomPattern: 'Ordres',
+        flakeRuns: 0,
+        recipe: demoRecipe(port),
+        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+      });
+
+      const said = await Promise.all(
+        outcome.events
+          .filter((e) => e.type === 'AGENT_MESSAGE')
+          .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+      );
+      const results = said
+        .map((b) => JSON.parse(b.toString()) as { ok?: boolean; output?: string })
+        .filter((line) => typeof line.ok === 'boolean')
+        .map((line) => line.output ?? '')
+        .join('\n');
+
+      // IT SAW IT. The rendered text of the h1, read out of a real Chromium that
+      // loaded a real page from the service the recipe booted.
+      expect(results).toMatch(/loaded http:\/\/127\.0\.0\.1:8096/);
+      expect(results).toMatch(/Ordres/);
+
+      // The screenshot was BANKED, by ref rather than by bytes, and the bytes are a
+      // PNG that survived the container boundary into the host store.
+      const ref = /sha256:[0-9a-f]{64}/.exec(results.split('png')[0] ?? '')?.[0];
+      expect(ref).toBeTruthy();
+      const png = await get(blobs, ref as ArtifactRef);
+      expect(png.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
+      expect(png.length).toBeGreaterThan(1000);
+
+      // AND THE JUDGE SAW NONE OF IT. The reproduction the agent committed is a
+      // `node --test` over the page template — no browser, no service, no network —
+      // and the sealed phase container ran it and went red for the reported symptom.
+      const state = fold(outcome.events);
+      expect(state.registeredRepro?.command).toBe('node --test test/heading.test.mjs');
+      expect(state.shownOnBase).toBe(true);
+      const base = state.testRuns.find((r) => r.phase === 'base')!;
+      expect(base.exit_code).not.toBe(0);
+      expect(base.symptom_matched).toBe(true);
+
+      // A browser-driven agent-authored reproduction is Tier 2. There is no path by
+      // which visual evidence raises a tier, and a screenshot is testimony.
+      expect(state.reproAuthoredByAgent).toBe(true);
+      expect(confidence(state).tier).toBeGreaterThanOrEqual(2);
+    } finally {
+      await model.close();
+    }
+  }, 900_000);
+
+  test('a phase container has no browser in it, and that is a property of its image', () => {
+    if (!haveDocker) return;
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+
+    // The claim is an ABSENCE, so the test is over the image the phases run. A flag
+    // that disabled the browser would be a policy someone can forget; a binary that
+    // is not installed cannot be forgotten.
+    const found = execFileSync(
+      'docker',
+      ['run', '--rm', '--entrypoint', 'sh', IMAGE, '-c', 'command -v chromium-browser chromium google-chrome || echo NONE'],
+      { encoding: 'utf8' },
+    ).trim();
+    expect(found).toBe('NONE');
+
+    // And the agent's image, if it is built, DOES have one — or the assertion above
+    // would pass for the boring reason that nothing anywhere has a browser.
+    if (agentImageAvailable()) {
+      const agent = execFileSync(
+        'docker',
+        ['run', '--rm', '--entrypoint', 'sh', AGENT_IMAGE, '-c', 'command -v chromium-browser'],
+        { encoding: 'utf8' },
+      ).trim();
+      expect(agent).toBe('/usr/bin/chromium-browser');
+    }
+  }, 300_000);
+});

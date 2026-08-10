@@ -21,6 +21,12 @@ node server.mjs           # http://127.0.0.1:8080
 node --test               # the project's own suite, which passes
 ```
 
+`page.mjs` holds the orders page as a function, separate from `server.mjs`. That is
+not tidiness: it is what makes a reproduction of the copy bug runnable in a sealed
+phase container with no browser and no service in it. A test that had to fetch a URL
+would need the app up; a test that grepped the source would be an oracle over the
+tree rather than over the behaviour.
+
 No `npm install` is needed — `node:sqlite` and `node:http` are the entire
 dependency list. The recipe still has an install step, because a recipe with no
 install step would not exercise the thing [ADR-0013](../docs/adr/0013-the-environment-recipe.md)

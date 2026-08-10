@@ -30,7 +30,7 @@ import type { RunEvent } from './events.js';
 import { fold, type RunState } from './fold.js';
 import {
   cloneRepository,
-  cloneUrl,
+  repoUrl,
   commentOnIssue,
   installationToken,
   openPullRequest,
@@ -88,12 +88,14 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
 
   // Minted before anything else, because a clone we cannot do makes the rest moot.
   const token = await installationToken(app, intake.installationId);
-  const remote = request.remote ? request.remote(token) : cloneUrl(intake.repo, token);
+  // The URL carries NO credential — the token goes in an `http.extraHeader` that git
+  // does not persist. See `repoUrl`.
+  const remote = request.remote ? request.remote(token) : repoUrl(intake.repo);
 
   const workspace = await mkdtemp(join(tmpdir(), 'engine-run-'));
   try {
     const source = join(workspace, 'source');
-    await cloneRepository(remote, source);
+    await cloneRepository(remote, source, token);
     // The default branch's tip, resolved to a sha. A branch name can move between now
     // and the phases, and a run that reported on "main" rather than on a commit would
     // be a run whose evidence nobody can re-check.
@@ -147,6 +149,7 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       // deleted directory ever had.
       exportTo: source,
       ...(request.recipe ? { recipe: request.recipe } : {}),
+      ...(request.agentImage ? { agentImage: request.agentImage } : {}),
       ...(request.loop ? { loop: request.loop } : {}),
       ...(request.flakeRuns === undefined ? {} : { flakeRuns: request.flakeRuns }),
     });
@@ -171,11 +174,11 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       // why the mint is a function rather than a value captured at the start. The
       // token from the clone may be dead by now.
       const fresh = await installationToken(app, intake.installationId);
-      const pushRemote = request.remote ? request.remote(fresh) : cloneUrl(intake.repo, fresh);
+      const pushRemote = request.remote ? request.remote(fresh) : repoUrl(intake.repo);
       const branch = `engine/run-${runId.slice(0, 8)}`;
       // Pushed from the orchestrator's own clone of the source, which is where the
       // agent's commit was fetched to. The sandbox never had a remote at all.
-      await pushBranch(source, pushRemote, branch, state.handedOver);
+      await pushBranch(source, pushRemote, branch, state.handedOver, fresh);
 
       const context = { issue, threadRef: intake.event.thread_ref };
       const pr = await openPullRequest(app, fresh, intake.repo, {

@@ -13,7 +13,8 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
 import {
   appJwt,
-  cloneUrl,
+  authConfig,
+  repoUrl,
   commentOnIssue,
   installationToken,
   intake,
@@ -175,15 +176,40 @@ describe('the App key mints a JWT of the documented shape', () => {
 });
 
 describe('the token is the host s, and only the host s', () => {
-  test('it appears in the git URL and nowhere a container can read', () => {
-    const url = cloneUrl('o/r', 'ghs_secret');
-    expect(url).toBe('https://x-access-token:ghs_secret@github.com/o/r.git');
-    // The assertion that matters is structural and lives in the sandbox suite: no
-    // container is ever given this string. Here, the narrower claim — the token is
-    // an ARGUMENT to one git invocation, never an environment variable and never a
-    // config write, so there is nothing for a later process to read it out of.
+  test('the repository URL carries no credential at all', () => {
+    // It used to: `https://x-access-token:<token>@github.com/…`, which works, is what
+    // GitHub documents, and which git then WRITES into `.git/config` of the clone as
+    // `remote.origin.url`. A review caught it. Traced, it was not exploitable —
+    // `orchestrate()` re-clones with `--mirror`, whose origin is the local path, so
+    // the token-bearing config never reached a mounted directory.
+    //
+    // It is fixed anyway, and this is the test that keeps it fixed. ADR-0012's claim
+    // is that there is NO configuration under which the container can read the token,
+    // and a claim that holds only because of an incidental property of `--mirror` is
+    // the safe-by-accident this project has been bitten by before.
+    expect(repoUrl('o/r')).toBe('https://github.com/o/r.git');
+    expect(repoUrl('o/r')).not.toMatch(/x-access-token|ghs_|@github/);
+  });
+
+  test('the credential travels as a header git does not persist', () => {
+    const config = authConfig('ghs_secret');
+    // `-c`, which lives for one invocation. Not `git config`, not an environment
+    // variable, not a credential helper — nothing a later process can read.
+    expect(config[0]).toBe('-c');
+    expect(config[1]).toContain('http.https://github.com/.extraHeader=Authorization: Basic ');
+    // Basic auth with GitHub's documented username, so only the transport changed.
+    expect(Buffer.from(config[1]!.split('Basic ')[1]!, 'base64').toString()).toBe('x-access-token:ghs_secret');
+    // Scoped to github.com, so a git command that touches a second host cannot be
+    // handed our header.
+    expect(config[1]).not.toMatch(/^-c http\.extraHeader/);
+
+    // And no other credential channel anywhere in the module.
     const source = readFileSync('src/github.ts', 'utf8');
     expect(source).not.toMatch(/GIT_ASKPASS|credential\.helper|GITHUB_TOKEN=/);
+    // And specifically not the URL form that started this: a credential interpolated
+    // ahead of an `@` host. `x-access-token:` on its own is legitimate — it is the
+    // Basic auth username above — so the pattern has to be the userinfo shape.
+    expect(source).not.toMatch(/\}@github\.com/);
   });
 
   test('a pull request and a comment go out over the API, with the installation token', async () => {

@@ -89,6 +89,15 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   maxAttempts?: number;
   agentImageMount?: string;
   /**
+   * The image for the AGENT container only — the one with a browser in it (5f).
+   *
+   * Two images rather than one with a flag, because "a phase container must never gain
+   * a browser" then stops being a policy anyone can forget and becomes a fact about
+   * `plan.image`: the binary is not in it. ADR-0006's amendment requires the split, and
+   * a flag would be the version of it that fails silently.
+   */
+  agentImage?: string;
+  /**
    * Drive the agent from the HOST, with tool calls travelling into the container
    * (ADR-0011). Set, and no agent binary runs in the sandbox at all.
    *
@@ -963,7 +972,10 @@ async function runContainer(
     '-v', `${store}:/blobs`,
     ...(handover ? ['-v', `${handover}:/out`] : []),
     ...(plan.agentImageMount ? ['-v', `${plan.agentImageMount}:/usr/local/bin/claude:ro`] : []),
-    plan.image,
+    // The agent's image when there is one, and `plan.image` for everything that
+    // judges. This one line is the whole of "the browser runs in the agent sandbox
+    // only".
+    phase === 'agent' ? (plan.agentImage ?? plan.image) : plan.image,
   ];
 
   // `spawn`, not `execFile`. execFile has no `input` option — that belongs to
