@@ -119,8 +119,15 @@ Named rather than waved at, and the list is deliberately concrete because the
 first version of this ADR claimed "only a commit crosses between them" and that
 was false within a day.
 
-- **A shared kernel, clock and network.** Egress control is M3.3; the rest is
-  what a container is.
+- **A shared kernel and clock.** What a container is.
+- **The AGENT's network.** Unrestricted: it needs the model API and nothing yet
+  distinguishes that from the rest of the internet (M3.3's 3c.2). The PHASE
+  containers no longer share a network with anything — `--network none`, since a
+  reproduction that can reach the network is an identity oracle over a wire, and
+  the code under judgement should not be able to exfiltrate the repository it was
+  handed. This list stays concrete because its first version claimed "only a
+  commit crosses between them" and was false within a day; leaving the phases in
+  it would be false in the safe direction, which is still false.
 - **The writable filesystem, enumerated rather than isolated.** `/tmp`,
   `/var/tmp` and `/dev/shm` are wiped, not namespaced. A path not on that list
   and writable by uid 1000 is still shared. The real answer is a mount namespace

@@ -1655,16 +1655,29 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       baseRef: fixture.base,
       fixRef: fixture.fix,
       flakeRuns: 0,
-      symptomPattern: 'no route|unreachable|not resolve|failed|refused',
+      symptomPattern: 'NO-NETWORK',
       repro: {
         command: 'sh repro.sh',
         // Two shapes: a name that must not resolve, and a literal address that
-        // must not route. DNS alone would pass on a host that resolves anything.
+        // must not route. DNS alone would pass on a host that resolves NOTHING,
+        // so the routing probe is what stops the test being vacuous there.
+        //
+        // `nc`, not `/dev/tcp`. That is a bash virtual path and the repro runs
+        // under busybox `ash`, so the first version printed "can't create
+        // /dev/tcp/..." in BOTH configurations and its assertion was a tautology
+        // — the test was DNS-only while its comment claimed otherwise. `nc` is
+        // busybox-owned, so unlike `getent` it cannot vanish under a base-image
+        // bump.
+        //
+        // And it exits 1, so the base run is RED and the gate opens: otherwise
+        // the reproduction passes on base, no fix container is ever spawned, and
+        // every assertion here is about one of the two containers it names.
         files: {
           'repro.sh':
             'getent hosts api.anthropic.com && echo RESOLVED\n' +
-            '(exec 3<>/dev/tcp/1.1.1.1/53) 2>&1 && echo ROUTED\n' +
-            'echo done\n',
+            'nc -w 3 1.1.1.1 53 </dev/null && echo ROUTED\n' +
+            'echo done: NO-NETWORK\n' +
+            'exit 1\n',
         },
       },
     });
@@ -1677,8 +1690,11 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     const output = said.map((b) => b.toString()).join('\n');
     expect(output).not.toMatch(/RESOLVED/);
     expect(output).not.toMatch(/ROUTED/);
-    // And the phases still RAN — the point is no network, not no container.
-    expect(output).toMatch(/done/);
+    // And BOTH phases ran — the point is no network, not no container, and a
+    // test whose assertions are all negative passes trivially when nothing
+    // happens.
+    expect(output).toMatch(/done: NO-NETWORK/);
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['base', 'fix']);
   }, 600_000);
 
   test('the agent cannot reach a fix the repository already has', async () => {
