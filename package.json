@@ -7,7 +7,8 @@
     "typecheck": "tsc --noEmit",
     "db:schema": "docker compose exec -T postgres psql -U postgres -d events -f - < db/schema.sql",
     "seed": "tsx --env-file=.env src/cli.ts seed",
-    "replay": "tsx --env-file=.env src/cli.ts replay"
+    "replay": "tsx --env-file=.env src/cli.ts replay",
+    "status": "tsx --env-file=.env src/status.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.116.0",

@@ -1,0 +1,171 @@
+// Status out: the event stream, tailed (ADR-0005).
+//
+// SSE rather than WebSockets because the feed is unidirectional and append-only,
+// and because `Last-Event-ID` maps 1:1 onto `seq`. That is the whole design: the
+// browser reconnects on its own and tells us the last id it saw, and the query is
+//
+//     where run_id = $1 and seq > $2 order by seq
+//
+// No protocol is invented. There is no ack, no cursor of ours, no replay buffer to
+// keep in sync with the store — the store IS the buffer, because the event log is
+// append-only and immutable. A dropped connection resumes with no missed and no
+// duplicated events for that reason alone, not because anything here is careful.
+//
+// `read` is injected so this is testable over an in-memory log. The Postgres
+// version is two lines at the call site and has nothing to do with the streaming.
+
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { RunEvent } from './events.js';
+
+/** How the tail gets more events. `afterSeq` is exclusive, exactly like the SQL. */
+export type ReadEvents = (runId: string, afterSeq: number) => Promise<RunEvent[]>;
+
+/** Idle cadence. A poll rather than a listen: Postgres LISTEN/NOTIFY would be a second channel. */
+const POLL_MS = 250;
+/** Something on the wire, so a proxy does not close a quiet run's connection. */
+const HEARTBEAT_MS = 15_000;
+
+/**
+ * One event on the wire.
+ *
+ * `id` is the seq and nothing else. That identity is what makes resumption free:
+ * an id the client echoes back becomes the `>` in the query, so there is no mapping
+ * table and no way for the two to disagree.
+ *
+ * `event:` carries the type so a consumer can subscribe per type, and `data:` is the
+ * whole event — envelope included — because a consumer that folds needs `run_id` and
+ * `seq`, and reconstructing them from the frame would be a second parser.
+ */
+export const formatEvent = (event: RunEvent): string =>
+  `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+
+/**
+ * `Last-Event-ID`, as the browser sends it, or nothing.
+ *
+ * A non-numeric value is treated as absent rather than as an error: EventSource
+ * sends back whatever it last saw, and a client that has been pointed at a
+ * different stream should get this one from the start rather than a 400 it cannot
+ * act on. Anything negative is clamped to 0 for the same reason — `seq > -5` and
+ * `seq > 0` would return the same rows anyway, and pretending otherwise invites a
+ * caller to think the field means something it does not.
+ */
+export const resumeFrom = (header: string | string[] | undefined): number => {
+  const raw = Array.isArray(header) ? header[0] : header;
+  const seq = Number(raw);
+  return Number.isInteger(seq) && seq > 0 ? seq : 0;
+};
+
+export type TailOptions = {
+  runId: string;
+  afterSeq: number;
+  read: ReadEvents;
+  write: (chunk: string) => void;
+  /** True while the client is still there. The tail stops when it is not. */
+  connected: () => boolean;
+  pollMs?: number;
+  heartbeatMs?: number;
+  /** Stop once the run has ended, instead of tailing forever. Off for a live dashboard. */
+  until?: (event: RunEvent) => boolean;
+};
+
+/**
+ * Tail one run until the client leaves, or until `until` says the run is over.
+ *
+ * Deliberately dumb. Every complication a tail can have — buffering, coalescing,
+ * back-pressure, a change feed — is a way for the stream to disagree with the log,
+ * and the log is the product.
+ */
+export async function tailRun(options: TailOptions): Promise<void> {
+  const pollMs = options.pollMs ?? POLL_MS;
+  const heartbeatMs = options.heartbeatMs ?? HEARTBEAT_MS;
+  let afterSeq = options.afterSeq;
+  let quietSince = Date.now();
+
+  while (options.connected()) {
+    const events = await options.read(options.runId, afterSeq);
+    for (const event of events) {
+      // Guard against a `read` that ignores `afterSeq`. Duplicates are the one
+      // thing a consumer folding this stream cannot survive — `apply()` throws on a
+      // seq that is not `lastSeq + 1` — so the tail refuses to emit one even if the
+      // query behind it is wrong.
+      if (event.seq <= afterSeq) continue;
+      options.write(formatEvent(event));
+      afterSeq = event.seq;
+      quietSince = Date.now();
+      if (options.until?.(event)) return;
+    }
+    if (Date.now() - quietSince >= heartbeatMs) {
+      // A comment frame. Not an event, so it cannot advance `Last-Event-ID` and
+      // cannot appear in a fold; it exists only so an idle connection survives a
+      // proxy's read timeout.
+      options.write(': keep-alive\n\n');
+      quietSince = Date.now();
+    }
+    await new Promise((done) => setTimeout(done, pollMs));
+  }
+}
+
+export type StatusServer = { port: number; close: () => Promise<void> };
+
+/**
+ * The one HTTP surface v1.5 has.
+ *
+ * `GET /runs/:runId/events` and nothing else. The dashboard is M6; the user-facing
+ * surface in v1.5 is the issue comment, and this exists so a run is watchable while
+ * it happens rather than as a product feature.
+ */
+export function startStatusServer(options: { read: ReadEvents; port?: number }): Promise<StatusServer> {
+  const server: Server = createServer((request: IncomingMessage, response: ServerResponse) => {
+    const match = /^\/runs\/([^/]+)\/events$/.exec((request.url ?? '').split('?')[0] ?? '');
+    if (request.method !== 'GET' || !match) {
+      response.writeHead(404, { 'content-type': 'text/plain' });
+      response.end('not found\n');
+      return;
+    }
+    const runId = decodeURIComponent(match[1]!);
+    response.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-store',
+      connection: 'keep-alive',
+      // Chunked, and flushed per write. A buffering proxy in front of this turns a
+      // live tail into a single response at the end, which is the failure mode SSE
+      // is most often reported broken for.
+      'x-accel-buffering': 'no',
+    });
+
+    let connected = true;
+    request.on('close', () => (connected = false));
+    response.on('close', () => (connected = false));
+
+    void tailRun({
+      runId,
+      afterSeq: resumeFrom(request.headers['last-event-id']),
+      read: options.read,
+      write: (chunk) => {
+        if (connected) response.write(chunk);
+      },
+      connected: () => connected,
+    }).finally(() => {
+      if (connected) response.end();
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    server.on('error', reject);
+    server.listen(options.port ?? 0, '127.0.0.1', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('the status server did not bind a port'));
+        return;
+      }
+      resolve({
+        port: address.port,
+        close: () =>
+          new Promise((done) => {
+            server.close(() => done());
+            server.closeAllConnections?.();
+          }),
+      });
+    });
+  });
+}

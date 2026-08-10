@@ -34,7 +34,7 @@ itself, so a green suite cannot read as a verified boundary.
 | 5d · one container per phase | **landed** | the code was already there; the assertions were not |
 | 5e · GitHub in and out | written, not committed | unit half done; live install skipped |
 | 5f · the browser | not started | |
-| 5g · status out | written, not committed | `src/sse.ts` + tests pass |
+| 5g · status out | **landed** | and the SQL is now executed, not just compiled |
 
 ---
 
@@ -220,6 +220,51 @@ does not exist", so the reproduction was made to report what it observed and whe
 The existing in-process test that an *unscrubbed* run credits a README-only "fix" is
 untouched. It is what stops the scrub quietly ceasing to be the reason the
 single-container path is safe.
+
+## 5g · status out
+
+| File | What it is |
+|---|---|
+| `src/sse.ts` | `formatEvent`, `resumeFrom`, `tailRun`, `startStatusServer`. `read` is injected. |
+| `src/store.ts` | `readRunAfter` — `where run_id = $1 and seq > $2 order by seq`. |
+| `src/status.ts` | The two lines that put Postgres behind the tail. |
+
+**`id` is the seq and nothing else**, which is the whole design: an id the client
+echoes back becomes the `>` in the query, so there is no mapping table, no cursor of
+ours, no acknowledgement and no replay buffer to keep in sync. The store *is* the
+buffer, because the log is append-only and immutable — a dropped connection resumes
+exactly for that reason, not because anything in the tail is careful.
+
+Done-when — *a dropped connection resumes with no missed and no duplicated events*:
+`sse.test.ts` opens a tail, drops it, lets the run advance while nobody is listening,
+reconnects with `Last-Event-ID`, and then **folds the concatenation of what the two
+connections delivered**. That is the assertion that catches both halves: a gap throws
+on the seq that never arrived, a duplicate throws on the seq that arrived twice.
+Nothing else catches both.
+
+The tail also refuses to emit a duplicate even when the `read` beneath it ignores
+`afterSeq` — asserted with a deliberately broken reader — because a folding consumer
+cannot survive one and the query being right is not something the tail should have to
+assume.
+
+### The Postgres gap I flagged earlier is closed
+
+The previous report said, of the recipe store, "**the SQL has not been executed**".
+It has now. `docker compose up -d`, `npm run db:schema` (which created the `recipes`
+table), and `test/store.test.ts` exercises both pieces of SQL against the real
+database: the recipe round-trip and its upsert, the tail's `seq > $2` at three
+cursors, the `run_id` half of the `where` clause, the jsonb round-trip of an
+`ENV_READY` payload, and the tail itself over the real store.
+
+`vitest.config.ts` now loads `.env` through Node's own `process.loadEnvFile`, because
+the test had been skipping for want of a variable sitting on disk — a skip nobody
+would notice, which is the worst kind. Without a database it still skips, and the
+message names exactly what is missing.
+
+*(The existing dev volume had a different password than the freshly generated `.env`.
+Aligned with `ALTER USER` over the container's unix socket rather than by deleting the
+volume — it held six events from the seeded demo run, and dropping someone's dev data
+to make a test pass is not a trade worth making.)*
 
 ## A note on branch shape
 
