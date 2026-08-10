@@ -115,6 +115,21 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * sealed, which is what the adversarial fixtures want and what 5a asserts.
    */
   recipe?: Recipe;
+  /**
+   * A git repository to copy the accepted agent commits into before the workspace is
+   * destroyed.
+   *
+   * Without this the commit under judgement exists ONLY in the mirror this function
+   * clones and then deletes, so the host has nothing to push and `state.handedOver`
+   * names an object nobody can resolve. That was not a hypothetical: 5e's end-to-end
+   * test reproduced the whole run and then failed on `git push` with `bad object`.
+   *
+   * A separate field rather than fetching into `repoPath` unconditionally, because
+   * this function's invariant is that it works from a clone it owns and writes to
+   * nothing it was handed. The caller names where it wants the commits, and takes
+   * responsibility for that being a repository it owns too.
+   */
+  exportTo?: string;
 } & (
   | { repro: Job['repro']; reproPrompt?: never }
   | { reproPrompt: string; repro?: never }
@@ -761,6 +776,22 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     }
   }
   if (ended) events.push(ended);
+
+  // The accepted commits, out of the workspace before it ceases to exist.
+  //
+  // `refs/heads/engine-agent-work-*` is where `applyHandover` puts each one. Fetched
+  // under a namespace of its own so nothing the caller already had is overwritten —
+  // the point is to make the objects resolvable, not to move anyone's branches.
+  if (plan.exportTo) {
+    await execFile('git', [
+      '-C', plan.exportTo, 'fetch', '--quiet', '--no-tags', source,
+      '+refs/heads/engine-agent-work-*:refs/engine/handover/*',
+    ]).catch(() => {
+      // Not fatal, and not silent either: the events are the record and a run whose
+      // commits could not be exported still produced every fact it observed. The
+      // caller discovers it when the push fails, with git's own words.
+    });
+  }
 
   // The workspace is a full clone and each handover holds whatever the agent
   // chose to leave in `/out`. Left behind, that is unbounded host-disk growth

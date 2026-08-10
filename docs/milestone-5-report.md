@@ -32,7 +32,7 @@ itself, so a green suite cannot read as a verified boundary.
 | 5b · the environment recipe | **landed** | see below |
 | 5c · the two prompts | **landed**, except the live run | no `ANTHROPIC_API_KEY` |
 | 5d · one container per phase | **landed** | the code was already there; the assertions were not |
-| 5e · GitHub in and out | written, not committed | unit half done; live install skipped |
+| 5e · GitHub in and out | **landed** | whole path tested against a local remote; live install skipped |
 | 5f · the browser | not started | |
 | 5g · status out | **landed** | and the SQL is now executed, not just compiled |
 
@@ -220,6 +220,78 @@ does not exist", so the reproduction was made to report what it observed and whe
 The existing in-process test that an *unscrubbed* run credits a README-only "fix" is
 untouched. It is what stops the scrub quietly ceasing to be the reason the
 single-container path is safe.
+
+## 5e · GitHub, in and out
+
+| File | What it is |
+|---|---|
+| `src/github.ts` | HMAC verification, the intake mapping, the webhook receiver, App key → JWT → installation token, clone/push, PR and comment. No SDK: `node:crypto` and the global `fetch`. |
+| `src/report.ts` | The PR body's five mandatory sections and the issue comment's four shapes. |
+| `src/run.ts` | The whole run: token → clone → repro agent → base → fix agent → fix → push → PR → comment. |
+
+### The done-when, and what stands in for GitHub
+
+> an issue opened on the demo repository produces a PR on the same repository with no
+> human step between them, and no container ever held the token
+
+`test/run.test.ts` runs exactly that, with a **bare repository on disk** where GitHub
+would be and a recording `fetch` for the API. Everything else is real: the HMAC, the
+token mint, the clone, three containers, the agent writing a failing `node --test`
+over the demo's own source, the base phase going red for the reported symptom, the fix
+agent editing the heading, three green fix runs, the push, the PR body, the comment.
+
+It asserts the things a green run could otherwise hide:
+
+- **the pushed commit is the one that was verified** — `state.handedOver`, the branch
+  tip on the remote, and the fix phase's `commit_sha` are compared to each other;
+- **the order, by `seq`** — `REPRO_REGISTERED` precedes the fix agent's first message,
+  and the handovers are `['repro', 'fix']` in that order (ADR-0008);
+- **the token was minted more than once** — the clone, the push and the comment each
+  mint, because a run can outlive an hour and ADR-0012 says the mint is a function
+  rather than a value captured at the start;
+- **the token appears nowhere in the log** — `JSON.stringify(events)` does not contain
+  it.
+
+What is *not* tested is whether GitHub accepts any of it. The live test is a
+`test.skip` naming the three environment variables that would unskip it.
+
+### A real bug this phase found
+
+The end-to-end test reproduced and fixed the demo bug and then **failed on `git
+push` with `fatal: bad object`**. `orchestrate()` clones the source into a workspace
+it owns, fetches the agent's bundle *there*, and destroys that workspace in a
+`finally` — so the commit under judgement existed only in a deleted directory, and
+`state.handedOver` named an object nobody could resolve. Every earlier test asserted
+the verdict, and a verdict does not need the commit to still exist.
+
+Fixed with `RunPlan.exportTo`: a repository the accepted handover refs are fetched
+into before teardown, under `refs/engine/handover/*` so nothing the caller already had
+is touched. A separate field rather than writing to `repoPath` unconditionally,
+because `orchestrate`'s invariant is that it works from a clone it owns.
+
+### Two smaller things worth knowing
+
+- **The webhook receiver verifies before it parses.** A receiver that parsed first
+  would be running our JSON parser on anything the internet posts, and it reads the
+  raw stream rather than a framework's re-serialisation, because any re-encode changes
+  the bytes and breaks the MAC. It also **acknowledges before the run**: a run takes
+  minutes, GitHub's delivery timeout is seconds, and holding the response open would
+  guarantee a retry and a second run for the same issue.
+- **`symptomFrom` escapes the issue text.** The base phase's output must match the
+  reported symptom, and before any agent has read anything the report is all there is.
+  An unescaped `(` from a bug report would be a regex someone else wrote, and
+  `new RegExp` on it throws inside the container — an operational failure caused by a
+  bug report.
+
+### Honestly incomplete
+
+The fix prompt is rendered **before** the reproduction is registered, so it tells the
+fix agent "the command registered in `.engine/repro.json` of the commit you are on"
+rather than the command itself. `orchestrate` defers the fix agent until after
+registration (that is ADR-0008's ordering and it holds), but the prompt is a string in
+the plan rather than a function of the fold, so it cannot quote what was registered.
+One indirection worse than it should be, and it is written down here rather than left
+for someone to notice in a transcript.
 
 ## 5g · status out
 

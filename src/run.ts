@@ -1,0 +1,275 @@
+// One run, end to end: an issue in, a pull request out.
+//
+// This is the file the milestone's "what done looks like" describes — "a person
+// opens a GitHub issue and receives a pull request whose description proves the bug
+// existed before the change and does not exist after it, with no step in between
+// where the engine trusted anything the agent said."
+//
+// It is deliberately a sequence and not a swarm. The ORDER is the product: the repro
+// agent runs before the base phase so `REPRO_REGISTERED` provably precedes the fix
+// agent by `seq` (ADR-0008), the gate reads the fold before a fix is attempted
+// (ADR-0007, ADR-0009), and the PR is opened only after the fix phase passed.
+//
+// Three things it holds that nothing below it may:
+//
+//   1. **The installation token.** Minted here, used for the clone and the push and
+//      the API, and never passed into a container (ADR-0012). Minted TWICE on
+//      purpose — see the comment at the push.
+//   2. **The pen.** Every event is appended by this function or by `orchestrate()`,
+//      which is the same trust boundary (ADR-0006's amendment).
+//   3. **The obligation to answer.** A run that ends silently is worse than no run,
+//      so the issue comment is in a `finally`.
+
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+import { put } from './blobs.js';
+import type { RunEvent } from './events.js';
+import { fold, type RunState } from './fold.js';
+import {
+  cloneRepository,
+  cloneUrl,
+  commentOnIssue,
+  installationToken,
+  openPullRequest,
+  pushBranch,
+  type GitHubApp,
+  type Intake,
+} from './github.js';
+import { orchestrate, type RunPlan } from './orchestrate.js';
+import { describeEnvironment, renderPrompt } from './prompts.js';
+import type { Recipe } from './recipe.js';
+import { issueComment, pullRequestBody, pullRequestTitle } from './report.js';
+
+const execFileAsync = promisify(execFile);
+
+export type RunRequest = {
+  intake: Intake;
+  app: GitHubApp;
+  /** Null for a repository with no recipe yet. Nothing boots, and the agent is told so. */
+  recipe: Recipe | null;
+  image: string;
+  /** The image with a browser in it, for the agent container only (5f). */
+  agentImage?: string;
+  blobRoot: string;
+  /**
+   * Where the events go. Injected because the store is a `pg.Client` and the shape of
+   * a run has nothing to do with Postgres — and because a test needs to read them
+   * without one.
+   */
+  append: (event: RunEvent) => Promise<void>;
+  /** The symptom the base phase's output must match. Defaults to the issue's own words. */
+  symptomPattern?: string;
+  /** Override for tests: the git remote to clone and push. Defaults to GitHub. */
+  remote?: (token: string) => string;
+  loop?: RunPlan['loop'];
+  flakeRuns?: number;
+};
+
+export type RunResult = { runId: string; state: RunState; prUrl?: string };
+
+/**
+ * Run one issue to a verdict, and answer on the issue either way.
+ *
+ * Returns rather than throws for every outcome the design has a name for. It throws
+ * only when it could not even start — no token, no clone — because at that point
+ * there is no run to report on and nothing to comment about.
+ */
+export async function runFromIssue(request: RunRequest): Promise<RunResult> {
+  const { intake, app } = request;
+  const runId = crypto.randomUUID();
+  const events: RunEvent[] = [];
+  const emit = async (event: RunEvent) => {
+    events.push(event);
+    await request.append(event);
+  };
+
+  // Minted before anything else, because a clone we cannot do makes the rest moot.
+  const token = await installationToken(app, intake.installationId);
+  const remote = request.remote ? request.remote(token) : cloneUrl(intake.repo, token);
+
+  const workspace = await mkdtemp(join(tmpdir(), 'engine-run-'));
+  try {
+    const source = join(workspace, 'source');
+    await cloneRepository(remote, source);
+    // The default branch's tip, resolved to a sha. A branch name can move between now
+    // and the phases, and a run that reported on "main" rather than on a commit would
+    // be a run whose evidence nobody can re-check.
+    const { stdout } = await execFileAsync('git', ['-C', source, 'rev-parse', 'HEAD']);
+    const baseRef = stdout.trim();
+
+    await emit({
+      run_id: runId,
+      seq: 1,
+      ts: new Date().toISOString(),
+      type: 'RUN_REQUESTED',
+      payload: intake.event,
+    });
+
+    const environment = describeEnvironment({
+      ...(request.recipe ? { services: request.recipe.services } : {}),
+      ...(request.recipe?.test ? { testCommand: request.recipe.test } : {}),
+      browser: request.agentImage !== undefined,
+    });
+    const issue = intake.event.raw_text;
+
+    // The fix prompt cannot be rendered yet: it names the registered command, and
+    // nothing has registered one. `orchestrate` defers the fix agent until after the
+    // base container has, which is the same ordering ADR-0008 asks for — so the
+    // placeholder is filled from the fold at that point rather than guessed now.
+    //
+    // Passed as a FUNCTION for that reason. A string here would be a fix prompt that
+    // quotes a command nobody has written.
+    const outcome = await orchestrate({
+      runId,
+      // `afterSeq` is not a field: `orchestrate` owns its own numbering from 1, and
+      // RUN_REQUESTED above is seq 1 — so the plan continues from there.
+      repoPath: source,
+      blobRoot: request.blobRoot,
+      image: request.image,
+      baseRef,
+      reproPrompt: await renderPrompt('repro', { issue, environment }),
+      agentPrompt: await renderPrompt('fix', {
+        issue,
+        environment,
+        // Filled in by `orchestrate` from the registration it made — see the note
+        // there. Until the fix-prompt-from-the-fold plumbing exists, the fix agent is
+        // told the manifest path rather than the command, which is honest and one
+        // indirection worse.
+        command: 'the command registered in .engine/repro.json of the commit you are on',
+        files: 'the files that manifest names',
+      }),
+      symptomPattern: request.symptomPattern ?? symptomFrom(issue),
+      // So the commit under judgement outlives `orchestrate`'s own workspace and this
+      // clone can push it. Without it `state.handedOver` names an object only a
+      // deleted directory ever had.
+      exportTo: source,
+      ...(request.recipe ? { recipe: request.recipe } : {}),
+      ...(request.loop ? { loop: request.loop } : {}),
+      ...(request.flakeRuns === undefined ? {} : { flakeRuns: request.flakeRuns }),
+    });
+
+    // `orchestrate` starts its own numbering at 1, and RUN_REQUESTED already took it.
+    // Renumbered rather than re-plumbed: the plan type has no `afterSeq`, and a gap or
+    // a collision is something `fold()` refuses outright.
+    let seq = 1;
+    for (const event of outcome.events) {
+      if (event.type === 'RUN_REQUESTED') continue;
+      await emit({ ...event, seq: ++seq });
+    }
+
+    let state = fold(events);
+    let prUrl: string | undefined;
+
+    // THE GATE, read off the fold and not re-derived (ADR-0009). A PR is opened only
+    // for a run the fold credits — red on base for the reported reason, green on the
+    // fix every time, the series vouched for.
+    if (state.reproduced && state.handedOver) {
+      // Minted AGAIN. A run can outlive an hour, and ADR-0012 is explicit that this is
+      // why the mint is a function rather than a value captured at the start. The
+      // token from the clone may be dead by now.
+      const fresh = await installationToken(app, intake.installationId);
+      const pushRemote = request.remote ? request.remote(fresh) : cloneUrl(intake.repo, fresh);
+      const branch = `engine/run-${runId.slice(0, 8)}`;
+      // Pushed from the orchestrator's own clone of the source, which is where the
+      // agent's commit was fetched to. The sandbox never had a remote at all.
+      await pushBranch(source, pushRemote, branch, state.handedOver);
+
+      const context = { issue, threadRef: intake.event.thread_ref };
+      const pr = await openPullRequest(app, fresh, intake.repo, {
+        title: pullRequestTitle(state, context),
+        body: pullRequestBody(state, context),
+        head: branch,
+        base: defaultBranchOf(source),
+      });
+      prUrl = pr.html_url;
+
+      await emit({
+        run_id: runId,
+        seq: ++seq,
+        ts: new Date().toISOString(),
+        type: 'PR_OPENED',
+        payload: {
+          v: 1,
+          repo: intake.repo,
+          pr_number: pr.number,
+          head_sha: pr.head_sha,
+          diff_hash: state.fixDiff?.diff_hash ?? (await put(request.blobRoot, '')),
+        },
+      });
+      await emit({
+        run_id: runId,
+        seq: ++seq,
+        ts: new Date().toISOString(),
+        type: 'RUN_ENDED',
+        payload: { v: 1, reason: 'pr_opened' },
+      });
+      state = fold(events);
+    }
+
+    // An issue comment on EVERY terminal outcome, including Tier 3 and errored. A run
+    // that ends silently is worse than no run: the person who opened the issue is
+    // left waiting on something that already finished.
+    //
+    // Best effort, and last. A failed comment must not discard a pull request that
+    // exists — the PR is the deliverable.
+    try {
+      const fresh = await installationToken(app, intake.installationId);
+      await commentOnIssue(app, fresh, intake.repo, intake.issueNumber, issueComment(state, { issue, threadRef: intake.event.thread_ref }));
+    } catch {
+      // Recorded nowhere, deliberately: there is no event class for "we could not
+      // reach GitHub to say what happened", and inventing one to describe our own
+      // outage would put a fact about us in a log about the user's bug.
+    }
+
+    return { runId, state, ...(prUrl === undefined ? {} : { prUrl }) };
+  } finally {
+    await rm(workspace, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * The symptom pattern, from the issue's own words.
+ *
+ * Crude on purpose: the longest quoted string, or the longest word over five
+ * characters. The base phase's output has to MATCH the reported symptom, and a
+ * pattern derived from the report is the only thing available before an agent has
+ * read anything. A caller who knows better passes `symptomPattern`.
+ *
+ * Escaped, because an issue is attacker-influenced text and an unescaped `(` from a
+ * bug report would be a regex someone else wrote.
+ */
+export function symptomFrom(issue: string): string {
+  const quoted = [...issue.matchAll(/"([^"]{2,60})"|`([^`]{2,60})`/g)]
+    .map((match) => match[1] ?? match[2] ?? '')
+    .sort((a, b) => b.length - a.length)[0];
+  const word = issue
+    .split(/[^\w.-]+/)
+    .filter((token) => token.length > 5)
+    .sort((a, b) => b.length - a.length)[0];
+  const chosen = quoted || word || '';
+  return chosen.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * The branch a pull request opens against.
+ *
+ * `symbolic-ref` on the clone's own HEAD, which is what the remote said its default
+ * branch was — rather than assuming `main`. A repository whose default is `master`,
+ * or `trunk`, would otherwise get a PR against a branch that does not exist.
+ */
+function defaultBranchOf(source: string): string {
+  try {
+    return execFileSync('git', ['-C', source, 'rev-parse', '--abbrev-ref', 'origin/HEAD'], {
+      encoding: 'utf8',
+    })
+      .trim()
+      .replace(/^origin\//, '');
+  } catch {
+    // A clone with no `origin/HEAD` — which a bare local remote in a test may not
+    // have. `main` is the guess, and it is a guess rather than a claim.
+    return 'main';
+  }
+}
