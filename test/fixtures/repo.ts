@@ -10,7 +10,7 @@
 // one level down, and still open.
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { ReproSpec } from '../../src/verify.js';
@@ -575,3 +575,50 @@ export const EOF_REPRO: ReproSpec = {
   command: 'sh repro.sh',
   files: { 'repro.sh': 'cat src.txt\n[ -z "$(tail -c 1 src.txt)" ]\n' },
 };
+
+/**
+ * The demo repository, as a git repo the orchestrator can clone.
+ *
+ * The one repository with an environment recipe (SHARED-UNDERSTANDING's v1.5
+ * amendment to Q8), so 5b, 5c and 5f are all tested against it. Deliberately NOT an
+ * adversarial fixture: those stay the tiny generated repos above, because seeding
+ * gaming attempts into a demo makes the demo worse.
+ *
+ * `fix` is the base commit. Nothing here pre-fixes anything — the bugs are the point
+ * and an agent is what repairs them.
+ */
+export function demoRepo(): Fixture {
+  const repo = mkdtempSync(join(tmpdir(), 'engine-demo-'));
+  const blobRoot = mkdtempSync(join(tmpdir(), 'engine-blobs-'));
+  created.push(repo, blobRoot);
+  cpSync(join(process.cwd(), 'demo'), repo, { recursive: true });
+  // A stray database from a local run must not travel into the fixture: the recipe's
+  // migrate and seed steps are what should create it, and a pre-seeded one would
+  // hide a broken migrate step.
+  rmSync(join(repo, 'demo.db'), { force: true });
+
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo });
+  git('init', '--quiet', '--initial-branch=main');
+  git('config', 'user.email', 'fixture@example.com');
+  git('config', 'user.name', 'Fixture');
+  git('add', '.');
+  git('commit', '--quiet', '-m', 'the demo, with its seeded bugs');
+  const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+  return { repo, base, fix: base, blobRoot };
+}
+
+/** The demo's recipe, on a caller-chosen port so two runs cannot collide. */
+export const demoRecipe = (port: number) => ({
+  install: 'npm install --no-audit --no-fund',
+  migrate: 'node db.mjs migrate',
+  seed: 'node db.mjs seed',
+  services: [
+    {
+      name: 'web',
+      command: `PORT=${port} node server.mjs`,
+      port,
+      healthcheck: `http://127.0.0.1:${port}/healthz`,
+    },
+  ],
+  test: 'node --test',
+});

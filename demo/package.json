@@ -1,0 +1,12 @@
+{
+  "name": "engine-demo-storefront",
+  "private": true,
+  "type": "module",
+  "description": "The demo target, and the only repository with an environment recipe.",
+  "scripts": {
+    "migrate": "node db.mjs migrate",
+    "seed": "node db.mjs seed",
+    "start": "node server.mjs",
+    "test": "node --test"
+  }
+}

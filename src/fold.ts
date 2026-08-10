@@ -5,6 +5,7 @@
 import type {
   AgentFinishedV1,
   ArtifactRef,
+  EnvReadyV1,
   RunEndedV1,
   RunEvent,
   VerificationPhase,
@@ -93,6 +94,15 @@ export type RunState = {
    * had just failed to show. "The gate never bends."
    */
   shownAttempts: number[];
+  /**
+   * The environment the run was judged in, once a healthcheck answered.
+   *
+   * Null means one of two very different things and the difference is in `aborts`:
+   * no recipe was replayed at all (the M2/M3 shape, and every adversarial fixture),
+   * or the replay failed — which appears as a `setup` abort with `cause:
+   * 'environment'` and disqualifies its attempt below.
+   */
+  env: Omit<EnvReadyV1, 'v'> | null;
   /** What the fix touched. Recorded for the confidence projection; the engine never judges it. */
   fixDiff: { changed_files: string[]; diff_hash: ArtifactRef } | null;
   /**
@@ -182,6 +192,7 @@ const initialState = (runId: string): RunState => ({
   reproducedAttempt: null,
   shownOnBase: false,
   shownAttempts: [],
+  env: null,
   fixDiff: null,
   completedAttempts: [],
   transcript: [],
@@ -308,6 +319,14 @@ export function apply(state: RunState, event: RunEvent): RunState {
       return { ...next, status: 'sandbox_ready' };
     case 'ATTEMPT_STARTED':
       return { ...next, status: 'attempting', currentAttempt: event.payload.n };
+    case 'ENV_READY': {
+      // Recorded, and nothing else recomputed. The environment is a precondition
+      // for the phases rather than an input to the verdict: it says the run was
+      // judged in a world that was actually up, which is what distinguishes an
+      // operational fault from a finding about the bug (ADR-0007's amendment).
+      const { v, ...ready } = event.payload;
+      return { ...next, env: ready };
+    }
     case 'TEST_RUN': {
       const testRuns = [
         ...state.testRuns,
@@ -512,8 +531,19 @@ function demonstrated(
   // would erase the record that the bug WAS demonstrated on base. And once
   // attempts are bounded, attempt 2's gate would read false and deny a fix for a
   // reproduction attempt 1 had genuinely shown.
+  //
+  // A failed ENVIRONMENT joins them, and it is the one setup abort that does.
+  // ADR-0007's amendment: "the fold should refuse a run that reports reaching a
+  // phase without ENV_READY". Keyed on the abort rather than on the absence of the
+  // event, because absence is not a discriminator — no stream written before v1.5
+  // carries `ENV_READY`, and every adversarial fixture in the suite has no
+  // environment to be ready. What IS in the log when a recipe fails to boot is this
+  // abort, set by the producer, and an attempt whose world never came up cannot
+  // have demonstrated anything.
   const truncated = new Set(
-    aborts.filter((a) => a.phase === 'base').map((a) => a.attempt),
+    aborts
+      .filter((a) => a.phase === 'base' || (a.phase === 'setup' && a.cause === 'environment'))
+      .map((a) => a.attempt),
   );
   const registered = new Map(registrations.map((r) => [r.attempt, r]));
   return testRuns.filter((base) => {

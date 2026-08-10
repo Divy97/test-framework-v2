@@ -15,6 +15,7 @@ import { basename } from 'node:path';
 import { promisify } from 'node:util';
 import type { RunEvent } from './events.js';
 import { superviseAgent } from './agent.js';
+import { replayRecipe, type Recipe, type ReplayOutcome } from './recipe.js';
 import { ToolHost } from './tools.js';
 import { MAX_REASON_CHARS, ObservationFailed, verify, type ReproSpec } from './verify.js';
 
@@ -59,6 +60,15 @@ export type Job = {
    *     that watched the process.
    */
   serveTools?: boolean;
+  /**
+   * Stand the environment up before the agent gets the tools (ADR-0013).
+   *
+   * Replayed, never derived: the recipe was drafted once and approved by a human,
+   * and it is stored on our side keyed by repository. Omitted, nothing is booted —
+   * which is the M2/M3 shape and what every adversarial fixture wants, since a tiny
+   * generated git repo has nothing to boot.
+   */
+  recipe?: Recipe;
   /**
    * Observe one phase and stop. Omitted, this container runs the whole run, as
    * M3 did.
@@ -425,7 +435,17 @@ export type WorkerRequest =
   | { done: true };
 
 export type WorkerReply =
-  /** The world is built and the tools will answer. The host waits for this. */
+  /**
+   * What the Runner observed while replaying the recipe. Sent before `ready`, so the
+   * host can emit `ENV_READY` — or refuse to spend a loop on a world that never came
+   * up — before any transcript event exists.
+   *
+   * A REPORT rather than an event for the same reason the handover is: in this mode
+   * the container is not a writer, and the host is the only thing that can allocate
+   * a seq.
+   */
+  | { env: ReplayOutcome }
+  /** The world is as built as it is going to get, and the tools will answer. */
   | { ready: true }
   | { result: { id: string; ok: boolean; output: string } }
   /**
@@ -439,7 +459,7 @@ export type WorkerReply =
 export const isWorkerReply = (line: unknown): line is WorkerReply =>
   typeof line === 'object' &&
   line !== null &&
-  ('ready' in line || 'result' in line || 'finished' in line);
+  ('ready' in line || 'result' in line || 'finished' in line || 'env' in line);
 
 /** One JSON object per line, and a trailing fragment at EOF is a whole line. */
 async function* readLines(stream: AsyncIterable<Buffer | string>): AsyncGenerator<string> {
@@ -634,6 +654,18 @@ export async function runJob(
       throw new ObservationFailed('serveTools was set with no request stream; nothing would drive the tools');
     }
     served = new ToolHost({ root: agentWorld.tree, gitDir: agentWorld.gitDir, runAs, env: agentWorld.env });
+    // The recipe, replayed, before the agent can touch anything. A service lives in
+    // a NAMED SESSION this ToolHost started and holds a handle to (ADR-0014), so it
+    // is still up when the agent arrives and it is torn down by `close()` rather
+    // than discovered in /proc.
+    //
+    // Reported whatever happened. A recipe that does not boot is an operational
+    // fault for the host to record as one — not an exception that unwinds a run and
+    // certainly not a finding about the user's bug.
+    if (job.recipe) {
+      const env = await replayRecipe(served, job.recipe);
+      emit(`${JSON.stringify({ env } satisfies WorkerReply)}\n`);
+    }
     // Announced only once the world exists. The host blocks on this rather than
     // guessing: a tool call that arrives before the clone lands would be refused
     // for a path that is about to exist, and the model would plan around a lie.
