@@ -693,6 +693,18 @@ async function runContainer(
 
   const args = [
     'run', '--rm', '-i',
+    // NO NETWORK for the phases. The agent needs the model API; the containers
+    // that judge a commit need nothing at all, and a reproduction that can reach
+    // the network is a reproduction that can be TOLD what to answer — the same
+    // identity-oracle channel ADR-0008's amendment is about, over a wire instead
+    // of over the tree. It also means the code under judgement cannot exfiltrate
+    // the repository it was handed.
+    //
+    // Dependency install is the thing this forecloses, and M3 already refuses it:
+    // a reproduction needing a package the base commit lacks is unrunnable today.
+    // When a `setupCommand` arrives it will need its own network decision rather
+    // than inheriting this one.
+    ...(phase === 'agent' ? [] : ['--network', 'none']),
     '-v', `${source}:/src:ro`,
     '-v', `${store}:/blobs`,
     ...(handover ? ['-v', `${handover}:/out`] : []),
