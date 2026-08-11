@@ -28,6 +28,29 @@ import { TOOL_SCHEMAS } from './tools.js';
 
 /** The model v1.5 runs on, and the thinking configuration ADR-0011's milestone names. */
 export const MODEL = 'claude-opus-5';
+
+/**
+ * The model to ask for: the caller's, then `ENGINE_MODEL`, then the default above.
+ *
+ * A function rather than a constant because a constant is read at module load, and an
+ * environment variable set after the first `import` would then be silently ignored —
+ * the kind of load-order bug that presents as "my config does nothing".
+ *
+ * `ENGINE_MODEL` exists because the model id is the ONE thing an Anthropic-compatible
+ * gateway may spell differently (OpenRouter takes `anthropic/claude-opus-5`).
+ * Everything else such a gateway needs — the base URL and the credential — the SDK
+ * already reads from `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` itself, which is
+ * why running against one is configuration rather than a change to this file.
+ *
+ * What that does NOT change is the boundary this project claims. The loop is on the
+ * host either way, so the container still cannot reach the credential (ADR-0011) and
+ * the phase containers are still sealed and agentless. What it DOES change is who else
+ * reads the traffic: a gateway sees every prompt and every tool result, including the
+ * issue text and whatever the agent quotes out of the repository. That is a real trade
+ * and it is the operator's to make, not this file's.
+ */
+export const modelId = (override?: string): string =>
+  override ?? process.env.ENGINE_MODEL ?? MODEL;
 /**
  * Non-streaming, so this stays under the SDK's HTTP timeout. The loop makes many
  * bounded turns rather than one enormous one, which is what a tool runner is.
@@ -60,6 +83,21 @@ export type LoopOptions = {
   invoke: (tool: string, input: Record<string, unknown>) => Promise<{ ok: boolean; output: string }>;
   apiKey?: string;
   /**
+   * A bearer credential instead of an `x-api-key`.
+   *
+   * Which is what an Anthropic-compatible gateway generally wants — OpenRouter's
+   * documented setup is `ANTHROPIC_AUTH_TOKEN` with an `sk-or-` key. Omit both and the
+   * SDK reads `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment on its
+   * own, which is why no wiring is needed to run against one.
+   *
+   * Do NOT set `ANTHROPIC_API_KEY=""` alongside it, whatever a gateway's Claude Code
+   * instructions say: an empty string is not nullish, so the SDK keeps it and sends an
+   * empty `x-api-key` beside the bearer token. That advice exists to stop the Claude
+   * Code CLI falling back to Anthropic; it is wrong for a direct SDK caller. Leave it
+   * unset.
+   */
+  authToken?: string;
+  /**
    * Points the SDK somewhere other than Anthropic.
    *
    * This is how the loop is tested without a credential: a local server that
@@ -70,6 +108,8 @@ export type LoopOptions = {
    * never produce on demand.
    */
   baseURL?: string;
+  /** Override the model. Otherwise `ENGINE_MODEL`, otherwise `MODEL`. */
+  model?: string;
   timeoutMs?: number;
   maxLines?: number;
   maxIterations?: number;
@@ -100,8 +140,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
   // start and one that started and produced nothing.
   let client: Anthropic;
   try {
+    // Every field omitted when not given, so the SDK falls back to its own environment
+    // resolution — `ANTHROPIC_API_KEY`, then `ANTHROPIC_AUTH_TOKEN`, then a profile,
+    // then `ANTHROPIC_BASE_URL`. That is what makes an Anthropic-compatible gateway a
+    // matter of setting two variables rather than of changing this file.
     client = new Anthropic({
       ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+      ...(options.authToken === undefined ? {} : { authToken: options.authToken }),
       ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
     });
   } catch (error) {
@@ -145,7 +190,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
 
   const drive = async (): Promise<void> => {
     const runner = client.beta.messages.toolRunner({
-      model: MODEL,
+      model: modelId(options.model),
       max_tokens: MAX_TOKENS,
       // Adaptive, and NOT disabled: with thinking off this model can write a tool
       // call into its visible text, where it reads as a completed turn and the

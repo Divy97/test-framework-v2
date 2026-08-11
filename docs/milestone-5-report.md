@@ -518,3 +518,71 @@ The one thing none of this can fake: a real model.
 Set `ANTHROPIC_API_KEY`, run the demo's `orders-heading` issue, and see whether a real
 agent reads `prompts/repro.md` and produces a manifest the engine accepts without a
 retry. Everything up to that boundary is asserted; that boundary is not.
+
+---
+
+## Running against an Anthropic-compatible gateway (OpenRouter)
+
+Asked after the milestone landed: can this use an OpenRouter key instead of an
+Anthropic one? **Yes**, and it is almost entirely configuration.
+
+OpenRouter ships a native Anthropic-Messages-compatible endpoint — their own Claude
+Code guide calls it the "Anthropic Skin" — at `https://openrouter.ai/api`, and states
+that "thinking blocks, native tool use, streaming, and multi-turn context all work as
+they do against Anthropic directly". That matters here because `src/loop.ts` uses the
+SDK's **beta tool runner**, which is a narrow Anthropic-specific surface; an
+OpenAI-shaped `/chat/completions` gateway would not have worked without a translating
+proxy, and several third-party ones exist for exactly that reason.
+
+### What to set
+
+```sh
+export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
+export ANTHROPIC_AUTH_TOKEN="sk-or-v1-…"      # your OpenRouter key
+export ENGINE_MODEL="anthropic/claude-opus-5"  # OpenRouter's provider/model form
+# and leave ANTHROPIC_API_KEY unset — see below
+```
+
+The SDK reads `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` itself, so nothing in
+this repository had to learn about them.
+
+### What actually changed in the code
+
+One thing: the model id was a hardcoded `const`. It is now `modelId()`, read at **call
+time** — as a constant it was read at module load, so an `ENGINE_MODEL` set after the
+first `import` would have been silently ignored, which is config that does nothing.
+
+`LoopOptions` also gained `authToken` for callers that pass credentials explicitly
+rather than through the environment.
+
+### One piece of their advice that is wrong for this codebase
+
+OpenRouter's setup instructions say to set `ANTHROPIC_API_KEY=""`. That is correct for
+the Claude Code **CLI**, where it stops a fallback to Anthropic. It is wrong for a
+direct SDK caller: an empty string is not nullish, so the SDK keeps it and sends an
+empty `x-api-key` header alongside the bearer token. Leave it unset. A test asserts the
+credential arrives as `Authorization: Bearer …` with no `x-api-key` beside it, so the
+advice cannot be followed in here by accident.
+
+### What this does and does not change about the trust boundary
+
+**Unchanged:** the loop is on the host either way, so the container still cannot reach
+the credential (ADR-0011), and the phase containers are still sealed, agentless, and
+deciding on exit codes.
+
+**Changed:** a gateway sees every prompt and every tool result — the issue text, and
+whatever the agent quotes out of the repository. For a project whose central claim is
+where the credentials are, that is worth stating plainly. It is an operator's decision,
+not a code one, and nothing here forces it either way.
+
+Also worth knowing: OpenRouter's own docs say the Anthropic endpoint is "only
+guaranteed to work with the Anthropic first-party provider", so this buys billing and
+failover rather than access to non-Anthropic models.
+
+**Still untested.** No OpenRouter key was available either, so what is asserted is that
+the base URL, the bearer credential and the model id are all environment-driven and
+reach the wire — proven against the scripted server. Whether OpenRouter accepts a
+`beta.messages.toolRunner` request is not something this suite can know.
+
+Sources: [OpenRouter + Claude Code](https://openrouter.ai/blog/tutorials/claude-code-openrouter/),
+[OpenRouter API overview](https://openrouter.ai/docs/api-reference/overview).
