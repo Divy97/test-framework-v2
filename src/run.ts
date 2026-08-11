@@ -28,6 +28,7 @@ import { promisify } from 'node:util';
 import { put } from './blobs.js';
 import type { RunEvent } from './events.js';
 import { fold, type RunState } from './fold.js';
+import type { LoopUsage } from './loop.js';
 import {
   cloneRepository,
   repoUrl,
@@ -68,7 +69,13 @@ export type RunRequest = {
   flakeRuns?: number;
 };
 
-export type RunResult = { runId: string; state: RunState; prUrl?: string };
+export type RunResult = {
+  runId: string;
+  state: RunState;
+  prUrl?: string;
+  /** What each agent phase spent, so a run's cost is readable without parsing blobs. */
+  usage?: { phase: string; usage: LoopUsage }[];
+};
 
 /**
  * Run one issue to a verdict, and answer on the issue either way.
@@ -124,6 +131,14 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
     //
     // Passed as a FUNCTION for that reason. A string here would be a fix prompt that
     // quotes a command nobody has written.
+    // Computed ONCE, because the agent is told this string and the engine checks for it.
+    // Deriving it twice is how the prompt and the check drift apart, and the first real
+    // model run is what proved that gap exists: the agent was asked to "mention the
+    // symptom the report describes", paraphrased it as it reasonably would, and the
+    // literal check refused a reproduction that was genuinely correct. The engine was
+    // right and the prompt was unsatisfiable except by luck.
+    const symptomPattern = request.symptomPattern ?? symptomFrom(issue);
+
     const outcome = await orchestrate({
       runId,
       // `afterSeq` is not a field: `orchestrate` owns its own numbering from 1, and
@@ -132,18 +147,25 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       blobRoot: request.blobRoot,
       image: request.image,
       baseRef,
-      reproPrompt: await renderPrompt('repro', { issue, environment }),
-      agentPrompt: await renderPrompt('fix', {
-        issue,
-        environment,
-        // Filled in by `orchestrate` from the registration it made — see the note
-        // there. Until the fix-prompt-from-the-fold plumbing exists, the fix agent is
-        // told the manifest path rather than the command, which is honest and one
-        // indirection worse.
-        command: 'the command registered in .engine/repro.json of the commit you are on',
-        files: 'the files that manifest names',
-      }),
-      symptomPattern: request.symptomPattern ?? symptomFrom(issue),
+      reproPrompt: await renderPrompt('repro', { issue, environment, symptom: symptomPattern }),
+      // A function, so it is rendered AFTER the reproduction is registered and can name
+      // the command that will actually judge the fix. It used to be rendered here with
+      // prose in place of both variables, which made the prompt contradict itself — it
+      // promises "you have exactly the command above" and then quoted a sentence telling
+      // the agent where to look instead. The first real model run is what exposed it.
+      agentPrompt: (repro) =>
+        renderPrompt('fix', {
+          issue,
+          environment,
+          command: repro.command,
+          // The reproduction's own paths, which rule 3 tells the agent not to touch. An
+          // empty manifest is possible and must read as a fact, not as a blank section.
+          files:
+            Object.keys(repro.files ?? {})
+              .map((path) => `- \`${path}\``)
+              .join('\n') || '(the manifest listed none)',
+        }),
+      symptomPattern,
       // So the commit under judgement outlives `orchestrate`'s own workspace and this
       // clone can push it. Without it `state.handedOver` names an object only a
       // deleted directory ever had.
@@ -227,7 +249,13 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       // outage would put a fact about us in a log about the user's bug.
     }
 
-    return { runId, state, ...(prUrl === undefined ? {} : { prUrl }) };
+    // What the agent phases spent. Carried out rather than logged, for the reason above:
+    // our bill is not a fact about the user's bug.
+    const usage = outcome.phases
+      .filter((phase) => phase.usage !== undefined)
+      .map((phase) => ({ phase: phase.phase, usage: phase.usage! }));
+
+    return { runId, state, ...(prUrl === undefined ? {} : { prUrl }), ...(usage.length === 0 ? {} : { usage }) };
   } finally {
     await rm(workspace, { recursive: true, force: true }).catch(() => {});
   }

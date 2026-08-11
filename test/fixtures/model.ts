@@ -99,3 +99,109 @@ export const call = (name: string, input: Record<string, unknown>, id = `toolu_$
   name,
   input,
 });
+
+/** One assistant turn from an OpenAI-shaped API. */
+export type ChatTurn = {
+  content?: string | null;
+  reasoning?: string;
+  tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[];
+  finish_reason?: string;
+};
+
+/**
+ * The same idea for `/chat/completions`, because the OpenRouter path is OUR loop.
+ *
+ * The Anthropic fixture above tests the SDK's tool runner as much as our code. Here
+ * there is no SDK: the turn-taking, the `tool` messages, the id matching are all
+ * `src/openrouter.ts`. A real server rather than a stubbed `fetch` for that exact
+ * reason — the request body has to survive serialisation and a real round trip, which
+ * is where a shape error actually shows up.
+ */
+export function fakeChat(
+  turns: ChatTurn[],
+  options: { status?: number; body?: string; repeatLast?: boolean; errorBody?: { message?: string; code?: number } } = {},
+): Promise<FakeModel> {
+  const requests: Record<string, unknown>[] = [];
+  let served = 0;
+
+  const server: Server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('end', () => {
+      try {
+        requests.push(JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>);
+      } catch {
+        requests.push({ unparsed: Buffer.concat(chunks).toString() });
+      }
+      if (options.status !== undefined) {
+        response.writeHead(options.status, { 'content-type': 'application/json' });
+        response.end(options.body ?? '{"error":{"message":"scripted"}}');
+        return;
+      }
+      // A 200 that is actually a refusal. Not invented for symmetry: this is what
+      // OpenRouter really answered when an upstream provider rejected the request, and
+      // reading `response.ok` alone reported it as the MODEL's failure rather than ours.
+      if (options.errorBody !== undefined) {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: options.errorBody }));
+        return;
+      }
+      // `repeatLast` is how a test drives the loop into its OWN ceiling: a model that
+      // asks for a tool forever. Without it the fixture ends the turn and the ceiling
+      // is never reached, so the assertion would pass for the wrong reason.
+      const fallback: ChatTurn = options.repeatLast
+        ? (turns[turns.length - 1] ?? { content: 'done' })
+        : { content: 'done', finish_reason: 'stop' };
+      const turn = turns[served] ?? fallback;
+      served += 1;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(
+        JSON.stringify({
+          id: `chatcmpl_${served}`,
+          object: 'chat.completion',
+          model: 'scripted/model',
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: turn.content ?? null,
+                ...(turn.reasoning === undefined ? {} : { reasoning: turn.reasoning }),
+                ...(turn.tool_calls === undefined ? {} : { tool_calls: turn.tool_calls }),
+              },
+              finish_reason: turn.finish_reason ?? (turn.tool_calls ? 'tool_calls' : 'stop'),
+            },
+          ],
+          usage: { prompt_tokens: 3, completion_tokens: 5 },
+        }),
+      );
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('the fake chat API did not bind a port'));
+        return;
+      }
+      resolve({
+        baseURL: `http://127.0.0.1:${address.port}`,
+        requests,
+        close: () =>
+          new Promise((done) => {
+            server.close(() => done());
+            server.closeAllConnections?.();
+          }),
+      });
+    });
+  });
+}
+
+/** An OpenAI-shaped tool call. `args` is stringified, as the wire format requires. */
+export const fnCall = (name: string, args: Record<string, unknown> | string, id = `call_${name}`) => ({
+  id,
+  type: 'function' as const,
+  function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) },
+});

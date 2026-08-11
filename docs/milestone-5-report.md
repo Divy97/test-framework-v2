@@ -13,7 +13,7 @@ happened when it was built.
 | Thing | State | Consequence |
 |---|---|---|
 | Docker daemon | available (29.1.2) | the sandbox suite runs |
-| A model credential | **absent** | 5c's live end-to-end run cannot happen |
+| A model credential | absent during the build; an **OpenRouter key was supplied afterwards** | 5c's live run was blocked, then done — see "The first real model run" |
 | Registered GitHub App | **absent** | 5e's live install cannot happen |
 | `gh` CLI auth | present (`Divy97`) | PRs can be opened for the phases themselves |
 | Postgres | started by this run | `test/store.test.ts` executes its SQL |
@@ -51,7 +51,7 @@ Neither is in the repository, and both are worth knowing about:
 |---|---|---|
 | 5a · the loop moves out | **landed** — PR #22 | 307 passed, 2 skipped |
 | 5b · the environment recipe | **landed** | see below |
-| 5c · the two prompts | **landed**, except the live run | no `ANTHROPIC_API_KEY` |
+| 5c · the two prompts | **landed**, live run included | done afterwards on OpenRouter; both prompts were **wrong** and a real model is what proved it |
 | 5d · one container per phase | **landed** | the code was already there; the assertions were not |
 | 5e · GitHub in and out | **landed** | whole path tested against a local remote; live install skipped |
 | 5f · the browser | **landed** | chromium, no browser-automation dependency |
@@ -646,3 +646,150 @@ first real run replaces them with measurements.
 Sources: [OpenRouter + Claude Code](https://openrouter.ai/blog/tutorials/claude-code-openrouter/),
 [DeepSeek R1 pricing](https://openrouter.ai/deepseek/deepseek-r1),
 [Kimi K2 Thinking pricing](https://openrouter.ai/moonshotai/kimi-k2-thinking).
+
+### Moving the model behind an adapter (ADR-0015)
+
+Asked next, and it was the right call: if the app talked OpenRouter's own API instead of
+Anthropic's, any model would work — so why keep the Anthropic adapter at all?
+
+Two of the three facts I wanted before agreeing came back from OpenRouter's model
+catalogue (`GET /api/v1/models`, which reports `supported_parameters` per model), and
+both corrected the section above:
+
+- **DeepSeek R1 does support tool calling.** So does Kimi K2 Thinking, and **336 of the
+  403 listed models**. The paragraph above treated this as unknown.
+- **No translation layer is needed.** The section above priced this as "build and
+  maintain a proxy that translates `tool_use` blocks". That framing was wrong: OpenAI's
+  `chat/completions` tool shape *is* a target we can emit directly, and our
+  `input_schema` is already the JSON Schema its `function.parameters` wants. The whole
+  adapter is ~130 lines and no new dependency.
+- **The cost gap is wider than five times.** `minimax/minimax-m2.5` is $0.22/$0.90 per
+  million — **28× cheaper than Opus 5 on output**, not five.
+
+With the proxy gone from the cost side and the model support confirmed, the trade
+reverses. What is now shipped:
+
+| | |
+|---|---|
+| `src/openrouter.ts` | An OpenAI-shaped agent loop. No SDK — one POST, same reasoning as `src/github.ts` and `src/browser.ts`. |
+| `openAiTools()` | A pure mapping over the **same** `TOOL_SCHEMAS`. One tool surface, two wire formats. |
+| `probeToolCalling()` | Refuses a model that cannot make a structured tool call, by name, before the run. |
+| `providerName()` | `ENGINE_PROVIDER=anthropic\|openrouter`, validated — a typo throws rather than silently selecting the expensive path. |
+
+```sh
+export ENGINE_PROVIDER="openrouter"
+export OPENROUTER_API_KEY="sk-or-v1-…"
+export ENGINE_MODEL="moonshotai/kimi-k2-thinking"   # or deepseek/deepseek-r1, minimax/minimax-m2.5
+export ENGINE_EFFORT="low"
+```
+
+**Where I did not do what was asked, and why.** The ask was to move *off* the Anthropic
+adapter. The Anthropic path is still there and still the default. It is the path with a
+real run behind it, and there is no model credential in this repository to verify the
+new one with — so deleting a tested path in favour of an untested one, and reporting
+that as a working migration, is the one thing the brief forbids outright. The switch of
+default is a one-line change the moment a real run passes on OpenRouter. Nothing else
+has to move.
+
+**The failure this was really about.** Cheap models vary in whether a tool call arrives
+as a structured call or as prose that looks like one, and the prose case is silent: the
+turn completes, nothing executes, and the transcript reads like an agent that chose to
+do nothing — indistinguishable from a genuine Tier 3. The engine would then report a
+finding about the *user's bug* that is actually a fact about the model. ADR-0011 hit
+this exact failure on Claude with thinking disabled and answered it by refusing to
+disable thinking. `probeToolCalling` is the same answer here, and
+`test/openrouter.test.ts` asserts it with a model that answers *"Sure! I would call
+glob(\"*\") now."*
+
+**What is asserted, and what is not.** 24 new tests against a scripted
+`chat/completions` server cover: the full tool surface reaching the wire in the OpenAI
+shape; a call executed and fed back under its own `tool_call_id`; **every** call in a
+turn answered in one follow-up request; malformed JSON arguments handed back as
+testimony with nothing invoked; a thrown tool not killing the run; `maxIterations`,
+`maxLines` and an HTTP 429 all recorded rather than swallowed; usage totalled; the probe
+refusing prose, an unoffered tool, a 401 and an unreachable host; and a missing
+`OPENROUTER_API_KEY` producing `spawn_failed` with zero turns rather than an empty
+transcript that could be read as a tier.
+
+**Since verified — see "The first real model run" below.** A key was supplied and
+`moonshotai/kimi-k2-thinking` took the `shipped-filter` issue to a credited Tier 2 pull
+request for eight cents. It took four attempts, and all four failures were in our code.
+
+A cheap model **cannot make the engine lie.** The gate is executed evidence, not
+testimony (ADR-0006), so a worse model produces a worse tier — which is precisely what
+the tier is for. That asymmetry is what makes this safe to offer at all.
+
+Source: [OpenRouter models API](https://openrouter.ai/api/v1/models) (`supported_parameters`, pricing; read 2026-08-11).
+
+### The first real model run
+
+`ENGINE_PROVIDER=openrouter`, `moonshotai/kimi-k2-thinking`, `ENGINE_EFFORT=low`, the
+`shipped-filter` issue, the demo repository, real containers, real recipe, real judge.
+The remote is a bare repo on disk and the GitHub API a recording `fetch`, because no App
+is registered — so this is **5c's done-when**, not 5e's.
+
+**The fourth attempt succeeded:**
+
+| | |
+|---|---|
+| `ENV_READY` | true — the recipe booted the app and a healthcheck answered |
+| registered repro | `node --test test/shipped-filter.test.mjs` |
+| base | exit 1, **symptom matched** |
+| fix | exit 0, three times |
+| diff | `orders.mjs`, `package-lock.json` |
+| tier | **Tier 2**, confidence **80/85** |
+| PR | opened, with the full evidence table |
+| cost | repro $0.0463 + fix $0.0358 = **$0.082** |
+| wall clock | 277s |
+
+Tier 2 and not Tier 1 for the recorded reason: `+0 the reproduction was written by the
+agent under judgement, so it cannot be shown to test the bug rather than which commit it
+is running on`. The cap held on a real run exactly as it holds on scripted ones.
+
+**Four defects, none of them the model's.** This is the part worth keeping.
+
+| # | Defect | Why 365 scripted tests missed it |
+|---|---|---|
+| 1 | `tool_choice: 'required'` is not portable — Moonshot rejects it | The probe was new and had only ever met a fixture that accepted everything |
+| 2 | OpenRouter answers **HTTP 200 with `{error: {code: 400}}`**; `response.ok` alone reads that as a successful turn | No fixture returned a 200 that was really a refusal. The first cost was a *wrong diagnosis*: the probe blamed the model for our malformed request |
+| 3 | The engine checks the reproduction's output against a literal string **the agent is never shown**, while the prompt asked only that the output "mention the symptom" | A scripted agent emits the exact string because the test author wrote it. Only a model that *reads* paraphrases |
+| 4 | The fix prompt promised *"you have exactly the command above"* and substituted the prose *"the command registered in .engine/repro.json"* | Same reason. The fix agent followed the indirection, read the manifest and the source, and quit in three turns without editing |
+
+Every one is a defect in **what we tell the agent**. That is the class of bug a scripted
+agent structurally cannot find, and it is the strongest argument for the cheap adapter:
+at eight cents a run, four rounds of this cost thirty cents.
+
+**What changed as a result:**
+
+- `apiError()` — a 200 carrying an error is named as an API error, in both the probe and
+  the loop, never as a fact about the model's capabilities.
+- The probe sends no `tool_choice`. Asserted, so it cannot be helpfully re-added.
+- `symptomPattern` is computed **once** in `run.ts` and passed to both the prompt and the
+  engine, so they cannot drift. `prompts/repro.md` prints the exact string in a fenced
+  block and says the match is character-for-character and a paraphrase fails.
+  `renderPrompt('repro', …)` now throws without it.
+- `RunPlan.agentPrompt` accepts `(repro: ReproSpec) => string | Promise<string>`, rendered
+  at the fix-agent call site from the reproduction the base container registered. This is
+  what `run.ts`'s own comment always said it should be.
+- `PhaseResult.usage` → `RunResult.usage`. The loop totalled what it spent and
+  `orchestrate` **dropped it**, so "what did that run cost" was unanswerable from outside
+  `src/loop.ts` — the same gap the totalling was added to close, reintroduced one layer
+  up. The $0.082 above is measured because of this fix, not estimated.
+
+**The matcher was never loosened.** Defect 3 could have been "made to pass" by making the
+symptom check fuzzy. That would have traded ADR-0008's anchor — the difference between
+reproducing *this* bug and reproducing some other one — for a green run. The prompt was
+wrong; the check was right.
+
+**One finding about the agent rather than the engine.** `package-lock.json` is in the fix
+diff. `git_commit` stages everything, and the recipe's install step created that file, so
+a side effect of the environment landed in the commit under judgement. Rule 4 of the fix
+prompt tells the agent to change what the bug needs and stop. The engine did the right
+thing — it published the diff for a human to read — but a lock file in a one-line SQL fix
+is noise a reviewer should not have to explain. Recorded, not fixed: it is outside what
+was asked for.
+
+**Not proven by this run:** the other three seeded bugs have never been driven by a real
+agent, so `orders-heading` (browser, Tier 2), `export-button` (Tier 3 info-request) and
+`total-rounding` (Tier 3, no fix attempted) remain scripted-only. And no GitHub App is
+registered, so nothing here has been accepted by GitHub.

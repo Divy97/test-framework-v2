@@ -24,9 +24,17 @@ Commit a file at exactly `.engine/repro.json`:
 ```
 
 - `command` is run from the repository root by `sh -c`. It must exit **non-zero**
-  on this commit, and its output must mention the symptom the report describes —
-  an engine you cannot reach checks the output against the reported symptom, and a
-  failure for some unrelated reason is not a reproduction of this bug.
+  on this commit, and its output must contain this text, character for character:
+
+  ```
+  {{symptom}}
+  ```
+
+  An engine you cannot reach searches your output for exactly that string. It does
+  not read for meaning, so a paraphrase of it fails — print it verbatim, on its own
+  line, alongside whatever else you want to say. This is not bureaucracy: a failure
+  for some unrelated reason is not a reproduction of this bug, and matching the
+  reported symptom is how the engine tells the two apart.
 - `files` lists **every** path the reproduction depends on that is not already part
   of the project: the test file you wrote, any helper it needs, and the manifest
   itself. At most 32 paths, 256KB of content in total. Each must be a regular file
