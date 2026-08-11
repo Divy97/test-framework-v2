@@ -135,10 +135,12 @@ each time. The App's **Advanced → Recent Deliveries** page shows the exact pay
 lets you **Redeliver** — that is a far faster loop than opening new issues, and it is the
 only way to retry a delivery without creating one.
 
-**One run at a time.** A recipe pins a fixed host port, so `serve.ts` serialises runs
-deliberately: two concurrent runs against the same repository would fight over that port
-and the loser's healthcheck would fail, which the engine would honestly record as
-`errored`. Label three issues at once and they queue.
+**One run at a time.** `serve.ts` serialises deliberately, because one run is five
+containers — an agent sandbox, a base phase, and three fix re-runs — so a second
+concurrent run doubles the Docker load and the model spend on one machine. It is a
+resource policy, not a correctness constraint: services bind inside each run's own
+container namespace and nothing is published to the host. Label three issues at once and
+they queue.
 
 ## What this still does not prove
 
