@@ -116,8 +116,25 @@ protects:
 ### Once per organisation
 
 1. The user installs our GitHub App and selects repositories. We request
-   `contents: read and write` and `pull_requests: write` — nothing else.
-2. GitHub calls our setup URL with an installation ID. We store it.
+   `contents: read and write`, `pull_requests: read and write` and
+   `issues: read and write` — nothing else.
+
+   **Corrected after tracing the calls.** This said `contents` and
+   `pull_requests` only. `issues: write` is required by
+   `POST /repos/:repo/issues/:n/comments`, which every run makes on every
+   outcome and which for Tier 3 **is** the whole deliverable — there is no PR.
+   With the narrower set a Tier 3 run does everything correctly, posts nothing,
+   and records no error, because `run.ts` deliberately swallows a failed comment
+   (there is no event class for our own outage). An under-specified permission
+   here fails silently, which is the one presentation this project refuses.
+2. Every delivery carries `installation.id`, and that is where the installation
+   comes from — `intake()` reads it per delivery.
+
+   **Also corrected.** This said GitHub calls a setup URL with an installation
+   ID and we store it. There is no setup URL and no installations table; nothing
+   is stored. Reading it per delivery is the better design for the reason ADR-0012
+   gives about the token — an id captured once is an id that can be stale — but the
+   document described a mechanism that was never built.
 
 No personal access token is ever requested. A PAT dies when its owner leaves the
 organisation and carries that person's full access while it lives; an
