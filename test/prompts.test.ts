@@ -1,0 +1,214 @@
+// The two prompts (§5c), and whether they tell the truth.
+//
+// The gap 5c closes is that the engine had a strict contract and had never stated
+// it to the party it binds: `src/agent.ts` said the prompt was the caller's
+// business, every prompt in the repo was a stub like `'fix it'`, and nothing told an
+// agent that `.engine/repro.json` exists. A real agent would have committed no
+// manifest and `readReproFromCommit` would have thrown.
+//
+// So the assertions here are not "the prompt mentions the manifest". They are that
+// every number and path the prompt states is the number and path the engine
+// ENFORCES. A prompt that promises a 64-file limit against a 32-file check is worse
+// than no prompt: it produces a confident agent and a refused run.
+
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, test } from 'vitest';
+import { MAX_REPRO_BYTES, MAX_REPRO_FILES, REPRO_MANIFEST } from '../src/orchestrate.js';
+import { describeEnvironment, extractRecipeDraft, PROMPT_DIR, renderPrompt } from '../src/prompts.js';
+
+const read = (name: string) => readFileSync(join(PROMPT_DIR, name), 'utf8');
+
+describe('the prompts are files, and they are filled in', () => {
+  test('both exist in version control rather than as string literals', () => {
+    // "They are prompts; they will be iterated." A diff on a file is legible; a diff
+    // inside a template literal at a call site is not.
+    expect(read('repro.md').length).toBeGreaterThan(500);
+    expect(read('fix.md').length).toBeGreaterThan(500);
+  });
+
+  test('a placeholder that is not filled is an error, not a prompt', async () => {
+    // A run wasted on a template bug reads as the agent being stupid rather than as
+    // us being wrong, which is the most expensive kind of silent failure here.
+    await expect(renderPrompt('fix', { issue: 'x', command: 'y', files: 'z' })).rejects.toThrow(
+      /needs environment/,
+    );
+    const filled = await renderPrompt('repro', { issue: 'the heading is wrong', environment: 'no services' });
+    expect(filled).toContain('the heading is wrong');
+    expect(filled).not.toMatch(/\{\{\w+\}\}/);
+  });
+});
+
+describe('the repro prompt states the contract the engine enforces', () => {
+  const prompt = read('repro.md');
+
+  test('the manifest path is the one the engine reads, character for character', () => {
+    expect(REPRO_MANIFEST).toBe('.engine/repro.json');
+    expect(prompt).toContain(REPRO_MANIFEST);
+    // And the shape, since a manifest with the right name and the wrong keys is
+    // refused with a message about JSON rather than about the contract.
+    expect(prompt).toMatch(/"command"/);
+    expect(prompt).toMatch(/"files"/);
+  });
+
+  test('the ceilings it quotes are the ceilings the engine applies', () => {
+    // The two numbers `readReproFromCommit` refuses on. If either changes, this test
+    // fails and the prompt has to be corrected — which is the whole reason it reads
+    // them from the source rather than restating them.
+    expect(MAX_REPRO_FILES).toBe(32);
+    expect(MAX_REPRO_BYTES).toBe(256 * 1024);
+    expect(prompt).toMatch(new RegExp(`${MAX_REPRO_FILES} paths`));
+    expect(prompt).toMatch(/256KB/);
+  });
+
+  test('it says the working tree is discarded, and that only a commit survives', () => {
+    // ADR-0010's consequence, and the single most likely way a real first run fails:
+    // an agent that writes a perfect reproduction and never commits it.
+    expect(prompt).toMatch(/Only committed files exist/);
+    expect(prompt).toMatch(/git_commit/);
+  });
+
+  test('it says the command must FAIL here, and why a green one ends the run', () => {
+    expect(prompt).toMatch(/must exit \*\*non-zero\*\*/);
+    expect(prompt).toMatch(/information request/);
+    // The symptom check, which is the difference between reproducing this bug and
+    // reproducing some other one.
+    expect(prompt).toMatch(/output must mention the symptom/);
+  });
+
+  test('it forbids testing the commit s identity, which is the attack the tier cap exists for', () => {
+    // ADR-0007's amendment: the repro agent knows base's tree exactly, so it can
+    // write an oracle over the commit instead of over the bug. Saying so is not a
+    // defence — the tier cap is — but an agent that does it by accident is a wasted
+    // run, and the sham control is described so the instruction has a reason.
+    expect(prompt).toMatch(/Reproduce the bug, not the commit/);
+    expect(prompt).toMatch(/sham/);
+    expect(prompt).toMatch(/Do not fix the bug/);
+  });
+});
+
+describe('the fix prompt states what will judge it', () => {
+  const prompt = read('fix.md');
+
+  test('it carries the registered command and says who will re-run it', () => {
+    expect(prompt).toContain('{{command}}');
+    expect(prompt).toMatch(/re-run again|run again, against your commit|a process you cannot reach/);
+    // Three runs, because "it passed once" is the failure the flake re-runs exist to
+    // catch and an agent that does not know the count will not check twice.
+    expect(prompt).toMatch(/three times/);
+  });
+
+  test('it says the repro files are not the agent s, and why editing them looks like tampering', () => {
+    expect(prompt).toContain('{{files}}');
+    expect(prompt).toMatch(/not yours to change/);
+    expect(prompt).toMatch(/tampering/);
+  });
+
+  test('it says nothing outside a commit crosses, and names the container boundary', () => {
+    // ADR-0014: base and fix are different containers, so a cache, a temp file or a
+    // background process reaches nothing. An agent that does not know this writes a
+    // fix that "works locally".
+    expect(prompt).toMatch(/Only committed files exist/);
+    expect(prompt).toMatch(/different container/);
+  });
+
+  test('it renders with a real command and file list', async () => {
+    const filled = await renderPrompt('fix', {
+      issue: 'the heading is misspelled',
+      command: 'sh repro.sh',
+      files: '- `repro.sh`\n- `.engine/repro.json`',
+      environment: 'no services are running',
+    });
+    expect(filled).toContain('sh repro.sh');
+    expect(filled).toContain('`.engine/repro.json`');
+    expect(filled).not.toMatch(/\{\{\w+\}\}/);
+  });
+});
+
+describe('the environment paragraph describes what was observed', () => {
+  test('with no services it says so, rather than implying one is up', () => {
+    const text = describeEnvironment({});
+    expect(text).toMatch(/No services are running/);
+    expect(text).toMatch(/There is no network/);
+  });
+
+  test('with services it names each one and its healthcheck', () => {
+    // Built from the recipe's own services, so the prompt cannot promise a booted
+    // service that never came up: `ENV_READY` is emitted for a healthcheck that
+    // passed, and this describes the same facts.
+    const text = describeEnvironment({
+      services: [{ name: 'web', port: 8080, healthcheck: 'http://127.0.0.1:8080/healthz' }],
+      testCommand: 'node --test',
+    });
+    expect(text).toMatch(/`web` on http:\/\/127\.0\.0\.1:8080/);
+    expect(text).toMatch(/healthcheck: http:\/\/127\.0\.0\.1:8080\/healthz/);
+    expect(text).toMatch(/answered a healthcheck before you started/);
+    expect(text).toMatch(/`node --test`/);
+  });
+
+  test('the browser is described as testimony, in the paragraph that offers it', () => {
+    // The one place an agent learns what a screenshot is worth. ADR-0006's
+    // amendment: it makes the agent better at its job and gives the judge nothing
+    // new to trust.
+    const text = describeEnvironment({ browser: true });
+    expect(text).toMatch(/browser_screenshot/);
+    expect(text).toMatch(/never evidence/);
+    expect(text).toMatch(/no browser in it/);
+  });
+});
+
+describe('the drafting prompt asks for a recipe a human can approve', () => {
+  const prompt = read('recipe.md');
+
+  test('it states the schema the store will validate', () => {
+    for (const key of ['"install"', '"migrate"', '"seed"', '"services"', '"port"', '"healthcheck"', '"test"']) {
+      expect(prompt).toContain(key);
+    }
+    // The naming rule `parseRecipe` enforces, because a name that fails validation
+    // wastes the one drafting session this repository gets.
+    expect(prompt).toMatch(/lowercase letters, digits/);
+  });
+
+  test('it forbids backgrounding, which is the harness s job', () => {
+    // ADR-0014: the service lives in a named session the Runner started and holds.
+    // A command that backgrounds itself exits immediately, which is indistinguishable
+    // from a service that crashed on startup.
+    expect(prompt).toMatch(/foreground/);
+    expect(prompt).toMatch(/do not add `&`/);
+  });
+
+  test('it says why a guessed command is expensive, in the terms the user will see', () => {
+    // The drafting agent is the only participant that can prevent an `errored` run,
+    // so it is told what one looks like from the outside.
+    expect(prompt).toMatch(/run what you propose/i);
+    // `\s` rather than a space: the prompt is hard-wrapped, so this sentence spans a
+    // line break. Matching on a literal space would make the assertion depend on
+    // where the paragraph happens to fold.
+    expect(prompt).toMatch(/no fix is\s+attempted/);
+    // And that an unsatisfiable requirement is a useful answer rather than a failure
+    // — ADR-0013's own "revisit when" is exactly this case.
+    expect(prompt).toMatch(/say so plainly/);
+  });
+
+  test('the draft is read from the LAST fenced block, not the first', () => {
+    // A drafting agent explains itself before it answers, and its explanation may
+    // quote a candidate it rejected. Taking the first block stored the rejected one.
+    const message = [
+      'I first tried:',
+      '```json',
+      '{"install":"yarn","services":[]}',
+      '```',
+      'which failed, because this project uses npm. So:',
+      '```json',
+      '{"install":"npm install","services":[]}',
+      '```',
+    ].join('\n');
+    expect(extractRecipeDraft(message)).toEqual({ install: 'npm install', services: [] });
+  });
+
+  test('a session that answered with no JSON block is an error, not an empty recipe', () => {
+    expect(() => extractRecipeDraft('I could not work out how to boot this.')).toThrow(
+      /no fenced JSON block/,
+    );
+  });
+});

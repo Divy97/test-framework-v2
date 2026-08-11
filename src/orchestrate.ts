@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
 import { runAgentLoop, type AgentTranscript } from './loop.js';
+import type { Recipe, ReplayOutcome } from './recipe.js';
 import { isWorkerReply, type Job, type WorkerRequest } from './runner.js';
 import { put } from './blobs.js';
 import type { ReproSpec } from './verify.js';
@@ -105,6 +106,15 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
     maxLines?: number;
     maxIterations?: number;
   };
+  /**
+   * The environment recipe for this repository, replayed in the agent sandbox
+   * before the agent gets the tools (ADR-0013).
+   *
+   * Its presence is also what gives the agent sandbox a network — see the docker
+   * args in `runContainer`. Omitted, nothing boots and every container stays
+   * sealed, which is what the adversarial fixtures want and what 5a asserts.
+   */
+  recipe?: Recipe;
 } & (
   | { repro: Job['repro']; reproPrompt?: never }
   | { reproPrompt: string; repro?: never }
@@ -137,6 +147,15 @@ export type PhaseResult = {
    * VERIFICATION_ABORTED with a seq only the host can allocate.
    */
   handoverReport?: string | null;
+  /**
+   * What the container observed while replaying the recipe, when it replayed one.
+   *
+   * Present and `ready` → the host emits `ENV_READY`. Present and not `ready` → the
+   * host emits a `setup` abort with `cause: 'environment'` and the run ends
+   * `errored`, because our infrastructure being wrong about someone's project is
+   * not a finding about their bug (ADR-0007's v1.5 amendment).
+   */
+  envReport?: ReplayOutcome;
 };
 
 export type RunOutcome = {
@@ -352,7 +371,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       at: number,
       extra: Partial<Job> = {},
     ): Promise<PhaseResult> => {
-      const shared: Partial<Job> = { only: 'agent', baseRef: base, ...extra };
+      const shared: Partial<Job> = {
+        only: 'agent',
+        baseRef: base,
+        ...(plan.recipe ? { recipe: plan.recipe } : {}),
+        ...extra,
+      };
       if (!plan.loop) {
         return await runContainer(plan, agentSource, at, 'agent', { agentPrompt: prompt, ...shared });
       }
@@ -369,6 +393,45 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       );
       let seq = at;
       const written: RunEvent[] = [];
+      // The environment, first, because it precedes everything the agent said.
+      //
+      // `ENV_READY` is emitted for an OBSERVED healthcheck and never for the
+      // recipe's claim that one would pass — that split is what ADR-0013 turns on,
+      // and it is why the payload carries what the Runner saw rather than what the
+      // recipe said.
+      if (result.envReport?.ready) {
+        written.push(
+          own(plan.runId, ++seq, {
+            type: 'ENV_READY',
+            payload: {
+              v: 1,
+              services: result.envReport.services.map((service) => ({
+                name: service.name,
+                port: service.port,
+                ...(service.healthcheck === undefined ? {} : { healthcheck: service.healthcheck }),
+                detail: service.detail,
+              })),
+              steps: result.envReport.steps.map((step) => ({ step: step.step, exit_code: step.exit_code })),
+            },
+          }),
+        );
+      } else if (result.envReport) {
+        // Not a tier, and not a reproduction that failed. `cause: 'environment'` is
+        // what makes the fold disqualify this attempt, and the caller turns it into
+        // `RUN_ENDED { error }` — a boot that never happened produces no tier at
+        // all, because tiers describe reproductions and there was never an attempt.
+        written.push(
+          own(plan.runId, ++seq, {
+            type: 'VERIFICATION_ABORTED',
+            payload: {
+              v: 1,
+              phase: 'setup',
+              cause: 'environment',
+              reason: (result.envReport.failed ?? 'the environment did not come up').slice(0, MAX_REASON_CHARS),
+            },
+          }),
+        );
+      }
       for (const [n, line] of transcript.lines.entries()) {
         written.push(
           own(plan.runId, ++seq, {
@@ -386,17 +449,23 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
           }),
         );
       }
-      written.push(
-        own(plan.runId, ++seq, {
-          type: 'AGENT_FINISHED',
-          payload: {
-            v: 1,
-            messages: transcript.lines.length,
-            exit_code: transcript.exitCode,
-            stopped: transcript.stopped,
-          },
-        }),
-      );
+      // Only when there WAS supervision. `AGENT_FINISHED` says how the loop ended,
+      // and a world that never came up means the loop was never started — emitting
+      // `spawn_failed` over an agent nobody asked to run would put a fact about the
+      // agent in a log where the fault is entirely ours.
+      if (!result.envReport || result.envReport.ready) {
+        written.push(
+          own(plan.runId, ++seq, {
+            type: 'AGENT_FINISHED',
+            payload: {
+              v: 1,
+              messages: transcript.lines.length,
+              exit_code: transcript.exitCode,
+              stopped: transcript.stopped,
+            },
+          }),
+        );
+      }
       // The container reported this rather than writing it, because it is not a
       // writer in this mode. `handoverReport === null` means the bundle was made.
       if (result.handoverReport) {
@@ -564,6 +633,17 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
 
       if (result.exitCode !== 0) {
         ended = endedBy(result.exitCode);
+        break;
+      }
+
+      // The environment never came up. `error`, and NOT `not_reproduced` — the whole
+      // point of ADR-0007's v1.5 amendment. Tier 3 means "we tried to reproduce the
+      // bug and could not", which is a deliverable with value; "our recipe no longer
+      // boots your app" is our infrastructure being wrong about the user's project,
+      // and presenting it as a finding about their bug is the confidence score
+      // becoming a disclaimer.
+      if (result.envReport && !result.envReport.ready) {
+        ended = own(plan.runId, ++afterSeq, { type: 'RUN_ENDED', payload: { v: 1, reason: 'error' } });
         break;
       }
 
@@ -832,7 +912,22 @@ async function runContainer(
     // cannot do its job, and a caller who needs one will notice immediately —
     // which is the failure this project wants, rather than a boundary that reads
     // as enforced and is not.
-    ...['--network', 'none'],
+    // The ASYMMETRY ADR-0013 turns on, and the only place it is expressed.
+    //
+    // The phase containers get nothing, always: a reproduction that can reach the
+    // network is a reproduction that can be TOLD what to answer, and the code under
+    // judgement must not be able to exfiltrate the repository it was handed.
+    //
+    // The AGENT sandbox gets a network when — and only when — there is a recipe to
+    // replay, because install needs a package registry and booted services need
+    // localhost. It is the default bridge rather than a registry-only allowlist:
+    // ADR-0011 established that this project cannot express "sealed plus one route"
+    // (`--network none` removes every interface; the transport does not exist), and
+    // ADR-0010's v1.5 amendment says the agent sandbox "is not contained, and it no
+    // longer needs to be" — nothing worth stealing lives there and nothing it
+    // produces is trusted. What makes that affordable is what LEFT it: no model
+    // credential, no GitHub token, no event channel.
+    ...(phase === 'agent' && plan.recipe ? [] : ['--network', 'none']),
     '-v', `${source}:/src:ro`,
     '-v', `${store}:/blobs`,
     ...(handover ? ['-v', `${handover}:/out`] : []),
@@ -867,6 +962,7 @@ async function runContainer(
   let ready = () => {};
   const readied = new Promise<void>((resolve) => (ready = resolve));
   let handoverReport: string | null | undefined;
+  let envReport: ReplayOutcome | undefined;
   let stdout = '';
   // Counted separately, because `stdout` is now DRAINED per line. Measuring the
   // ceiling against it would measure the current partial line, and the guard would
@@ -889,6 +985,7 @@ async function runContainer(
       return;
     }
     if ('ready' in parsed) ready();
+    else if ('env' in parsed) envReport = parsed.env;
     else if ('finished' in parsed) handoverReport = parsed.finished.handover;
     else {
       const settle = pending.get(parsed.result.id);
@@ -951,8 +1048,12 @@ async function runContainer(
     // that fails to stand up never sends `ready` and the driver must not block on
     // a message that is not coming.
     await Promise.race([readied, closed]);
+    // A world that never came up gets no loop. Spending a model on a container
+    // whose services are down produces a transcript full of connection refusals and
+    // a reproduction of our own outage; the host records the operational fault
+    // instead.
     try {
-      await driver({ invoke });
+      if (!envReport || envReport.ready) await driver({ invoke });
     } finally {
       // Always, however the driver ended. Without this the container serves
       // forever and the run hangs on a loop that has already finished.
@@ -1023,6 +1124,7 @@ async function runContainer(
     stderr: stderr.trim(),
     ...(handover ? { handover } : {}),
     ...(handoverReport === undefined ? {} : { handoverReport }),
+    ...(envReport === undefined ? {} : { envReport }),
   };
 }
 

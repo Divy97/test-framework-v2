@@ -28,6 +28,8 @@ import {
   noOpFix,
   regression,
   survivorGamed,
+  demoRepo,
+  demoRecipe,
 } from './fixtures/repo.js';
 import { call, fakeModel } from './fixtures/model.js';
 
@@ -2192,6 +2194,235 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       await model.close();
     }
   }, 600_000);
+
+  // ── 5b: the environment recipe ──────────────────────────────────────────────
+
+  test('the demo boots from its recipe, and ENV_READY says what actually answered', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = demoRepo();
+    const blobs = hostBlobs();
+    const port = 8099;
+
+    // The agent's only job here is to prove the world is real: talk to the service
+    // the recipe booted, and check the registry route exists. Everything asserted
+    // below is about the environment, not about a reproduction.
+    const model = await fakeModel([
+      { content: [call('shell_create', { name: 'probe' })], stop_reason: 'tool_use' },
+      {
+        content: [
+          call(
+            'shell_write',
+            {
+              name: 'probe',
+              input:
+                `node -e "fetch('http://127.0.0.1:${port}/').then(r=>r.text()).then(t=>console.log('PAGE:'+(t.includes('Ordres')?'BUGGY':'CLEAN')))" ; ` +
+                'getent hosts registry.npmjs.org >/dev/null 2>&1 && echo REGISTRY-RESOLVED || echo REGISTRY-NO-DNS',
+            },
+            'toolu_probe',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      { content: [{ type: 'text', text: 'the world is up' }], stop_reason: 'end_turn' },
+    ]);
+
+    try {
+      const outcome = await orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: blobs,
+        image: IMAGE,
+        baseRef: fixture.base,
+        reproPrompt: 'look at the orders page',
+        symptomPattern: 'Ordres',
+        flakeRuns: 0,
+        recipe: demoRecipe(port),
+        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+      });
+
+      // ENV_READY, once, carrying the OBSERVATION rather than the recipe's promise.
+      const ready = outcome.events.filter((e) => e.type === 'ENV_READY');
+      expect(ready).toHaveLength(1);
+      expect(ready[0]!.payload).toMatchObject({
+        services: [{ name: 'web', port, detail: 'HTTP 200' }],
+      });
+      // And the steps that got it there, in order, each with what it returned.
+      expect((ready[0]!.payload as { steps: { step: string }[] }).steps.map((s) => s.step)).toEqual([
+        'install',
+        'migrate',
+        'seed',
+      ]);
+      expect(fold(outcome.events).env?.services[0]?.detail).toBe('HTTP 200');
+
+      // The world is real from inside: the agent reached the booted service on
+      // localhost and the registry resolves. Both are what ADR-0013 grants the agent
+      // sandbox and neither is available to a phase container.
+      const said = await Promise.all(
+        outcome.events
+          .filter((e) => e.type === 'AGENT_MESSAGE')
+          .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+      );
+      const results = said
+        .map((b) => JSON.parse(b.toString()) as { ok?: boolean; output?: string })
+        .filter((line) => typeof line.ok === 'boolean')
+        .map((line) => line.output ?? '')
+        .join('\n');
+      expect(results).toMatch(/PAGE:BUGGY/);
+      expect(results).toMatch(/REGISTRY-RESOLVED/);
+    } finally {
+      await model.close();
+    }
+  }, 900_000);
+
+  test('a recipe that no longer boots the app is errored, never a tier', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = demoRepo();
+    const blobs = hostBlobs();
+
+    // Recipes rot (ADR-0013). This is what that looks like: a start command that
+    // names a file the project does not have. The distinction being asserted is the
+    // sharpest one in ADR-0007's amendment — "our recipe no longer boots your app"
+    // must not be presented as "we could not reproduce your bug".
+    const model = await fakeModel([{ content: [{ type: 'text', text: 'never asked' }], stop_reason: 'end_turn' }]);
+    try {
+      const outcome = await orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: blobs,
+        image: IMAGE,
+        baseRef: fixture.base,
+        reproPrompt: 'look at the orders page',
+        symptomPattern: 'Ordres',
+        flakeRuns: 0,
+        recipe: {
+          migrate: 'node db.mjs migrate',
+          services: [
+            {
+              name: 'web',
+              command: 'node server-renamed-last-year.mjs',
+              port: 8098,
+              healthcheck: 'http://127.0.0.1:8098/healthz',
+            },
+          ],
+        },
+        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+      });
+
+      const state = fold(outcome.events);
+      expect(state.status).toBe('errored');
+      expect(state.endedReason).toBe('error');
+      // Named as an environment fault, which is what makes the fold disqualify it.
+      expect(state.aborts.at(-1)).toMatchObject({ phase: 'setup', cause: 'environment' });
+      expect(state.aborts.at(-1)!.reason).toMatch(/no answer from web:8098/);
+      // No tier, because tiers describe reproductions and there was never an attempt.
+      expect(state.shownOnBase).toBe(false);
+      expect(state.reproduced).toBe(false);
+      expect(confidence(state).tier).toBe(3);
+      // And no model was spent on a dead world: the loop was never started, so there
+      // is no transcript and nothing claims supervision happened.
+      expect(state.transcript).toHaveLength(0);
+      expect(state.agent).toBeNull();
+      // No phase container ran either.
+      expect(outcome.phases.map((p) => p.phase)).toEqual(['agent']);
+    } finally {
+      await model.close();
+    }
+  }, 900_000);
+
+  test('the phase containers stay sealed while the agent sandbox has a network', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = demoRepo();
+    const blobs = hostBlobs();
+    const port = 8097;
+
+    // The asymmetry ADR-0013 turns on, in one run: the agent's container reaches a
+    // registry and localhost because install needs one and services need the other,
+    // and the containers that JUDGE reach nothing — "a reproduction that can reach
+    // the network is a reproduction that can be TOLD what to answer".
+    //
+    // A caller-supplied repro, so both phases actually run and the negative
+    // assertions below are about two containers that existed.
+    const model = await fakeModel([
+      { content: [call('shell_create', { name: 'probe' })], stop_reason: 'tool_use' },
+      {
+        content: [
+          call(
+            'shell_write',
+            { name: 'probe', input: 'getent hosts registry.npmjs.org >/dev/null 2>&1 && echo AGENT-HAS-DNS || echo AGENT-NO-DNS' },
+            'toolu_probe',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      // It has to hand over a real commit, or the orchestrator refuses the agent and
+      // no phase container is ever spawned — which would make every assertion below
+      // vacuous. This is the shape of the bug the previous version of this test had.
+      { content: [call('write', { path: 'note.txt', content: 'a change\n' }, 'toolu_w')], stop_reason: 'tool_use' },
+      { content: [call('git_commit', { message: 'fix: something' }, 'toolu_c')], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' },
+    ]);
+
+    try {
+      const outcome = await orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: blobs,
+        image: IMAGE,
+        baseRef: fixture.base,
+        agentPrompt: 'make a change so both phases run',
+        symptomPattern: 'PHASE-NO-DNS',
+        flakeRuns: 0,
+        recipe: demoRecipe(port),
+        repro: {
+          command: 'sh repro.sh',
+          files: {
+            'repro.sh':
+              'getent hosts registry.npmjs.org && echo PHASE-HAS-DNS\n' +
+              'nc -w 3 1.1.1.1 53 </dev/null && echo PHASE-ROUTED\n' +
+              'echo done: PHASE-NO-DNS\n' +
+              'exit 1\n',
+          },
+        },
+        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+      });
+
+      const agentSaid = await Promise.all(
+        outcome.events
+          .filter((e) => e.type === 'AGENT_MESSAGE')
+          .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+      );
+      const agentResults = agentSaid
+        .map((b) => JSON.parse(b.toString()) as { ok?: boolean; output?: string })
+        .filter((line) => typeof line.ok === 'boolean')
+        .map((line) => line.output ?? '')
+        .join('\n');
+      expect(agentResults).toMatch(/AGENT-HAS-DNS/);
+
+      const phaseOutput = (
+        await Promise.all(
+          outcome.events
+            .filter((e) => e.type === 'TEST_RUN')
+            .map((e) => get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash)),
+        )
+      )
+        .map((b) => b.toString())
+        .join('\n');
+
+      // Positive first, so the negatives cannot pass by nothing having run.
+      expect(phaseOutput).toMatch(/done: PHASE-NO-DNS/);
+      expect(phaseOutput).not.toMatch(/PHASE-HAS-DNS/);
+      expect(phaseOutput).not.toMatch(/PHASE-ROUTED/);
+      // BOTH judging containers ran — the base went red for the reported symptom, so
+      // the gate opened and the fix container ran too. Two sealed containers is what
+      // makes the two negatives above mean something.
+      expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'fix']);
+      // Four probes, two per container. A single one would leave open the
+      // possibility that only one container was checked.
+      expect(outcome.events.filter((e) => e.type === 'TEST_RUN')).toHaveLength(2);
+    } finally {
+      await model.close();
+    }
+  }, 900_000);
 
   test('the deleted egress proxy is not referenced anywhere', () => {
     // ADR-0011 deletes `src/egress.ts` rather than deprecating it: "a sealed

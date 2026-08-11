@@ -54,6 +54,10 @@ describe('fold', () => {
       reproduced: true,
       reproducedAttempt: 1,
       shownOnBase: true, shownAttempts: [1],
+      // Null, and that is the M2/M3 shape: this stream replays no recipe, so there
+      // was no environment to be ready. `aborts` is what distinguishes that from a
+      // recipe that failed to boot.
+      env: null,
       fixDiff: {
         changed_files: ['src/checkout/discount.ts'],
         diff_hash: 'sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
@@ -695,5 +699,104 @@ describe('an attempt that could not be observed', () => {
       expect(state.completedAttempts).toEqual([1]);
       expect(state.reproduced).toBe(true);
     }
+  });
+});
+
+describe('the environment is part of the log, and a dead one is not a tier', () => {
+  const ENV: RunEvent = {
+    run_id: DEMO_RUN_ID,
+    seq: 4,
+    ts: 'T',
+    type: 'ENV_READY',
+    payload: {
+      v: 1,
+      services: [{ name: 'web', port: 8080, healthcheck: 'http://127.0.0.1:8080/healthz', detail: 'HTTP 200' }],
+      steps: [{ step: 'migrate', exit_code: 0 }],
+    },
+  };
+
+  it('records what ANSWERED, not what the recipe claimed', () => {
+    // ADR-0013's split: the recipe is testimony, the healthcheck passing is
+    // evidence. The payload carries the observation (`HTTP 200`) because that is
+    // the thing the event exists to state.
+    const state = fold([demoRunEvents[0]!, demoRunEvents[1]!, demoRunEvents[2]!, ENV]);
+    expect(state.env).toEqual({
+      services: [{ name: 'web', port: 8080, healthcheck: 'http://127.0.0.1:8080/healthz', detail: 'HTTP 200' }],
+      steps: [{ step: 'migrate', exit_code: 0 }],
+    });
+    // It is not a verdict input. The run has not moved.
+    expect(state.reproduced).toBe(false);
+    expect(state.shownOnBase).toBe(false);
+    expect(state.status).toBe('attempting');
+  });
+
+  it('disqualifies the attempt when the environment never came up', () => {
+    // The sharpest consequence of ADR-0013, and the reason `cause` exists: a
+    // recipe that no longer boots the app must not be able to produce a tier. The
+    // base run below is a perfectly clean red — matching symptom, intact hashes —
+    // and it is still refused, because the world it ran in was never established.
+    const withEnvFailure: RunEvent[] = [
+      demoRunEvents[0]!,
+      demoRunEvents[1]!,
+      demoRunEvents[2]!,
+      {
+        run_id: DEMO_RUN_ID,
+        seq: 4,
+        ts: 'T',
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'setup', cause: 'environment', reason: 'no answer from web:8080' },
+      },
+      { ...demoRunEvents[3]!, seq: 5 }, // REPRO_REGISTERED
+      { ...demoRunEvents[4]!, seq: 6 }, // TEST_RUN base, red, symptom matched
+    ];
+    const state = fold(withEnvFailure);
+    expect(state.shownOnBase).toBe(false);
+    expect(state.shownAttempts).toEqual([]);
+    expect(state.reproduced).toBe(false);
+  });
+
+  it('a setup abort for any OTHER cause still does not disqualify the attempt', () => {
+    // Narrow on purpose. A handover refusal already means no phase ran, so treating
+    // every setup abort as disqualifying would be a change with no case behind it —
+    // and `collection` is a tidy-up failure on a run where everything was observed.
+    for (const cause of ['handover', 'collection'] as const) {
+      const state = fold([
+        demoRunEvents[0]!,
+        demoRunEvents[1]!,
+        demoRunEvents[2]!,
+        {
+          run_id: DEMO_RUN_ID,
+          seq: 4,
+          ts: 'T',
+          type: 'VERIFICATION_ABORTED',
+          payload: { v: 1, phase: 'setup', cause, reason: 'something else' },
+        },
+        { ...demoRunEvents[3]!, seq: 5 },
+        { ...demoRunEvents[4]!, seq: 6 },
+      ]);
+      expect(state.shownOnBase).toBe(true);
+    }
+  });
+
+  it('folds a failed environment to errored, never to unresolved', () => {
+    // `unresolved` is "we could not reproduce it" — a deliverable with value.
+    // `errored` is "the sandbox fell over". Collapsing them would let an
+    // infrastructure problem masquerade as a finding about the bug, which is the
+    // one presentation ADR-0007's amendment forbids.
+    const state = fold([
+      demoRunEvents[0]!,
+      demoRunEvents[1]!,
+      demoRunEvents[2]!,
+      {
+        run_id: DEMO_RUN_ID,
+        seq: 4,
+        ts: 'T',
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'setup', cause: 'environment', reason: 'no answer from web:8080' },
+      },
+      { run_id: DEMO_RUN_ID, seq: 5, ts: 'T', type: 'RUN_ENDED', payload: { v: 1, reason: 'error' } },
+    ]);
+    expect(state.status).toBe('errored');
+    expect(state.endedReason).toBe('error');
   });
 });

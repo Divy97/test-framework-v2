@@ -24,6 +24,34 @@ export type AttemptStartedV1 = {
 };
 
 /**
+ * The environment came up. The one event class v1.5 adds to the spine.
+ *
+ * It exists because of a distinction ADR-0013 turns on: **the recipe is testimony,
+ * and the healthcheck passing is evidence.** An agent's claim about how to boot a
+ * project is worth nothing on its own; a service answering on its port is a fact
+ * the Runner observed at its own process boundary. This event is emitted for the
+ * second, never the first — so `services` carries what was OBSERVED (`HTTP 200`,
+ * `port 8080 accepted a connection`) rather than what the recipe promised.
+ *
+ * It is an event rather than a precondition nobody records because recipes rot, and
+ * the fold has to be able to tell "the start command no longer boots the app" from
+ * "we tried to reproduce the bug and could not". A run that never reaches this ends
+ * `errored`, never `not_reproduced` (ADR-0007's v1.5 amendment): our infrastructure
+ * being wrong about someone's project is not a finding about their bug.
+ */
+export type EnvReadyV1 = {
+  v: 1;
+  /** Every declared service, and how its answer was observed. */
+  services: { name: string; port: number; healthcheck?: string; detail: string }[];
+  /**
+   * The recipe steps that ran and what they returned. A fact about the replay, not
+   * a fact about the project: `install` exiting 0 says the command succeeded, and
+   * nothing about whether it installed the right thing.
+   */
+  steps: { step: string; exit_code: number }[];
+};
+
+/**
  * The reproduction's identity, fixed before either phase runs.
  *
  * A red-then-green comparison only means something if the same thing ran both
@@ -243,8 +271,15 @@ export type VerificationAbortedV1 = {
    * emitting the same phase label hands the fold a completion witness it has no
    * standing to assert (ADR-0009), which is exactly what happened when the host
    * started recording collection failures as `cleanup`.
+   *
+   * `environment` is the third, and it is the one that must never read as a finding
+   * about the bug: the recipe did not boot the project (ADR-0013's "recipes rot").
+   * The fold disqualifies the attempt and the run ends `errored`, which is exactly
+   * what ADR-0007's amendment asks for — a boot that never happened produces no
+   * tier at all, because tiers describe reproductions and there was never an
+   * attempt.
    */
-  cause?: 'handover' | 'collection';
+  cause?: 'handover' | 'collection' | 'environment';
 };
 
 /**
@@ -271,6 +306,7 @@ export type EventPayload =
   | { type: 'REPRO_REGISTERED'; payload: ReproRegisteredV1 }
   | { type: 'SANDBOX_CREATED'; payload: SandboxCreatedV1 }
   | { type: 'ATTEMPT_STARTED'; payload: AttemptStartedV1 }
+  | { type: 'ENV_READY'; payload: EnvReadyV1 }
   | { type: 'AGENT_MESSAGE'; payload: AgentMessageV1 }
   | { type: 'AGENT_FINISHED'; payload: AgentFinishedV1 }
   | { type: 'AGENT_HANDED_OVER'; payload: AgentHandedOverV1 }
