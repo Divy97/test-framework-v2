@@ -140,6 +140,45 @@ describe('the symptom pattern comes from the report, and is escaped', () => {
     expect(() => new RegExp(symptomFrom('a [b(c'))).not.toThrow();
     expect(symptomFrom('')).toBe('');
   });
+
+  test('an ordinary report yields its title, not one word out of the middle', () => {
+    // The defect the first real webhook-driven run exposed. This used to return the
+    // longest word over five characters, so the issue below derived `"everything"` — and
+    // the engine then refused a genuinely correct reproduction (`Expected 2 shipped
+    // orders, got 4`) because that output contains no such word. `not_reproduced`, on a
+    // real bug that had been shown.
+    const issue =
+      'The shipped filter returns everything\n\n' +
+      '/api/orders?status=shipped returns every order, including pending ones.';
+    expect(symptomFrom(issue)).toBe('The shipped filter returns everything');
+    expect(symptomFrom(issue)).not.toBe('everything');
+  });
+
+  test('a one-word anchor is refused, because it would match almost any output', () => {
+    // The deeper problem, and the reason this is not just about ergonomics: ADR-0008
+    // wants the output to prove THIS bug failed rather than some other thing. A common
+    // word matches unrelated prose, so a weak anchor is a broken gate even when the
+    // agent satisfies it.
+    const symptom = symptomFrom('Orders page is broken\n\nthe totals look wrong sometimes');
+    expect(symptom.split(' ').length).toBeGreaterThan(1);
+  });
+
+  test('a title too short to anchor anything falls through to the body', () => {
+    expect(symptomFrom('Bug\n\nthe orders total is wrong for order 3')).toBe(
+      'the orders total is wrong for order 3',
+    );
+  });
+
+  test('a very long title is cut at a word boundary, never mid-word', () => {
+    const long = `the export button does nothing at all when I click it ${'and again '.repeat(12)}`;
+    const symptom = symptomFrom(long);
+    expect(symptom.length).toBeLessThanOrEqual(100);
+    // The property is that the cut lands ON a boundary — the next character in the
+    // original is a space or the end. Asserting a particular last word instead would be
+    // asserting the fixture, since "…and again and" ends at a boundary perfectly well.
+    expect(long.startsWith(symptom)).toBe(true);
+    expect([' ', undefined]).toContain(long[symptom.length]);
+  });
 });
 
 describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no human step', () => {
