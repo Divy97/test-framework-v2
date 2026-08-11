@@ -190,8 +190,10 @@ store.
 Slack and CLI connectors · multi-repo runs · deployment and preview URLs · a
 streamed browser · diff-coverage instrumentation (still the only thing that would
 lift an agent-authored reproduction above Tier 2) · autonomous Sentry-triggered runs
-· concurrent runs (recipes pin fixed host ports, so `serve.ts` serialises
-deliberately; fixing that means allocating ports, which is its own change).
+· raising the concurrency of `serve.ts`'s queue (it serialises as a resource policy —
+one run is five containers — **not** because ports collide, which an earlier draft of
+this document claimed and which is not true: services bind inside each run's own
+container namespace and nothing is published to the host).
 
 ## What "done" looks like
 

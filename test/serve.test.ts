@@ -5,10 +5,9 @@
 // tests is the wiring nobody had, not the run, which `test/run.test.ts` already drives
 // through containers.
 //
-// Three of these cover failures that are silent by construction: a service that starts
-// with no secret and 401s every real delivery, a receiver that awaits a minutes-long run
-// until GitHub redelivers and starts the issue twice, and two runs racing for the host
-// port a recipe pins.
+// Two of these cover failures that are silent by construction: a service that starts with
+// no secret and 401s every real delivery, and a recipe whose absence is treated as fatal
+// rather than as the un-onboarded repository it describes.
 
 import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -242,10 +241,15 @@ describe('the queue is the boundary, not an optimisation', () => {
   // A test that cannot fail is worse than no test, because it implies coverage that is
   // not there. The property is real and is asserted where it lives: `test/github.test.ts`.
 
-  it('runs one at a time, because a recipe pins a host port', async () => {
-    // Two concurrent runs against the same repository bind the same `Service.port`; the
-    // loser's healthcheck fails and the engine records `errored` — our infrastructure
-    // being wrong about someone's repository, reported as a fact about their bug.
+  it('runs one at a time, so one machine holds one sandbox', async () => {
+    // The behaviour is right; the reason first given for it was not. This said concurrent
+    // runs would fight over the host port a recipe pins — they cannot: `replayRecipe` runs
+    // inside the container, its healthcheck fetches `127.0.0.1:port` from inside that same
+    // container, and nothing publishes a port to the host.
+    //
+    // The real reason: one run is an agent container plus a base plus three fix runs, so a
+    // second concurrent run doubles the Docker load and the model spend with no ceiling.
+    // A default worth asserting, and a policy rather than a constraint.
     let concurrent = 0;
     let peak = 0;
     const order: number[] = [];

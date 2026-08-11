@@ -11,12 +11,19 @@
 //   1. **Config is validated before anything binds a port.** A service that starts with
 //      no webhook secret and 401s every delivery looks identical to GitHub sending
 //      nothing. `readConfig` refuses, by name, with the variable that is missing.
-//   2. **Runs are serialised.** A recipe pins a fixed host port (`Service.port`), so two
-//      concurrent runs against the same repository fight over it and the loser's
-//      healthcheck fails — which the engine would honestly record as `errored`, an
-//      infrastructure failure reported as a fact about someone's bug. A queue of one is
-//      the correct answer until recipes allocate ports, and this is the ceiling being
-//      named rather than discovered.
+//   2. **Runs are serialised — as a resource policy, not a correctness requirement.**
+//      An earlier version of this comment said concurrent runs would fight over the host
+//      port a recipe pins. That was **wrong**, and it is worth recording rather than
+//      quietly deleting: `replayRecipe` runs inside the container (`runner.ts`), its
+//      healthcheck fetches `127.0.0.1:port` from inside that same container, and no
+//      container publishes a port to the host. Each run's services live in their own
+//      network namespace, so nothing collides.
+//
+//      What is actually true: one run is an agent container plus a base container plus
+//      three fix containers, and a second concurrent run doubles the Docker load and the
+//      model spend on one machine with no ceiling. A queue of one is a defensible default
+//      for a single-host deployment and a **choice**, not a constraint — raising it is a
+//      configuration change, not a redesign.
 
 import { readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -120,7 +127,8 @@ export type ServeOptions = {
 /**
  * Boot the receiver and the event tail, and run one issue at a time.
  *
- * The queue here does exactly ONE job — serialise runs, because recipes pin host ports.
+ * The queue here does exactly ONE job — serialise runs, so one machine is not asked to
+ * hold several sandboxes and several model bills at once.
  * It is worth being precise about what it does not do: acknowledging GitHub before the
  * run is `startWebhookReceiver`'s guarantee, which replies `202` and then calls
  * `onIntake` without awaiting it (`src/github.ts`, asserted in `test/github.test.ts`).
@@ -134,7 +142,7 @@ export async function serve(options: ServeOptions): Promise<Service> {
   const start = options.run ?? runFromIssue;
   await ensureBlobRoot(config.blobRoot);
 
-  // A queue of one, for the reason in this file's header: recipes pin host ports.
+  // A queue of one — see the header. A resource policy, not a port constraint.
   let tail: Promise<void> = Promise.resolve();
 
   const enqueue = (intake: Intake): void => {
