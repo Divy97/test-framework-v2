@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { createServer } from 'node:http';
-import { MODEL, modelId, runAgentLoop } from '../src/loop.js';
+import { effortLevel, MODEL, modelId, runAgentLoop } from '../src/loop.js';
 import { TOOL_SCHEMAS, ToolHost, type ToolWorld } from '../src/tools.js';
 import { call, fakeModel, type FakeModel } from './fixtures/model.js';
 
@@ -313,3 +313,77 @@ function restore(name: string, was: string | undefined): void {
   if (was === undefined) delete process.env[name];
   else process.env[name] = was;
 }
+
+describe('what a run costs is measured, not guessed', () => {
+  test('the usage of every turn is totalled onto the transcript', async () => {
+    // The per-turn numbers were already recorded into the transcript, where reading
+    // them meant fetching blobs and parsing JSON — so "what did that run cost" was
+    // unanswerable. For a project whose subject is evidence that was a strange gap.
+    const { transcript } = await drive([
+      { content: [call('read', { path: 'src.txt' })], stop_reason: 'tool_use' },
+      { content: [call('read', { path: 'src.txt' }, 'toolu_2')], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' },
+    ]);
+
+    // Three turns, and the scripted server reports one token each way per turn.
+    expect(transcript.usage.turns).toBe(3);
+    expect(transcript.usage.input_tokens).toBe(3);
+    expect(transcript.usage.output_tokens).toBe(3);
+  });
+
+  test('a run stopped by a ceiling still reports what it spent getting there', async () => {
+    // Totalled as it goes rather than at the end, because the expensive runs are
+    // exactly the ones a ceiling stops — and those are the ones worth costing.
+    const model = await fakeModel(
+      Array.from({ length: 50 }, (_, n) => ({
+        content: [call('read', { path: 'src.txt' }, `toolu_${n}`)],
+        stop_reason: 'tool_use' as const,
+      })),
+    );
+    models.push(model);
+    const transcript = await runAgentLoop({
+      prompt: 'loop forever',
+      apiKey: 'sk-ant-not-a-real-key',
+      baseURL: model.baseURL,
+      timeoutMs: 30_000,
+      maxLines: 6,
+      invoke: async () => ({ ok: true, output: 'wrong\n' }),
+    });
+
+    expect(transcript.stopped).toBe('line_cap');
+    expect(transcript.usage.turns).toBeGreaterThan(0);
+    expect(transcript.usage.output_tokens).toBe(transcript.usage.turns);
+  });
+
+  test('the effort level is configurable, and a typo is refused rather than billed', async () => {
+    // Effort was hardcoded to `high`. It is the single biggest lever on what a run
+    // costs, and `low` answers the only question prompt iteration asks.
+    const model = await fakeModel([{ content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' }]);
+    models.push(model);
+    await runAgentLoop({
+      prompt: 'x',
+      apiKey: 'sk-ant-not-a-real-key',
+      baseURL: model.baseURL,
+      effort: 'low',
+      maxTokens: 2048,
+      timeoutMs: 30_000,
+      invoke: async () => ({ ok: true, output: '' }),
+    });
+    const request = model.requests[0] as { output_config: unknown; max_tokens: number };
+    expect(request.output_config).toEqual({ effort: 'low' });
+    expect(request.max_tokens).toBe(2048);
+
+    // A misspelling must not silently fall back to `high` and a surprising bill.
+    expect(() => effortLevel('lowish')).toThrow(/must be one of/);
+    expect(effortLevel('max')).toBe('max');
+  });
+
+  test('the iteration ceiling is low enough to be a ceiling', () => {
+    // It was 200, which on a large model at high effort is a single run costing more
+    // than a developer expected to spend all day. A ceiling chosen so it never fires
+    // is not a ceiling.
+    const source = readFileSync(join(process.cwd(), 'src/loop.ts'), 'utf8');
+    const cap = Number(/const MAX_ITERATIONS = (\d+)/.exec(source)?.[1]);
+    expect(cap).toBeLessThanOrEqual(25);
+  });
+});

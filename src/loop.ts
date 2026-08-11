@@ -58,8 +58,48 @@ export const modelId = (override?: string): string =>
 const MAX_TOKENS = 16_000;
 /** Ceilings on an untrusted, paid-for loop. Every one of them is a recorded fact when hit. */
 const MAX_LINES = 10_000;
-const MAX_ITERATIONS = 200;
+/**
+ * Turns, not tokens — and this is the one ceiling that is also a BILL.
+ *
+ * It was 200, which on a large model at high effort is a run that can cost more than
+ * the developer expected to spend all day. Twenty-five is enough for the demo's bugs
+ * (the scripted runs use six to eight) and a caller who needs more says so. A ceiling
+ * chosen so it never fires is not a ceiling; it is a number that makes the code look
+ * bounded.
+ */
+const MAX_ITERATIONS = 25;
 const DEFAULT_TIMEOUT_MS = 1_800_000;
+
+/**
+ * How hard the model is asked to think, and the single biggest lever on what a run
+ * costs. It was hardcoded to `high`.
+ *
+ * `high` is right for a real fix on a real repository. It is wrong for the tenth
+ * iteration on a prompt, where `low` or `medium` answers the only question being asked
+ * — does the agent read the contract and produce a well-formed manifest — for a
+ * fraction of the tokens.
+ */
+const DEFAULT_EFFORT = 'high';
+type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+const EFFORTS: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/** `ENGINE_EFFORT`, validated — a typo must not silently become `high` and a big bill. */
+export const effortLevel = (override?: string): Effort => {
+  const wanted = override ?? process.env.ENGINE_EFFORT ?? DEFAULT_EFFORT;
+  if (!EFFORTS.includes(wanted as Effort)) {
+    throw new Error(`ENGINE_EFFORT must be one of ${EFFORTS.join(', ')}, not ${wanted}`);
+  }
+  return wanted as Effort;
+};
+
+/** What the turns actually consumed. Measured, because the alternative is guessing. */
+export type LoopUsage = {
+  turns: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+};
 
 /**
  * One line of the transcript, exactly as it will be stored.
@@ -75,6 +115,16 @@ export type AgentTranscript = {
   stopped: AgentFinishedV1['stopped'];
   /** 0 when the loop ran to its own end; -1 when a ceiling or a failure stopped it. */
   exitCode: number;
+  /**
+   * What this loop consumed, totalled.
+   *
+   * The per-turn numbers were already being recorded into the transcript and nobody
+   * could read them without fetching blobs and parsing JSON — so "what did that run
+   * cost" was unanswerable, which is a strange gap in a project whose subject is
+   * evidence. Not an event: there is no event class for it and inventing one to
+   * describe our own spending would put a fact about us in a log about the user's bug.
+   */
+  usage: LoopUsage;
 };
 
 export type LoopOptions = {
@@ -110,6 +160,10 @@ export type LoopOptions = {
   baseURL?: string;
   /** Override the model. Otherwise `ENGINE_MODEL`, otherwise `MODEL`. */
   model?: string;
+  /** Override the effort. Otherwise `ENGINE_EFFORT`, otherwise `high`. The cost lever. */
+  effort?: string;
+  /** Per-turn output ceiling. Lower it to bound spend; a truncated turn is visible. */
+  maxTokens?: number;
   timeoutMs?: number;
   maxLines?: number;
   maxIterations?: number;
@@ -127,6 +181,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
   const maxLines = options.maxLines ?? MAX_LINES;
   let stopped: AgentFinishedV1['stopped'] = 'exit';
   let exitCode = 0;
+  const usage: LoopUsage = {
+    turns: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
 
   const record = (claimed_type: string, payload: unknown): void => {
     if (lines.length >= maxLines) return;
@@ -151,7 +212,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
     });
   } catch (error) {
     record('loop_error', { message: String(error) });
-    return { lines, stopped: 'spawn_failed', exitCode: -1 };
+    return { lines, stopped: 'spawn_failed', exitCode: -1, usage };
   }
 
   // `BetaRunnableTool` by hand rather than through `betaTool()`: that helper infers
@@ -191,13 +252,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
   const drive = async (): Promise<void> => {
     const runner = client.beta.messages.toolRunner({
       model: modelId(options.model),
-      max_tokens: MAX_TOKENS,
+      max_tokens: options.maxTokens ?? MAX_TOKENS,
       // Adaptive, and NOT disabled: with thinking off this model can write a tool
       // call into its visible text, where it reads as a completed turn and the
       // call never runs. A silent no-op is the exact failure class this project
       // is built to refuse, so the more expensive setting is the correct one.
       thinking: { type: 'adaptive' },
-      output_config: { effort: 'high' },
+      output_config: { effort: effortLevel(options.effort) },
       tools,
       messages: [{ role: 'user', content: options.prompt }],
       max_iterations: options.maxIterations ?? MAX_ITERATIONS,
@@ -212,6 +273,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
         // cannot be separated by an early exit.
       }
       record('result', { stop_reason: message.stop_reason, usage: message.usage });
+      // Totalled as it goes, so a run that is stopped by a ceiling still reports what
+      // it spent getting there.
+      usage.turns += 1;
+      usage.input_tokens += message.usage?.input_tokens ?? 0;
+      usage.output_tokens += message.usage?.output_tokens ?? 0;
+      usage.cache_read_input_tokens += message.usage?.cache_read_input_tokens ?? 0;
+      usage.cache_creation_input_tokens += message.usage?.cache_creation_input_tokens ?? 0;
       if (lines.length >= maxLines) {
         stopped = 'line_cap';
         exitCode = -1;
@@ -237,5 +305,5 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
     }
   }
 
-  return { lines, stopped, exitCode };
+  return { lines, stopped, exitCode, usage };
 }

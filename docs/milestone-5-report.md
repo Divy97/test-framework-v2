@@ -586,3 +586,63 @@ reach the wire — proven against the scripted server. Whether OpenRouter accept
 
 Sources: [OpenRouter + Claude Code](https://openrouter.ai/blog/tutorials/claude-code-openrouter/),
 [OpenRouter API overview](https://openrouter.ai/docs/api-reference/overview).
+
+### Using a cheaper model, and what a run actually costs
+
+Asked next: can a cheap reasoning model (DeepSeek, Kimi) be used so prompt iteration
+does not cost tens of dollars?
+
+**Not through the endpoint above.** OpenRouter's own guide is explicit: *"Claude Code
+expects Anthropic request semantics, so non-Anthropic models aren't supported through
+the native endpoint."* The Anthropic Skin is Anthropic-models-only. `src/loop.ts` uses
+the SDK's **beta tool runner** with `thinking` and `output_config.effort`, which are
+Anthropic-shaped parameters — so reaching DeepSeek or Kimi means a translating proxy
+(Messages → `chat/completions`) or a second loop written against the OpenAI shape.
+
+Before recommending either, the premise was worth checking — and it turned out this
+loop had two cost problems of its own:
+
+| Was | Now | Why it mattered |
+|---|---|---|
+| `output_config: { effort: 'high' }`, hardcoded | `effortLevel()`, from `ENGINE_EFFORT` | The single biggest lever on spend. `high` is right for a real fix; `low` answers the only question prompt iteration asks. A typo now throws rather than silently costing `high`. |
+| `MAX_ITERATIONS = 200` | `25` | 200 turns on a large model at high effort is one run costing more than a developer expected to spend all day. **A ceiling chosen so it never fires is not a ceiling.** |
+| per-turn `usage` recorded, never totalled | `AgentTranscript.usage` | "What did that run cost" was unanswerable without fetching blobs and parsing JSON — a strange gap in a project whose subject is evidence. Totalled as it goes, so a run a ceiling stops still reports what it spent. |
+
+`max_tokens` and the model are configurable too, and all of it flows through
+`RunPlan.loop`.
+
+**The cheapest change that gets cheap iteration is a cheaper *Claude*.** Sonnet 5 works
+with the tool runner, adaptive thinking and effort exactly as Opus does, so it needs no
+adapter at all:
+
+```sh
+export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
+export ANTHROPIC_AUTH_TOKEN="sk-or-v1-…"
+export ENGINE_MODEL="anthropic/claude-sonnet-5"
+export ENGINE_EFFORT="low"
+```
+
+Haiku 4.5 is cheaper still but is **not** a drop-in: it predates adaptive thinking, so
+it needs `thinking: {type: 'enabled', budget_tokens: N}`, and `output_config.effort`
+errors on it outright. That is a real code branch, not a variable.
+
+**The honest arithmetic on DeepSeek/Kimi.** At roughly $0.60–$0.70 per million input
+and $2.50 per million output they are around five times cheaper than Sonnet 5 on
+output. On a workload of this size that is a difference measured in single dollars
+across a few dozen runs — against building and maintaining a translation layer for
+**tool calls**, which is the one thing the entire loop depends on. A proxy that garbles
+a `tool_use` block does not fail loudly; it produces an agent that appears to work and
+silently never calls anything. That is the trade, and on these numbers it is a bad one
+for prompt iteration.
+
+**And most iteration needs no model at all.** The scripted Messages API drives every
+path end to end — that is what all 340 tests do, for free. A real model answers exactly
+one question: whether an agent *reading the prompt* produces a well-formed manifest and
+a working fix. That takes a handful of runs, not dozens.
+
+**The numbers above are estimates.** The usage plumbing now exists precisely so the
+first real run replaces them with measurements.
+
+Sources: [OpenRouter + Claude Code](https://openrouter.ai/blog/tutorials/claude-code-openrouter/),
+[DeepSeek R1 pricing](https://openrouter.ai/deepseek/deepseek-r1),
+[Kimi K2 Thinking pricing](https://openrouter.ai/moonshotai/kimi-k2-thinking).

@@ -110,7 +110,13 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    */
   loop?: {
     apiKey?: string;
+    /** A bearer credential, for an Anthropic-compatible gateway. */
+    authToken?: string;
     baseURL?: string;
+    /** Cheaper model, cheaper effort — the two levers that decide what a run costs. */
+    model?: string;
+    effort?: string;
+    maxTokens?: number;
     timeoutMs?: number;
     maxLines?: number;
     maxIterations?: number;
@@ -404,7 +410,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       if (!plan.loop) {
         return await runContainer(plan, agentSource, at, 'agent', { agentPrompt: prompt, ...shared });
       }
-      let transcript: AgentTranscript = { lines: [], stopped: 'spawn_failed', exitCode: -1 };
+      let transcript: AgentTranscript = {
+        lines: [],
+        stopped: 'spawn_failed',
+        exitCode: -1,
+        usage: { turns: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      };
       const result = await runContainer(
         plan,
         agentSource,
