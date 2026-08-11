@@ -31,6 +31,8 @@ import { join } from 'node:path';
 import type pg from 'pg';
 import type { Intake } from './github.js';
 import { startWebhookReceiver } from './github.js';
+import { MODEL, effortLevel, providerName } from './loop.js';
+import { DEFAULT_OPENROUTER_MODEL } from './openrouter.js';
 import { loadRecipe } from './recipe.js';
 import { runFromIssue } from './run.js';
 import { startStatusServer } from './sse.js';
@@ -47,6 +49,17 @@ export type Config = {
   blobRoot: string;
   webhookPort: number;
   eventsPort: number;
+  /**
+   * Which model drives the agent, and the credential for it.
+   *
+   * Not optional, and validated at startup, because of how its absence presents. With
+   * no `loop` on the plan, `orchestrate` takes its pre-ADR-0011 branch — `claude`
+   * spawned inside the sealed container, which cannot reach any model — and the run
+   * ends `unresolved` with `AGENT_FINISHED { stopped: 'spawn_failed', messages: 0 }`,
+   * no `ENV_READY`, and every container exiting 0 with empty stderr. That is what the
+   * first real webhook-driven run did, and nothing in the log named a cause.
+   */
+  loop: { provider: string; apiKey: string; model: string; effort: string };
 };
 
 /** What a missing variable costs, so the message can say it. */
@@ -79,8 +92,28 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (!privateKeyPem) missing.push('GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_PATH');
 
+  // The model credential, for the provider actually selected. A service that starts
+  // without one reaches the agent phase and silently consults nothing.
+  const provider = providerName(env.ENGINE_PROVIDER);
+  const modelKey =
+    provider === 'openrouter'
+      ? (env.OPENROUTER_API_KEY ?? '')
+      : (env.ANTHROPIC_API_KEY ?? env.ANTHROPIC_AUTH_TOKEN ?? '');
+  if (!modelKey) {
+    missing.push(
+      provider === 'openrouter'
+        ? 'OPENROUTER_API_KEY (ENGINE_PROVIDER=openrouter)'
+        : 'ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN (ENGINE_PROVIDER=anthropic)',
+    );
+  }
+
   if (missing.length > 0) {
-    const detail = missing.map((key) => `  ${key} — ${REQUIRED[key] ?? 'the App cannot authenticate'}`).join('\n');
+    const cost = (key: string) =>
+      REQUIRED[key] ??
+      (key.includes('API_KEY') || key.includes('AUTH_TOKEN')
+        ? 'no model would ever be consulted: the run reaches the agent phase and silently does nothing'
+        : 'the App cannot authenticate');
+    const detail = missing.map((key) => `  ${key} — ${cost(key)}`).join('\n');
     throw new Error(`cannot start; these are not set:\n${detail}\n\nSee .env.example.`);
   }
 
@@ -99,6 +132,16 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
     blobRoot: env.ENGINE_BLOB_ROOT ?? '/blobs',
     webhookPort: Number(env.WEBHOOK_PORT ?? 8787),
     eventsPort: Number(env.EVENTS_PORT ?? 8788),
+    loop: {
+      provider,
+      apiKey: modelKey,
+      // NOT `modelId()`. That falls back to `MODEL` — an Anthropic id — for every
+      // provider, and ADR-0015 records why sending `claude-opus-5` to OpenRouter's
+      // OpenAI endpoint is a 404 whose cause is not in the message. The default has to
+      // follow the provider.
+      model: env.ENGINE_MODEL ?? (provider === 'openrouter' ? DEFAULT_OPENROUTER_MODEL : MODEL),
+      effort: effortLevel(env.ENGINE_EFFORT),
+    },
   };
 }
 
@@ -162,7 +205,19 @@ export async function serve(options: ServeOptions): Promise<Service> {
           agentImage: config.agentImage,
           blobRoot: config.blobRoot,
           append: (event) => appendEvent(client, event),
+          // Without this, `orchestrate` runs its pre-ADR-0011 path and no model is
+          // reached. Passed explicitly rather than left to the loop's own environment
+          // resolution, so the wiring is visible and a test can assert it.
+          loop: config.loop,
         });
+
+        // A run that reached no tier is an operational failure until proven otherwise, and
+        // the container's own stderr is the only thing that can say which. Printed, because
+        // a service whose failures are only visible in a debugger is not a service.
+        for (const d of result.diagnostics ?? []) {
+          log(`${label}: [${d.phase}] exit ${d.exitCode} stderr=${d.stderr.trim() ? `\n${d.stderr.trimEnd()}` : '(empty)'}`);
+        }
+        log(`${label}: phases=${(result.diagnostics ?? []).length} env=${JSON.stringify(result.state.env ?? null)}`);
 
         const spent = (result.usage ?? []).reduce((total, entry) => total + entry.usage.output_tokens, 0);
         log(

@@ -363,6 +363,53 @@ describe('what a run costs is measured, not guessed', () => {
     expect(transcript.usage.output_tokens).toBe(transcript.usage.turns);
   });
 
+  test('the turn ceiling says it stopped the agent, on this path too', async () => {
+    // The SDK's runner ends its iteration whether the model finished or `max_iterations`
+    // ran out, and from outside those looked identical: `stopped: 'exit'`, `exit_code: 0`.
+    // The first real webhook-driven run's fix agent hit the ceiling one turn short of
+    // committing — file edited, fix verified through the browser — and the log called it
+    // a clean exit. The last turn's `stop_reason` is what tells them apart.
+    const model = await fakeModel(
+      Array.from({ length: 20 }, (_, n) => ({
+        content: [call('read', { path: 'src.txt' }, `toolu_${n}`)],
+        stop_reason: 'tool_use' as const,
+      })),
+    );
+    models.push(model);
+    const transcript = await runAgentLoop({
+      prompt: 'never finish',
+      apiKey: 'sk-ant-not-a-real-key',
+      provider: 'anthropic',
+      baseURL: model.baseURL,
+      timeoutMs: 30_000,
+      maxIterations: 3,
+      invoke: async () => ({ ok: true, output: 'again\n' }),
+    });
+
+    expect(transcript.stopped).toBe('turn_cap');
+    expect(transcript.exitCode).toBe(-1);
+    expect(transcript.lines.at(-1)!.raw).toContain('iteration ceiling');
+  });
+
+  test('a model that ends its own turn is not accused of hitting the ceiling', async () => {
+    const model = await fakeModel([
+      { content: [call('read', { path: 'src.txt' }, 'toolu_1')], stop_reason: 'tool_use' as const },
+      { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' as const },
+    ]);
+    models.push(model);
+    const transcript = await runAgentLoop({
+      prompt: 'finish',
+      apiKey: 'sk-ant-not-a-real-key',
+      provider: 'anthropic',
+      baseURL: model.baseURL,
+      timeoutMs: 30_000,
+      maxIterations: 2,
+      invoke: async () => ({ ok: true, output: 'ok\n' }),
+    });
+    expect(transcript.stopped).toBe('exit');
+    expect(transcript.exitCode).toBe(0);
+  });
+
   test('the effort level is configurable, and a typo is refused rather than billed', async () => {
     // Effort was hardcoded to `high`. It is the single biggest lever on what a run
     // costs, and `low` answers the only question prompt iteration asks.
@@ -387,12 +434,33 @@ describe('what a run costs is measured, not guessed', () => {
     expect(effortLevel('max')).toBe('max');
   });
 
-  test('the iteration ceiling is low enough to be a ceiling', () => {
-    // It was 200, which on a large model at high effort is a single run costing more
-    // than a developer expected to spend all day. A ceiling chosen so it never fires
-    // is not a ceiling.
+  test('the iteration ceiling is a ceiling, and now a measured one', () => {
+    // It was 200 — a single run on a large model costing more than a developer expected
+    // to spend all day. A ceiling chosen so it never fires is not a ceiling.
+    //
+    // It was then 25, and this test asserted `<= 25`. That bound came from scripted runs
+    // using "six to eight", and the first real webhook-driven run disproved it: the repro
+    // agent finished naturally in 22 turns and the fix agent hit 25 EXACTLY, one turn
+    // short of committing a fix it had already written and verified. A bound derived from
+    // agents that never read the prompt was measuring the wrong workload.
+    //
+    // So the assertion moves, and stays an assertion: still bounded, and still far below
+    // the 200 that made it meaningless. Raising it past 200 fails here, and so does
+    // deleting it.
     const source = readFileSync(join(process.cwd(), 'src/loop.ts'), 'utf8');
     const cap = Number(/const MAX_ITERATIONS = (\d+)/.exec(source)?.[1]);
-    expect(cap).toBeLessThanOrEqual(25);
+    expect(cap).toBeGreaterThanOrEqual(40); // below this, a real fix phase is cut off
+    expect(cap).toBeLessThanOrEqual(120); // above this, it stops bounding the bill
+  });
+
+  test('a ceiling nobody can hear is not a ceiling', () => {
+    // The property behind `turn_cap`, asserted over the source because it is about what
+    // the code CANNOT do: report an interrupted agent and a finished one with the same
+    // value. Both loops must name the ceiling.
+    for (const file of ['src/loop.ts', 'src/openrouter.ts']) {
+      const source = readFileSync(join(process.cwd(), file), 'utf8');
+      expect(source, file).toContain("stopped = 'turn_cap'");
+      expect(source, file).toContain('iteration ceiling');
+    }
   });
 });

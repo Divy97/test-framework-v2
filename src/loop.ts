@@ -92,13 +92,19 @@ const MAX_LINES = 10_000;
 /**
  * Turns, not tokens — and this is the one ceiling that is also a BILL.
  *
- * It was 200, which on a large model at high effort is a run that can cost more than
- * the developer expected to spend all day. Twenty-five is enough for the demo's bugs
- * (the scripted runs use six to eight) and a caller who needs more says so. A ceiling
- * chosen so it never fires is not a ceiling; it is a number that makes the code look
- * bounded.
+ * It was 200, then 25, and 25 was justified by scripted runs using "six to eight". The
+ * first real webhook-driven run measured the truth: the repro agent finished naturally in
+ * **22** turns, and the fix agent hit **25 exactly** — mid-sentence, having edited the
+ * file and verified the fix through the browser, one turn short of committing it. The run
+ * aborted on a handover the repository already had.
+ *
+ * So 25 was not a ceiling chosen to bound a real workload; it was a number derived from
+ * agents that do not read. Eighty, from the same measurement: about 110 output tokens per
+ * turn on this workload, so eighty turns is roughly 9k output tokens — two cents on a
+ * cheap reasoning model, twenty on Opus. Still a ceiling, and now one with a run behind
+ * the number rather than an assumption.
  */
-const MAX_ITERATIONS = 25;
+const MAX_ITERATIONS = 80;
 const DEFAULT_TIMEOUT_MS = 1_800_000;
 
 /**
@@ -329,6 +335,11 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
       messages: [{ role: 'user', content: options.prompt }],
       max_iterations: options.maxIterations ?? MAX_ITERATIONS,
     });
+    // The SDK's runner ends its iteration either because the model stopped asking for
+    // tools or because `max_iterations` ran out, and the loop cannot tell those apart
+    // from the outside. The last turn's `stop_reason` can: `tool_use` means the model
+    // still wanted a tool when the runner stopped, which is the ceiling, not a decision.
+    let lastStopReason: string | null = null;
     for await (const message of runner) {
       for (const block of message.content) {
         if (block.type === 'text') record('assistant', { text: block.text });
@@ -339,6 +350,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
         // cannot be separated by an early exit.
       }
       record('result', { stop_reason: message.stop_reason, usage: message.usage });
+      lastStopReason = message.stop_reason ?? null;
       // Totalled as it goes, so a run that is stopped by a ceiling still reports what
       // it spent getting there.
       usage.turns += 1;
@@ -351,6 +363,15 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
         exitCode = -1;
         return;
       }
+    }
+    // Said out loud, for the same reason as the OpenRouter path: an agent that was
+    // interrupted one turn short of committing is not an agent that chose not to.
+    if (lastStopReason === 'tool_use') {
+      stopped = 'turn_cap';
+      exitCode = -1;
+      record('loop_error', {
+        message: `stopped after ${usage.turns} turns: the iteration ceiling was reached while the model was still calling tools`,
+      });
     }
   };
 

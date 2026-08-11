@@ -75,6 +75,18 @@ export type RunResult = {
   prUrl?: string;
   /** What each agent phase spent, so a run's cost is readable without parsing blobs. */
   usage?: { phase: string; usage: LoopUsage }[];
+  /**
+   * What each container said on stderr, and how it exited.
+   *
+   * `PhaseResult.stderr` already existed and its own note says why discarding it is
+   * wrong — "an operational failure with no diagnosis is the wrong thing to ship" — and
+   * then it was discarded here anyway. The first real webhook-driven run ended
+   * `spawn_failed` with `messages: 0`, and nothing anywhere could say why: no `ENV_READY`,
+   * no environment abort, just a container that never reached ready. This is that gap.
+   *
+   * Not an event: a container's stderr is our infrastructure talking about itself.
+   */
+  diagnostics?: { phase: string; exitCode: number; stderr: string }[];
 };
 
 /**
@@ -255,7 +267,21 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       .filter((phase) => phase.usage !== undefined)
       .map((phase) => ({ phase: phase.phase, usage: phase.usage! }));
 
-    return { runId, state, ...(prUrl === undefined ? {} : { prUrl }), ...(usage.length === 0 ? {} : { usage }) };
+    // Every phase, not only the ones that exited non-zero. A container that exits 0
+    // having done nothing is the failure that has no other symptom.
+    const diagnostics = outcome.phases.map((phase) => ({
+      phase: phase.phase,
+      exitCode: phase.exitCode,
+      stderr: phase.stderr,
+    }));
+
+    return {
+      runId,
+      state,
+      ...(prUrl === undefined ? {} : { prUrl }),
+      ...(usage.length === 0 ? {} : { usage }),
+      ...(diagnostics.length === 0 ? {} : { diagnostics }),
+    };
   } finally {
     await rm(workspace, { recursive: true, force: true }).catch(() => {});
   }

@@ -180,7 +180,17 @@ export type AgentFinishedV1 = {
   /** -1 when the process died by signal without returning a status. */
   exit_code: number;
   signal?: string;
-  stopped: 'exit' | 'line_cap' | 'byte_cap' | 'timeout' | 'spawn_failed';
+  /**
+   * `turn_cap` was added after the first real webhook-driven run. The loop fell out of
+   * its iteration ceiling with `stopped: 'exit'` and `exit_code: 0` — indistinguishable
+   * from a model that finished — and the log therefore reported an agent cut off
+   * mid-sentence as one that had chosen to stop. It had edited the file, verified the fix
+   * through the browser, said "let me run the tests", and never committed; the run
+   * aborted on a handover the repository already had, and nothing anywhere named the
+   * ceiling. A ceiling that reports itself as success is the failure class this project
+   * exists to refuse, and it was in our own loop.
+   */
+  stopped: 'exit' | 'line_cap' | 'byte_cap' | 'timeout' | 'turn_cap' | 'spawn_failed';
 };
 
 /**

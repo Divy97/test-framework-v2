@@ -183,7 +183,7 @@ describe('the ceilings are real', () => {
   it('stops at maxIterations rather than looping on a model that never finishes', async () => {
     model = await fakeChat([{ tool_calls: [fnCall('glob', { pattern: '*' })] }], { repeatLast: true });
     const tools = recorder();
-    await runOpenRouterLoop({
+    const transcript = await runOpenRouterLoop({
       prompt: 'p',
       invoke: tools.invoke,
       apiKey: 'k',
@@ -192,6 +192,45 @@ describe('the ceilings are real', () => {
     });
     expect(bodies(model)).toHaveLength(4);
     expect(tools.seen).toHaveLength(4);
+    // And SAYS it stopped, rather than reporting the same thing a finished run reports.
+    expect(transcript.stopped).toBe('turn_cap');
+    expect(transcript.exitCode).toBe(-1);
+  });
+
+  it('does not cry turn_cap when the model simply finished', async () => {
+    // The other half, and the one that makes the value mean something: a model that ends
+    // its own conversation on the last permitted turn finished, and must not be recorded
+    // as interrupted.
+    model = await fakeChat([{ tool_calls: [fnCall('glob', { pattern: '*' })] }, { content: 'all done' }]);
+    const transcript = await runOpenRouterLoop({
+      prompt: 'p',
+      invoke: recorder().invoke,
+      apiKey: 'k',
+      baseURL: model.baseURL,
+      maxIterations: 2,
+    });
+    expect(transcript.stopped).toBe('exit');
+    expect(transcript.exitCode).toBe(0);
+  });
+
+  it('reports the ceiling as testimony, so a cut-off agent is legible in the log', async () => {
+    // The failure this exists for: the first real webhook-driven run's fix agent hit the
+    // ceiling one turn short of committing, having already edited the file and verified
+    // the fix. `AGENT_FINISHED` said `stopped: 'exit'`, `exit_code: 0` — a clean finish —
+    // and the run then aborted on "a commit the repository already had". Nothing named
+    // the ceiling, so the missing commit read as the model's choice.
+    model = await fakeChat([{ tool_calls: [fnCall('edit', { path: 'a' })] }], { repeatLast: true });
+    const transcript = await runOpenRouterLoop({
+      prompt: 'p',
+      invoke: recorder().invoke,
+      apiKey: 'k',
+      baseURL: model.baseURL,
+      maxIterations: 3,
+    });
+    const error = transcript.lines.at(-1)!;
+    expect(error.claimed_type).toBe('loop_error');
+    expect(error.raw).toContain('iteration ceiling');
+    expect(error.raw).toContain('3 turns');
   });
 
   it('reports the line cap instead of silently truncating', async () => {
