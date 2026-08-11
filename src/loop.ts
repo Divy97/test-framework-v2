@@ -35,16 +35,25 @@ export type Provider = 'anthropic' | 'openrouter';
 const PROVIDERS: Provider[] = ['anthropic', 'openrouter'];
 
 /**
- * Which API to talk to: the caller's, then `ENGINE_PROVIDER`, then Anthropic.
+ * Which API to talk to: the caller's, then `ENGINE_PROVIDER`, then OpenRouter.
  *
- * Anthropic stays the default for one reason and it is not preference: it is the path
- * with a real run behind it. `openrouter` is the path that makes the README's
- * "replaceable component" claim true and a round of prompt iteration cost cents instead
- * of dollars (ADR-0015). Validated rather than defaulted, because a typo that silently
- * selects the expensive provider is exactly the mistake this is meant to prevent.
+ * OpenRouter is the default because it is the only path with a real run behind it. That
+ * reads backwards until you check: no Anthropic credential has ever been present in this
+ * repository, so defaulting to `anthropic` made the default the path nobody had executed,
+ * gated behind a key nobody had, while the verified one sat behind a flag. ADR-0015
+ * originally kept Anthropic on the grounds that it was the tested path; a real run
+ * inverted that, and the default follows the evidence rather than the ADR's first draft.
+ *
+ * It is also the cheap path, which is the point: a round of prompt iteration costs cents.
+ * The Anthropic tool runner is still the better engine — native thinking blocks, a
+ * maintained agentic loop, prompt caching we did not write — and `ENGINE_PROVIDER=anthropic`
+ * is one line for a run on a real repository that deserves it.
+ *
+ * Validated rather than defaulted: a typo must not silently pick a provider, in either
+ * direction.
  */
 export const providerName = (override?: string): Provider => {
-  const wanted = override ?? process.env.ENGINE_PROVIDER ?? 'anthropic';
+  const wanted = override ?? process.env.ENGINE_PROVIDER ?? 'openrouter';
   if (!PROVIDERS.includes(wanted as Provider)) {
     throw new Error(`ENGINE_PROVIDER must be one of ${PROVIDERS.join(', ')}, not ${wanted}`);
   }

@@ -2094,7 +2094,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
         reproPrompt: 'reproduce the bug',
         symptomPattern: 'wrong',
         flakeRuns: 0,
-        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 120_000 },
+        loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 120_000 },
       });
 
       const said = await Promise.all(
@@ -2177,7 +2177,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
         reproPrompt: 'try to escape',
         symptomPattern: 'wrong',
         flakeRuns: 0,
-        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 120_000 },
+        loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 120_000 },
       });
 
       const said = await Promise.all(
@@ -2238,7 +2238,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
         symptomPattern: 'Ordres',
         flakeRuns: 0,
         recipe: demoRecipe(port),
-        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+        loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
       });
 
       // ENV_READY, once, carrying the OBSERVATION rather than the recipe's promise.
@@ -2306,7 +2306,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
             },
           ],
         },
-        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+        loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
       });
 
       const state = fold(outcome.events);
@@ -2384,7 +2384,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
               'exit 1\n',
           },
         },
-        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+        loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
       });
 
       const agentSaid = await Promise.all(
@@ -2676,7 +2676,7 @@ describe('the browser, in the agent sandbox only', () => {
         symptomPattern: 'Ordres',
         flakeRuns: 0,
         recipe: demoRecipe(port),
-        loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+        loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
       });
 
       const said = await Promise.all(

@@ -323,7 +323,14 @@ describe('a 200 is not proof the request was accepted', () => {
 });
 
 describe('choosing a provider', () => {
-  it('defaults to anthropic, the path with a real run behind it', () => {
+  it('defaults to openrouter, the path with a real run behind it', () => {
+    // This asserted `anthropic` when the adapter landed, on the grounds that Anthropic
+    // was the tested path. A real run inverted it: no Anthropic credential has ever been
+    // present here, so that default was the path nobody had executed, behind a key nobody
+    // had. The default follows the evidence.
+    expect(providerName()).toBe('openrouter');
+    expect(providerName('anthropic')).toBe('anthropic');
+    process.env.ENGINE_PROVIDER = 'anthropic';
     expect(providerName()).toBe('anthropic');
   });
 
@@ -333,9 +340,9 @@ describe('choosing a provider', () => {
     expect(() => providerName()).toThrow(/openai/);
   });
 
-  it('routes to openrouter through ENGINE_PROVIDER', async () => {
+  it('routes to openrouter with no provider configured at all', async () => {
     model = await fakeChat([{ content: 'hello from a cheap model' }]);
-    process.env.ENGINE_PROVIDER = 'openrouter';
+    // No `ENGINE_PROVIDER` and no `provider` — this is the default path now.
     process.env.OPENROUTER_API_KEY = 'sk-or-test';
     const transcript = await runAgentLoop({ prompt: 'p', invoke: recorder().invoke, baseURL: model.baseURL });
     expect(JSON.parse(transcript.lines[0]!.raw)).toEqual({ text: 'hello from a cheap model' });

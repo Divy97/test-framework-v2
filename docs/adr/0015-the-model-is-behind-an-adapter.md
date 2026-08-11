@@ -132,17 +132,30 @@ find — it does not read its prompt. Finding them cost about thirty cents. On O
 four rounds are roughly ten times that, which is the argument for this ADR restated as a
 number.
 
-## On flipping the default
+## On flipping the default — done
 
 This ADR said the Anthropic default goes "when a real run has passed on the new one, and
-not before." That condition is now met, and the position is worth stating precisely
-because it has inverted: **OpenRouter is now the only path with a real run behind it.** No
-Anthropic credential was ever present here, so the tested-for-real path and the default
-are no longer the same path.
+not before." That condition was met, and holding the default anyway did not survive the
+obvious question: **why is the default the path nobody has executed?**
 
-It is still not flipped, for one reason that is about evidence rather than preference: one
-run, on one bug, is not a suite. `orders-heading` (browser-driven), `export-button`
-(Tier 3 info-request) and `total-rounding` (Tier 3, no fix attempted) have never been
-driven by a real agent on either provider. The flip is a one-line change to
-`providerName()` plus `provider: 'anthropic'` on the Anthropic suite's call sites, and the
-honest trigger for it is those three bugs passing on a real model — not this one passing.
+No Anthropic credential has ever been present in this repository. So `anthropic` as the
+default meant the default was untested and gated behind a key nobody had, while the one
+path with a real run behind it sat behind a flag. The reason recorded above for keeping
+Anthropic — "it is the path with a real run behind it" — had become false, and a default
+justified by a fact that is no longer true is just inertia.
+
+**`ENGINE_PROVIDER` now defaults to `openrouter`.** `ENGINE_PROVIDER=anthropic` is one
+line, and it is still the better engine for a run that deserves it: native thinking
+blocks, a maintained agentic loop, prompt caching we did not write.
+
+The consequence in the suite is an improvement rather than churn. Every test that drives
+the scripted **Messages API** fixture now says `provider: 'anthropic'` — seventeen call
+sites across three files. They were all relying on an ambient default to select a wire
+format, which is exactly what made the `.env` leak above so hard to read: a test that does
+not name the wire format it exercises cannot fail loudly when the wire format changes
+underneath it.
+
+What is still true, and is the reason this ADR does not claim more: one bug, one model.
+`orders-heading` (browser-driven), `export-button` (Tier 3 info-request) and
+`total-rounding` (Tier 3, no fix attempted) have never been driven by a real agent on
+either provider.

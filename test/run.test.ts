@@ -221,7 +221,7 @@ describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no h
       append: async (event) => void events.push(event),
       remote: () => remotePath,
       flakeRuns: 2,
-      loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+      loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
     });
 
     // THE VERDICT. Red on base for the reported reason, green on the fix every time,
@@ -326,7 +326,7 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
       append: async (event) => void events.push(event),
       remote: () => bareRemote(fixture.repo),
       flakeRuns: 0,
-      loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+      loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
     });
     return { result, events, calls };
   };
@@ -546,7 +546,7 @@ describe.skipIf(!dockerAvailable())('shipped-filter: an API bug the agent needs 
       remote: () => remotePath,
       flakeRuns: 2,
       symptomPattern: 'status=shipped returns every order',
-      loop: { apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+      loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
     });
 
     // The environment was stood up and OBSERVED — this is the only run in the suite
