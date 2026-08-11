@@ -89,6 +89,15 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   maxAttempts?: number;
   agentImageMount?: string;
   /**
+   * The image for the AGENT container only — the one with a browser in it (5f).
+   *
+   * Two images rather than one with a flag, because "a phase container must never gain
+   * a browser" then stops being a policy anyone can forget and becomes a fact about
+   * `plan.image`: the binary is not in it. ADR-0006's amendment requires the split, and
+   * a flag would be the version of it that fails silently.
+   */
+  agentImage?: string;
+  /**
    * Drive the agent from the HOST, with tool calls travelling into the container
    * (ADR-0011). Set, and no agent binary runs in the sandbox at all.
    *
@@ -101,7 +110,13 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    */
   loop?: {
     apiKey?: string;
+    /** A bearer credential, for an Anthropic-compatible gateway. */
+    authToken?: string;
     baseURL?: string;
+    /** Cheaper model, cheaper effort — the two levers that decide what a run costs. */
+    model?: string;
+    effort?: string;
+    maxTokens?: number;
     timeoutMs?: number;
     maxLines?: number;
     maxIterations?: number;
@@ -115,6 +130,21 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * sealed, which is what the adversarial fixtures want and what 5a asserts.
    */
   recipe?: Recipe;
+  /**
+   * A git repository to copy the accepted agent commits into before the workspace is
+   * destroyed.
+   *
+   * Without this the commit under judgement exists ONLY in the mirror this function
+   * clones and then deletes, so the host has nothing to push and `state.handedOver`
+   * names an object nobody can resolve. That was not a hypothetical: 5e's end-to-end
+   * test reproduced the whole run and then failed on `git push` with `bad object`.
+   *
+   * A separate field rather than fetching into `repoPath` unconditionally, because
+   * this function's invariant is that it works from a clone it owns and writes to
+   * nothing it was handed. The caller names where it wants the commits, and takes
+   * responsibility for that being a repository it owns too.
+   */
+  exportTo?: string;
 } & (
   | { repro: Job['repro']; reproPrompt?: never }
   | { reproPrompt: string; repro?: never }
@@ -380,7 +410,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       if (!plan.loop) {
         return await runContainer(plan, agentSource, at, 'agent', { agentPrompt: prompt, ...shared });
       }
-      let transcript: AgentTranscript = { lines: [], stopped: 'spawn_failed', exitCode: -1 };
+      let transcript: AgentTranscript = {
+        lines: [],
+        stopped: 'spawn_failed',
+        exitCode: -1,
+        usage: { turns: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      };
       const result = await runContainer(
         plan,
         agentSource,
@@ -762,6 +797,22 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   }
   if (ended) events.push(ended);
 
+  // The accepted commits, out of the workspace before it ceases to exist.
+  //
+  // `refs/heads/engine-agent-work-*` is where `applyHandover` puts each one. Fetched
+  // under a namespace of its own so nothing the caller already had is overwritten —
+  // the point is to make the objects resolvable, not to move anyone's branches.
+  if (plan.exportTo) {
+    await execFile('git', [
+      '-C', plan.exportTo, 'fetch', '--quiet', '--no-tags', source,
+      '+refs/heads/engine-agent-work-*:refs/engine/handover/*',
+    ]).catch(() => {
+      // Not fatal, and not silent either: the events are the record and a run whose
+      // commits could not be exported still produced every fact it observed. The
+      // caller discovers it when the push fails, with git's own words.
+    });
+  }
+
   // The workspace is a full clone and each handover holds whatever the agent
   // chose to leave in `/out`. Left behind, that is unbounded host-disk growth
   // per run — and the handover dirs are agent-writable, which is not something
@@ -932,7 +983,10 @@ async function runContainer(
     '-v', `${store}:/blobs`,
     ...(handover ? ['-v', `${handover}:/out`] : []),
     ...(plan.agentImageMount ? ['-v', `${plan.agentImageMount}:/usr/local/bin/claude:ro`] : []),
-    plan.image,
+    // The agent's image when there is one, and `plan.image` for everything that
+    // judges. This one line is the whole of "the browser runs in the agent sandbox
+    // only".
+    phase === 'agent' ? (plan.agentImage ?? plan.image) : plan.image,
   ];
 
   // `spawn`, not `execFile`. execFile has no `input` option — that belongs to

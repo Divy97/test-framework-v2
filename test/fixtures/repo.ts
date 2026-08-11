@@ -622,3 +622,35 @@ export const demoRecipe = (port: number) => ({
   ],
   test: 'node --test',
 });
+
+/**
+ * Red once, green after — and it SAYS which it saw, plus which machine it is on.
+ *
+ * `ORDER_DEPENDENT_REPRO` above already fails to be credited, and that has been
+ * asserted for two milestones. What was never asserted is WHY. Under one container
+ * the reason was the phase-boundary scrub: the flag was written, and then wiped.
+ * Under a container per phase the reason is that the flag's world does not exist —
+ * a different mount namespace, so nothing had to be wiped.
+ *
+ * A verdict cannot tell those two apart, so this fixture reports what it observed
+ * and where. `hostname` is docker's own per-container random name, which is why it
+ * is the witness: it cannot be faked from inside and it is not something the engine
+ * hands to the phases.
+ *
+ * `flag` is a parameter because ADR-0010 enumerated `$TMPDIR` and a literal `/tmp`
+ * separately, and the milestone names both.
+ */
+export const ORDER_DEPENDENT_REPORTING = (flag: string): ReproSpec => ({
+  command: 'sh repro.sh',
+  files: {
+    'repro.sh':
+      `flag="${flag}"\n` +
+      'echo "HOST:$(hostname)"\n' +
+      'cat src.txt\n' +
+      'if [ -f "$flag" ]; then echo FLAG-PRESENT; exit 0; fi\n' +
+      'echo FLAG-ABSENT\n' +
+      'mkdir -p "$(dirname "$flag")" 2>/dev/null || true\n' +
+      'touch "$flag"\n' +
+      'grep -q right src.txt\n',
+  },
+});

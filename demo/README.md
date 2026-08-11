@@ -21,6 +21,17 @@ node server.mjs           # http://127.0.0.1:8080
 node --test               # the project's own suite, which passes
 ```
 
+`page.mjs` and `orders.mjs` hold the page and the orders query as functions, separate
+from `server.mjs`. That is not tidiness: it is what makes a reproduction of each bug
+runnable in a sealed phase container with no browser and no service in it. A test that
+had to fetch a URL would need the app up; a test that grepped the source would be an
+oracle over the tree rather than over the behaviour. SQLite is a file, so a
+reproduction can migrate, seed and query with nothing running.
+
+**Each expected outcome below has a run behind it** — `test/run.test.ts` and
+`test/sandbox.test.ts` drive all four through the engine. A claimed tier with no test
+is the kind of claim this project exists to refuse.
+
 No `npm install` is needed — `node:sqlite` and `node:http` are the entire
 dependency list. The recipe still has an install step, because a recipe with no
 install step would not exercise the thing [ADR-0013](../docs/adr/0013-the-environment-recipe.md)
@@ -44,7 +55,10 @@ Expected outcome: **Tier 2**, browser-driven, agent-authored.
 > /api/orders?status=shipped returns every order, including pending ones.
 
 Needs the backend booted and the seed data present, which is the whole reason the
-recipe exists. Expected outcome: **Tier 2**.
+recipe exists. Expected outcome: **Tier 2** — and this is the run that drives a recipe
+through the entire issue-to-pull-request path: the agent queries the live endpoint and
+sees four orders where two were asked for, then commits a reproduction that needs
+neither the service nor the network.
 
 ### 3. `export-button` — irreproducible by design
 
@@ -52,7 +66,9 @@ recipe exists. Expected outcome: **Tier 2**.
 > last week.
 
 There is no Export button and there never was. Expected outcome: **Tier 3** — a
-structured info-request, no fix attempted, the gate holding in public.
+structured info-request, no fix attempted, the gate holding in public. Asserted down
+to the comment's wording: it names what would help, in order, and it does not
+apologise.
 
 ### 4. `total-rounding` — the obvious fix is a no-op
 
@@ -60,5 +76,7 @@ structured info-request, no fix attempted, the gate holding in public.
 
 It is not wrong; order 3 genuinely totals what it says. The tempting fix is a
 rounding change that alters nothing, which is the control shape: a run that
-credits it has learned nothing about the bug. Expected outcome: **Tier 3**, or a
-fix the base phase refuses because the reproduction was never red.
+credits it has learned nothing about the bug. Expected outcome: **Tier 3**. The run
+asserts the sharper thing: an honest reproduction is registered, the base container
+runs it, it passes — and **no fix agent is ever spawned**, proved by the absence of a
+fix container and of a `fix` handover in the log.

@@ -1,5 +1,16 @@
 import { defineConfig } from 'vitest/config';
 
+// `.env` holds DATABASE_URL, and `test/store.test.ts` is the only coverage the SQL
+// has. Without this it skipped for want of a variable that was sitting on disk — a
+// skip nobody would notice, which is the worst kind. `loadEnvFile` is Node 22's own,
+// so no dotenv; wrapped because a machine with no `.env` is a valid state and the
+// test's skip message is the correct outcome there.
+try {
+  process.loadEnvFile?.('.env');
+} catch {
+  // No .env. `test/store.test.ts` will say so in its skip message.
+}
+
 // The engine fixtures shell out to real git and run a repro three times, so the
 // slowest tests sit near vitest's 5s default and fail under load. Raise the
 // ceiling rather than let a green suite depend on how busy the machine is.

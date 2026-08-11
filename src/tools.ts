@@ -29,6 +29,8 @@ import { execFile } from 'node:child_process';
 import { glob, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { promisify } from 'node:util';
+import { put } from './blobs.js';
+import { Browser } from './browser.js';
 import { PathRefused, resolveInside } from './paths.js';
 
 const execFileAsync = promisify(execFile);
@@ -151,6 +153,68 @@ export const TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
   {
+    name: 'browser_navigate',
+    description:
+      'Open a URL in the headless browser and report the title. Use this to LOOK at the running ' +
+      'application — a wrong string on a page, a control that does nothing, a layout that hides ' +
+      'something — which is the class of bug you cannot find by reading code. Only reachable when ' +
+      'a service is running; there is no internet.',
+    input_schema: {
+      type: 'object',
+      properties: { url: { type: 'string', description: 'e.g. http://127.0.0.1:8080/orders' } },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'browser_click',
+    description:
+      "Click the first element matching a CSS selector, through the page's own handlers. Fails if " +
+      'nothing matches, which is itself a useful answer when the report says a control is missing.',
+    input_schema: {
+      type: 'object',
+      properties: { selector: { type: 'string' } },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'browser_type',
+    description:
+      'Set a form field to a value and fire the input and change events a framework listens for. ' +
+      'Use this to reach a state the report describes before looking at the result.',
+    input_schema: {
+      type: 'object',
+      properties: { selector: { type: 'string' }, text: { type: 'string' } },
+      required: ['selector', 'text'],
+    },
+  },
+  {
+    name: 'browser_text',
+    description:
+      'The RENDERED text of the page, or of one element. Usually what you want rather than a ' +
+      'screenshot: it is what the user reads, and you can compare it to the words in the report.',
+    input_schema: {
+      type: 'object',
+      properties: { selector: { type: 'string', description: 'Optional; the whole body if omitted.' } },
+      required: [],
+    },
+  },
+  {
+    name: 'browser_screenshot',
+    description:
+      'Capture the viewport as a PNG and return the content-addressed reference it was stored ' +
+      'under. The image is attached to the pull request so a human can see what you saw. It is ' +
+      'evidence of NOTHING — no verdict reads it, and a screenshot cannot raise the tier of a ' +
+      'reproduction. Take one when a person would want to see the bug.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'browser_console',
+    description:
+      'Console output and browser log entries since the page loaded. Read this when something ' +
+      'silently does not happen — a failed request or a thrown error is often the whole bug.',
+    input_schema: { type: 'object', properties: {}, required: [] },
+  },
+  {
     name: 'git_commit',
     description:
       'Stage every change in the workspace and commit it. This is the ONLY way anything you did ' +
@@ -176,6 +240,12 @@ export type ToolWorld = {
   gitDir: string;
   runAs?: { uid: number; gid: number };
   env: Record<string, string>;
+  /**
+   * Where a screenshot is banked. The Runner's STAGING directory, not `/blobs`: blobs
+   * reach the mounted store only at the final flush, so nothing a participant writes
+   * is visible to another participant or to the host mid-run (ADR-0010).
+   */
+  blobRoot?: string;
 };
 
 /** A named shell session: a live `sh` the Runner owns a handle to (ADR-0014). */
@@ -205,7 +275,39 @@ export class ToolHost {
    * keeps the reap at. Teardown closes handles this object owns; there is
    * nothing to enumerate, which is the point.
    */
+  /**
+   * The browser, launched on first use.
+   *
+   * Lazily, because most runs never need one and Chromium is expensive to start. A
+   * container without it fails HERE, as a tool result the agent reads, rather than at
+   * container startup where it would look like the environment being broken.
+   */
+  private browser(): Browser {
+    this.chromium ??= new Browser();
+    return this.chromium;
+  }
+
+  private chromium?: Browser;
+
+  /**
+   * Take a screenshot and BANK it, returning the ref rather than the bytes.
+   *
+   * The bytes would blow the result ceiling and put a picture in the next prompt. The
+   * ref goes into the transcript, so the pull request can show what the agent saw —
+   * and the blob is written at the moment it is taken, which is the thing ADR-0011
+   * says a typed tool call buys over an opaque command.
+   */
+  private async screenshot(): Promise<string> {
+    const png = await this.browser().screenshot();
+    if (!this.world.blobRoot) {
+      throw new Error('there is nowhere to store a screenshot in this container');
+    }
+    const ref = await put(this.world.blobRoot, png);
+    return `${ref} (${png.length} bytes, png)`;
+  }
+
   async close(): Promise<void> {
+    await this.chromium?.close();
     for (const session of this.sessions.values()) {
       try {
         // The group, not the child: a service started with `&` is a grandchild,
@@ -244,6 +346,24 @@ export class ToolHost {
           return ok(await this.grep(call));
         case 'glob':
           return ok(await this.glob(str(call.input.pattern, 'pattern')));
+        case 'browser_navigate':
+          return ok(await this.browser().navigate(str(call.input.url, 'url')));
+        case 'browser_click':
+          return ok(await this.browser().click(str(call.input.selector, 'selector')));
+        case 'browser_type':
+          return ok(
+            await this.browser().type(str(call.input.selector, 'selector'), str(call.input.text, 'text')),
+          );
+        case 'browser_text':
+          return ok(
+            await this.browser().text(
+              call.input.selector === undefined ? undefined : str(call.input.selector, 'selector'),
+            ),
+          );
+        case 'browser_screenshot':
+          return ok(await this.screenshot());
+        case 'browser_console':
+          return ok(this.browser().console());
         case 'git_commit':
           return ok(await this.commit(str(call.input.message, 'message')));
         default:
