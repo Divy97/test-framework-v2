@@ -12,5 +12,11 @@ dist/
 *.pem
 *.key
 *.p12
+
+# The evidence store. Content-addressed blobs of agent transcripts and captured test
+# output — whatever an agent read out of a repository ends up here. It appeared untracked
+# and unignored after the first real run, 672K and one `git add -A` from a commit. It is
+# a run's evidence, not source, and `ENGINE_BLOB_ROOT` can point anywhere.
+.blobs/
 *.log
 .DS_Store
