@@ -3,5 +3,14 @@ dist/
 .env
 .env.*
 !.env.example
+
+# A GitHub App private key IS the App: whoever holds it can act as it on every
+# repository the App is installed on. One landed at the repository root during setup,
+# untracked but not ignored — a single `git add -A` from being public. The key itself
+# belongs outside the repository (`~/.config/test-framework-v2/github-app.pem`); this
+# is the net under that, not the plan.
+*.pem
+*.key
+*.p12
 *.log
 .DS_Store
