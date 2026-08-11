@@ -59,6 +59,7 @@ async function drive(turns: Parameters<typeof fakeModel>[0], options: Parameters
   const transcript = await runAgentLoop({
     prompt: 'reproduce the bug',
     apiKey: 'sk-ant-not-a-real-key',
+    provider: 'anthropic',
     baseURL: model.baseURL,
     timeoutMs: 30_000,
     invoke: async (tool, input) => {
@@ -159,6 +160,7 @@ describe('a scripted tool-call sequence drives a full run', () => {
     await runAgentLoop({
       prompt: 'look at it',
       apiKey: key,
+      provider: 'anthropic',
       baseURL: model.baseURL,
       timeoutMs: 30_000,
       invoke: async (tool, input) => {
@@ -179,6 +181,7 @@ describe('the loop ends honestly', () => {
     const transcript = await runAgentLoop({
       prompt: 'reproduce the bug',
       apiKey: 'sk-ant-not-a-real-key',
+      provider: 'anthropic',
       baseURL: model.baseURL,
       timeoutMs: 30_000,
       maxIterations: 1,
@@ -202,6 +205,7 @@ describe('the loop ends honestly', () => {
     const transcript = await runAgentLoop({
       prompt: 'loop forever',
       apiKey: 'sk-ant-not-a-real-key',
+      provider: 'anthropic',
       baseURL: model.baseURL,
       timeoutMs: 30_000,
       maxLines: 6,
@@ -241,6 +245,8 @@ describe('an Anthropic-compatible gateway is configuration, not code', () => {
       // after the first `import` is silently ignored — config that does nothing.
       expect(modelId()).toBe('anthropic/claude-opus-5');
       const transcript = await runAgentLoop({
+        // Named, because this test is ABOUT the SDK resolving its own environment.
+        provider: 'anthropic',
         prompt: 'reproduce the bug',
         timeoutMs: 30_000,
         invoke: async () => ({ ok: true, output: '' }),
@@ -295,6 +301,7 @@ describe('an Anthropic-compatible gateway is configuration, not code', () => {
       await runAgentLoop({
         prompt: 'x',
         authToken: 'sk-or-v1-not-a-real-openrouter-key',
+        provider: 'anthropic',
         baseURL: `http://127.0.0.1:${port}`,
         timeoutMs: 30_000,
         invoke: async () => ({ ok: true, output: '' }),
@@ -344,6 +351,7 @@ describe('what a run costs is measured, not guessed', () => {
     const transcript = await runAgentLoop({
       prompt: 'loop forever',
       apiKey: 'sk-ant-not-a-real-key',
+      provider: 'anthropic',
       baseURL: model.baseURL,
       timeoutMs: 30_000,
       maxLines: 6,
@@ -363,6 +371,7 @@ describe('what a run costs is measured, not guessed', () => {
     await runAgentLoop({
       prompt: 'x',
       apiKey: 'sk-ant-not-a-real-key',
+      provider: 'anthropic',
       baseURL: model.baseURL,
       effort: 'low',
       maxTokens: 2048,

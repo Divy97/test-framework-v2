@@ -33,9 +33,34 @@ describe('the prompts are files, and they are filled in', () => {
     await expect(renderPrompt('fix', { issue: 'x', command: 'y', files: 'z' })).rejects.toThrow(
       /needs environment/,
     );
-    const filled = await renderPrompt('repro', { issue: 'the heading is wrong', environment: 'no services' });
+    const filled = await renderPrompt('repro', {
+      issue: 'the heading is wrong',
+      environment: 'no services',
+      symptom: 'Ordres',
+    });
     expect(filled).toContain('the heading is wrong');
     expect(filled).not.toMatch(/\{\{\w+\}\}/);
+  });
+
+  test('the repro prompt cannot be rendered without the symptom the engine checks for', async () => {
+    // The gap the first real model run found. The engine searches the reproduction's
+    // output for a literal string; the prompt used to ask only that the output "mention
+    // the symptom the report describes", so a model that paraphrased — as one did — was
+    // refused for a reproduction that was correct. Making it a required variable means
+    // the prompt can no longer be rendered without the exact text being in it.
+    await expect(
+      renderPrompt('repro', { issue: 'the heading is wrong', environment: 'no services' }),
+    ).rejects.toThrow(/needs symptom/);
+  });
+
+  test('the symptom reaches the agent verbatim, because the check is literal', async () => {
+    const symptom = 'status=shipped returns every order';
+    const filled = await renderPrompt('repro', { issue: 'i', environment: 'e', symptom });
+    expect(filled).toContain(symptom);
+    // And the prompt must say the match is literal. Told to "mention" it, a model
+    // reasonably rewrites it in its own words, which is precisely what failed.
+    expect(filled).toMatch(/character for character|verbatim/);
+    expect(filled).toMatch(/paraphrase/);
   });
 });
 
@@ -72,8 +97,16 @@ describe('the repro prompt states the contract the engine enforces', () => {
     expect(prompt).toMatch(/must exit \*\*non-zero\*\*/);
     expect(prompt).toMatch(/information request/);
     // The symptom check, which is the difference between reproducing this bug and
-    // reproducing some other one.
-    expect(prompt).toMatch(/output must mention the symptom/);
+    // reproducing some other one. This assertion used to read `/output must mention the
+    // symptom/`, and a real model run showed that wording was the defect: told to
+    // "mention" a symptom, it paraphrased, and the engine's LITERAL check refused a
+    // reproduction that was correct. So the assertion is now the stronger one — the
+    // prompt has to carry the exact string and say that the match is character-for-
+    // character. Wording that merely asks the output to "mention" it fails this.
+    expect(prompt).toMatch(/output must contain this text, character for character/);
+    expect(prompt).toContain('{{symptom}}');
+    expect(prompt).toMatch(/a paraphrase of it fails/);
+    expect(prompt).not.toMatch(/output must mention the symptom/);
   });
 
   test('it forbids testing the commit s identity, which is the attack the tier cap exists for', () => {
@@ -210,5 +243,33 @@ describe('the drafting prompt asks for a recipe a human can approve', () => {
     expect(() => extractRecipeDraft('I could not work out how to boot this.')).toThrow(
       /no fenced JSON block/,
     );
+  });
+});
+
+describe('the fix prompt names the command that will judge it', () => {
+  // The gap the first real model run found, from the other side. `orchestrate` accepts a
+  // function for `agentPrompt` so the prompt can be rendered AFTER registration; before
+  // that, `run.ts` rendered it up front with prose in both slots, and the result promised
+  // the agent an exact command while handing it directions to go and find one.
+
+  test('the prompt claims the command is given exactly, so it must be', () => {
+    const prompt = read('fix.md');
+    // The sentence that makes a placeholder a lie rather than an inconvenience.
+    expect(prompt).toMatch(/you have exactly the command above/);
+    expect(prompt).toContain('{{command}}');
+  });
+
+  test('a rendered fix prompt contains a command, not directions to one', async () => {
+    const filled = await renderPrompt('fix', {
+      issue: 'the shipped filter is broken',
+      environment: 'no services',
+      command: 'node --test test/repro.test.mjs',
+      files: '- `test/repro.test.mjs`',
+    });
+    expect(filled).toContain('node --test test/repro.test.mjs');
+    // The exact prose that used to be substituted. A model told this, while also being
+    // told it has the command exactly, is being given two incompatible instructions.
+    expect(filled).not.toMatch(/the command registered in \.engine\/repro\.json/);
+    expect(filled).not.toMatch(/the files that manifest names/);
   });
 });

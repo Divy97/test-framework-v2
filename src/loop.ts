@@ -24,10 +24,41 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { BetaRunnableTool } from '@anthropic-ai/sdk/lib/tools/BetaRunnableTool';
 import type { AgentFinishedV1 } from './events.js';
+import { DEFAULT_OPENROUTER_MODEL, runOpenRouterLoop } from './openrouter.js';
 import { TOOL_SCHEMAS } from './tools.js';
 
 /** The model v1.5 runs on, and the thinking configuration ADR-0011's milestone names. */
 export const MODEL = 'claude-opus-5';
+
+/** The two wire shapes this engine can drive an agent over. */
+export type Provider = 'anthropic' | 'openrouter';
+const PROVIDERS: Provider[] = ['anthropic', 'openrouter'];
+
+/**
+ * Which API to talk to: the caller's, then `ENGINE_PROVIDER`, then OpenRouter.
+ *
+ * OpenRouter is the default because it is the only path with a real run behind it. That
+ * reads backwards until you check: no Anthropic credential has ever been present in this
+ * repository, so defaulting to `anthropic` made the default the path nobody had executed,
+ * gated behind a key nobody had, while the verified one sat behind a flag. ADR-0015
+ * originally kept Anthropic on the grounds that it was the tested path; a real run
+ * inverted that, and the default follows the evidence rather than the ADR's first draft.
+ *
+ * It is also the cheap path, which is the point: a round of prompt iteration costs cents.
+ * The Anthropic tool runner is still the better engine — native thinking blocks, a
+ * maintained agentic loop, prompt caching we did not write — and `ENGINE_PROVIDER=anthropic`
+ * is one line for a run on a real repository that deserves it.
+ *
+ * Validated rather than defaulted: a typo must not silently pick a provider, in either
+ * direction.
+ */
+export const providerName = (override?: string): Provider => {
+  const wanted = override ?? process.env.ENGINE_PROVIDER ?? 'openrouter';
+  if (!PROVIDERS.includes(wanted as Provider)) {
+    throw new Error(`ENGINE_PROVIDER must be one of ${PROVIDERS.join(', ')}, not ${wanted}`);
+  }
+  return wanted as Provider;
+};
 
 /**
  * The model to ask for: the caller's, then `ENGINE_MODEL`, then the default above.
@@ -167,6 +198,8 @@ export type LoopOptions = {
   timeoutMs?: number;
   maxLines?: number;
   maxIterations?: number;
+  /** `anthropic` (default) or `openrouter`. Otherwise `ENGINE_PROVIDER`. */
+  provider?: string;
 };
 
 /**
@@ -177,6 +210,39 @@ export type LoopOptions = {
  * off can never read as one that finished.
  */
 export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscript> {
+  if (providerName(options.provider) === 'openrouter') {
+    const apiKey = options.apiKey ?? options.authToken ?? process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+      // The same shape a missing Anthropic credential produces, for the same reason: an
+      // engine that cannot reach a model has not observed the bug, and must not be able
+      // to report a tier as though it had.
+      return {
+        lines: [{ claimed_type: 'loop_error', raw: JSON.stringify({ message: 'OPENROUTER_API_KEY is not set' }) }],
+        stopped: 'spawn_failed',
+        exitCode: -1,
+        usage: { turns: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      };
+    }
+    const effort = effortLevel(options.effort);
+    return runOpenRouterLoop({
+      prompt: options.prompt,
+      invoke: options.invoke,
+      apiKey,
+      // `ENGINE_MODEL` means "a model id" on both paths, but the default differs: an
+      // Anthropic id sent to OpenRouter's OpenAI endpoint is a 404, so falling back to
+      // `MODEL` here would be a confusing failure rather than a working default.
+      model: options.model ?? process.env.ENGINE_MODEL ?? DEFAULT_OPENROUTER_MODEL,
+      ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
+      // Collapsed to the three levels OpenRouter's `reasoning.effort` accepts. Asking
+      // for more thinking than a provider can express is not an error worth failing on.
+      effort: effort === 'xhigh' || effort === 'max' ? 'high' : effort,
+      ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+      ...(options.maxIterations === undefined ? {} : { maxIterations: options.maxIterations }),
+      ...(options.maxLines === undefined ? {} : { maxLines: options.maxLines }),
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    });
+  }
+
   const lines: TranscriptLine[] = [];
   const maxLines = options.maxLines ?? MAX_LINES;
   let stopped: AgentFinishedV1['stopped'] = 'exit';

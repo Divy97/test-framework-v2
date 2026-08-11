@@ -32,7 +32,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
-import { runAgentLoop, type AgentTranscript } from './loop.js';
+import { runAgentLoop, type AgentTranscript, type LoopUsage } from './loop.js';
 import type { Recipe, ReplayOutcome } from './recipe.js';
 import { isWorkerReply, type Job, type WorkerRequest } from './runner.js';
 import { put } from './blobs.js';
@@ -46,7 +46,24 @@ const MAX_STREAM_BYTES = 32 * 1024 * 1024;
 /** Tail of a container's diagnostics. The reason is at the end, not the start. */
 const MAX_STDERR_CHARS = 8 * 1024;
 
-export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 'repro'> & {
+export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 'repro' | 'agentPrompt'> & {
+  /**
+   * The fix agent's prompt — as a FUNCTION of the reproduction that was registered,
+   * because it has to quote a command that did not exist when the run started.
+   *
+   * A string was accepted before, and `run.ts` therefore passed prose in place of the
+   * command: the prompt promised "you have exactly the command above, so there is no
+   * guessing about what will be checked" and then handed over the sentence "the command
+   * registered in .engine/repro.json of the commit you are on". The first real model run
+   * is what showed the cost — the fix agent followed the indirection, read the manifest,
+   * read the source, and finished in three turns without editing anything. A prompt that
+   * contradicts itself is not "one indirection worse"; it is a fix phase that does not
+   * work, and no scripted test could see it because a scripted agent never reads.
+   *
+   * A plain string is still accepted for the fix-only path, where the CALLER supplied the
+   * reproduction and there is no ordering to prove.
+   */
+  agentPrompt?: string | ((repro: ReproSpec) => string | Promise<string>);
   /**
    * The reproduction, when the caller supplies it. Omitted when `reproPrompt` is
    * set: the agent authors it, and a spec chosen in advance would be anchoring a
@@ -109,6 +126,8 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * speaks the Messages API scripts the tool calls.
    */
   loop?: {
+    /** `anthropic` (default) or `openrouter` — which API drives the agent (ADR-0015). */
+    provider?: string;
     apiKey?: string;
     /** A bearer credential, for an Anthropic-compatible gateway. */
     authToken?: string;
@@ -155,6 +174,16 @@ export type PhaseResult = {
   phase: 'agent' | 'base' | 'fix';
   events: RunEvent[];
   exitCode: number;
+  /**
+   * What the agent loop spent, when this phase ran one.
+   *
+   * The loop totalled this and then it was dropped here, which made "what did that run
+   * cost" unanswerable from outside `src/loop.ts` — the exact gap the totalling was
+   * added to close, reintroduced one layer up. Deliberately NOT an event: inventing an
+   * event class to describe our own spending would put a fact about us in a log about
+   * the user's bug (ADR-0006), so it rides on the result instead.
+   */
+  usage?: LoopUsage;
   /** Host directory the agent container left its commits in, when it had one. */
   handover?: string;
   /**
@@ -516,7 +545,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
           }),
         );
       }
-      return { ...result, events: [...result.events, ...written] };
+      return { ...result, usage: transcript.usage, events: [...result.events, ...written] };
     };
 
     const steps: {
@@ -553,7 +582,13 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       // returns on `only: 'agent'` before `verify()` ever reads it. Passed anyway
       // because a future agent path should get the sha rather than a name the
       // stripped source no longer carries.
-      steps.push({ phase: 'agent', job: {}, source: agentSource, kind: 'fix', prompt: plan.agentPrompt });
+      steps.push({
+        phase: 'agent',
+        job: {},
+        source: agentSource,
+        kind: 'fix',
+        prompt: typeof plan.agentPrompt === 'function' ? await plan.agentPrompt(plan.repro!) : plan.agentPrompt,
+      });
     }
     steps.push({ phase: 'base', job: { only: 'base' }, source });
 
@@ -709,7 +744,13 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         // The fix agent, deferred to here so the log can PROVE it never saw the
         // reproduction before that reproduction was registered.
         if (plan.reproPrompt && plan.agentPrompt) {
-          const author = await agentContainer(plan.agentPrompt, afterSeq, {
+          // Rendered HERE, after registration, which is the whole reason it is a
+          // function: `resolvedRepro` is the reproduction the base container read out of
+          // the agent's commit, so the fix agent is told the command that will actually
+          // judge it rather than where to go looking for it.
+          const fixPrompt =
+            typeof plan.agentPrompt === 'function' ? await plan.agentPrompt(resolvedRepro!) : plan.agentPrompt;
+          const author = await agentContainer(fixPrompt, afterSeq, {
             ...(resolvedRepro ? { repro: resolvedRepro } : {}),
           });
           phases.push(author);

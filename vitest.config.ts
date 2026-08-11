@@ -11,6 +11,25 @@ try {
   // No .env. `test/store.test.ts` will say so in its skip message.
 }
 
+// …and then scrub the model selection back out, because `.env` is the operator's
+// configuration and this suite is not supposed to have one.
+//
+// Not tidiness. The moment a real `ENGINE_PROVIDER=openrouter` landed in `.env` for an
+// actual run, six tests went red: every Anthropic-path test was routed through the
+// OpenRouter branch, where the scripted **Messages API** fixture is the wrong wire
+// format, so the agent did nothing and the reproduction was never registered. Nothing in
+// the failures pointed at a file on disk that no test mentions.
+//
+// The suite's central promise is that it needs no credential and no configuration —
+// every model is a scripted server on a local port. A developer's `.env` deciding
+// whether the suite passes breaks that promise silently, and silently is the part this
+// project refuses. A test that wants a provider sets it itself; `openrouter.test.ts`
+// does exactly that, and its "defaults to anthropic" case is only a real assertion
+// because of these five lines.
+for (const key of ['ENGINE_PROVIDER', 'ENGINE_MODEL', 'ENGINE_EFFORT', 'OPENROUTER_API_KEY']) {
+  delete process.env[key];
+}
+
 // The engine fixtures shell out to real git and run a repro three times, so the
 // slowest tests sit near vitest's 5s default and fail under load. Raise the
 // ceiling rather than let a green suite depend on how busy the machine is.
