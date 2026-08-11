@@ -213,7 +213,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const service = await serve({ config, client });
   console.log(`webhook  http://127.0.0.1:${service.webhookPort}/`);
   console.log(`events   http://127.0.0.1:${service.eventsPort}/runs/<run-id>/events`);
-  console.log('one run at a time; a recipe pins a host port, so concurrent runs would collide');
+  console.log('one run at a time — one run is five containers, so a second would double the bill');
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.once(signal, () => {
