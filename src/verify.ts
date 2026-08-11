@@ -21,6 +21,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { put } from './blobs.js';
 import type { ArtifactRef, RunEvent, VerificationPhase } from './events.js';
+import { PathRefused, resolveInside as confine } from './paths.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -311,64 +312,24 @@ async function trackedPaths(sha: string, cwd: string, env?: Env): Promise<Set<st
  * symlink would redirect a write that was proved safe against the base checkout.
  */
 async function resolveInside(root: string, input: string, allowSymlinks = false): Promise<Resolved> {
-  const target = resolve(root, input);
-  const rel = relative(root, target);
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
-    throw new ObservationFailed(`repro path escapes the repository: ${input}`);
+  try {
+    // ONE implementation, in `src/paths.ts`. It used to live here, and it moved
+    // when ADR-0011 gave it a second caller: with the loop outside the sandbox the
+    // agent's `write` tool needs exactly this check, and two functions that look
+    // similar is how every enumeration in ADR-0010 went wrong — one of them gets
+    // fixed and the other does not.
+    //
+    // `subject` keeps the messages byte-identical, which matters: the abort reason
+    // is the durable record on the failure path and the suite asserts its text.
+    return await confine(root, input, { allowSymlinks, subject: 'repro path' });
+  } catch (error) {
+    // A refused path means different things to the two callers, and the error type
+    // is where that difference lives. To the engine it is a failure to OBSERVE —
+    // it cannot judge a reproduction it cannot safely write. To a tool it is a
+    // result the agent reads and works around.
+    throw error instanceof PathRefused ? new ObservationFailed(error.message) : error;
   }
-  if (hasGitSegment(rel)) {
-    throw new ObservationFailed(`repro path writes into git's own state: ${input}`);
-  }
-  // Containment is not the invariant. The committed-path guard compares *names*,
-  // so a fix commit that ships `t -> .` makes the applied path `t/src.txt` — a
-  // name matching nothing tracked — land on the tracked `src.txt`, and the engine
-  // writes the agent's bytes over the code it is judging. The path has to be what
-  // its name says, so walk down from the root refusing any symlinked component.
-  //
-  // lstat, not realpath: a dangling link makes realpath throw, and the loop below
-  // would then treat "cannot resolve" as "nothing to check".
-  if (!allowSymlinks) {
-    let walked = root;
-    for (const segment of rel.split(sep)) {
-      walked = join(walked, segment);
-      try {
-        if ((await lstat(walked)).isSymbolicLink()) {
-          throw new ObservationFailed(`repro path traverses a symlink: ${input}`);
-        }
-      } catch (error) {
-        if (error instanceof ObservationFailed) throw error;
-        break; // Does not exist yet, so nothing below it can either.
-      }
-    }
-  }
-  // Both rules again, this time against the *real* path. The lexical check above
-  // only sees the name: a symlink the fix commit ships can point into `.git`
-  // while satisfying containment, which is the same arbitrary-config write by a
-  // different door. The walk starts at the target itself, not its parent — the
-  // final component is a symlink the attacker controls just as easily.
-  let probe = target;
-  while (probe !== root) {
-    try {
-      const realRel = relative(root, await realpath(probe));
-      if (realRel.startsWith('..') || isAbsolute(realRel)) {
-        throw new ObservationFailed(`repro path resolves outside the repository: ${input}`);
-      }
-      if (hasGitSegment(realRel)) {
-        throw new ObservationFailed(`repro path resolves into git's own state: ${input}`);
-      }
-      break;
-    } catch (error) {
-      if (error instanceof ObservationFailed) throw error;
-      // Does not exist yet: keep walking up to the deepest part that does.
-      probe = dirname(probe);
-    }
-  }
-  return { rel, target };
 }
-
-/** `.git` in any position, case-folded — `sub/.git/hooks` and `.Git` are git state too. */
-const hasGitSegment = (path: string) =>
-  path.split(sep).some((segment) => segment.toLowerCase() === '.git');
 
 type Resolved = { rel: string; target: string };
 
