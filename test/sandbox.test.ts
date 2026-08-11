@@ -2198,6 +2198,101 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
 
   // ── 5b: the environment recipe ──────────────────────────────────────────────
 
+  test('the fix agent is GIVEN the reproduction, and cannot commit it', async () => {
+    // The failure this closes, from a real webhook-driven run that got all the way here:
+    // `prompts/fix.md` promised "run the registered command yourself" and "the engine
+    // writes its own copy of them over your commit", and neither was true — the fix
+    // agent's world is a clone of base with no reproduction in it. The agent read the
+    // file, found it absent, wrote its own copy so it could run the command, committed
+    // it, and `verify` refused the whole run: a repro path tracked in the fix commit
+    // means the agent may have rewritten the test it is judged by.
+    //
+    // Two things are asserted, and the second is the one that keeps the anchor: the file
+    // is THERE for the fix agent, and a `git add -A` cannot stage it.
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+    const blobs = hostBlobs();
+
+    const repro = { command: 'cat repro.txt', files: { 'repro.txt': 'the registered bytes\n' } };
+
+    // The repro agent registers nothing here — the reproduction is caller-supplied, so
+    // this exercises the FIX agent's world directly.
+    const model = await fakeModel([
+      { content: [call('shell_create', { name: 'look' })], stop_reason: 'tool_use' },
+      {
+        content: [
+          call(
+            'shell_write',
+            {
+              name: 'look',
+              // Does the registered reproduction exist, and does `git add -A` stage it?
+              input:
+                'cat repro.txt && ' +
+                'git add -A -- && ' +
+                '(git diff --cached --name-only | grep -q "^repro.txt$" && echo STAGED || echo NOT-STAGED)',
+            },
+            'toolu_look',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      { content: [call('write', { path: 'src.txt', content: 'right\n' }, 'toolu_w')], stop_reason: 'tool_use' },
+      { content: [call('git_commit', { message: 'fix: the thing' }, 'toolu_c')], stop_reason: 'tool_use' },
+      { content: [{ type: 'text', text: 'fixed' }], stop_reason: 'end_turn' },
+    ]);
+
+    try {
+      const outcome = await orchestrate({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        blobRoot: blobs,
+        image: IMAGE,
+        baseRef: fixture.base,
+        repro,
+        agentPrompt: 'fix it',
+        flakeRuns: 0,
+        // So the agent's commit outlives orchestrate's own workspace and can be inspected
+        // here — the same reason `run.ts` needs it to push.
+        exportTo: fixture.repo,
+        loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 300_000 },
+      });
+
+      const said = await Promise.all(
+        outcome.events
+          .filter((e) => e.type === 'AGENT_MESSAGE')
+          .map((e) => get(blobs, (e.payload as { raw_hash: ArtifactRef }).raw_hash)),
+      );
+      const output = said
+        .map((b) => JSON.parse(b.toString()) as { ok?: boolean; output?: string })
+        .filter((line) => typeof line.ok === 'boolean')
+        .map((line) => line.output ?? '')
+        .join('\n');
+
+      // It is there, with the bytes the ENGINE registered — not a copy the agent wrote.
+      expect(output).toContain('the registered bytes');
+      // And `git add -A` does not stage it, so an honest agent cannot trip verify's
+      // refusal by accident. `info/exclude` is a property of the clone, which is why the
+      // agent's own shell git obeys it too.
+      // Anchored to the line: `not.toContain('STAGED')` is satisfied by the substring
+      // inside NOT-STAGED, which is an assertion that cannot fail.
+      expect(output).toMatch(/^NOT-STAGED$/m);
+      expect(output).not.toMatch(/^STAGED$/m);
+
+      // The handover is a real commit, and the reproduction is not in it.
+      const handover = outcome.events.find((e) => e.type === 'AGENT_HANDED_OVER');
+      expect(handover).toBeDefined();
+      const fixSha = (handover!.payload as { commit: string }).commit;
+      const tracked = execFileSync('git', ['ls-tree', '-r', '--name-only', fixSha], {
+        cwd: fixture.repo,
+        encoding: 'utf8',
+      });
+      expect(tracked).toContain('src.txt');
+      expect(tracked).not.toContain('repro.txt');
+    } finally {
+      await model.close();
+    }
+  }, 600_000);
+
   test('the demo boots from its recipe, and ENV_READY says what actually answered', async () => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = demoRepo();

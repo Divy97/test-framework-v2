@@ -9,12 +9,13 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { chmod, lstat, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, lstat, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
-import { basename } from 'node:path';
+import { basename, dirname } from 'node:path';
 import { promisify } from 'node:util';
 import type { RunEvent } from './events.js';
 import { superviseAgent } from './agent.js';
+import { resolveInside as confine } from './paths.js';
 import { replayRecipe, type Recipe, type ReplayOutcome } from './recipe.js';
 import { ToolHost } from './tools.js';
 import { MAX_REASON_CHARS, ObservationFailed, verify, type ReproSpec } from './verify.js';
@@ -647,6 +648,39 @@ export async function runJob(
   // Set when the host drove the tools from outside, so the teardown below reports
   // the handover on the channel instead of writing an event: in that mode this
   // container is not a writer (ADR-0006's amendment) and must not look like one.
+  // The registered reproduction, placed in the FIX agent's tree.
+  //
+  // `prompts/fix.md` already told the agent "run the registered command yourself — you
+  // have exactly the command above" and "the engine writes its own copy of them over your
+  // commit". Neither was true: the fix agent's world is a clone of base and nothing put
+  // the reproduction in it. The first real run that got this far did the only rational
+  // thing — read the file, found it absent, WROTE ITS OWN COPY so it could run the
+  // command, and committed it. `verify` then refused the whole run, correctly: a repro
+  // path tracked in the fix commit means the agent may have rewritten the test it is
+  // judged by.
+  //
+  // So the engine supplies the bytes it registered, and the paths go into
+  // `info/exclude` so `git add -A` cannot stage them. That is deliberately not a filter
+  // inside one tool: the agent commits through the shell too (the repro agent did), and
+  // an exclusion that is a property of the CLONE holds for every git invocation in it
+  // rather than only the one we remembered to guard.
+  //
+  // `verify`'s refusal stays exactly as it is. This removes the reason an honest agent
+  // trips it; it does not soften what happens when one does.
+  if (agentWorld && job.repro?.files && Object.keys(job.repro.files).length > 0) {
+    for (const [input, content] of Object.entries(job.repro.files)) {
+      // The manifest is the agent's own text, so containment first — a path from a
+      // reproduction is exactly as untrusted as a path from a tool call.
+      const { target, rel } = await confine(agentWorld.tree, input, { subject: 'repro path' });
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, content);
+      await appendFile(`${agentWorld.gitDir}/info/exclude`, `/${rel}\n`).catch(async () => {
+        await mkdir(`${agentWorld.gitDir}/info`, { recursive: true });
+        await appendFile(`${agentWorld.gitDir}/info/exclude`, `/${rel}\n`);
+      });
+    }
+  }
+
   let served: ToolHost | null = null;
   const transcript: RunEvent[] = [];
   if (agentWorld && job.serveTools) {
