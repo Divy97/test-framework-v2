@@ -5,10 +5,9 @@
 // tests is the wiring nobody had, not the run, which `test/run.test.ts` already drives
 // through containers.
 //
-// Three of these cover failures that are silent by construction: a service that starts
-// with no secret and 401s every real delivery, a receiver that awaits a minutes-long run
-// until GitHub redelivers and starts the issue twice, and two runs racing for the host
-// port a recipe pins.
+// Two of these cover failures that are silent by construction: a service that starts with
+// no secret and 401s every real delivery, and a recipe whose absence is treated as fatal
+// rather than as the un-onboarded repository it describes.
 
 import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -47,6 +46,7 @@ const config = (over: Partial<Config> = {}): Config => ({
   blobRoot: join(temp(), 'blobs'),
   webhookPort: 0,
   eventsPort: 0,
+  loop: { provider: 'openrouter', apiKey: 'sk-or-test', model: 'moonshotai/kimi-k2-thinking', effort: 'low' },
   ...over,
 });
 
@@ -116,8 +116,43 @@ describe('the service refuses to start rather than start uselessly', () => {
       GITHUB_WEBHOOK_SECRET: 's',
       DATABASE_URL: 'postgres://x',
       GITHUB_PRIVATE_KEY_PATH: path,
+      OPENROUTER_API_KEY: 'sk-or-x',
     } as NodeJS.ProcessEnv;
     expect(readConfig(env).privateKeyPem).toBe(PEM);
+  });
+
+  it('refuses to start with no model credential for the selected provider', () => {
+    // A service that starts without one reaches the agent phase and silently consults
+    // nothing — the failure has no symptom except a run that resolves nothing.
+    const base = {
+      GITHUB_APP_ID: '1',
+      GITHUB_WEBHOOK_SECRET: 's',
+      DATABASE_URL: 'postgres://x',
+      GITHUB_PRIVATE_KEY: PEM,
+    } as NodeJS.ProcessEnv;
+    expect(() => readConfig({ ...base, ENGINE_PROVIDER: 'openrouter' })).toThrow(/OPENROUTER_API_KEY/);
+    expect(() => readConfig({ ...base, ENGINE_PROVIDER: 'anthropic' })).toThrow(/ANTHROPIC_API_KEY/);
+    // And says what the absence costs, not just the name.
+    try {
+      readConfig({ ...base, ENGINE_PROVIDER: 'openrouter' });
+      expect.unreachable('started with no model credential');
+    } catch (error) {
+      expect(String((error as Error).message)).toMatch(/no model would ever be consulted/);
+    }
+    // With one, it starts and carries the selection through.
+    const ok = readConfig({ ...base, ENGINE_PROVIDER: 'openrouter', OPENROUTER_API_KEY: 'sk-or-x', ENGINE_EFFORT: 'low' });
+    expect(ok.loop).toEqual({
+      provider: 'openrouter',
+      apiKey: 'sk-or-x',
+      model: 'moonshotai/kimi-k2-thinking',
+      effort: 'low',
+    });
+    // The model default follows the PROVIDER. `modelId()` would return `claude-opus-5`
+    // here, and ADR-0015 records that an Anthropic id on OpenRouter's OpenAI endpoint is
+    // a 404 whose cause is not in the message.
+    expect(ok.loop.model).not.toContain('claude');
+    const anth = readConfig({ ...base, ENGINE_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'sk-ant-x' });
+    expect(anth.loop.model).toBe('claude-opus-5');
   });
 
   it('refuses a key that is not a PEM at startup, not on the first delivery', () => {
@@ -128,6 +163,7 @@ describe('the service refuses to start rather than start uselessly', () => {
       GITHUB_WEBHOOK_SECRET: 's',
       DATABASE_URL: 'postgres://x',
       GITHUB_PRIVATE_KEY: 'not-a-key',
+      OPENROUTER_API_KEY: 'sk-or-x',
     } as NodeJS.ProcessEnv;
     expect(() => readConfig(env)).toThrow(/not a PEM/);
   });
@@ -138,6 +174,7 @@ describe('the service refuses to start rather than start uselessly', () => {
       GITHUB_WEBHOOK_SECRET: 's',
       DATABASE_URL: 'postgres://x',
       GITHUB_PRIVATE_KEY_PATH: '/nope/absent.pem',
+      OPENROUTER_API_KEY: 'sk-or-x',
     } as NodeJS.ProcessEnv;
     expect(() => readConfig(env)).toThrow(/unreadable/);
   });
@@ -169,6 +206,35 @@ describe('a signed issue becomes a run', () => {
     expect(seen[0]!.image).toBe('sandbox:test');
     expect(seen[0]!.agentImage).toBe('agent:test');
     expect(seen[0]!.app.appId).toBe('123456');
+  });
+
+  it('passes a loop, because without one no model is ever consulted', async () => {
+    // The bug this exists for, found by the first real webhook-driven run. `serve.ts`
+    // passed no `loop`, so `orchestrate` took its pre-ADR-0011 branch — `claude` spawned
+    // INSIDE the sealed container, which can reach no model — and the run ended
+    // `unresolved` with `AGENT_FINISHED { stopped: 'spawn_failed', messages: 0 }`, no
+    // ENV_READY, and every container exiting 0 with an empty stderr. Nothing named a cause.
+    //
+    // The 18 tests here could not catch it: they replace `runFromIssue` with a fake, and
+    // asserted the image and the app id reached it while never asserting a MODEL did.
+    const seen: RunRequest[] = [];
+    const service = await serve({
+      config: config(),
+      client: fakeClient(),
+      log: () => {},
+      run: async (request) => {
+        seen.push(request);
+        return ok('r');
+      },
+    });
+    services.push(service);
+    await deliver(service.webhookPort, delivery());
+    await service.drain();
+
+    expect(seen[0]!.loop).toBeDefined();
+    expect(seen[0]!.loop!.provider).toBe('openrouter');
+    expect(seen[0]!.loop!.apiKey).toBe('sk-or-test');
+    expect(seen[0]!.loop!.model).toBe('moonshotai/kimi-k2-thinking');
   });
 
   it('creates the evidence store, so the first run has somewhere to write', async () => {
@@ -242,10 +308,15 @@ describe('the queue is the boundary, not an optimisation', () => {
   // A test that cannot fail is worse than no test, because it implies coverage that is
   // not there. The property is real and is asserted where it lives: `test/github.test.ts`.
 
-  it('runs one at a time, because a recipe pins a host port', async () => {
-    // Two concurrent runs against the same repository bind the same `Service.port`; the
-    // loser's healthcheck fails and the engine records `errored` — our infrastructure
-    // being wrong about someone's repository, reported as a fact about their bug.
+  it('runs one at a time, so one machine holds one sandbox', async () => {
+    // The behaviour is right; the reason first given for it was not. This said concurrent
+    // runs would fight over the host port a recipe pins — they cannot: `replayRecipe` runs
+    // inside the container, its healthcheck fetches `127.0.0.1:port` from inside that same
+    // container, and nothing publishes a port to the host.
+    //
+    // The real reason: one run is an agent container plus a base plus three fix runs, so a
+    // second concurrent run doubles the Docker load and the model spend with no ceiling.
+    // A default worth asserting, and a policy rather than a constraint.
     let concurrent = 0;
     let peak = 0;
     const order: number[] = [];

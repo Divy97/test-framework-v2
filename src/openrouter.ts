@@ -196,6 +196,9 @@ export async function runOpenRouterLoop(options: OpenRouterOptions): Promise<Age
   };
   let stopped: AgentFinishedV1['stopped'] = 'exit';
   let exitCode = 0;
+  // Whether the MODEL ended the conversation, as opposed to the ceiling ending it. The
+  // two used to be the same value.
+  let modelFinished = false;
 
   const record = (claimed_type: string, payload: unknown): void => {
     if (lines.length >= maxLines) return;
@@ -283,7 +286,10 @@ export async function runOpenRouterLoop(options: OpenRouterOptions): Promise<Age
       exitCode = -1;
       break;
     }
-    if (toolCalls.length === 0) break;
+    if (toolCalls.length === 0) {
+      modelFinished = true;
+      break;
+    }
 
     // Verbatim, `tool_calls` included — the ids below have to match.
     messages.push({
@@ -318,6 +324,18 @@ export async function runOpenRouterLoop(options: OpenRouterOptions): Promise<Age
       }
       messages.push({ role: 'tool', tool_call_id: toolCall.id, content: output });
     }
+  }
+
+  // The ceiling, said out loud. Reached only by falling out of the loop while the model
+  // was still asking for tools — which is an agent that was interrupted, not one that
+  // was done, and the difference decides whether a missing commit is the model's choice
+  // or our budget.
+  if (!modelFinished && stopped === 'exit') {
+    stopped = 'turn_cap';
+    exitCode = -1;
+    record('loop_error', {
+      message: `stopped after ${usage.turns} turns: the iteration ceiling was reached while the model was still calling tools`,
+    });
   }
 
   return { lines, stopped, exitCode, usage };

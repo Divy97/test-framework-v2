@@ -11,12 +11,19 @@
 //   1. **Config is validated before anything binds a port.** A service that starts with
 //      no webhook secret and 401s every delivery looks identical to GitHub sending
 //      nothing. `readConfig` refuses, by name, with the variable that is missing.
-//   2. **Runs are serialised.** A recipe pins a fixed host port (`Service.port`), so two
-//      concurrent runs against the same repository fight over it and the loser's
-//      healthcheck fails — which the engine would honestly record as `errored`, an
-//      infrastructure failure reported as a fact about someone's bug. A queue of one is
-//      the correct answer until recipes allocate ports, and this is the ceiling being
-//      named rather than discovered.
+//   2. **Runs are serialised — as a resource policy, not a correctness requirement.**
+//      An earlier version of this comment said concurrent runs would fight over the host
+//      port a recipe pins. That was **wrong**, and it is worth recording rather than
+//      quietly deleting: `replayRecipe` runs inside the container (`runner.ts`), its
+//      healthcheck fetches `127.0.0.1:port` from inside that same container, and no
+//      container publishes a port to the host. Each run's services live in their own
+//      network namespace, so nothing collides.
+//
+//      What is actually true: one run is an agent container plus a base container plus
+//      three fix containers, and a second concurrent run doubles the Docker load and the
+//      model spend on one machine with no ceiling. A queue of one is a defensible default
+//      for a single-host deployment and a **choice**, not a constraint — raising it is a
+//      configuration change, not a redesign.
 
 import { readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
@@ -24,6 +31,8 @@ import { join } from 'node:path';
 import type pg from 'pg';
 import type { Intake } from './github.js';
 import { startWebhookReceiver } from './github.js';
+import { MODEL, effortLevel, providerName } from './loop.js';
+import { DEFAULT_OPENROUTER_MODEL } from './openrouter.js';
 import { loadRecipe } from './recipe.js';
 import { runFromIssue } from './run.js';
 import { startStatusServer } from './sse.js';
@@ -40,6 +49,17 @@ export type Config = {
   blobRoot: string;
   webhookPort: number;
   eventsPort: number;
+  /**
+   * Which model drives the agent, and the credential for it.
+   *
+   * Not optional, and validated at startup, because of how its absence presents. With
+   * no `loop` on the plan, `orchestrate` takes its pre-ADR-0011 branch — `claude`
+   * spawned inside the sealed container, which cannot reach any model — and the run
+   * ends `unresolved` with `AGENT_FINISHED { stopped: 'spawn_failed', messages: 0 }`,
+   * no `ENV_READY`, and every container exiting 0 with empty stderr. That is what the
+   * first real webhook-driven run did, and nothing in the log named a cause.
+   */
+  loop: { provider: string; apiKey: string; model: string; effort: string };
 };
 
 /** What a missing variable costs, so the message can say it. */
@@ -72,8 +92,28 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (!privateKeyPem) missing.push('GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_PATH');
 
+  // The model credential, for the provider actually selected. A service that starts
+  // without one reaches the agent phase and silently consults nothing.
+  const provider = providerName(env.ENGINE_PROVIDER);
+  const modelKey =
+    provider === 'openrouter'
+      ? (env.OPENROUTER_API_KEY ?? '')
+      : (env.ANTHROPIC_API_KEY ?? env.ANTHROPIC_AUTH_TOKEN ?? '');
+  if (!modelKey) {
+    missing.push(
+      provider === 'openrouter'
+        ? 'OPENROUTER_API_KEY (ENGINE_PROVIDER=openrouter)'
+        : 'ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN (ENGINE_PROVIDER=anthropic)',
+    );
+  }
+
   if (missing.length > 0) {
-    const detail = missing.map((key) => `  ${key} — ${REQUIRED[key] ?? 'the App cannot authenticate'}`).join('\n');
+    const cost = (key: string) =>
+      REQUIRED[key] ??
+      (key.includes('API_KEY') || key.includes('AUTH_TOKEN')
+        ? 'no model would ever be consulted: the run reaches the agent phase and silently does nothing'
+        : 'the App cannot authenticate');
+    const detail = missing.map((key) => `  ${key} — ${cost(key)}`).join('\n');
     throw new Error(`cannot start; these are not set:\n${detail}\n\nSee .env.example.`);
   }
 
@@ -92,6 +132,16 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
     blobRoot: env.ENGINE_BLOB_ROOT ?? '/blobs',
     webhookPort: Number(env.WEBHOOK_PORT ?? 8787),
     eventsPort: Number(env.EVENTS_PORT ?? 8788),
+    loop: {
+      provider,
+      apiKey: modelKey,
+      // NOT `modelId()`. That falls back to `MODEL` — an Anthropic id — for every
+      // provider, and ADR-0015 records why sending `claude-opus-5` to OpenRouter's
+      // OpenAI endpoint is a 404 whose cause is not in the message. The default has to
+      // follow the provider.
+      model: env.ENGINE_MODEL ?? (provider === 'openrouter' ? DEFAULT_OPENROUTER_MODEL : MODEL),
+      effort: effortLevel(env.ENGINE_EFFORT),
+    },
   };
 }
 
@@ -120,7 +170,8 @@ export type ServeOptions = {
 /**
  * Boot the receiver and the event tail, and run one issue at a time.
  *
- * The queue here does exactly ONE job — serialise runs, because recipes pin host ports.
+ * The queue here does exactly ONE job — serialise runs, so one machine is not asked to
+ * hold several sandboxes and several model bills at once.
  * It is worth being precise about what it does not do: acknowledging GitHub before the
  * run is `startWebhookReceiver`'s guarantee, which replies `202` and then calls
  * `onIntake` without awaiting it (`src/github.ts`, asserted in `test/github.test.ts`).
@@ -134,7 +185,7 @@ export async function serve(options: ServeOptions): Promise<Service> {
   const start = options.run ?? runFromIssue;
   await ensureBlobRoot(config.blobRoot);
 
-  // A queue of one, for the reason in this file's header: recipes pin host ports.
+  // A queue of one — see the header. A resource policy, not a port constraint.
   let tail: Promise<void> = Promise.resolve();
 
   const enqueue = (intake: Intake): void => {
@@ -154,7 +205,19 @@ export async function serve(options: ServeOptions): Promise<Service> {
           agentImage: config.agentImage,
           blobRoot: config.blobRoot,
           append: (event) => appendEvent(client, event),
+          // Without this, `orchestrate` runs its pre-ADR-0011 path and no model is
+          // reached. Passed explicitly rather than left to the loop's own environment
+          // resolution, so the wiring is visible and a test can assert it.
+          loop: config.loop,
         });
+
+        // A run that reached no tier is an operational failure until proven otherwise, and
+        // the container's own stderr is the only thing that can say which. Printed, because
+        // a service whose failures are only visible in a debugger is not a service.
+        for (const d of result.diagnostics ?? []) {
+          log(`${label}: [${d.phase}] exit ${d.exitCode} stderr=${d.stderr.trim() ? `\n${d.stderr.trimEnd()}` : '(empty)'}`);
+        }
+        log(`${label}: phases=${(result.diagnostics ?? []).length} env=${JSON.stringify(result.state.env ?? null)}`);
 
         const spent = (result.usage ?? []).reduce((total, entry) => total + entry.usage.output_tokens, 0);
         log(
@@ -205,7 +268,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const service = await serve({ config, client });
   console.log(`webhook  http://127.0.0.1:${service.webhookPort}/`);
   console.log(`events   http://127.0.0.1:${service.eventsPort}/runs/<run-id>/events`);
-  console.log('one run at a time; a recipe pins a host port, so concurrent runs would collide');
+  console.log('one run at a time — one run is five containers, so a second would double the bill');
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.once(signal, () => {

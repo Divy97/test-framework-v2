@@ -75,6 +75,18 @@ export type RunResult = {
   prUrl?: string;
   /** What each agent phase spent, so a run's cost is readable without parsing blobs. */
   usage?: { phase: string; usage: LoopUsage }[];
+  /**
+   * What each container said on stderr, and how it exited.
+   *
+   * `PhaseResult.stderr` already existed and its own note says why discarding it is
+   * wrong — "an operational failure with no diagnosis is the wrong thing to ship" — and
+   * then it was discarded here anyway. The first real webhook-driven run ended
+   * `spawn_failed` with `messages: 0`, and nothing anywhere could say why: no `ENV_READY`,
+   * no environment abort, just a container that never reached ready. This is that gap.
+   *
+   * Not an event: a container's stderr is our infrastructure talking about itself.
+   */
+  diagnostics?: { phase: string; exitCode: number; stderr: string }[];
 };
 
 /**
@@ -255,7 +267,21 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       .filter((phase) => phase.usage !== undefined)
       .map((phase) => ({ phase: phase.phase, usage: phase.usage! }));
 
-    return { runId, state, ...(prUrl === undefined ? {} : { prUrl }), ...(usage.length === 0 ? {} : { usage }) };
+    // Every phase, not only the ones that exited non-zero. A container that exits 0
+    // having done nothing is the failure that has no other symptom.
+    const diagnostics = outcome.phases.map((phase) => ({
+      phase: phase.phase,
+      exitCode: phase.exitCode,
+      stderr: phase.stderr,
+    }));
+
+    return {
+      runId,
+      state,
+      ...(prUrl === undefined ? {} : { prUrl }),
+      ...(usage.length === 0 ? {} : { usage }),
+      ...(diagnostics.length === 0 ? {} : { diagnostics }),
+    };
   } finally {
     await rm(workspace, { recursive: true, force: true }).catch(() => {});
   }
@@ -272,15 +298,53 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
  * Escaped, because an issue is attacker-influenced text and an unescaped `(` from a
  * bug report would be a regex someone else wrote.
  */
+/** Longest line a symptom may be. Beyond this it is cut at a word boundary. */
+const MAX_SYMPTOM_CHARS = 100;
+/** Below this a line says too little to anchor anything — "Bug", "Broken", "help". */
+const MIN_SYMPTOM_CHARS = 12;
+
 export function symptomFrom(issue: string): string {
+  // A human quoting the symptom is the strongest signal there is, and it stays first.
   const quoted = [...issue.matchAll(/"([^"]{2,60})"|`([^`]{2,60})`/g)]
     .map((match) => match[1] ?? match[2] ?? '')
     .sort((a, b) => b.length - a.length)[0];
+
+  // Then the first line that says something — which for a GitHub issue is its TITLE,
+  // because `intake` builds this text as `title\n\nbody`.
+  //
+  // This used to be "the longest word over five characters", and the first real
+  // webhook-driven run showed what that costs. For
+  //
+  //   The shipped filter returns everything
+  //   /api/orders?status=shipped returns every order, including pending ones.
+  //
+  // it derived `"everything"`. The agent then wrote a genuinely good reproduction —
+  // `Expected 2 shipped orders, got 4` — and the engine refused it, because the output
+  // had to contain the literal string `everything` and no sane assertion message does.
+  // The run ended `not_reproduced` on a correct reproduction of a real bug.
+  //
+  // A single common word is also a WEAK anchor, which is the deeper problem: ADR-0008
+  // wants the output to prove this bug failed rather than some other thing, and
+  // `everything` would match almost any prose. A title is specific, meaningful, and
+  // short enough for an agent to print verbatim.
+  const line = issue
+    .split('\n')
+    .map((candidate) => candidate.trim())
+    .find((candidate) => candidate.length >= MIN_SYMPTOM_CHARS);
+  const capped =
+    line && line.length > MAX_SYMPTOM_CHARS
+      ? line.slice(0, line.lastIndexOf(' ', MAX_SYMPTOM_CHARS) + 1 || MAX_SYMPTOM_CHARS).trim()
+      : line;
+
+  // And only then the old rule, for a report that is one long word or nothing at all.
   const word = issue
     .split(/[^\w.-]+/)
     .filter((token) => token.length > 5)
     .sort((a, b) => b.length - a.length)[0];
-  const chosen = quoted || word || '';
+
+  const chosen = quoted || capped || word || '';
+  // Escaped, because an issue is attacker-influenced text and `new RegExp` on an
+  // unescaped `(` from a bug report throws inside the container.
   return chosen.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
