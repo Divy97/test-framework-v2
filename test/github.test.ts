@@ -66,6 +66,11 @@ describe('the receiver authenticates before it does anything else', () => {
 describe('intake maps exactly two triggers and refuses the rest', () => {
   test('an opened issue becomes RUN_REQUESTED with the thread to answer on', () => {
     const result = intake('issues', opened)!;
+    // The discriminant, asserted first. `intake()` maps installation deliveries too since
+    // M6a, and those carry no issue — so every field below is only reachable once the arm
+    // is established, and a test that skipped this would be casting rather than checking.
+    expect(result.kind).toBe('issue');
+    if (result.kind !== 'issue') throw new Error('unreachable');
     expect(result.event).toEqual({
       v: 1,
       source: 'github_issue',
@@ -84,7 +89,9 @@ describe('intake maps exactly two triggers and refuses the rest', () => {
     // empty, so both halves are kept and an empty body must not produce a run whose
     // prompt is blank.
     const labelled = { ...opened, action: 'labeled', issue: { ...opened.issue, body: null } };
-    expect(intake('issues', labelled)!.event.raw_text).toBe('The orders page title is misspelled');
+    const mapped = intake('issues', labelled)!;
+    if (mapped.kind !== 'issue') throw new Error('a labelled issue must map to an issue');
+    expect(mapped.event.raw_text).toBe('The orders page title is misspelled');
   });
 
   test('everything else is nothing, including plausible near-misses', () => {

@@ -57,13 +57,38 @@ export function verifyWebhook(secret: string, body: string, signature: string | 
   return timingSafeEqual(given, want);
 }
 
-/** What the receiver needs out of a delivery, once it is authentic. */
-export type Intake = {
+/** What the receiver needs out of an ISSUE delivery, once it is authentic. */
+export type IssueIntake = {
+  kind: 'issue';
   event: RunRequestedV1;
   repo: string;
   installationId: number;
   issueNumber: number;
 };
+
+/**
+ * What the receiver needs out of an INSTALLATION delivery (M6a).
+ *
+ * A separate shape rather than a widened `IssueIntake`, because an installation
+ * delivery has no issue: no number to comment on, no reported text, and nothing that is
+ * honestly a `RUN_REQUESTED`. Fabricating those to reuse one type would put an invented
+ * issue number into the only record we keep, and the discriminant is one `switch` at
+ * three call sites.
+ *
+ * `repos` is plural because `installation_repositories` adds and removes several at
+ * once, and `installation` itself carries the whole selected set.
+ */
+export type InstallationIntake = {
+  kind: 'installation';
+  /** `added` covers install and select-more; `removed` covers uninstall and deselect. */
+  action: 'added' | 'removed';
+  installationId: number;
+  /** The owner login the App was installed on, for display. */
+  account: string;
+  repos: string[];
+};
+
+export type Intake = IssueIntake | InstallationIntake;
 
 /**
  * Map a delivery to `RUN_REQUESTED`, or to nothing.
@@ -81,6 +106,9 @@ export type Intake = {
  * sanitiser here would be a claim we cannot keep.
  */
 export function intake(event: string, payload: unknown): Intake | null {
+  if (event === 'installation' || event === 'installation_repositories') {
+    return installationIntake(event, payload);
+  }
   if (event !== 'issues') return null;
   if (typeof payload !== 'object' || payload === null) return null;
   const body = payload as {
@@ -99,6 +127,7 @@ export function intake(event: string, payload: unknown): Intake | null {
   const title = typeof body.issue?.title === 'string' ? body.issue.title : '';
   const text = typeof body.issue?.body === 'string' ? body.issue.body : '';
   return {
+    kind: 'issue',
     repo,
     installationId,
     issueNumber: number,
@@ -112,6 +141,67 @@ export function intake(event: string, payload: unknown): Intake | null {
       raw_text: `${title}\n\n${text}`.trim(),
     },
   };
+}
+
+/**
+ * Map an installation delivery, which is how we learn a repository exists at all.
+ *
+ * Before this, `installation.id` arrived on every delivery and was discarded, so the
+ * first thing the product ever learned about a repository was an issue — by which point
+ * a run had started with `recipe: null`, booted nothing, and produced a Tier 3 about a
+ * bug that was never shown. **A user's first experience was a wrong answer**, recorded in
+ * an immutable log as a finding about their bug rather than about our onboarding.
+ *
+ * The two events carry the repository list in different fields, which is GitHub's shape
+ * and not a choice: `installation` has `repositories` (the whole selection), while
+ * `installation_repositories` has `repositories_added` and `repositories_removed`.
+ */
+function installationIntake(event: string, payload: unknown): InstallationIntake | null {
+  if (typeof payload !== 'object' || payload === null) return null;
+  const body = payload as {
+    action?: unknown;
+    installation?: { id?: unknown; account?: { login?: unknown } };
+    repositories?: unknown;
+    repositories_added?: unknown;
+    repositories_removed?: unknown;
+  };
+  const installationId = body.installation?.id;
+  const account = body.installation?.account?.login;
+  if (typeof installationId !== 'number' || typeof account !== 'string') return null;
+
+  // `full_name` only. A repository we cannot name is one we cannot key a recipe by, so
+  // it is dropped rather than stored under a placeholder.
+  const names = (value: unknown): string[] =>
+    Array.isArray(value)
+      ? value
+          .map((entry) => (entry as { full_name?: unknown })?.full_name)
+          .filter((name): name is string => typeof name === 'string')
+      : [];
+
+  if (event === 'installation') {
+    // `created` and `deleted` only. `suspend`/`unsuspend`/`new_permissions_accepted` are
+    // real actions that say nothing about which repositories we hold, and treating them
+    // as `added` would resurrect a removed row.
+    if (body.action !== 'created' && body.action !== 'deleted') return null;
+    const repos = names(body.repositories);
+    // Symmetric with `installation_repositories` below: a delivery naming no repository
+    // is not a fact about any repository. It was non-null here and null there, which is
+    // the same rule stated twice and obeyed once.
+    if (repos.length === 0) return null;
+    return {
+      kind: 'installation',
+      action: body.action === 'created' ? 'added' : 'removed',
+      installationId,
+      account,
+      repos,
+    };
+  }
+
+  if (body.action !== 'added' && body.action !== 'removed') return null;
+  const repos = names(body.action === 'added' ? body.repositories_added : body.repositories_removed);
+  // An add or remove naming nothing is not a fact about any repository.
+  if (repos.length === 0) return null;
+  return { kind: 'installation', action: body.action, installationId, account, repos };
 }
 
 /**
