@@ -7,7 +7,7 @@
 // The governing rule is ADR-0004's: every point is traceable to a
 // content-addressed artifact. No vibes. A ground that cannot name the bytes a
 // reviewer would open to check it does not belong here — which is why the score
-// stops at 85 rather than 100, and says what the missing 15 was for.
+// stops short of 100 (`CEILING`) and says what the missing points were for.
 
 import type { ArtifactRef } from './events.js';
 import type { RunState } from './fold.js';
@@ -42,18 +42,46 @@ export type Confidence = {
    * Bump when the scoring changes. Old runs re-fold under the new version
    * without history being touched, which is the point of keeping the score out
    * of the log (ADR-0004).
+   *
+   * **2** — the regression arm (+10) and the symptom's disappearance from the fix
+   * output (+8) became grounds, the base ground now cites every base draw rather than
+   * one, and the ceiling moved from 85 to 103. A `80/85` recorded anywhere against
+   * version 1 is still a true statement about that run under that scale; this number is
+   * how a reader knows which scale it was. It was left at 1 through the whole of that
+   * change and caught only by re-reading ADR-0015's record of the first real run —
+   * which is the exact drift this field exists to prevent.
    */
-  scoring: 1;
+  scoring: 2;
   tier: Tier;
-  /** 0–85. See `unmeasured` for the rest. */
+  /** 0–`ceiling`. See `unmeasured` for the rest. */
   score: number;
+  /**
+   * The most a run can score, and therefore the denominator to print.
+   *
+   * A field rather than the literal `85` it replaces. That number was written out in
+   * `report.ts` twice, in `cli.ts`, in this file's own doc comments and in the README,
+   * so every change to the grounds silently made five statements false — and
+   * `scripts/real-run.mts` was already reading `verdict.ceiling` off a type that did
+   * not have it, printing `80/undefined`. One derived number, one place.
+   */
+  ceiling: number;
   grounds: Ground[];
-  /** What the number does not account for. Named so nobody reads 85 as "nearly perfect". */
+  /** What the number does not account for. Named so nobody reads a full score as "perfect". */
   unmeasured: string[];
 };
 
 /** The ceiling a run can actually reach, and the reason it is not 100. */
 const DIFF_COVERAGE_POINTS = 15;
+
+/**
+ * Every ground at its maximum. The denominator, derived rather than restated.
+ *
+ * It is no longer 85 and no longer lands on 100, because two grounds were added and
+ * rescaling the others to preserve a round number would change what every existing
+ * ground claims in order to make a denominator prettier. `scoring` is the field that
+ * makes numbers from different versions comparable; the total is just their sum.
+ */
+const CEILING = 45 + 3 * 5 + 15 + 7 + 3 + 8 + 10;
 
 const hashesOf = (record: Record<string, ArtifactRef> | undefined): ArtifactRef[] =>
   record ? Object.values(record) : [];
@@ -71,9 +99,10 @@ export function confidence(state: RunState): Confidence {
   // reproduction, no fix, no partial credit (ADR-0007).
   if (!state.reproduced) {
     return {
-      scoring: 1,
+      scoring: 2,
       tier: 3,
       score: 0,
+      ceiling: CEILING,
       grounds: [
         {
           claim: notReproducedBecause(state),
@@ -91,7 +120,11 @@ export function confidence(state: RunState): Confidence {
   // attempt, so a junk attempt appended after a genuine one was scored Tier 1
   // with its green base run cited as proof the reproduction had failed.
   const attempt = state.reproducedAttempt;
-  const base = state.testRuns.find((r) => r.phase === 'base' && r.attempt === attempt);
+  // EVERY base run, not the first. The base phase repeats now, the fold requires all of
+  // them red for the reported reason, and a ground that cited one draw while the score
+  // rested on several would be citing less than it claims.
+  const bases = state.testRuns.filter((r) => r.phase === 'base' && r.attempt === attempt);
+  const base = bases[0];
   const fixes = state.testRuns.filter((r) => r.phase === 'fix' && r.attempt === attempt);
   // The LAST registration of the attempt, matching the fold's own Map, which
   // later entries overwrite. `.find` would take the first and score a run
@@ -103,9 +136,10 @@ export function confidence(state: RunState): Confidence {
   // make a run permanently unviewable.
   if (!base || !registration) {
     return {
-      scoring: 1,
+      scoring: 2,
       tier: 3,
       score: 0,
+      ceiling: CEILING,
       grounds: [
         {
           claim: 'the log says a reproduction was credited but does not contain the runs behind it',
@@ -119,9 +153,11 @@ export function confidence(state: RunState): Confidence {
 
   const grounds: Ground[] = [
     {
-      claim: 'the reproduction ran red on the base commit with output matching the reported symptom',
+      claim:
+        `the reproduction ran red on the base commit ${bases.length} time(s), every one of them with ` +
+        'output matching the reported symptom',
       points: 45,
-      evidence: [base.stdout_hash],
+      evidence: bases.map((r) => r.stdout_hash),
     },
   ];
 
@@ -158,7 +194,63 @@ export function confidence(state: RunState): Confidence {
   grounds.push({
     claim: 'every run reported the reproduction byte-identical to its registration',
     points: 7,
-    evidence: [base, ...fixes].flatMap((r) => hashesOf(r.repro_hashes)),
+    evidence: [...bases, ...fixes].flatMap((r) => hashesOf(r.repro_hashes)),
+  });
+
+  // Did the reported symptom actually GO AWAY?
+  //
+  // Base's output had to contain it, which ties the failure to the report. Nothing
+  // looked at the fix's output at all — so a reproduction that printed the symptom
+  // unconditionally satisfied the tie while proving nothing, and `prompts/repro.md`
+  // asked for precisely that print ("on its own line, alongside whatever else you want
+  // to say"). The engine handed the agent the string and then treated the echo as
+  // evidence.
+  //
+  // Priced rather than gated, because `eofBug` proves the absence of the symptom is not
+  // a necessary property of an honest reproduction: when the reported string also
+  // occurs in correct output, it survives a real fix. So this ground says which
+  // situation the run is in and lets the number carry it — a reproduction whose output
+  // no longer mentions the symptom is strictly better evidence than one that does, and
+  // neither is disqualifying.
+  const symptomGone = fixes.length > 0 && fixes.every((r) => r.symptom_matched === false);
+  const symptomObserved = fixes.some((r) => r.symptom_matched !== undefined);
+  grounds.push({
+    claim: symptomGone
+      ? 'the reported symptom is present in the base output and gone from every fix run, so the ' +
+        'output tracks the bug rather than being printed regardless of it'
+      : symptomObserved
+        ? 'the reported symptom still appears in the output of the passing fix runs: either the ' +
+          'reproduction prints it regardless of the bug, or the reported wording also occurs in ' +
+          'correct output — this run cannot tell which'
+        : 'the fix runs predate this check, so nothing observed whether the symptom survived',
+    points: symptomGone ? 8 : 0,
+    evidence: fixes.map((r) => r.stdout_hash),
+  });
+
+  // THE SECOND ARM. The reproduction says the bug is gone; this says nothing else went
+  // with it, and it is the question a maintainer asks first.
+  //
+  // Scored rather than merely reported, because until it existed a fix that turned the
+  // reproduction green and the rest of the project red earned every point above and was
+  // opened as a pull request that said nothing about it. `already_red` and `unmeasured`
+  // score zero and say which: not knowing is not the same as knowing it is fine, and a
+  // repository that arrived broken must not be told its own state is the fix's fault.
+  const suites = state.suiteRuns.filter((r) => r.attempt === attempt);
+  grounds.push({
+    claim: {
+      clean: "the project's own test suite passed on the base commit and passed again on the fix",
+      broken:
+        "the project's own test suite passed on the base commit and FAILS on the fix — this change " +
+        'breaks something else',
+      already_red:
+        "the project's own test suite was already failing on the base commit, so it can say nothing " +
+        'about what this fix broke',
+      unmeasured:
+        "the project's own test suite was not run on both commits, so no regression check stands " +
+        'behind this fix',
+    }[state.regression],
+    points: state.regression === 'clean' ? 10 : 0,
+    evidence: suites.map((r) => r.stdout_hash),
   });
 
   // Only `base` and `fix` aborts mean something went unwatched. Reaching `diff`
@@ -199,8 +291,9 @@ export function confidence(state: RunState): Confidence {
   // identity oracle executes none of the lines the fix changed.
   if (state.reproAuthoredByAgent) {
     return {
-      scoring: 1,
+      scoring: 2,
       tier: 2,
+      ceiling: CEILING,
       score: grounds.reduce((total, ground) => total + ground.points, 0),
       grounds: [
         ...grounds,
@@ -222,8 +315,9 @@ export function confidence(state: RunState): Confidence {
   }
 
   return {
-    scoring: 1,
+    scoring: 2,
     tier: 1,
+    ceiling: CEILING,
     score: grounds.reduce((total, ground) => total + ground.points, 0),
     grounds,
     unmeasured,

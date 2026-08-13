@@ -11,6 +11,11 @@ describe('fold', () => {
       source: 'slack',
       threadRef: 'C0DEMO/p1754395200000100',
       currentAttempt: 1,
+      // The synthetic demo stream predates SUITE_RUN and carries none, so the
+      // regression arm has nothing to say about it — which is what `unmeasured`
+      // means and why it is a value rather than a boolean.
+      suiteRuns: [],
+      regression: 'unmeasured',
       testRuns: [
         {
           attempt: 1,

@@ -56,7 +56,7 @@ try {
     // The projection, beside the state it is derived from. Replay is the whole
     // point: this number is recomputed from the log every time, never stored.
     const score = confidence(state!);
-    console.log(`\ntier ${score.tier}, confidence ${score.score}/85`);
+    console.log(`\ntier ${score.tier}, confidence ${score.score}/${score.ceiling}`);
     for (const ground of score.grounds) {
       console.log(`  +${String(ground.points).padStart(2)}  ${ground.claim}`);
       for (const ref of ground.evidence) console.log(`        ${ref}`);

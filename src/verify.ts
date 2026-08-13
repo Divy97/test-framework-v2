@@ -109,6 +109,17 @@ export type VerifyOptions = {
   blobRoot: string;
   /** Extra fix-phase executions beyond the first, to catch a flaky pass. */
   flakeRuns?: number;
+  /** Extra base-phase executions beyond the first, to catch a flaky FAILURE. Default 1. */
+  baseRuns?: number;
+  /**
+   * The project's own test command, run on BOTH commits so a regression is visible.
+   *
+   * Absent, no suite runs and the fold says so — which is honest and is what a
+   * repository with no recipe gets. Never inferred: guessing `npm test` at a repo that
+   * does not have it produces a red suite on base, and "already broken" is the one
+   * verdict that must never be invented.
+   */
+  suiteCommand?: string;
   /** Per-command ceiling. A repro that hangs must fail the run, not wedge it. */
   timeoutMs?: number;
   /** Output ceiling. Exceeding it aborts the run rather than storing a truncated artifact. */
@@ -377,6 +388,10 @@ async function observe(
   // the loop below run zero times, so the engine would emit the completion
   // witness over a fix phase that never executed.
   const flakeRuns = Math.max(0, options.flakeRuns ?? 2);
+  // Extra BASE executions beyond the first. Clamped for the same reason as above: a
+  // negative value would make the loop run zero times, and a base phase that emitted
+  // no run at all would reach the gate with nothing to refuse.
+  const baseRepeats = Math.max(0, options.baseRuns ?? 1);
   const timeoutMs = options.timeoutMs ?? 120_000;
   const maxOutputBytes = options.maxOutputBytes ?? MAX_OUTPUT_BYTES;
 
@@ -423,6 +438,63 @@ async function observe(
   const emit = (event: Omit<RunEvent, 'run_id' | 'seq' | 'ts'>) => {
     const seq = ++progress.seq;
     events.push({ ...event, run_id: runId, seq, ts: new Date().toISOString() } as RunEvent);
+  };
+
+  /**
+   * Run the project's own suite and record what came back. Never throws.
+   *
+   * A suite is arbitrary third-party code and it is not the thing under judgement, so
+   * nothing it does may end the run: a suite that hangs, floods its output, or exits by
+   * signal is a fact to record beside the reproduction, not a reason to discard a
+   * reproduction that was observed perfectly well. `run()` throws on timeout and
+   * overflow, which is right for the repro and wrong here — the reproduction is what
+   * the verdict rests on; this is context for a human reading the diff.
+   */
+  const runSuite = async (phase: 'base' | 'fix'): Promise<void> => {
+    const command = options.suiteCommand;
+    if (!command) return;
+    // WITHOUT the reproduction in the tree.
+    //
+    // The applied files are untracked additions and a suite discovers files: `node
+    // --test` with no arguments walks the tree, `pytest` collects, `go test ./...`
+    // compiles everything. So a reproduction that is a test file — the ordinary case —
+    // gets picked up by the project's own suite, which then fails on base for the very
+    // reason the reproduction exists. The baseline would be red on every honest run and
+    // `regression` would be permanently `already_red`: a check reporting "cannot tell"
+    // forever, which reads as caution and is actually a bug.
+    //
+    // Removed and put back rather than run before the reproduction, because the
+    // reproduction's verdict is what the entire system rests on and a suite with side
+    // effects must not run ahead of it. Pinned paths stay: those are committed, part of
+    // the project, and legitimately the suite's business.
+    for (const path of appliedFiles.keys()) {
+      const { target } = await resolveInside(root, path);
+      await rm(target, { force: true });
+    }
+    try {
+      const suite = await run(command, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+      emit({
+        type: 'SUITE_RUN',
+        payload: {
+          v: 1,
+          phase,
+          command,
+          exit_code: suite.exitCode,
+          ...(suite.signal ? { signal: suite.signal } : {}),
+          stdout_hash: await put(blobRoot, suite.output),
+          duration_ms: suite.durationMs,
+        },
+      });
+    } catch {
+      // Recorded as nothing rather than as a result. An unobserved suite must not read
+      // as a passing one, and the fold's `unmeasured` IS the absence of this event — so
+      // silence here is already the honest answer.
+    } finally {
+      // Always. The base half's caller goes on to hash and re-run against these paths,
+      // and leaving the tree short of them would turn a suite failure into a missing
+      // reproduction — the two things this file works hardest to keep apart.
+      await applyRepro();
+    }
   };
 
   const baseSha = await checkout(baseRef, repoPath, gitEnv);
@@ -546,23 +618,50 @@ async function observe(
   // an immutable log. The gate already handles a bug that was never shown.
   let baseRed = false;
   if (options.only !== 'fix') {
-    const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
-    baseRed = base.exitCode !== 0 && !base.signal;
-    emit({
-      type: 'TEST_RUN',
-      payload: {
-        v: 1,
-        phase: 'base',
-        commit_sha: baseSha,
-        exit_code: base.exitCode,
-        ...(base.signal ? { signal: base.signal } : {}),
-        stdout_hash: await put(blobRoot, base.output),
-        duration_ms: base.durationMs,
-        symptom_matched: symptom.test(base.output),
-        repeat: 0,
-        repro_hashes: await hashRepro(),
-      },
-    });
+    // REPEATED, for the same reason the fix side is. The fix half was re-run three
+    // times to catch a green that was luck, and the base half was run ONCE — so a
+    // reproduction that fails half the time earned the largest single ground in the
+    // confidence score on a single sample. Red-then-green is only evidence if the red
+    // is reliable, and one draw cannot say that.
+    //
+    // The tree is shared between draws, exactly as the fix re-runs share theirs:
+    // these are re-executions of one reproduction, not independent trials, and
+    // isolating them would hide the order-dependent flake they exist to catch.
+    //
+    // ponytail: two draws by default, not three. It catches a coin-flip repro 75% of
+    // the time and costs one extra execution; raise `baseRuns` where a repro is cheap
+    // and the stakes are higher.
+    let everyDrawRed = true;
+    for (let repeat = 0; repeat <= baseRepeats; repeat += 1) {
+      const base = await run(reproCommand, repoPath, timeoutMs, maxOutputBytes, options.runAs, options.runEnv);
+      everyDrawRed = everyDrawRed && base.exitCode !== 0 && !base.signal;
+      emit({
+        type: 'TEST_RUN',
+        payload: {
+          v: 1,
+          phase: 'base',
+          commit_sha: baseSha,
+          exit_code: base.exitCode,
+          ...(base.signal ? { signal: base.signal } : {}),
+          stdout_hash: await put(blobRoot, base.output),
+          duration_ms: base.durationMs,
+          symptom_matched: symptom.test(base.output),
+          repeat,
+          repro_hashes: await hashRepro(),
+        },
+      });
+    }
+    baseRed = everyDrawRed;
+
+    // THE REGRESSION BASELINE. Run here, on base, with the reproduction already
+    // applied — the same tree the reproduction ran in, because a suite result from a
+    // different tree is not a baseline for anything.
+    //
+    // Its exit code is not judged. Green means a later red is attributable to the fix;
+    // red means it is not, and saying which is the entire value. A run that refused to
+    // proceed on a red suite would refuse most real repositories on their worst day,
+    // which is not our call to make about someone else's project.
+    await runSuite('base');
   }
 
   // THE SHAM FIX. A negative control, and the only defence here that is about
@@ -813,11 +912,32 @@ async function observe(
         ...(fix.signal ? { signal: fix.signal } : {}),
         stdout_hash: await put(blobRoot, fix.output),
         duration_ms: fix.durationMs,
+        // OBSERVED ON THE FIX SIDE TOO, which is what turns the symptom from a
+        // formality into an anchor.
+        //
+        // Only base's output was ever matched, so the check was satisfiable by a
+        // `console.log` of the symptom string on any code path at all — and
+        // `prompts/repro.md` asked for precisely that: "print it verbatim, on its own
+        // line, alongside whatever else you want to say". The engine handed the agent
+        // the string, told it to print it unconditionally, and then treated the print
+        // as evidence the failure was about the reported bug.
+        //
+        // A failure message appears when the assertion fails and not when it passes.
+        // So requiring the symptom to be PRESENT on base and ABSENT here is free for
+        // an honest reproduction and unsatisfiable by a hardcoded print — which is the
+        // difference between anchoring the reproduction to the report and anchoring it
+        // to nothing.
+        symptom_matched: symptom.test(fix.output),
         repeat,
         repro_hashes: await hashRepro(),
       },
     });
   }
+
+  // The other arm, on the other commit. AFTER the flake loop, so the reproduction's
+  // own verdict is never contaminated by whatever a suite leaves behind, and before
+  // the diff so it lands inside the fix phase where a reader looks for it.
+  await runSuite('fix');
 
   // Three-dot: what the fix side changed since the merge base. Two-dot would
   // attribute base-side commits to the fix, over-reporting the very paths the

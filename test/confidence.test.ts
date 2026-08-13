@@ -32,7 +32,7 @@ const RUN_ID = '2b8e4f61-0c3a-4d7e-9a15-6f8b0c2e4d39';
 /** A state with nothing in it, for the incoherent-log cases. */
 const EMPTY: RunState = {
   runId: 'r', status: 'attempting', source: null, threadRef: null, currentAttempt: 1,
-  testRuns: [], registeredRepro: null, registrations: [], reproduced: false,
+  testRuns: [], suiteRuns: [], regression: 'unmeasured', registeredRepro: null, registrations: [], reproduced: false,
   reproducedAttempt: null, shownOnBase: false, shownAttempts: [], env: null, fixDiff: null, completedAttempts: [], transcript: [],
   agent: null, handedOver: null, handovers: [], reproAuthoredByAgent: false, pr: null, aborts: [], afterEnd: [], endedReason: null,
   artifactHashes: [], lastSeq: 0,
@@ -66,9 +66,13 @@ describe('a clean reproduction', () => {
     const score = confidence(conclude(await observe(fixture)));
 
     expect(score.tier).toBe(1);
-    // 80 at the default two re-runs, not the 85 ceiling: the third re-run is
-    // worth points because it could catch a flake the first two did not.
-    expect(score.score).toBe(80);
+    // 88 at the default two re-runs. Two grounds arrived since this said 80: the
+    // symptom disappearing from the fix output (+8, and `clean()` earns it — the
+    // reproduction prints `wrong` only while the bug is there), and the regression arm
+    // (+10, which this scores ZERO for because `observe()` passes no test command).
+    // The third re-run is still worth points, so this is not the ceiling.
+    expect(score.score).toBe(88);
+    expect(score.ceiling).toBe(103);
 
     // The rule ADR-0004 actually states. A ground that cannot be opened is a
     // vibe with a number attached, so every ref in every ground is resolved —
@@ -119,27 +123,34 @@ describe('a clean reproduction', () => {
     expect(mixed.grounds.some((g) => g.claim.includes('detectable, not preventable'))).toBe(true);
   });
 
-  test('stops at 85 and says what the missing points were for', async () => {
-    // 100 would claim the fix diff was checked against the reproduction path.
-    // It was not — ADR-0008 retired the filename version as disproved and the
+  test('stops short of the ceiling and says what the missing points were for', async () => {
+    // A full score would claim the fix diff was checked against the reproduction
+    // path. It was not — ADR-0008 retired the filename version as disproved and the
     // real one needs instrumentation. Scoring it as if measured is the exact
     // dishonesty this projection exists to avoid.
-    // The ceiling IS reachable — with a third re-run — so 85 is a real number
-    // rather than an unattainable one, and the gap to 100 is the honest part.
-    expect(confidence(conclude(await observe(clean(), { flakeRuns: 3 }))).score).toBe(85);
+    //
+    // 93 with a third re-run: the ceiling minus the regression arm's 10, which no run
+    // through `observe()` can earn because none of them declares a test command. So
+    // the number is reachable rather than notional, and what it is short of is named.
+    const best = confidence(conclude(await observe(clean(), { flakeRuns: 3 })));
+    expect(best.score).toBe(93);
+    expect(best.score).toBe(best.ceiling - 10);
 
     const score = confidence(conclude(await observe(clean())));
-    expect(score.score).toBeLessThanOrEqual(85);
+    expect(score.score).toBeLessThan(best.score);
     expect(score.unmeasured.join(' ')).toMatch(/diff-coverage/);
     expect(score.unmeasured.join(' ')).toMatch(/Tier 2/);
+    // And the arm that scored nothing says so in its own ground rather than silently.
+    expect(score.grounds.some((g) => g.points === 0 && /not run on both commits/.test(g.claim))).toBe(true);
   });
 
   test('the re-run bonus is capped, so the advertised ceiling stays true', async () => {
-    // Uncapped, a long flake loop scores past 85 and the type's own "0–85"
-    // becomes a lie — and the extra points would be bought with repetition
+    // Uncapped, a long flake loop scores past the ceiling and the type's own
+    // "0–ceiling" becomes a lie — and the extra points would be bought with repetition
     // rather than with any new kind of evidence.
     const many = confidence(conclude(await observe(clean(), { flakeRuns: 8 })));
-    expect(many.score).toBe(85);
+    expect(many.score).toBe(93);
+    expect(many.score).toBeLessThanOrEqual(many.ceiling);
   });
 
   test('scores fewer re-runs lower, because fewer flakes could have been caught', async () => {
@@ -491,6 +502,9 @@ describe('the projection is a projection', () => {
   test('carries a scoring version, so old runs can be re-scored later', async () => {
     // ADR-0004: scoring improves after the fact by re-folding, never by editing
     // history. The version is what makes two runs comparable or not.
-    expect(confidence(conclude(await observe(clean()))).scoring).toBe(1);
+    // 2 since the regression arm and the symptom-disappeared ground landed and the
+    // ceiling moved 85 → 103. Pinned to the literal rather than read off the object,
+    // because the failure this guards is the version NOT moving when the scale does.
+    expect(confidence(conclude(await observe(clean()))).scoring).toBe(2);
   });
 });

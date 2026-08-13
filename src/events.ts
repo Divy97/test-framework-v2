@@ -105,7 +105,15 @@ export type TestRunV1 = {
    * itself, the same class of act as recording an exit code. The fold cannot
    * re-derive this — the bytes live in the blob store and the fold is pure —
    * so the observation is recorded and the conclusion drawn from it is not.
-   * Base phase only; meaningless on the fix phase.
+   *
+   * Recorded on BOTH phases, and the fold wants opposite answers from them: present
+   * on base is what ties the failure to the report, and absent on the fix is what
+   * makes that tie mean something. While only base was matched, the check was
+   * satisfied by printing the string unconditionally — which the repro prompt asked
+   * for — so it certified nothing at all.
+   *
+   * Absent on streams written before the fix side was observed. The fold reads that
+   * as "not observed" and does not hold it against them.
    */
   symptom_matched?: boolean;
   /** Flake re-run index. 0 is the first execution of the phase. */
@@ -117,6 +125,37 @@ export type TestRunV1 = {
    * so a mutation during run 0 would otherwise silently govern runs 1 and 2.
    */
   repro_hashes?: Record<string, ArtifactRef>;
+};
+
+/**
+ * The project's OWN test suite, run by the engine on each commit under judgement.
+ *
+ * The second arm of the comparison, and the one that was missing entirely. The
+ * reproduction arm asks "did this change repair the reported bug"; nothing asked "did
+ * it break anything else", so a fix that turned the repro green and forty other tests
+ * red was credited at 80/85 and opened as a pull request. That is the one question a
+ * maintainer always asks before merging, and the PR was silent on it.
+ *
+ * A SEPARATE event class rather than another `TEST_RUN.phase`, deliberately. Every fold
+ * filter that decides credit keys on `phase === 'base' | 'fix'`, so a new phase value
+ * would enter the reproduction's credit path by default and have to be excluded
+ * everywhere by hand — the mistake `control` avoided by being explicit about it. A
+ * different kind of observation gets a different fact class.
+ *
+ * `command` is carried on the event because the recipe lives outside the log: a reader
+ * replaying this stream in a year cannot otherwise know what was run. It is the
+ * recipe's own `test`, which is testimony — that the engine executed it and observed
+ * this exit code is the evidence (ADR-0006).
+ */
+export type SuiteRunV1 = {
+  v: 1;
+  phase: 'base' | 'fix';
+  command: string;
+  /** -1 when the process died by signal without returning a status. */
+  exit_code: number;
+  signal?: string;
+  stdout_hash: ArtifactRef;
+  duration_ms: number;
 };
 
 /**
@@ -321,6 +360,7 @@ export type EventPayload =
   | { type: 'AGENT_FINISHED'; payload: AgentFinishedV1 }
   | { type: 'AGENT_HANDED_OVER'; payload: AgentHandedOverV1 }
   | { type: 'TEST_RUN'; payload: TestRunV1 }
+  | { type: 'SUITE_RUN'; payload: SuiteRunV1 }
   | { type: 'FIX_DIFF_OBSERVED'; payload: FixDiffObservedV1 }
   | { type: 'VERIFICATION_ABORTED'; payload: VerificationAbortedV1 }
   | { type: 'PR_OPENED'; payload: PrOpenedV1 }

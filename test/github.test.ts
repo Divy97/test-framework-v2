@@ -331,7 +331,9 @@ describe('the pull request description proves what happened', () => {
     }
     // The claims, and the bytes behind each one.
     expect(body).toContain('sh repro.sh');
-    expect(body).toMatch(/\| base \| `b{12}` \| 1 \| yes \|/);
+    // `base (run 0)` now, because the base phase repeats and the row has to say which
+    // draw it is — a table of identical `base` rows is a table a reviewer cannot read.
+    expect(body).toMatch(/\| base \(run 0\) \| `b{12}` \| 1 \| yes \|/);
     expect(body).toMatch(/\| fix \(run 2\) \| `c{12}` \| 0 \|/);
     expect(body).toContain('demo/server.mjs');
     expect(body).toMatch(/\*\*Tier 2\*\*/);

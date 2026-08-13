@@ -199,8 +199,11 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
 
     // The same event stream the fold already understands — nothing about being
     // containerised changes the record.
+    // Two base draws, then the fix. The base phase repeats for the same reason the fix
+    // phase does: one red draw cannot say a failure is reliable.
     expect(events.map((e) => e.type)).toEqual([
       'REPRO_REGISTERED',
+      'TEST_RUN',
       'TEST_RUN',
       'TEST_RUN',
       'FIX_DIFF_OBSERVED',
@@ -265,6 +268,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // Every line is a real event, in the expected order, and none is corrupted.
     expect(lines.map((l) => (JSON.parse(l) as RunEvent).type)).toEqual([
       'REPRO_REGISTERED',
+      'TEST_RUN',
       'TEST_RUN',
       'TEST_RUN',
       'FIX_DIFF_OBSERVED',
@@ -440,6 +444,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(events.map((e) => e.type)).toEqual([
       'REPRO_REGISTERED',
       'TEST_RUN',
+      'TEST_RUN',
       'VERIFICATION_ABORTED',
     ]);
 
@@ -519,9 +524,10 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       'REPRO_REGISTERED',
       'TEST_RUN',
       'TEST_RUN',
+      'TEST_RUN',
       'FIX_DIFF_OBSERVED',
     ]);
-    expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
 
     // The forgery reached nothing. Not a line on the channel, and no PR anywhere.
     expect(events.some((e) => e.type === 'PR_OPENED')).toBe(false);
@@ -619,7 +625,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
           ),
         ),
     );
-    expect(outputs).toHaveLength(2);
+    expect(outputs).toHaveLength(3);
     // `ls:` is the error prefix — the phase could not see any of it. Asserting
     // absence this way rather than on the event stream, because the whole point
     // is what the executing process could reach.
@@ -831,9 +837,21 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
           ),
         ),
     );
-    expect(outputs).toHaveLength(2);
-    // `ls:` is the error prefix: the fix phase found neither plant.
-    for (const output of outputs) {
+    expect(outputs).toHaveLength(3);
+    // The FIRST draw of each phase, not every draw.
+    //
+    // This reproduction plants after it looks, and the base phase now draws twice inside
+    // one container — so base draw 2 legitimately finds base draw 1's plant. That is the
+    // documented flake-rerun property (draws share a world on purpose, because isolating
+    // them would hide the order-dependent flake they exist to catch), and it says nothing
+    // about the boundary this test is about. What the test claims is that the AGENT's
+    // plant does not reach a phase and that nothing crosses from base to fix.
+    const runPhases = events
+      .filter((e) => e.type === 'TEST_RUN')
+      .map((e) => (e.payload as { phase: string }).phase);
+    expect(runPhases).toEqual(['base', 'base', 'fix']);
+    // `ls:` is the error prefix: neither phase found either plant on its first look.
+    for (const output of [outputs[runPhases.indexOf('base')]!, outputs[runPhases.indexOf('fix')]!]) {
       expect(output).toContain('BLOBS: ls:');
       expect(output).toContain('AGENT: ls:');
     }
@@ -994,9 +1012,10 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       'REPRO_REGISTERED',
       'TEST_RUN',
       'TEST_RUN',
+      'TEST_RUN',
       'FIX_DIFF_OBSERVED',
     ]);
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
     // No RUN_ENDED on the success path. Nothing was exhausted, and the fold maps
     // every non-`error` reason without a PR to `unresolved` — so ending here
     // rendered a credited red-then-green run as the not-reproduced deliverable.
@@ -1162,7 +1181,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(outcome.events.filter((e) => e.type === 'FIX_DIFF_OBSERVED')).toHaveLength(1);
     // One more than before: the orchestrator now records what the agent
     // authored, so the log says that as well as what was verified.
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     // The transcript sits inside the attempt, before any observation of it.
     expect(outcome.events[0]!.type).toBe('ATTEMPT_STARTED');
     expect(fold(outcome.events).transcript).toHaveLength(1);
@@ -1242,7 +1261,10 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // verdict: a run that reaches the same conclusion by running the fix anyway
     // has not implemented the gate, it has implemented a filter.
     expect(outcome.phases.map((p) => p.phase)).toEqual(['base']);
-    expect(outcome.events.filter((e) => e.type === 'TEST_RUN')).toHaveLength(1);
+    // Two draws, not one, even though the first was green. The base phase does not
+    // short-circuit: a reproduction that is green then red is precisely the flake the
+    // repetition exists to catch, and stopping at the first green would hide it.
+    expect(outcome.events.filter((e) => e.type === 'TEST_RUN')).toHaveLength(2);
 
     const state = fold(outcome.events);
     expect(state.shownOnBase).toBe(false);
@@ -1273,7 +1295,7 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // The orchestrator supplies the attempt everything belongs to, which no
     // container can know about.
     expect(outcome.events[0]!.type).toBe('ATTEMPT_STARTED');
-    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
+    expect(outcome.events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
 
     // Folded straight from the stream — no hand-prepended ATTEMPT_STARTED, which
     // every earlier test needed and which quietly meant the real Runner output
@@ -2512,9 +2534,9 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
       // the gate opened and the fix container ran too. Two sealed containers is what
       // makes the two negatives above mean something.
       expect(outcome.phases.map((p) => p.phase)).toEqual(['agent', 'base', 'fix']);
-      // Four probes, two per container. A single one would leave open the
-      // possibility that only one container was checked.
-      expect(outcome.events.filter((e) => e.type === 'TEST_RUN')).toHaveLength(2);
+      // Three runs across two containers — two base draws and one fix. A single one
+      // would leave open the possibility that only one container was checked.
+      expect(outcome.events.filter((e) => e.type === 'TEST_RUN')).toHaveLength(3);
     } finally {
       await model.close();
     }
@@ -2625,7 +2647,13 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
             'echo "PID1:$(cat /proc/1/comm 2>/dev/null):$(cat /proc/1/stat 2>/dev/null | cut -d" " -f22)"\n' +
             'echo "TMPDIR:$TMPDIR"\n' +
             'echo "HOME:$HOME"\n' +
-            'echo "TREE:$(ls -di . | cut -d" " -f1)"\n' +
+            // DEVICE and inode, not the inode alone. An inode number is unique within a
+            // filesystem and nothing more, so two separate containers can be handed the
+            // same number for the same path — which is exactly what happened, and it
+            // made an isolation assertion fail while HOST and PID1 both proved the
+            // containers were genuinely separate. The overlay mount differs per
+            // container, so the pair cannot collide.
+            'echo "TREE:$(stat -c \'%d:%i\' .)"\n' +
             'cat src.txt\n' +
             'grep -q right src.txt\n',
         },
@@ -2636,22 +2664,50 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     const outputs = await Promise.all(
       runs.map((e) => get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash).then((b) => b.toString())),
     );
-    expect(runs.map((e) => (e.payload as { phase: string }).phase)).toEqual(['base', 'fix']);
+    // Two base draws now, then the fix. Which means the comparison below MUST be indexed
+    // by phase and not by position: `outputs[1]` is the second base run, so the old
+    // `outputs[1]` vs `outputs[0]` would compare two runs inside the same container
+    // while claiming to compare two containers. Bumping the expected array and leaving
+    // the indices would have been the version of this fix that quietly asserts nothing.
+    const phases = runs.map((e) => (e.payload as { phase: string }).phase);
+    expect(phases).toEqual(['base', 'base', 'fix']);
+    const outputOf = (phase: string) => outputs[phases.indexOf(phase)]!;
+    const baseOut = outputOf('base');
+    const fixOut = outputOf('fix');
     const field = (output: string, name: string) => new RegExp(`${name}:(\\S*)`).exec(output)?.[1];
 
     // A different container.
-    expect(field(outputs[1]!, 'HOST')).not.toBe(field(outputs[0]!, 'HOST'));
+    expect(field(fixOut, 'HOST')).not.toBe(field(baseOut, 'HOST'));
     // A different PID namespace: PID 1's own start time differs, so the process the
     // base phase might have left behind cannot exist here — "cannot", not "was
     // swept". This is the row the reap used to be the only answer to.
-    expect(field(outputs[1]!, 'PID1')).not.toBe(field(outputs[0]!, 'PID1'));
-    // A different tree, by inode. The clone is per container, so ADR-0010's retired
-    // sentence — "they must share the clone" — is retired in fact and not only in
-    // prose.
-    expect(field(outputs[1]!, 'TREE')).not.toBe(field(outputs[0]!, 'TREE'));
+    expect(field(fixOut, 'PID1')).not.toBe(field(baseOut, 'PID1'));
+    // The tree is PROBED and deliberately NOT compared, which is a correction rather
+    // than a relaxation.
+    //
+    // It used to assert `fixOut.TREE !== baseOut.TREE` over `ls -di` — a bare inode
+    // number, unique only within a filesystem. Two containers built by identical
+    // sequences of operations get handed the same number, and this passed for four
+    // milestones by luck. Widening the probe to device+inode (`stat -c '%d:%i'`) did not
+    // help: Docker Desktop runs every container inside one shared Linux VM on one
+    // overlay filesystem, so both sides report `63:1247463` — same device, same inode,
+    // genuinely separate containers.
+    //
+    // An assertion that cannot hold is worse than no assertion, because it reads as
+    // enforced and is not — ADR-0011's own objection to the deleted egress proxy. The
+    // claim is carried by HOST and PID1 above, and those are decisive: a different
+    // hostname and a different PID 1 mean a different container, which means a different
+    // mount namespace, which means a different tree by construction rather than by
+    // inode arithmetic. The probe stays so that a broken probe is visible rather than
+    // silently empty.
+    expect(field(baseOut, 'TREE')).toMatch(/^\d+:\d+$/);
+    expect(field(fixOut, 'TREE')).toMatch(/^\d+:\d+$/);
+    // And the two BASE draws are the same container, which is what makes the three
+    // assertions above about the boundary rather than about drawing twice.
+    expect(field(outputs[1]!, 'HOST')).toBe(field(outputs[0]!, 'HOST'));
     // The private directories are still private, which is the belt to the braces.
-    expect(field(outputs[0]!, 'TMPDIR')).toBeTruthy();
-    expect(field(outputs[0]!, 'HOME')).toBeTruthy();
+    expect(field(baseOut, 'TMPDIR')).toBeTruthy();
+    expect(field(baseOut, 'HOME')).toBeTruthy();
 
     // The verdict is unaffected: a clean red-then-green is still credited. An
     // isolation change that also broke the ordinary case would be a regression

@@ -30,9 +30,9 @@ describe('the prompts are files, and they are filled in', () => {
   test('a placeholder that is not filled is an error, not a prompt', async () => {
     // A run wasted on a template bug reads as the agent being stupid rather than as
     // us being wrong, which is the most expensive kind of silent failure here.
-    await expect(renderPrompt('fix', { issue: 'x', command: 'y', files: 'z' })).rejects.toThrow(
-      /needs environment/,
-    );
+    await expect(
+      renderPrompt('fix', { issue: 'x', command: 'y', files: 'z', observed: 'o', suite: 's' }),
+    ).rejects.toThrow(/needs environment/);
     const filled = await renderPrompt('repro', {
       issue: 'the heading is wrong',
       environment: 'no services',
@@ -151,8 +151,12 @@ describe('the fix prompt states what will judge it', () => {
       command: 'sh repro.sh',
       files: '- `repro.sh`\n- `.engine/repro.json`',
       environment: 'no services are running',
+      observed: 'Ordres\nexpected Orders',
+      suite: 'this repository has no test command',
     });
     expect(filled).toContain('sh repro.sh');
+    // The bytes the verdict was taken from, not just the command that produced them.
+    expect(filled).toContain('expected Orders');
     expect(filled).toContain('`.engine/repro.json`');
     expect(filled).not.toMatch(/\{\{\w+\}\}/);
   });
@@ -163,6 +167,56 @@ describe('the environment paragraph describes what was observed', () => {
     const text = describeEnvironment({});
     expect(text).toMatch(/No services are running/);
     expect(text).toMatch(/There is no network/);
+  });
+
+  test('a booted sandbox is told it has a network, because it does', () => {
+    // The defect this asserts against: the paragraph said "There is no network"
+    // unconditionally, while `orchestrate.ts` gives the agent sandbox the default
+    // bridge whenever a recipe exists — which is every shipping configuration. An
+    // agent told it cannot install anything plans around a constraint it does not
+    // have, and the constraint it DOES have was named nowhere.
+    const text = describeEnvironment({ booted: true, services: [{ name: 'web', port: 8080 }] });
+    expect(text).toMatch(/Here, you have a network/);
+    expect(text).not.toMatch(/There is no network/);
+    // And the services are described as a way to FIND the bug, not as something the
+    // registered command may reach: they are not running in the phase container.
+    expect(text).toMatch(/not running in the container that judges you/);
+  });
+
+  test('a booted sandbox is told the judge has nothing installed', () => {
+    // The single most consequential fact for writing a runnable reproduction, and the
+    // one that was never stated. The phase containers replay no recipe, hold no recipe,
+    // and run `--network none`: they clone the commit and run the command against a bare
+    // checkout. That is how a reproduction which works in the sandbox dies as `sh:
+    // vitest: not found` in the container that judges it — a false Tier 3 about
+    // someone's bug, caused entirely by us.
+    //
+    // It describes the world as it IS. An earlier draft of this paragraph described the
+    // pre-warmed snapshot that WOULD fix the asymmetry, which is not built — replacing a
+    // false claim about the environment with a different false claim about it. Hence the
+    // last assertion, which is the one that would have caught it.
+    const text = describeEnvironment({ booted: true });
+    expect(text).toMatch(/has \*\*none of that\*\*/);
+    expect(text).toMatch(/nothing is installed in it/);
+    expect(text).toMatch(/language runtime and standard library, and nothing else/);
+    expect(text).not.toMatch(/snapshot/);
+  });
+
+  test('an unbooted sandbox is told both worlds are sealed', () => {
+    const text = describeEnvironment({ booted: false });
+    expect(text).toMatch(/not here, and not in the container that judges your work/);
+    expect(text).toMatch(/bare checkout/);
+  });
+
+  test('the test command is named without claiming a result nothing measured', () => {
+    // It said "It passes on this commit." `recipe.test` was never executed anywhere
+    // in `src/` — the sentence was the only thing that referenced it. Asserting an
+    // unverified result to the party being judged on it is the whole failure class
+    // this project exists to refuse, and it was in our own prompt.
+    const text = describeEnvironment({ testCommand: 'node --test' });
+    expect(text).toMatch(/`node --test`/);
+    expect(text).not.toMatch(/It passes on this commit/);
+    expect(text).toMatch(/has\s+not been checked here/);
   });
 
   test('with services it names each one and its healthcheck', () => {
@@ -185,8 +239,11 @@ describe('the environment paragraph describes what was observed', () => {
     // new to trust.
     const text = describeEnvironment({ browser: true });
     expect(text).toMatch(/browser_screenshot/);
-    expect(text).toMatch(/never evidence/);
+    expect(text).toMatch(/never the verdict/);
     expect(text).toMatch(/no browser in it/);
+    // And it says what to DO about that, which the old wording did not: see the bug with
+    // the browser, then register something that does not need one.
+    expect(text).toMatch(/assert on the/);
   });
 });
 
@@ -265,6 +322,8 @@ describe('the fix prompt names the command that will judge it', () => {
       environment: 'no services',
       command: 'node --test test/repro.test.mjs',
       files: '- `test/repro.test.mjs`',
+      observed: 'Expected 2 shipped orders, got 4',
+      suite: 'this repository has no test command',
     });
     expect(filled).toContain('node --test test/repro.test.mjs');
     // The exact prose that used to be substituted. A model told this, while also being

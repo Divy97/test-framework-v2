@@ -14,10 +14,13 @@ import type {
   FixDiffObservedV1,
   ReproRegisteredV1,
   RunEvent,
+  SuiteRunV1,
   TestRunV1,
   VerificationAbortedV1,
 } from '../src/events.js';
+import { confidence } from '../src/confidence.js';
 import { fold, type RunState } from '../src/fold.js';
+import { pullRequestBody } from '../src/report.js';
 import { MAX_REASON_CHARS, ObservationFailed, verify, type VerifyOptions } from '../src/verify.js';
 import {
   APPLIED_REPRO,
@@ -32,12 +35,19 @@ import {
   NOISY_REPRO,
   nonAsciiPath,
   noOpFix,
+  needsInstalledDependency,
+  suiteGreenThroughout,
+  suiteBrokenByFix,
+  suiteRedOnBase,
+  suiteThatDiscoversTests,
+  REPRO_NEEDING_DEPENDENCY,
   ORDER_DEPENDENT_REPRO,
   IGNORED_PATH_REPRO,
   noOpFixWithIgnores,
   PINNED_REPRO,
   pinnedTampering,
   REPRO_NEEDING_FIX_HELPER,
+  REPRO_ECHOING_STATE,
   REPRO_VIA_HELPER,
   RESIDUE_REPRO,
   residueFromBase,
@@ -107,8 +117,13 @@ describe('clean red -> green', () => {
 
     // Registration precedes every observation: the reproduction is fixed before
     // anything is judged by it.
+    //
+    // Two base runs and three fix runs. The base phase repeats for the same reason the
+    // fix phase does — a single red draw cannot say a failure is reliable — so the
+    // count here is 2 + 3 and not 1 + 3.
     expect(events.map((e) => e.type)).toEqual([
       'REPRO_REGISTERED',
+      'TEST_RUN',
       'TEST_RUN',
       'TEST_RUN',
       'TEST_RUN',
@@ -223,6 +238,38 @@ describe('the anchor does not reach this far', () => {
     );
     expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
     expect(fixPhases(events).every((r) => r.exit_code === 0)).toBe(true);
+    expect(conclude(events).reproduced).toBe(true);
+  });
+
+  test('a reproduction whose symptom survives the fix is PRICED, not refused', async () => {
+    // The fix neuters the assertion and leaves `src.txt` saying `wrong`, so this
+    // reproduction exits 0 while still printing the thing the report complained about.
+    // That is worth knowing and it is recorded — but it does not end the run, because
+    // `eofBug` below proves an honest reproduction can do the same thing.
+    const events = await observe(helperTampering(), { repro: REPRO_ECHOING_STATE });
+
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events).every((r) => r.exit_code === 0 && r.symptom_matched === true)).toBe(true);
+
+    const scored = confidence(conclude(events));
+    expect(scored.grounds.some((g) => g.points === 0 && /still appears in the output/.test(g.claim))).toBe(
+      true,
+    );
+    // And it is still credited. The gate is about whether the bug was shown; this is
+    // about how good the showing was, which is the line ADR-0004 draws.
+    expect(conclude(events).reproduced).toBe(true);
+  });
+
+  test('and an honest reproduction of a bug whose symptom persists is not punished for it', async () => {
+    // `eofBug` is the refutation, kept as a test so the gate cannot quietly come back.
+    // The report says `wrong`; the bug is the missing terminating newline; the fixed
+    // file still says `wrong`. Any rule requiring the symptom to vanish refuses this
+    // correct reproduction of a real bug — which is the sham-fix control's history
+    // repeating, and the reason this observation prices instead of judging.
+    const events = await observe(eofBug(), { repro: EOF_REPRO, flakeRuns: 0 });
+
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(fixPhases(events).every((r) => r.exit_code === 0 && r.symptom_matched === true)).toBe(true);
     expect(conclude(events).reproduced).toBe(true);
   });
 });
@@ -512,6 +559,7 @@ describe('an abort keeps what was already observed', () => {
     expect(error.observed.map((e) => e.type)).toEqual([
       'REPRO_REGISTERED',
       'TEST_RUN',
+      'TEST_RUN',
       'VERIFICATION_ABORTED',
     ]);
     expect(basePhase(error.observed)).toMatchObject({ exit_code: 1, symptom_matched: true });
@@ -528,7 +576,7 @@ describe('an abort keeps what was already observed', () => {
     expect(abortOn(error.observed).reason).toMatch(/exceeded 2000ms/);
     // The abort continues the log rather than restarting it: a consumer appending
     // these must not collide with the seq the base observation already took.
-    expect(error.observed.map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect(error.observed.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
   });
 
   test('a partial run is still not a reproduction', async () => {
@@ -624,6 +672,7 @@ describe('an abort keeps what was already observed', () => {
       'REPRO_REGISTERED',
       'TEST_RUN',
       'TEST_RUN',
+      'TEST_RUN',
       'VERIFICATION_ABORTED',
     ]);
     expect(abortOn(error.observed).phase).toBe('diff');
@@ -652,6 +701,7 @@ describe('an abort keeps what was already observed', () => {
 
         expect(error.observed.map((e) => e.type)).toEqual([
           'REPRO_REGISTERED',
+          'TEST_RUN',
           'TEST_RUN',
           'TEST_RUN',
           'FIX_DIFF_OBSERVED',
@@ -728,6 +778,113 @@ const cloneOf = (repo: string) => {
   return `${into}/repo`;
 };
 
+describe("the regression arm: the project's own suite, on both commits", () => {
+  const suite = (fixture: Fixture) =>
+    observe(fixture, { suiteCommand: 'sh suite.sh', flakeRuns: 0, baseRuns: 0 });
+  const suiteRuns = (events: RunEvent[]) =>
+    events.filter((e) => e.type === 'SUITE_RUN').map((e) => e.payload as SuiteRunV1);
+
+  test('a fix that keeps the suite green is credited for it', async () => {
+    const events = await suite(suiteGreenThroughout());
+
+    expect(suiteRuns(events).map((r) => [r.phase, r.exit_code])).toEqual([
+      ['base', 0],
+      ['fix', 0],
+    ]);
+    const state = conclude(events);
+    expect(state.regression).toBe('clean');
+    expect(state.reproduced).toBe(true);
+    expect(confidence(state).grounds.some((g) => g.points === 10)).toBe(true);
+  });
+
+  test('a fix that breaks the suite is reported as breaking it, and scores nothing for it', async () => {
+    // Everything the reproduction arm checks is satisfied — red on base for the reported
+    // reason, green on the fix. Before this arm existed that was the whole verdict, and
+    // a change that repaired the bug and broke the rest of the project was credited at
+    // full marks with a pull request that said nothing about it.
+    const events = await suite(suiteBrokenByFix());
+
+    expect(suiteRuns(events).map((r) => [r.phase, r.exit_code])).toEqual([
+      ['base', 0],
+      ['fix', 1],
+    ]);
+    const state = conclude(events);
+    expect(state.regression).toBe('broken');
+    // Still a reproduction: the bug WAS shown and it WAS repaired. What is withheld is
+    // the claim that the change is safe.
+    expect(state.reproduced).toBe(true);
+    expect(confidence(state).grounds.some((g) => g.points === 0 && /breaks something else/.test(g.claim))).toBe(
+      true,
+    );
+    // And a reviewer must not have to scroll for it.
+    const body = pullRequestBody(state, { issue: 'it is wrong', threadRef: 'o/r#1' });
+    expect(body.indexOf('breaks the project')).toBeLessThan(body.indexOf('## The bug'));
+  });
+
+  test('a suite already failing on base is never blamed on the fix', async () => {
+    const events = await suite(suiteRedOnBase());
+
+    expect(conclude(events).regression).toBe('already_red');
+    expect(confidence(conclude(events)).grounds.some((g) => /already failing/.test(g.claim))).toBe(true);
+  });
+
+  test('the applied reproduction is out of the tree while the suite runs', async () => {
+    // Otherwise a discovering suite — every real one — runs our reproduction as part of
+    // the project's tests and fails on base for our reason, so the baseline is red on
+    // every honest run and the arm reports "cannot tell" forever.
+    const events = await suite(suiteThatDiscoversTests());
+
+    expect(suiteRuns(events).map((r) => r.exit_code)).toEqual([0, 0]);
+    expect(conclude(events).regression).toBe('clean');
+    // And the reproduction still ran, and is still anchored: removing it for the suite
+    // must not leave the tree short of it.
+    expect(basePhase(events)).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(testRuns(events).every((r) => r.repro_hashes!['repro.sh'] === registration(events).files['repro.sh'])).toBe(
+      true,
+    );
+  });
+
+  test('no test command means no suite runs, and the arm says so rather than guessing', async () => {
+    const events = await observe(suiteGreenThroughout(), { flakeRuns: 0, baseRuns: 0 });
+
+    expect(events.filter((e) => e.type === 'SUITE_RUN')).toEqual([]);
+    expect(conclude(events).regression).toBe('unmeasured');
+  });
+});
+
+describe('the gap the phase containers still have: installed dependencies', () => {
+  test('a reproduction that needs an installed dependency reports NOT REPRODUCED', async () => {
+    // The negative control for a defence that does not exist yet, written the way this
+    // repository writes them: assert the vulnerability, so the eventual fix has
+    // something to turn green and cannot quietly stop being the reason it is green.
+    //
+    // What this means in production, and it is the largest single limitation in the
+    // engine: the repro agent boots the recipe, installs, writes a reproduction, proves
+    // it red, and commits. The base container then runs the same command against a bare
+    // checkout with no network and no `install`, gets exit 127, and the output does not
+    // contain the reported symptom — so the fold refuses it, the gate holds, and the
+    // reporter is told we could not reproduce their bug. Every claim in that chain is
+    // correct and the conclusion is false.
+    //
+    // It is invisible to every other fixture here because they are shell scripts with no
+    // dependencies, and invisible to the demo app because it has none either.
+    const events = await observe(needsInstalledDependency(), {
+      repro: REPRO_NEEDING_DEPENDENCY,
+      flakeRuns: 0,
+      baseRuns: 0,
+    });
+
+    // Not a test failure. The reproduction never ran.
+    expect(basePhase(events)).toMatchObject({ exit_code: 127, symptom_matched: false });
+    expect(conclude(events).reproduced).toBe(false);
+
+    // And the deliverable is a Tier 3 about the user's bug rather than an `errored` run
+    // about our environment, which is the presentation ADR-0007's amendment forbids.
+    expect(confidence(conclude(events)).tier).toBe(3);
+    expect(conclude(events).aborts).toEqual([]);
+  });
+});
+
 describe('the world the fix phase sees, not just the tree', () => {
 
   test('a repro that is red once and green after is NOT a reproduction', async () => {
@@ -739,6 +896,8 @@ describe('the world the fix phase sees, not just the tree', () => {
         for (const e of readdirSync(tmp)) rmSync(join(tmp, e), { recursive: true, force: true });
       },
       flakeRuns: 2,
+      // Pinned, because the fixture counts base draws to stay red through all of them.
+      baseRuns: 1,
     });
 
     // Everything the engine checks is satisfied: the repro hashes identically on
@@ -779,8 +938,13 @@ describe('the world the fix phase sees, not just the tree', () => {
       repro: ORDER_DEPENDENT_REPRO,
       runEnv: { TMPDIR: tmp },
       flakeRuns: 2,
+      baseRuns: 1,
     });
 
+    // Both base draws red, which is what the counter in the fixture buys: an attack
+    // that gave up after one red draw would now be caught by the repeated base phase
+    // instead, and this control would stop measuring the scrub.
+    expect(testRuns(events).filter((r) => r.phase === 'base').map((r) => r.exit_code)).toEqual([1, 1]);
     expect(fixDiff(events).changed_files).toEqual(['README.md']);
     expect(conclude(events).reproduced).toBe(true);
     rmSync(tmp, { recursive: true, force: true });
@@ -833,9 +997,10 @@ describe('one phase at a time', () => {
       'REPRO_REGISTERED',
       'TEST_RUN',
       'TEST_RUN',
+      'TEST_RUN',
       'FIX_DIFF_OBSERVED',
     ]);
-    expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+    expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
   });
 
   test('still refuses a fix that does not fix anything', async () => {
@@ -857,6 +1022,7 @@ describe('one phase at a time', () => {
     const events = await separately(noOpFix(), {
       repro: ORDER_DEPENDENT_REPRO,
       flakeRuns: 0,
+      baseRuns: 1,
     });
     expect(conclude(events).reproduced).toBe(false);
   });
@@ -1050,7 +1216,7 @@ describe('the sham-fix control', () => {
     // now finds it gone. Both shapes are checked here.
     const baseOnly = await observe(clean(), { controlRun: true, only: 'base', flakeRuns: 0 });
     expect(baseOnly.filter((e) => e.type === 'VERIFICATION_ABORTED')).toHaveLength(0);
-    expect(testRuns(baseOnly).filter((r) => r.phase === 'base')).toHaveLength(1);
+    expect(testRuns(baseOnly).filter((r) => r.phase === 'base')).toHaveLength(2);
     expect(testRuns(baseOnly).filter((r) => r.phase === 'control')).toHaveLength(2);
 
     // And the full path, where the fix phase does its own checkout and re-apply.
@@ -1082,7 +1248,7 @@ describe('the sham-fix control', () => {
         ...events.map((e) => ({ ...e, seq: e.seq + 1 })),
       ]);
       expect(folded.testRuns.filter((r) => r.phase === 'control')).toHaveLength(2);
-      expect(folded.testRuns.filter((r) => r.phase === 'base')).toHaveLength(1);
+      expect(folded.testRuns.filter((r) => r.phase === 'base')).toHaveLength(2);
       expect(folded.reproduced).toBe(true);
     });
   });

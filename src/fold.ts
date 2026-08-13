@@ -42,6 +42,31 @@ export type TestRunRecord = {
   repro_hashes?: Record<string, ArtifactRef>;
 };
 
+/** One execution of the project's own suite, by the engine, on one commit. */
+export type SuiteRunRecord = {
+  attempt: number;
+  phase: 'base' | 'fix';
+  command: string;
+  exit_code: number;
+  signal?: string;
+  stdout_hash: ArtifactRef;
+  duration_ms: number;
+};
+
+/**
+ * What the project's own suite says about the fix, per attempt.
+ *
+ * `clean` — it passed on base and passed on the fix.
+ * `broken` — it passed on base and FAILED on the fix. The fix broke something.
+ * `already_red` — it failed on base too, so nothing here is attributable to the fix.
+ * `unmeasured` — no suite ran: no test command, or the run never got that far.
+ *
+ * Four values rather than a boolean because collapsing the last two into "not clean"
+ * would report a repository that arrived with a red suite as a fix that broke it, in an
+ * immutable log, about someone else's project.
+ */
+export type Regression = 'clean' | 'broken' | 'already_red' | 'unmeasured';
+
 export type RegisteredRepro = {
   /**
    * Which attempt registered it. A run may register a fresh reproduction on each
@@ -63,6 +88,17 @@ export type RunState = {
   threadRef: string | null;
   currentAttempt: number; // 0 until the first ATTEMPT_STARTED
   testRuns: TestRunRecord[];
+  /** Every execution of the project's own suite, by the engine, on either commit. */
+  suiteRuns: SuiteRunRecord[];
+  /**
+   * Interpretation: what the project's own suite says about the credited attempt's fix.
+   *
+   * Derived here rather than in the confidence projection and the PR body separately —
+   * two definitions of "did this fix break the build" would be free to disagree, which
+   * is the mistake ADR-0009 exists about and which this fold has already been bitten
+   * by twice.
+   */
+  regression: Regression;
   /** The reproduction's identity, fixed before either phase ran. The latest, for display. */
   registeredRepro: RegisteredRepro | null;
   /** Every registration, so each attempt is judged against its own. */
@@ -186,6 +222,8 @@ const initialState = (runId: string): RunState => ({
   threadRef: null,
   currentAttempt: 0,
   testRuns: [],
+  suiteRuns: [],
+  regression: 'unmeasured',
   registeredRepro: null,
   registrations: [],
   reproduced: false,
@@ -360,8 +398,40 @@ export function apply(state: RunState, event: RunEvent): RunState {
         artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
       };
     }
+
+    case 'SUITE_RUN': {
+      const suiteRuns = [
+        ...state.suiteRuns,
+        {
+          attempt: state.currentAttempt,
+          phase: event.payload.phase,
+          command: event.payload.command,
+          exit_code: event.payload.exit_code,
+          signal: event.payload.signal,
+          stdout_hash: event.payload.stdout_hash,
+          duration_ms: event.payload.duration_ms,
+        },
+      ];
+      return {
+        ...next,
+        suiteRuns,
+        // Recomputed over the whole list, like every other interpretation here. The
+        // attempt this describes is the CREDITED one when there is one — a regression
+        // in an attempt whose fix was never credited is not a finding about a fix
+        // anybody is being offered.
+        regression: regressionOf(suiteRuns, state.reproducedAttempt ?? state.currentAttempt),
+        artifactHashes: [...state.artifactHashes, event.payload.stdout_hash],
+      };
+    }
     case 'FIX_DIFF_OBSERVED': {
       const completedAttempts = [...state.completedAttempts, state.currentAttempt];
+      const settled = credited(
+        state.testRuns,
+        state.registrations,
+        state.aborts,
+        completedAttempts,
+        state.handovers,
+      );
       return {
         ...next,
         fixDiff: {
@@ -371,7 +441,12 @@ export function apply(state: RunState, event: RunEvent): RunState {
         completedAttempts,
         // The completion witness arrives after the runs it vouches for, so a fold
         // that only recomputed on TEST_RUN would never see it.
-        ...credited(state.testRuns, state.registrations, state.aborts, completedAttempts, state.handovers),
+        ...settled,
+        // Recomputed here too, because this is where the CREDITED attempt is settled
+        // and the suite ran before it. Computing it only when a SUITE_RUN arrives left
+        // it describing whichever attempt happened to be current then — right for a
+        // single-attempt run and quietly wrong for a retry.
+        regression: regressionOf(state.suiteRuns, settled.reproducedAttempt ?? state.currentAttempt),
         artifactHashes: [...state.artifactHashes, event.payload.diff_hash],
       };
     }
@@ -546,7 +621,7 @@ function demonstrated(
       .map((a) => a.attempt),
   );
   const registered = new Map(registrations.map((r) => [r.attempt, r]));
-  return testRuns.filter((base) => {
+  const qualifies = (base: TestRunRecord): boolean => {
     // attempt 0 means no ATTEMPT_STARTED was ever seen, so "within one attempt"
     // is unenforceable and runs from unrelated attempts could be paired.
     if (base.phase !== 'base' || base.attempt === 0) return false;
@@ -563,7 +638,50 @@ function demonstrated(
     if (base.signal) return false;
     if (base.exit_code === 0 || base.symptom_matched !== true) return false;
     return intact(base, repro);
-  });
+  };
+
+  // EVERY base run of the attempt, not any one of them.
+  //
+  // `filter` alone was "at least one draw was red for the reported reason", which was
+  // the whole truth while the base phase ran once. It now runs twice by default, and a
+  // reproduction that fails intermittently would have had its one red draw credited
+  // with the largest ground in the score while the green draw sat inertly beside it in
+  // the same log. A reproduction is evidence about the base commit only if it is
+  // reliable about the base commit.
+  const perAttempt = new Map<number, TestRunRecord[]>();
+  for (const run of testRuns) {
+    if (run.phase !== 'base') continue;
+    perAttempt.set(run.attempt, [...(perAttempt.get(run.attempt) ?? []), run]);
+  }
+  const shown = new Set(
+    [...perAttempt.entries()]
+      .filter(([, runs]) => runs.length > 0 && runs.every(qualifies))
+      .map(([attempt]) => attempt),
+  );
+  return testRuns.filter((run) => run.phase === 'base' && shown.has(run.attempt));
+}
+
+/**
+ * What the project's own suite says about one attempt's fix.
+ *
+ * Needs BOTH sides to say anything. A fix-side result with no baseline cannot
+ * distinguish "this fix broke the suite" from "the suite was already red", and
+ * guessing between those two puts an accusation about someone's repository into an
+ * append-only log — so the answer is `unmeasured` and the report says so.
+ *
+ * A suite killed by a signal counts as failing on the side it died on: it did not pass,
+ * and treating "we could not tell" as a pass is the direction that credits a fix the
+ * suite never vouched for.
+ */
+function regressionOf(suiteRuns: SuiteRunRecord[], attempt: number): Regression {
+  const of = (phase: 'base' | 'fix') =>
+    suiteRuns.filter((run) => run.phase === phase && run.attempt === attempt).at(-1);
+  const base = of('base');
+  const fix = of('fix');
+  if (!base || !fix) return 'unmeasured';
+  const green = (run: SuiteRunRecord) => run.exit_code === 0 && !run.signal;
+  if (!green(base)) return 'already_red';
+  return green(fix) ? 'clean' : 'broken';
 }
 
 /** The registered bytes and the bytes that ran are the same bytes. */
@@ -630,6 +748,19 @@ function reproducedAttempt(
       (h) => (h.attempt === base.attempt || h.attempt === 0) && h.kind === 'fix',
     );
     if (handed.some((h) => fixes.some((r) => r.commit_sha !== h.commit))) return false;
+    // The symptom surviving into the fix's output is NOT a gate, deliberately.
+    //
+    // It was one for an hour, and `eofBug` refuted it: a missing terminating newline,
+    // reported as `wrong`, honestly reproduced by a test that prints the file. The
+    // content is *supposed* to still say `wrong` after the fix — only the newline
+    // changes — so the symptom legitimately appears on both sides and a gate here
+    // refused a correct reproduction of a real bug.
+    //
+    // That is the same false-positive class that demoted the sham-fix control to
+    // advisory after six rounds, and the precedent governs: a check that convicts
+    // honest work does not get to end runs. The observation is kept, shown in the PR
+    // table, and priced by `confidence()` — which is exactly ADR-0004's split between
+    // facts the engine observed and how much they are worth.
     return (
       fixes.length > 0 && fixes.every((r) => r.exit_code === 0 && !r.signal && intact(r, repro))
     );

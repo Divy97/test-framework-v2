@@ -49,11 +49,28 @@ const artifact = (context: ReportContext, ref: string): string =>
 export function pullRequestBody(state: RunState, context: ReportContext): string {
   const score = confidence(state);
   const attempt = state.reproducedAttempt;
-  const base = state.testRuns.find((run) => run.phase === 'base' && run.attempt === attempt);
+  const bases = state.testRuns.filter((run) => run.phase === 'base' && run.attempt === attempt);
   const fixes = state.testRuns.filter((run) => run.phase === 'fix' && run.attempt === attempt);
   const repro = state.registrations.find((registration) => registration.attempt === attempt);
 
   const sections: string[] = [];
+
+  // BEFORE the bug, before the evidence, before the tier. A fix that breaks the
+  // project's own suite is the one thing a reviewer must not have to scroll for, and
+  // burying it in the tier section beside eight other bullet points is burying it.
+  // Nothing else in this document is allowed to precede it.
+  if (state.regression === 'broken') {
+    const broke = state.suiteRuns.find((run) => run.phase === 'fix' && run.attempt === attempt);
+    sections.push(
+      `> [!WARNING]\n` +
+        `> **This fix breaks the project's own test suite.** \`${broke?.command ?? 'the suite'}\` ` +
+        `passed on the base commit and exits ${broke?.exit_code ?? 'non-zero'} on this one.\n` +
+        `>\n> The reproduction below is genuine and the evidence for it holds. What does not hold ` +
+        `is that this change is safe to merge as it stands.` +
+        (broke ? ` Output: ${artifact(context, broke.stdout_hash)}` : '') +
+        `\n`,
+    );
+  }
 
   sections.push(
     `## The bug\n\nReported in ${context.threadRef}:\n\n` +
@@ -76,20 +93,23 @@ export function pullRequestBody(state: RunState, context: ReportContext): string
 
   sections.push(
     `## Base red, fix green\n\n` +
-      (base
-        ? `| phase | commit | exit | symptom matched | output |\n|---|---|---|---|---|\n` +
-          `| base | \`${base.commit_sha.slice(0, 12)}\` | ${base.exit_code} | ` +
-          `${base.symptom_matched === true ? 'yes' : 'no'} | ${artifact(context, base.stdout_hash)} |\n` +
-          fixes
+      (bases.length > 0
+        ? `| phase | commit | exit | symptom in output | output |\n|---|---|---|---|---|\n` +
+          [...bases, ...fixes]
             .map(
               (run) =>
-                `| fix (run ${run.repeat ?? 0}) | \`${run.commit_sha.slice(0, 12)}\` | ${run.exit_code} | — | ` +
+                `| ${run.phase} (run ${run.repeat ?? 0}) | \`${run.commit_sha.slice(0, 12)}\` | ` +
+                `${run.exit_code} | ${run.symptom_matched === true ? 'yes' : 'no'} | ` +
                 `${artifact(context, run.stdout_hash)} |`,
             )
             .join('\n') +
           `\n\nEach row is a command the engine executed itself, in a container of its own, ` +
-          `with no network and no agent in it. The fix ran ${fixes.length} time` +
-          `${fixes.length === 1 ? '' : 's'}: one green run is not a fix.\n`
+          `with no network and no agent in it. The reproduction ran ${bases.length} time` +
+          `${bases.length === 1 ? '' : 's'} on base — every one red, so the failure is not a flake — ` +
+          `and ${fixes.length} time${fixes.length === 1 ? '' : 's'} on the fix: one green run is not a fix.\n\n` +
+          `The **symptom** column is the anchor in both directions. The reported symptom has to appear ` +
+          `in the base output, which ties the failure to the report, and has to be **gone** from every ` +
+          `fix run — otherwise the reproduction printed it regardless of the bug and proved nothing.\n`
         : 'No phase runs were credited to a single attempt.\n'),
   );
 
@@ -104,7 +124,7 @@ export function pullRequestBody(state: RunState, context: ReportContext): string
   sections.push(
     `## The tier\n\n` +
       `**Tier ${score.tier}** — ${TIER_MEANING[score.tier] ?? 'unknown'}. ` +
-      `Confidence ${score.score}/85.\n\n` +
+      `Confidence ${score.score}/${score.ceiling}.\n\n` +
       score.grounds.map((ground) => `- +${ground.points} ${ground.claim}`).join('\n') +
       `\n\nNot measured:\n\n` +
       score.unmeasured.map((gap) => `- ${gap}`).join('\n') +
@@ -146,7 +166,7 @@ export function issueComment(state: RunState, context: ReportContext): string {
     return (
       `Opened #${state.pr.pr_number} for this.\n\n` +
       `The reproduction failed on \`${state.pr.head_sha.slice(0, 12)}\`'s parent and passes on it — ` +
-      `Tier ${score.tier}, confidence ${score.score}/85. The pull request carries the failing test, ` +
+      `Tier ${score.tier}, confidence ${score.score}/${score.ceiling}. The pull request carries the failing test, ` +
       `both exit codes, the diff, and every artifact by hash.\n\n` +
       `Nothing has been merged. That is always yours.`
     );
