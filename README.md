@@ -94,6 +94,15 @@ A run that never manages to *boot* the project is `errored`, not Tier 3 — our 
 
 Confidence = tier + deterministic evidence quality. Every point traceable to a content-addressed artifact.
 
+### Two arms, not one
+
+"Did this repair the reported bug" and "did it break anything else" are different questions, and only the first was ever asked. So a change that turned the reproduction green and forty other tests red scored full marks and opened a pull request that said nothing about it.
+
+- **The reproduction arm** — the registered command, red on base **twice** and green on the fix three times, byte-identical every run. Repeated on base for the same reason it is repeated on the fix: one red draw cannot say a failure is reliable, and the largest single ground in the score used to rest on one sample.
+- **The regression arm** — the project's *own* test command, executed by the engine on both commits, with the applied reproduction taken out of the tree first (every real suite discovers test files, and ours would otherwise fail the baseline for our own reason). Green→red is a finding: the pull request leads with it, before the bug. Red→red is recorded and never blamed on the fix.
+
+The reported symptom is also observed on **both** sides now. Present on base is what ties the failure to the report; absent on the fix is what makes that tie mean something — while only base was checked, a `console.log` of the symptom string satisfied the anti-gaming check completely, and the repro prompt asked for exactly that print. It is **priced, not enforced**: `eofBug` is an honest reproduction of a missing newline reported as `wrong`, and correct output still says `wrong`. A check that convicts honest work does not get to end runs — the same conclusion six rounds of the sham-fix control reached.
+
 ## Architectural decisions
 
 1. [Why event sourcing](docs/adr/0001-why-event-sourcing.md)
@@ -110,12 +119,14 @@ Confidence = tier + deterministic evidence quality. Every point traceable to a c
 12. [The GitHub App, and where the token lives](docs/adr/0012-the-github-app-and-where-the-token-lives.md)
 13. [The environment recipe: asked once, replayed forever](docs/adr/0013-the-environment-recipe.md)
 14. [Long-lived services, and what the reap is still for](docs/adr/0014-long-lived-services-and-named-shells.md)
+15. [The model is behind an adapter](docs/adr/0015-the-model-is-behind-an-adapter.md)
+16. [The second arm: the project's own suite, on both commits](docs/adr/0016-the-second-arm.md)
 
 The full decision record from the founding design session: [SHARED-UNDERSTANDING.md](SHARED-UNDERSTANDING.md).
 
 ## Honest limitations
 
-**A real model has now run, and the first four runs found four defects — all of them ours.** `moonshotai/kimi-k2-thinking`, driven through OpenRouter, took the `shipped-filter` issue to a credited **Tier 2** pull request: reproduction red on base matching the reported symptom, fix green three times, `orders.mjs` changed, confidence 80/85. It cost **$0.08**. Getting there took four attempts, and not one of the failures was the model's:
+**A real model has now run, and the first four runs found four defects — all of them ours.** `moonshotai/kimi-k2-thinking`, driven through OpenRouter, took the `shipped-filter` issue to a credited **Tier 2** pull request: reproduction red on base matching the reported symptom, fix green three times, `orders.mjs` changed, confidence 80/85 — *under scoring version 1; the grounds and the ceiling have moved since, which is what `Confidence.scoring` exists to make legible* ([ADR-0016](docs/adr/0016-the-second-arm.md)). It cost **$0.08**. Getting there took four attempts, and not one of the failures was the model's:
 
 1. `tool_choice: 'required'` is not portable — the provider rejected it, so the conformance probe failed on exactly the cheap models it exists to screen.
 2. OpenRouter answers **HTTP 200 with an `{error: {code: 400}}` body**, and checking `response.ok` alone reported our own malformed request as the model's inability to call a tool.
@@ -128,15 +139,23 @@ Every one is a defect in **what we tell the agent**, which is why 365 scripted t
 
 **The isolation took four adversarial review rounds, each of which defeated the previous round's fix.** One of them landed a false `reproduced: true` against a *maintainer-authored, pinned, hashed* test — the strongest provenance the design recognises — with a fix commit that changed one unrelated file. The agent forged nothing; it shared a filesystem with the phases, which was enough. Every fix enumerated a channel and the enumeration was never the answer: [ADR-0014](docs/adr/0014-long-lived-services-and-named-shells.md) replaces it with a container boundary per phase, which closes the class instead of extending the list.
 
-**What remains open is named, not waved at.** `/blobs` is a bind mount every participant can write, outlives the run, and is append-only by convention rather than construction. Flake re-runs share everything with each other, deliberately, because isolating them would hide the order-dependent flake they exist to catch. The agent sandbox is *not* contained — it has a browser, booted services and a registry route — which is affordable only because nothing worth stealing lives there and nothing it produces is trusted.
+**The judge has no dependencies installed, so today this engine can only certify repositories that need none.** This is the largest limitation here and it was invisible through 352 green tests, because every adversarial fixture is a shell script and `demo/` has zero dependencies and runs on `node --test`.
+
+The agent sandbox replays the recipe, so `install` has run: the repro agent boots the project, writes a reproduction, proves it red, commits. The phase containers replay nothing, hold no recipe and run `--network none` — they clone the commit and run the command against a bare checkout, and a dependency is a gitignored path so it is not in the commit either. `npm test` there is exit 127, the output does not contain the reported symptom, the fold correctly refuses it, and the reporter is told **we could not reproduce your bug**. Every step in that chain is right and the conclusion is false. On a React or Next.js repository it is the outcome every time.
+
+It is pinned by a test rather than described here alone — `verify.test.ts`, *"a reproduction that needs an installed dependency reports NOT REPRODUCED"* — and the agent is now at least told the truth about it, so a reproduction can be written to survive the boundary. The fix is to snapshot the booted sandbox before the agent acts and run the phases from it; the obstacle is that `install` lands in gitignored paths, which is exactly what the phase-boundary scrub deliberately destroys to catch `IGNORED_PATH_REPRO`. That needs its own adversarial round on the file with the worst blast radius in the repo, so it is not in this change.
+
+**What else remains open is named, not waved at.** `/blobs` is a bind mount every participant can write, outlives the run, and is append-only by convention rather than construction. Flake re-runs share everything with each other, deliberately, because isolating them would hide the order-dependent flake they exist to catch. The agent sandbox is *not* contained — it has a browser, booted services and a registry route — which is affordable only because nothing worth stealing lives there and nothing it produces is trusted.
 
 ## Status
 
 The engine works; the product does not exist yet.
 
-**Built and tested:** event store · fold and projections · tiers and confidence · the verification engine · the reproduce-first gate · the anchored reproduction · the sandbox and its adversarial suite · agent supervision against a hostile fake · the agent loop outside the sandbox · the environment recipe · the two prompts · one container per phase · the GitHub App in and out · the browser · the SSE tail ([milestone 5](docs/milestone-5-v1.5.md), [report](docs/milestone-5-report.md)).
+**Built and tested:** event store · fold and projections · tiers and confidence · the verification engine · the reproduce-first gate · the anchored reproduction · the sandbox and its adversarial suite · agent supervision against a hostile fake · the agent loop outside the sandbox · the environment recipe · the two prompts · one container per phase · the GitHub App in and out · the browser · the SSE tail ([milestone 5](docs/milestone-5-v1.5.md), [report](docs/milestone-5-report.md)) · the regression arm, the repeated base phase and the symptom observed on both sides ([milestone 7](docs/milestone-7.md), [ADR-0016](docs/adr/0016-the-second-arm.md)).
 
 **Still not true, and this is the honest list:** no GitHub App is registered, so nothing here has been accepted by GitHub — a bare repository on disk stood in for the remote, and the real run's pull request was opened against a recording `fetch`. The real run is a run, not a suite: one bug, one model, four attempts, and the other three seeded bugs have never been driven by a real agent. `/blobs` remains append-only by convention rather than construction. Diff-coverage is still not built, so an agent-authored reproduction still cannot earn Tier 1 — the real run capped at Tier 2 for exactly that reason. And the real run exposed one thing about the agent rather than the engine: `git_commit` stages everything, so the recipe's `npm install` left `package-lock.json` in the fix diff, which rule 4 of the fix prompt tells the agent not to do.
+
+And nothing in [milestone 7](docs/milestone-7.md) has been driven by a real model: the prompt changes in it are green under a *scripted* agent, which the four defects above establish proves nothing about what a prompt says. That is a run away, not a rewrite — but until it happens the status of those changes is unverified, and saying otherwise would be the exact failure this section exists for.
 
 **Deliberately not in v1.5:** Slack and CLI connectors · the dashboard · deployment and preview URLs · multi-repo runs · LSP tools · diff-coverage · observability-triggered runs.
 
