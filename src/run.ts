@@ -133,6 +133,9 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       ...(request.recipe ? { services: request.recipe.services } : {}),
       ...(request.recipe?.test ? { testCommand: request.recipe.test } : {}),
       browser: request.agentImage !== undefined,
+      // A recipe is what gives the agent sandbox a network and what the phases'
+      // snapshot is taken of, so it is the condition the asymmetry paragraph turns on.
+      booted: request.recipe !== null,
     });
     const issue = intake.event.raw_text;
 
@@ -165,15 +168,22 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       // prose in place of both variables, which made the prompt contradict itself — it
       // promises "you have exactly the command above" and then quoted a sentence telling
       // the agent where to look instead. The first real model run is what exposed it.
-      agentPrompt: (repro) =>
+      agentPrompt: (context) =>
         renderPrompt('fix', {
           issue,
           environment,
-          command: repro.command,
+          command: context.repro.command,
+          // What the base container watched the reproduction print. Every placeholder
+          // must be filled — `renderPrompt` refuses a template with one left — so the
+          // absence has to read as a fact rather than as an empty fence.
+          observed:
+            context.baseOutput?.trim() ||
+            '(the engine has not run it yet on this path, so there is no captured output)',
+          suite: describeSuite(request.recipe?.test, context.suite),
           // The reproduction's own paths, which rule 3 tells the agent not to touch. An
           // empty manifest is possible and must read as a fact, not as a blank section.
           files:
-            Object.keys(repro.files ?? {})
+            Object.keys(context.repro.files ?? {})
               .map((path) => `- \`${path}\``)
               .join('\n') || '(the manifest listed none)',
         }),
@@ -285,6 +295,31 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
   } finally {
     await rm(workspace, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/**
+ * The suite baseline, in the fix prompt's own words.
+ *
+ * Three genuinely different situations, and the agent has to be able to tell them
+ * apart: there is no suite, there is one and it was green on base, or there is one
+ * that was ALREADY red. Only the middle case makes "do not break it" a meaningful
+ * instruction — telling an agent not to break something already broken is how a
+ * pre-existing failure becomes the agent's problem, and then ours.
+ */
+function describeSuite(command: string | undefined, observed?: { command: string; exitCode: number }): string {
+  if (!command) return 'This repository has no test command in its recipe, so no suite is run against your commit.';
+  if (!observed) {
+    return (
+      `The project's own suite is \`${command}\`. It is run on your commit and the result is ` +
+      `published, but nothing has run it on the base commit, so there is no baseline to compare against.`
+    );
+  }
+  return observed.exitCode === 0
+    ? `The project's own suite — \`${command}\` — **passed** on the base commit. It is run again on ` +
+        `yours and the two are compared, so a fix that turns it red is reported as a regression.`
+    : `The project's own suite — \`${command}\` — was **already failing** on the base commit ` +
+        `(exit ${observed.exitCode}), before anything you do. You are not being asked to repair that, ` +
+        `and it will not be attributed to your fix. Do not let it distract you from the reproduction.`;
 }
 
 /**

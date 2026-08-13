@@ -35,9 +35,41 @@ import { fold } from './fold.js';
 import { runAgentLoop, type AgentTranscript, type LoopUsage } from './loop.js';
 import type { Recipe, ReplayOutcome } from './recipe.js';
 import { isWorkerReply, type Job, type WorkerRequest } from './runner.js';
-import { put } from './blobs.js';
+import { get, put } from './blobs.js';
 import type { ReproSpec } from './verify.js';
 import { MAX_REASON_CHARS } from './verify.js';
+
+/**
+ * What the fix agent is told, beyond the issue and its own tree.
+ *
+ * An object rather than a positional `ReproSpec`, because everything worth adding
+ * here is a fact the base container observed and the caller cannot know in advance
+ * — and each one arrived by being threaded through a signature that had no room
+ * for it. The command was the first. It will not be the last.
+ */
+export type FixContext = {
+  repro: ReproSpec;
+  /**
+   * The tail of what the reproduction actually PRINTED on base, read out of the
+   * evidence store.
+   *
+   * The agent had the command and not its output, so its first act was always to
+   * re-run the command to see the failure it was being asked to remove — a turn
+   * spent rediscovering something the engine had already observed and hashed. Worse
+   * when the re-run disagrees: the sandbox and the phase container are different
+   * worlds, so "run it yourself" is not guaranteed to show the same failure the
+   * verdict will be taken from. This is that failure, verbatim.
+   */
+  baseOutput?: string;
+  /**
+   * How the project's own suite fared on base — the baseline a regression is
+   * measured against. Absent when the recipe declares no test command.
+   */
+  suite?: { command: string; exitCode: number };
+};
+
+/** Tail of base's output handed to the fix agent. The failure is at the end. */
+const MAX_OBSERVED_CHARS = 8 * 1024;
 
 /** Output ceiling per container. Matches what the sandbox tests already allow. */
 const execFile = promisify(execFileCb);
@@ -63,7 +95,7 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * A plain string is still accepted for the fix-only path, where the CALLER supplied the
    * reproduction and there is no ordering to prove.
    */
-  agentPrompt?: string | ((repro: ReproSpec) => string | Promise<string>);
+  agentPrompt?: string | ((context: FixContext) => string | Promise<string>);
   /**
    * The reproduction, when the caller supplies it. Omitted when `reproPrompt` is
    * set: the agent authors it, and a spec chosen in advance would be anchoring a
@@ -587,7 +619,13 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         job: {},
         source: agentSource,
         kind: 'fix',
-        prompt: typeof plan.agentPrompt === 'function' ? await plan.agentPrompt(plan.repro!) : plan.agentPrompt,
+        // No observed output to hand over on this path: the caller supplied the
+        // reproduction and this agent runs BEFORE the base container, so nothing has
+        // watched it fail yet.
+        prompt:
+          typeof plan.agentPrompt === 'function'
+            ? await plan.agentPrompt({ repro: plan.repro! })
+            : plan.agentPrompt,
       });
     }
     steps.push({ phase: 'base', job: { only: 'base' }, source });
@@ -748,8 +786,18 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
           // function: `resolvedRepro` is the reproduction the base container read out of
           // the agent's commit, so the fix agent is told the command that will actually
           // judge it rather than where to go looking for it.
+          //
+          // And with the base container's own observations, which only exist by now:
+          // what the reproduction printed, and how the project's suite fared. Read
+          // out of the blob store rather than re-derived, so the agent is shown the
+          // exact bytes the verdict was taken from.
           const fixPrompt =
-            typeof plan.agentPrompt === 'function' ? await plan.agentPrompt(resolvedRepro!) : plan.agentPrompt;
+            typeof plan.agentPrompt === 'function'
+              ? await plan.agentPrompt({
+                  repro: resolvedRepro!,
+                  ...(await observedOnBase(plan.blobRoot, events, n)),
+                })
+              : plan.agentPrompt;
           const author = await agentContainer(fixPrompt, afterSeq, {
             ...(resolvedRepro ? { repro: resolvedRepro } : {}),
           });
@@ -926,6 +974,41 @@ async function applyHandover(source: string, runId: string, dir: string | undefi
 }
 
 /**
+ * What the base container observed, for the fix agent's prompt.
+ *
+ * Read off the fold rather than by scanning for event types, so "which attempt" has
+ * one definition (ADR-0009) — and read out of the blob store rather than kept in
+ * memory, because the bytes the verdict was taken from are the ones the agent should
+ * see, and those are the ones with a hash.
+ *
+ * Never throws. A prompt is better with this and must not depend on it: a missing
+ * blob is a degraded prompt, not a lost run.
+ */
+async function observedOnBase(
+  blobRoot: string,
+  events: RunEvent[],
+  attempt: number,
+): Promise<Pick<FixContext, 'baseOutput' | 'suite'>> {
+  try {
+    const state = fold(events);
+    // The FIRST base run of the attempt — `repeat: 0`, the one the flake repeats
+    // repeat. They are all red or the gate would not be open, so any would do; the
+    // first is the one a reader would go looking for.
+    const base = state.testRuns.find((run) => run.phase === 'base' && run.attempt === attempt);
+    const suite = state.suiteRuns.find((run) => run.phase === 'base' && run.attempt === attempt);
+    const output = base ? (await get(blobRoot, base.stdout_hash)).toString('utf8') : undefined;
+    return {
+      ...(output === undefined
+        ? {}
+        : { baseOutput: output.length > MAX_OBSERVED_CHARS ? output.slice(-MAX_OBSERVED_CHARS) : output }),
+      ...(suite === undefined ? {} : { suite: { command: suite.command, exitCode: suite.exit_code } }),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Drives a tool-serving container from out here.
  *
  * The whole of ADR-0011 in one function type: something on the host is handed a
@@ -964,6 +1047,12 @@ async function runContainer(
     // cannot arrive here without one.
     repro: overrides.repro ?? plan.repro ?? { command: '' },
     symptomPattern: plan.symptomPattern,
+    // Read off the recipe here rather than asked of the caller, so there is no way to
+    // configure a run whose suite command disagrees with the one its environment was
+    // built from. The agent container ignores it — `only: 'agent'` returns before
+    // `verify()` — so this reaches only the two containers that judge.
+    ...(plan.recipe?.test === undefined ? {} : { suiteCommand: plan.recipe.test }),
+    ...(plan.baseRuns === undefined ? {} : { baseRuns: plan.baseRuns }),
     ...(plan.flakeRuns === undefined ? {} : { flakeRuns: plan.flakeRuns }),
     ...(plan.timeoutMs === undefined ? {} : { timeoutMs: plan.timeoutMs }),
     ...(plan.agentTimeoutMs === undefined ? {} : { agentTimeoutMs: plan.agentTimeoutMs }),

@@ -31,10 +31,22 @@ Commit a file at exactly `.engine/repro.json`:
   ```
 
   An engine you cannot reach searches your output for exactly that string. It does
-  not read for meaning, so a paraphrase of it fails — print it verbatim, on its own
-  line, alongside whatever else you want to say. This is not bureaucracy: a failure
-  for some unrelated reason is not a reproduction of this bug, and matching the
-  reported symptom is how the engine tells the two apart.
+  not read for meaning, so a paraphrase of it fails — print it verbatim. This is not
+  bureaucracy: a failure for some unrelated reason is not a reproduction of this bug,
+  and matching the reported symptom is how the engine tells the two apart.
+
+  **Print it from the failing path, so it disappears when the bug is fixed.** The
+  same engine runs your command again on the repaired commit and looks for the string
+  there too. Gone is what it wants: that is a reproduction whose output tracks the
+  bug. So put it in the assertion message — the text printed *because* the check
+  failed — and not in a test name, a heading, a banner, or any `print` that runs
+  either way. A string that appears whether or not the bug is present says nothing
+  about the bug.
+
+  This is scored, not enforced, and the reason is worth knowing: sometimes the
+  reported wording legitimately appears in correct output too, and then it survives a
+  real fix through no fault of yours. So do not contort the test to hide it. Print it
+  from the failing path where you can, and let it be where you cannot.
 - `files` lists **every** path the reproduction depends on that is not already part
   of the project: the test file you wrote, any helper it needs, and the manifest
   itself. At most 32 paths, 256KB of content in total. Each must be a regular file

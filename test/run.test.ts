@@ -280,6 +280,29 @@ describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no h
     expect(events.findIndex((e, i) => i > registered && e.type === 'AGENT_MESSAGE')).toBeGreaterThan(registered);
     expect(handovers.map((e) => (e.payload as { kind: string }).kind)).toEqual(['repro', 'fix']);
 
+    // WHAT THE FIX AGENT WAS TOLD, out of the requests the model actually received.
+    //
+    // It had the command and never the failure. Its first act was therefore always to
+    // re-run the command to discover something the engine had already observed and
+    // hashed — and if the sandbox and the phase container disagree, the failure it finds
+    // is not the failure it is judged on. This asserts the observed bytes crossed.
+    const prompts = model.requests
+      .flatMap((request) => (request.messages as { content: unknown }[] | undefined) ?? [])
+      .map((message) => JSON.stringify(message.content));
+    const fixPrompt = prompts.find((text) => text.includes('You are fixing a reported bug'));
+    expect(fixPrompt).toBeDefined();
+    // The assertion message the repro prints on base, quoted back from the blob store.
+    expect(fixPrompt).toContain('Ordres: the heading is misspelled');
+    // And the suite baseline, so "do not break it" is a statement about something known.
+    expect(fixPrompt).toMatch(/node --test/);
+
+    // THE REGRESSION ARM, absent here on purpose: this run passes `recipe: null`, so
+    // there is no test command and nothing to compare. `unmeasured` is the honest answer
+    // and it must not read as a pass — the recipe-bearing run below is where `clean` is
+    // asserted.
+    expect(result.state.suiteRuns).toEqual([]);
+    expect(result.state.regression).toBe('unmeasured');
+
     // THE PUSH happened, against the real remote, on a branch we created.
     const branches = execFileSync('git', ['-C', remotePath, 'for-each-ref', '--format=%(refname:short)'], {
       encoding: 'utf8',
@@ -612,8 +635,26 @@ describe.skipIf(!dockerAvailable())('shipped-filter: an API bug the agent needs 
     expect(base.exit_code).not.toBe(0);
     expect(base.symptom_matched).toBe(true);
     expect(result.state.testRuns.filter((r) => r.phase === 'fix')).toHaveLength(3);
+    // And red on base MORE THAN ONCE, so the failure is not one lucky draw.
+    expect(result.state.testRuns.filter((r) => r.phase === 'base')).toHaveLength(2);
+    expect(result.state.testRuns.filter((r) => r.phase === 'base').every((r) => r.exit_code !== 0)).toBe(true);
     expect(result.state.reproduced).toBe(true);
     expect(result.state.fixDiff?.changed_files).toContain('orders.mjs');
     expect(result.prUrl).toBe('https://github.com/o/r/pull/9');
+
+    // THE REGRESSION ARM, end to end and in a sealed container: this is the one run in
+    // the suite with a recipe, so `node --test` is what the engine executes on both
+    // commits. The demo's own tests pass on the buggy tree by design (`demo/test/
+    // orders.test.mjs` says so in its own comments), which is exactly what makes a
+    // green-to-red transition attributable to a fix.
+    expect(result.state.suiteRuns.map((r) => [r.phase, r.exit_code])).toEqual([
+      ['base', 0],
+      ['fix', 0],
+    ]);
+    expect(result.state.regression).toBe('clean');
+    const pr = calls.find((c) => c.url.endsWith('/pulls'))!.body as { body: string };
+    expect(pr.body).toContain("the project's own test suite passed on the base commit and passed again");
+    // And no warning banner, because nothing broke.
+    expect(pr.body).not.toContain('breaks the project');
   }, 900_000);
 });

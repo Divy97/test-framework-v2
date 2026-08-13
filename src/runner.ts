@@ -82,6 +82,16 @@ export type Job = {
    */
   only?: 'base' | 'fix' | 'agent';
   flakeRuns?: number;
+  baseRuns?: number;
+  /**
+   * The project's own test command, run on both commits so a regression is visible.
+   *
+   * Passed as a bare string rather than inferred from `recipe`, because the phase
+   * containers deliberately carry no recipe: they replay nothing, and handing them a
+   * whole boot procedure to extract one field from would give them a capability they
+   * must not have. The orchestrator reads it off the recipe and passes the command.
+   */
+  suiteCommand?: string;
   timeoutMs?: number;
   /** Run the sham-fix control. Set when the AGENT wrote the reproduction. */
   controlRun?: boolean;
@@ -824,6 +834,8 @@ export async function runJob(
       onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME], evidence),
       ...(job.only === undefined ? {} : { only: job.only }),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
+      ...(job.baseRuns === undefined ? {} : { baseRuns: job.baseRuns }),
+      ...(job.suiteCommand === undefined ? {} : { suiteCommand: job.suiteCommand }),
       ...(job.controlRun === undefined ? {} : { controlRun: job.controlRun }),
       ...(job.timeoutMs === undefined ? {} : { timeoutMs: job.timeoutMs }),
     });

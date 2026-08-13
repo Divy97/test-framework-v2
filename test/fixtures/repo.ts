@@ -159,6 +159,26 @@ export const FLAKY_REPRO: ReproSpec = {
  */
 export const REPRO_VIA_HELPER: ReproSpec = {
   command: 'sh repro.sh',
+  // The symptom is printed FROM THE FAILING PATH, which is what `prompts/repro.md`
+  // asks a reproduction to do: present when the bug is, gone when it is not. It used
+  // to `cat src.txt` unconditionally, and once the engine started checking the fix
+  // side for the symptom too that made this fixture fail for the wrong reason — the
+  // helper tampering was never reached, because the echo alone convicted it. A
+  // negative control has to fail for exactly the reason it documents.
+  files: { 'repro.sh': '. ./helper.sh\ncheck_answer || { cat src.txt; exit 1; }\n' },
+};
+
+/**
+ * The same tampering, with a reproduction that ECHOES the state it is about.
+ *
+ * This is the shape the symptom check can see through. The fix neuters `check_answer`
+ * and leaves `src.txt` saying `wrong`, so the reported symptom is still in the output
+ * of a run that exits 0 — a "fix" under which the reported behaviour demonstrably did
+ * not change. `REPRO_VIA_HELPER` above is the same attack wearing the prompt's own
+ * advice, and it is NOT caught, which is why both exist.
+ */
+export const REPRO_ECHOING_STATE: ReproSpec = {
+  command: 'sh repro.sh',
   files: { 'repro.sh': 'cat src.txt\n. ./helper.sh\ncheck_answer\n' },
 };
 
@@ -404,18 +424,113 @@ export const survivorGamed = () =>
 export const ORDER_DEPENDENT_REPRO: ReproSpec = {
   command: 'sh repro.sh',
   files: {
+    // A COUNTER, not a flag, and this is the second round of this fixture.
+    //
+    // `if [ -f "$flag" ]; then exit 0; fi` was enough while the base phase ran once.
+    // Once it ran twice, the attack defeated itself: base draw 2 saw the flag base
+    // draw 1 had planted and went green, so the fold refused it for being an
+    // unreliable failure and the phase-boundary scrub stopped being the reason this
+    // control fails. A negative control that passes for a new reason is a defence
+    // nobody is measuring any more.
+    //
+    // So it counts instead: red for as many draws as the base phase takes, green
+    // after. The state still has to cross the phase boundary, which is the one thing
+    // the scrub exists to prevent — so with the scrub in place the fix side starts
+    // counting from zero and goes red, exactly as before.
+    //
+    // It hardcodes the number of base draws, which is why every call site pins
+    // `baseRuns` rather than inheriting the default.
     'repro.sh':
       'flag="${TMPDIR:-/tmp}/.seen"\n' +
-      'cat src.txt\n' +
-      'if [ -f "$flag" ]; then exit 0; fi\n' +
-      'touch "$flag"\n' +
-      'grep -q right src.txt\n',
+      'n=$(cat "$flag" 2>/dev/null || echo 0)\n' +
+      'n=$((n+1))\n' +
+      'echo "$n" > "$flag"\n' +
+      'if [ "$n" -gt 2 ]; then exit 0; fi\n' +
+      // On the failing path only — see `REPRO_VIA_HELPER`.
+      'grep -q right src.txt || { cat src.txt; exit 1; }\n',
   },
 };
 
 /** The bug is untouched; the "fix" edits an unrelated file. */
 export const noOpFix = () =>
   makeRepo({ 'src.txt': 'wrong\n' }, { 'README.md': 'an unrelated change\n' });
+
+/**
+ * A project with a test suite of its own — the second arm of the comparison.
+ *
+ * `APPLIED_REPRO` is red on base and green on the fix in all three, so the reproduction
+ * arm is identical and only the suite differs. That is the point: the regression arm has
+ * to be the thing that separates them.
+ */
+export const suiteGreenThroughout = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', 'other.txt': 'keep\n', 'suite.sh': 'grep -q keep other.txt\n' },
+    { 'src.txt': 'right\n' },
+  );
+
+/** The fix repairs the bug and breaks something else. The case the arm exists for. */
+export const suiteBrokenByFix = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', 'other.txt': 'keep\n', 'suite.sh': 'grep -q keep other.txt\n' },
+    { 'src.txt': 'right\n', 'other.txt': 'clobbered\n' },
+  );
+
+/** Already failing before anyone touched it. Never the fix's fault. */
+export const suiteRedOnBase = () =>
+  makeRepo({ 'src.txt': 'wrong\n', 'suite.sh': 'exit 1\n' }, { 'src.txt': 'right\n' });
+
+/**
+ * A suite that DISCOVERS test files, which is what every real one does.
+ *
+ * It runs every `*.sh` beside it, so if the engine leaves the applied reproduction in
+ * the tree while the suite runs, the suite inherits the reproduction's own failure on
+ * base — the baseline goes red for our reason rather than the project's, and every
+ * honest run reports `already_red` forever.
+ */
+export const suiteThatDiscoversTests = () =>
+  makeRepo(
+    {
+      'src.txt': 'wrong\n',
+      'suite.sh': 'for f in *.sh; do [ "$f" = suite.sh ] && continue; sh "$f" || exit 1; done\n',
+    },
+    { 'src.txt': 'right\n' },
+  );
+
+/**
+ * A repository whose reproduction needs an INSTALLED dependency.
+ *
+ * The shape of every real project and of none of the fixtures above. `demo/` has zero
+ * dependencies and runs on `node --test`, which is the only reason the golden path
+ * works — and it is why the gap this fixture documents went unnoticed through 352
+ * green tests.
+ *
+ * The agent sandbox replays the recipe, so `install` has run and the dependency is
+ * there when the reproduction is authored and proven. The phase containers replay
+ * nothing, hold no recipe, and have `--network none`: they clone the commit and run the
+ * command against a bare checkout. A dependency is a gitignored path, so it is not in
+ * the commit either.
+ */
+export const needsInstalledDependency = () =>
+  makeRepo(
+    { 'src.txt': 'wrong\n', '.gitignore': 'node_modules/\n' },
+    { 'src.txt': 'right\n', '.gitignore': 'node_modules/\n' },
+  );
+
+/**
+ * The reproduction a real repository's agent writes: it uses what `install` installed.
+ *
+ * Deliberately explicit about the failure rather than letting a missing module produce
+ * an incidental error — the point is to show WHICH exit the engine records, and that it
+ * is not the reproduction's own verdict.
+ */
+export const REPRO_NEEDING_DEPENDENCY: ReproSpec = {
+  command: 'sh repro.sh',
+  files: {
+    'repro.sh':
+      'test -f node_modules/dep/marker || { echo "sh: dep: not found"; exit 127; }\n' +
+      'grep -q right src.txt || { cat src.txt; exit 1; }\n',
+  },
+};
 
 /**
  * The same order-dependent trick, with the flag inside the repo — in a directory
@@ -643,14 +758,23 @@ export const demoRecipe = (port: number) => ({
 export const ORDER_DEPENDENT_REPORTING = (flag: string): ReproSpec => ({
   command: 'sh repro.sh',
   files: {
+    // A COUNTER, for the reason `ORDER_DEPENDENT_REPRO` above carries one: with the base
+    // phase drawing twice inside ONE container, a bare `if [ -f "$flag" ]` fires on the
+    // second base draw. The attack then defeats itself before the phase boundary is ever
+    // exercised — base goes green on draw two, the gate shuts, no fix container runs at
+    // all, and the assertion about the fix phase reads `undefined`. The flag has to
+    // survive every base draw and only flip afterwards, which is what makes the fix
+    // phase's answer a statement about the boundary.
     'repro.sh':
       `flag="${flag}"\n` +
       'echo "HOST:$(hostname)"\n' +
       'cat src.txt\n' +
-      'if [ -f "$flag" ]; then echo FLAG-PRESENT; exit 0; fi\n' +
-      'echo FLAG-ABSENT\n' +
       'mkdir -p "$(dirname "$flag")" 2>/dev/null || true\n' +
-      'touch "$flag"\n' +
+      'n=$(cat "$flag" 2>/dev/null || echo 0)\n' +
+      'n=$((n+1))\n' +
+      'echo "$n" > "$flag"\n' +
+      'if [ "$n" -gt 2 ]; then echo FLAG-PRESENT; exit 0; fi\n' +
+      'echo FLAG-ABSENT\n' +
       'grep -q right src.txt\n',
   },
 });
