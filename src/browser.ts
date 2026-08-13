@@ -21,7 +21,16 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 
 /** Where the image puts it. Named by the Dockerfile so a base-image change fails loudly. */
-const CHROMIUM = process.env.ENGINE_CHROMIUM ?? '/usr/bin/chromium-browser';
+/**
+ * Read at LAUNCH, not at import.
+ *
+ * It was a module-level `const`, so anything setting `ENGINE_CHROMIUM` after this module
+ * was imported — which is every test that wants to point the browser somewhere, and any
+ * caller configuring at runtime — was silently ignored and got `ENOENT` for the container
+ * default. A configuration variable that only works if you set it before an import you do
+ * not control is not a configuration variable.
+ */
+const chromium = () => process.env.ENGINE_CHROMIUM ?? '/usr/bin/chromium-browser';
 const PORT = 9222;
 const START_TIMEOUT_MS = 20_000;
 const CALL_TIMEOUT_MS = 30_000;
@@ -50,7 +59,7 @@ export class Browser {
   async start(): Promise<void> {
     if (this.socket) return;
     this.child = spawn(
-      CHROMIUM,
+      chromium(),
       [
         '--headless=new',
         // Chromium's own sandbox needs privileges this container does not have, and
@@ -200,7 +209,7 @@ export class Browser {
       // Fail fast on a spawn that never happened. Polling for twenty seconds for a
       // process that does not exist is a slow way to say the image is wrong.
       if (this.spawnFailure) {
-        throw new Error(`the browser could not be started: ${this.spawnFailure} (is ${CHROMIUM} present?)`);
+        throw new Error(`the browser could not be started: ${this.spawnFailure} (is ${chromium()} present?)`);
       }
       try {
         const response = await fetch(`http://127.0.0.1:${PORT}/json/version`, {
@@ -216,7 +225,7 @@ export class Browser {
     }
     // Named rather than a timeout with no cause: "the browser is not in this image"
     // and "the browser crashed on startup" are different operational faults.
-    throw new Error(`the browser did not come up on port ${PORT} (${last}); is ${CHROMIUM} present?`);
+    throw new Error(`the browser did not come up on port ${PORT} (${last}); is ${chromium()} present?`);
   }
 
   private send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
@@ -263,12 +272,34 @@ export class Browser {
       return;
     }
     if (message.method) {
-      for (const waiter of this.waiters.splice(0).filter((w) => w.event !== message.method)) {
-        this.waiters.push(waiter);
+      // RESOLVE the waiters this event is for, and put the rest back.
+      //
+      // This used to filter the matching waiter out of the list and drop it on the
+      // floor without ever calling `resolve`, so the promise `navigate()` awaits for
+      // `Page.loadEventFired` never settled. The `Promise.race` around it then always
+      // fell through to the 30-second ceiling — meaning EVERY navigation cost 30s and
+      // reported success, in the container as well as on a host. It is a performance
+      // bug that looks like a slow page, which is why it survived: nothing was ever
+      // wrong with the result, only with how long the agent waited for it.
+      const waiting = this.waiters.splice(0);
+      for (const waiter of waiting) {
+        if (waiter.event === message.method) waiter.resolve();
+        else this.waiters.push(waiter);
       }
       // Console output and browser log entries, kept bounded: an application that
       // logs in a loop must not fill host memory through a tool nobody is reading.
-      if (message.method === 'Runtime.consoleAPICalled' || message.method === 'Log.entryAdded') {
+      // `Runtime.exceptionThrown` as well as the two log channels.
+      //
+      // Without it an uncaught page exception was INVISIBLE: a page containing
+      // `<script>notAFunction()</script>` left `console()` reading `nothing logged`. That
+      // is the failure the browser exists to find — ADR-0006's amendment gave the agent a
+      // browser to see bugs it cannot find by reading, and a JavaScript error is the most
+      // common thing a rendered page gets wrong.
+      if (
+        message.method === 'Runtime.consoleAPICalled' ||
+        message.method === 'Log.entryAdded' ||
+        message.method === 'Runtime.exceptionThrown'
+      ) {
         if (this.log.length < 200) this.log.push(summarise(message.method, message.params ?? {}));
       }
     }
@@ -280,6 +311,17 @@ function summarise(method: string, params: Record<string, unknown>): string {
   if (method === 'Log.entryAdded') {
     const entry = params.entry as { level?: string; text?: string } | undefined;
     return `[${entry?.level ?? 'log'}] ${entry?.text ?? ''}`;
+  }
+  // An uncaught page exception, which used to be invisible: neither of the two log
+  // channels carries one, so a page whose script threw read as a page with nothing to
+  // say. Reported at `[error]` so it reads like what it is, with the first stack frame —
+  // the message alone rarely names the file.
+  if (method === 'Runtime.exceptionThrown') {
+    const details = params.exceptionDetails as
+      | { text?: string; url?: string; lineNumber?: number; exception?: { description?: string } }
+      | undefined;
+    const where = details?.url ? ` (${details.url}:${(details.lineNumber ?? 0) + 1})` : '';
+    return `[error] ${details?.exception?.description ?? details?.text ?? 'uncaught exception'}${where}`;
   }
   const args = (params.args as { value?: unknown; description?: string }[] | undefined) ?? [];
   const level = String(params.type ?? 'log');

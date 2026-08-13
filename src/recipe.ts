@@ -22,6 +22,7 @@
 // project is not a finding about their bug.
 
 import type pg from 'pg';
+import { redact } from './redact.js';
 import type { ToolHost } from './tools.js';
 
 /** One long-lived process the recipe declares, and how to know it came up. */
@@ -168,7 +169,11 @@ export async function replayRecipe(host: ToolHost, recipe: Recipe): Promise<Repl
     const code = Number(/\[exit (-?\d+)\]/.exec(result.output)?.[1] ?? (result.ok ? 0 : -1));
     steps.push({ step, exit_code: code, output: result.output });
     if (!result.ok) {
-      return { ready: false, steps, services, failed: `recipe step ${step} failed: ${command}` };
+      // REDACTED, because this string becomes `VERIFICATION_ABORTED.reason` and events are
+      // immutable: a recipe carries environment inline (`PORT=8080 node server.mjs`), and
+      // failure is exactly when a misconfigured credential appears in one. A secret
+      // written here could never be deleted (M6e).
+      return { ready: false, steps, services, failed: redact(`recipe step ${step} failed: ${command}`) };
     }
   }
 

@@ -22,6 +22,7 @@ import { promisify } from 'node:util';
 import { put } from './blobs.js';
 import type { ArtifactRef, RunEvent, VerificationPhase } from './events.js';
 import { PathRefused, resolveInside as confine } from './paths.js';
+import { redact } from './redact.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -73,7 +74,11 @@ export const MAX_REASON_CHARS = 2000;
 
 const abortReason = (error: Error): string => {
   const text = `${error.name}: ${error.message}`;
-  return text.length <= MAX_REASON_CHARS ? text : `${text.slice(0, MAX_REASON_CHARS)}… (truncated)`;
+  // Redacted here, at the ONE way this producer reaches an immutable event. A repro
+  // command is agent-chosen text and a recipe carries environment inline, so a reason
+  // is the likeliest place for a credential to land somewhere it can never be deleted.
+  const safe = redact(text);
+  return safe.length <= MAX_REASON_CHARS ? safe : `${safe.slice(0, MAX_REASON_CHARS)}… (truncated)`;
 };
 
 /**
