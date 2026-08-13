@@ -112,6 +112,12 @@ console.log(`registered repro    ${result.state.registeredRepro?.command ?? '(no
 for (const run of result.state.testRuns) {
   console.log(`  ${run.phase.padEnd(5)} exit=${run.exit_code} symptom_matched=${run.symptom_matched}`);
 }
+// The second arm. `unmeasured` here would mean the suite never ran on both commits,
+// which for a recipe that declares `test` is a bug rather than a property of the repo.
+console.log(`regression          ${result.state.regression}`);
+for (const run of result.state.suiteRuns) {
+  console.log(`  suite ${run.phase.padEnd(4)} exit=${run.exit_code} \`${run.command}\``);
+}
 console.log(`fix touched         ${result.state.fixDiff?.changed_files?.join(', ') ?? '(no fix)'}`);
 const verdict = confidence(result.state);
 console.log(`tier                ${verdict.tier} (confidence ${verdict.score}/${verdict.ceiling})`);
