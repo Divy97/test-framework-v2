@@ -50,9 +50,42 @@ const config = (over: Partial<Config> = {}): Config => ({
   ...over,
 });
 
-/** A `pg.Client` that answers only what the service actually asks it. */
-const fakeClient = (rows: unknown[] = []) =>
-  ({ query: vi.fn(async () => ({ rows, rowCount: rows.length })) }) as unknown as pg.Client;
+/**
+ * A `pg.Client` that answers per QUERY, not one shape for everything.
+ *
+ * It used to return the same rows to every question, which stopped working the moment
+ * the issue path asked two: is this repository still installed (M6a), and does it have an
+ * approved recipe. A single-shape fake made those indistinguishable, so a test about the
+ * recipe gate was silently exercising the installation gate instead.
+ */
+const fakeClient = (options: { installed?: boolean; recipe?: unknown } = {}) => {
+  const installed = options.installed ?? true;
+  return {
+    query: vi.fn(async (sql: string) => {
+      const rows =
+        typeof sql === 'string' && sql.includes('from installations')
+          ? installed
+            ? [{ repo: 'o/r', installation_id: 987654, account: 'o', connected_at: new Date(), removed_at: null }]
+            : []
+          : typeof sql === 'string' && sql.includes('from recipes')
+            ? options.recipe === undefined
+              ? []
+              : [{ recipe: options.recipe }]
+            : [];
+      return { rows, rowCount: rows.length };
+    }),
+  } as unknown as pg.Client;
+};
+
+/**
+ * A client that answers `loadRecipe`, i.e. an ONBOARDED repository.
+ *
+ * Since M6a an issue on a repository with no approved recipe starts no run at all, so
+ * every test about what a run receives has to say which repository it is talking about.
+ * Named rather than inlined because the distinction is the subject of two tests below and
+ * `fakeClient([])` silently means "not onboarded" now.
+ */
+const onboarded = () => fakeClient({ recipe: { install: 'npm ci', services: [], test: 'npm test' } });
 
 const delivery = (issueNumber = 41) => ({
   action: 'opened',
@@ -185,7 +218,7 @@ describe('a signed issue becomes a run', () => {
     const seen: RunRequest[] = [];
     const service = await serve({
       config: config(),
-      client: fakeClient(),
+      client: onboarded(),
       log: () => {},
       run: async (request) => {
         seen.push(request);
@@ -220,7 +253,7 @@ describe('a signed issue becomes a run', () => {
     const seen: RunRequest[] = [];
     const service = await serve({
       config: config(),
-      client: fakeClient(),
+      client: onboarded(),
       log: () => {},
       run: async (request) => {
         seen.push(request);
@@ -239,7 +272,7 @@ describe('a signed issue becomes a run', () => {
 
   it('creates the evidence store, so the first run has somewhere to write', async () => {
     const root = join(temp(), 'blobs');
-    const service = await serve({ config: config({ blobRoot: root }), client: fakeClient(), log: () => {}, run: async () => ok('r') });
+    const service = await serve({ config: config({ blobRoot: root }), client: onboarded(), log: () => {}, run: async () => ok('r') });
     services.push(service);
     expect(existsSync(join(root, '.evidence-store'))).toBe(true);
   });
@@ -248,7 +281,7 @@ describe('a signed issue becomes a run', () => {
     const lines: string[] = [];
     const service = await serve({
       config: config(),
-      client: fakeClient(),
+      client: onboarded(),
       log: (line) => lines.push(line),
       run: async () => ok('run-1', 'https://github.com/o/r/pull/7'),
     });
@@ -265,7 +298,7 @@ describe('a signed issue becomes a run', () => {
     const seen: RunRequest[] = [];
     const service = await serve({
       config: config(),
-      client: fakeClient(),
+      client: onboarded(),
       log: () => {},
       run: async (request) => {
         seen.push(request);
@@ -283,7 +316,7 @@ describe('a signed issue becomes a run', () => {
     const seen: RunRequest[] = [];
     const service = await serve({
       config: config(),
-      client: fakeClient(),
+      client: onboarded(),
       log: () => {},
       run: async (request) => {
         seen.push(request);
@@ -323,7 +356,7 @@ describe('the queue is the boundary, not an optimisation', () => {
 
     const service = await serve({
       config: config(),
-      client: fakeClient(),
+      client: onboarded(),
       log: () => {},
       run: async (request) => {
         concurrent += 1;
@@ -348,7 +381,7 @@ describe('the queue is the boundary, not an optimisation', () => {
     let second = false;
     const service = await serve({
       config: config(),
-      client: fakeClient(),
+      client: onboarded(),
       log: (line) => lines.push(line),
       run: async (request) => {
         if (request.intake.issueNumber === 1) throw new Error('no installation token');
@@ -362,7 +395,8 @@ describe('the queue is the boundary, not an optimisation', () => {
     await deliver(service.webhookPort, delivery(2));
     await service.drain();
 
-    expect(lines.join('\n')).toContain('no installation token');
+    // The first delivery's run throws; the queue survives and the second still runs.
+    expect(lines.join('\n')).toContain('could not start');
     expect(second).toBe(true);
   });
 });
@@ -373,7 +407,7 @@ describe('the recipe is per repository, and its absence is not an error', () => 
     const seen: RunRequest[] = [];
     const service = await serve({
       config: config(),
-      client: fakeClient([{ recipe }]),
+      client: fakeClient({ recipe }),
       log: () => {},
       run: async (request) => {
         seen.push(request);
@@ -386,26 +420,63 @@ describe('the recipe is per repository, and its absence is not an error', () => 
     expect(seen[0]!.recipe).toMatchObject({ install: 'npm ci' });
   });
 
-  it('runs with a null recipe and says so, rather than refusing the issue', async () => {
-    // ADR-0013: a repository with no recipe boots nothing and the agent is told. That is
-    // a Tier 3 waiting to happen, not a reason to drop the delivery on the floor.
+  it('starts NO run for a repository with no approved recipe, and says so on the issue', async () => {
+    // THIS TEST IS INVERTED, and the inversion is milestone 6a.
+    //
+    // It used to assert the opposite: that a missing recipe was "a Tier 3 waiting to
+    // happen, not a reason to drop the delivery on the floor". That reasoning was right
+    // about not dropping the delivery and wrong about what to do instead. With no recipe
+    // nothing boots, the agent is told there is no environment, and the overwhelmingly
+    // likely outcome is `not_reproduced` — "we could not reproduce this" written onto a
+    // stranger's issue, in an append-only log, about a bug we never had the means to look
+    // at. A user's first experience of the product was a confident wrong answer.
+    //
+    // The reproduce-first gate could not catch it either: ADR-0007 judges reproductions,
+    // and this failure is upstream of anything being reproduced.
     const lines: string[] = [];
     const seen: RunRequest[] = [];
+    const comments: { repo: string; issue: number; body: string }[] = [];
     const service = await serve({
       config: config(),
-      client: fakeClient([]),
+      client: fakeClient(),
       log: (line) => lines.push(line),
       run: async (request) => {
         seen.push(request);
         return ok('r');
       },
+      comment: async (repo, issue, body) => void comments.push({ repo, issue, body }),
     });
     services.push(service);
     await deliver(service.webhookPort, delivery());
     await service.drain();
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.recipe).toBeNull();
-    expect(lines.join('\n')).toMatch(/no recipe/);
+
+    // Zero runs. Not a cheap run, not a short run — none.
+    expect(seen).toHaveLength(0);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ repo: 'o/r', issue: 41 });
+    expect(comments[0]!.body).toMatch(/not onboarded yet/);
+    // And it says whose gap it is, rather than implying the report was inadequate.
+    expect(comments[0]!.body).toMatch(/no run was started/);
+    expect(lines.join('\n')).toMatch(/not onboarded/);
+  });
+
+  it('a failed comment does not take the service down, because the next issue is not this one', async () => {
+    // The comment is best-effort for the same reason `run.ts`'s is: GitHub being
+    // unreachable is our outage, and one unreachable repository must not stop the queue.
+    const lines: string[] = [];
+    const service = await serve({
+      config: config(),
+      client: fakeClient(),
+      log: (line) => lines.push(line),
+      run: async () => ok('r'),
+      comment: async () => {
+        throw new Error('github said no');
+      },
+    });
+    services.push(service);
+    await deliver(service.webhookPort, delivery());
+    await service.drain();
+    expect(lines.join('\n')).toMatch(/could not comment/);
   });
 });
 
@@ -490,5 +561,38 @@ describe('the setup document cannot drift from the calls we make', () => {
     const architecture = readFileSync(new URL('../docs/architecture-v1.5.md', import.meta.url), 'utf8');
     expect(architecture).toMatch(/issues: read and write/);
     expect(architecture).not.toMatch(/`contents: read and write` and `pull_requests: write` — nothing else/);
+  });
+
+  it('subscribes the operator to exactly the events intake() acts on', () => {
+    // The test milestone 6a asks for, and the one the permission set needed and did not
+    // have: "the permission set was wrong for a whole milestone because no document was
+    // ever checked against the code."
+    //
+    // An event `intake()` handles but the guide never mentions is a subscription nobody
+    // ticks, and its absence is silent — GitHub simply never delivers, which is
+    // indistinguishable from nothing happening. That is precisely how installation
+    // events would fail: the operator sees issues working and never learns that
+    // onboarding is deaf.
+    //
+    // Read off the source rather than restated, so adding an event to `intake()` without
+    // documenting it fails here.
+    // `[!=]==` because the issues branch is written as a guard — `if (event !== 'issues')
+    // return null` — and a regex looking only for equality found two of the three.
+    const handled = [...github.matchAll(/\bevent [!=]== '([a-z_]+)'/g)].map((match) => match[1]!).sort();
+    expect([...new Set(handled)]).toEqual(['installation', 'installation_repositories', 'issues']);
+
+    expect(guide).toMatch(/\*\*Issues\*\* \| `opened`, `labeled`/);
+    expect(guide).toMatch(/\*\*Installation\*\* \| `created`, `deleted`/);
+    expect(guide).toMatch(/\*\*Installation repositories\*\* \| `added`, `removed`/);
+    // And the guide no longer says the thing that stopped being true.
+    expect(guide).not.toMatch(/\*\*Issues only\.\*\*/);
+  });
+
+  it('says why an un-onboarded repository gets a comment rather than a run', () => {
+    // The behaviour change with the least visible failure mode: starting a run anyway
+    // produces a confident Tier 3 about a bug nothing ever had the means to look at, and
+    // writes it somewhere it cannot be deleted. A guide that does not explain the
+    // subscription's purpose gets it switched off by someone tidying.
+    expect(guide).toMatch(/no run starts at all/);
   });
 });

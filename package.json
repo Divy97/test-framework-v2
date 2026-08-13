@@ -9,7 +9,8 @@
     "seed": "tsx --env-file=.env src/cli.ts seed",
     "replay": "tsx --env-file=.env src/cli.ts replay",
     "status": "tsx --env-file=.env src/status.ts",
-    "serve": "tsx src/serve.ts"
+    "serve": "tsx src/serve.ts",
+    "rebuild": "tsx --env-file=.env src/cli.ts rebuild"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.116.0",

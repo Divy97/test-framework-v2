@@ -2271,6 +2271,9 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
         image: IMAGE,
         baseRef: fixture.base,
         repro,
+        // Required by `RunPlan` and omitted here, which had `npm run typecheck` red on
+        // main: the plan type demands it, and only the compiler was saying so.
+        symptomPattern: 'wrong',
         agentPrompt: 'fix it',
         flakeRuns: 0,
         // So the agent's commit outlives orchestrate's own workspace and can be inspected

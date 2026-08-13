@@ -37,7 +37,7 @@ import {
   openPullRequest,
   pushBranch,
   type GitHubApp,
-  type Intake,
+  type IssueIntake,
 } from './github.js';
 import { orchestrate, type RunPlan } from './orchestrate.js';
 import { describeEnvironment, renderPrompt } from './prompts.js';
@@ -47,7 +47,12 @@ import { issueComment, pullRequestBody, pullRequestTitle } from './report.js';
 const execFileAsync = promisify(execFile);
 
 export type RunRequest = {
-  intake: Intake;
+  /**
+   * An ISSUE intake specifically. `intake()` also maps installation deliveries now
+   * (M6a), and those carry no issue to comment on and no reported text — this function
+   * would have to invent both to accept one.
+   */
+  intake: IssueIntake;
   app: GitHubApp;
   /** Null for a repository with no recipe yet. Nothing boots, and the agent is told so. */
   recipe: Recipe | null;

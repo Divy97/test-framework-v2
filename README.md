@@ -53,6 +53,24 @@ There is **no runs table**. A run's state exists only as a fold over its events.
 
 The full target architecture, with the user's flow step by step: [docs/architecture-v1.5.md](docs/architecture-v1.5.md).
 
+## The dashboard, and why it holds nothing
+
+The surface is server-rendered HTML on the same port as the live tail — `/` , `/repos`,
+`/runs`, and `/runs/<id>`. No framework and no build step, for the same reason
+`src/github.ts` speaks HTTP by hand and `src/browser.ts` speaks the DevTools protocol by
+hand: a dependency here would be a large surface for a few pages.
+
+The interesting screen is `/runs/<id>`. It shows base red for the reported symptom, fix
+green, the regression arm, and every confidence point beside the `sha256:` it rests on —
+and on a Tier 3 it shows the gate **refusing to attempt a fix**, with no diff at all.
+Every other product in this category has a run list; the screen that is rare is the one
+where a refusal is as legible as a success.
+
+**Delete the entire dashboard database and it rebuilds from the log.** `npm run rebuild`
+drops `run_projection` and replays `events` into byte-identical rows. That is the property
+that makes "there is no runs table" still true with a runs table in the schema: the table
+holds no truth, and a test drops it, replays, and compares the bytes.
+
 ## Two credentials, and where they are not
 
 The agent sandbox holds **neither** the model API key nor the GitHub token.
@@ -156,6 +174,15 @@ The engine works; the product does not exist yet.
 **Still not true, and this is the honest list:** no GitHub App is registered, so nothing here has been accepted by GitHub — a bare repository on disk stood in for the remote, and the real run's pull request was opened against a recording `fetch`. The real run is a run, not a suite: one bug, one model, four attempts, and the other three seeded bugs have never been driven by a real agent. `/blobs` remains append-only by convention rather than construction. Diff-coverage is still not built, so an agent-authored reproduction still cannot earn Tier 1 — the real run capped at Tier 2 for exactly that reason. And the real run exposed one thing about the agent rather than the engine: `git_commit` stages everything, so the recipe's `npm install` left `package-lock.json` in the fix diff, which rule 4 of the fix prompt tells the agent not to do.
 
 And nothing in [milestone 7](docs/milestone-7.md) has been driven by a real model: the prompt changes in it are green under a *scripted* agent, which the four defects above establish proves nothing about what a prompt says. That is a run away, not a rewrite — but until it happens the status of those changes is unverified, and saying otherwise would be the exact failure this section exists for.
+
+**Milestone 6 landed the product around the run** — installations recorded so an
+un-onboarded repository is answered rather than run against, recipe approval in the
+browser, the read model and its rebuild, what a run cost, redaction, and the dashboard
+([milestone 6](docs/milestone-6.md)). Two things in it are deliberately absent and both
+are named there: the drafting run that *proposes* a recipe (the approval is the control,
+and drafting needs a model credential this repository does not have), and the
+environment-variable UI, which that phase itself blocks on a security ADR that does not
+exist.
 
 **Deliberately not in v1.5:** Slack and CLI connectors · the dashboard · deployment and preview URLs · multi-repo runs · LSP tools · diff-coverage · observability-triggered runs.
 

@@ -12,6 +12,7 @@ import { readFile } from 'node:fs/promises';
 import { confidence } from './confidence.js';
 import { apply, fold, type RunState } from './fold.js';
 import { DEMO_RUN_ID, demoRunEvents } from './fixtures/demo-run.js';
+import { rebuildProjection } from './readmodel.js';
 import { loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
 import { appendEvent, connect, readRun } from './store.js';
 
@@ -63,6 +64,17 @@ try {
     }
     console.log('  not measured:');
     for (const gap of score.unmeasured) console.log(`        ${gap}`);
+  } else if (command === 'rebuild') {
+    // The claim, as a command (M6c). "Delete the entire dashboard database and it
+    // rebuilds from the log" is the most interesting property this milestone produces,
+    // and a property is worth what the thing demonstrating it is worth — so it is a
+    // command an operator can run rather than a sentence in a README.
+    //
+    // Safe by construction: `run_projection` holds no truth. Every column is recomputed
+    // by `projectRun` from `events`, which is append-only and untouched here.
+    const rebuilt = await rebuildProjection(client);
+    console.log(`dropped the projection and replayed ${rebuilt} run(s) out of the log`);
+    console.log('nothing was lost: every column is derived, and `events` was only read');
   } else if (command === 'recipe' && arg === 'show') {
     const recipe = await loadRecipe(client, arg2!);
     console.log(recipe === null ? `no recipe for ${arg2}` : JSON.stringify(recipe, null, 2));
@@ -91,7 +103,7 @@ try {
     console.log(`Stored. ${repo} will replay this and never re-derive it.`);
   } else {
     console.error(
-      'usage: cli.ts seed | replay <run_id> | recipe show <owner/repo> | ' +
+      'usage: cli.ts seed | replay <run_id> | rebuild | recipe show <owner/repo> | ' +
         'recipe approve <draft.json> <owner/repo>',
     );
     process.exit(1);

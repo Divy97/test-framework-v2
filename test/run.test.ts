@@ -18,7 +18,21 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import type { RunEvent } from '../src/events.js';
 import { confidence } from '../src/confidence.js';
-import { intake, startWebhookReceiver } from '../src/github.js';
+import { intake, startWebhookReceiver, type IssueIntake } from '../src/github.js';
+
+/**
+ * `intake()` for an issue delivery, narrowed.
+ *
+ * It returns a union since M6a — installation deliveries carry no issue — and
+ * `runFromIssue` takes the issue arm specifically. Narrowing here rather than casting at
+ * each call site means a delivery that stops mapping to an issue fails loudly, in the
+ * test, rather than being asserted into the right shape.
+ */
+const issueIntake = (payload: unknown): IssueIntake => {
+  const mapped = intake('issues', payload);
+  if (!mapped || mapped.kind !== 'issue') throw new Error('the delivery did not map to an issue');
+  return mapped;
+};
 import { runFromIssue, symptomFrom } from '../src/run.js';
 import { call, fakeModel, type FakeModel } from './fixtures/model.js';
 import { cleanupFixtures, demoRecipe, demoRepo } from './fixtures/repo.js';
@@ -250,7 +264,7 @@ describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no h
     models.push(model);
 
     const events: RunEvent[] = [];
-    const mapped = intake('issues', delivery('It says "Ordres" instead of "Orders".'))!;
+    const mapped = issueIntake(delivery('It says "Ordres" instead of "Orders".'));
     const result = await runFromIssue({
       intake: mapped,
       app: { appId: '123456', privateKeyPem: PEM, api: 'https://api.test.invalid', fetch: recorder },
@@ -378,7 +392,7 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
     const model = await fakeModel(options.turns);
     models.push(model);
     const events: RunEvent[] = [];
-    const mapped = intake('issues', { ...delivery(options.body), issue: { ...delivery(options.body).issue, title: options.title } })!;
+    const mapped = issueIntake({ ...delivery(options.body), issue: { ...delivery(options.body).issue, title: options.title } });
     const result = await runFromIssue({
       intake: mapped,
       app: { appId: '123456', privateKeyPem: PEM, api: 'https://api.test.invalid', fetch: recorder },
@@ -594,10 +608,10 @@ describe.skipIf(!dockerAvailable())('shipped-filter: an API bug the agent needs 
 
     const events: RunEvent[] = [];
     const body = '/api/orders?status=shipped returns every order, including pending ones.';
-    const mapped = intake('issues', {
+    const mapped = issueIntake({
       ...delivery(body),
       issue: { ...delivery(body).issue, title: 'The shipped filter returns everything' },
-    })!;
+    });
     const result = await runFromIssue({
       intake: mapped,
       app: { appId: '123456', privateKeyPem: PEM, api: 'https://api.test.invalid', fetch: recorder },

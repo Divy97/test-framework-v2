@@ -1,5 +1,5 @@
 ---
-status: draft
+status: built, except 6e's UI and 6b's drafting run
 ---
 
 # Milestone 6 — the product around the run
@@ -15,6 +15,39 @@ the code** — the App's permission set, the installation flow, and a claim that
 queue provided a guarantee it did not. Every one was found by running the thing, not
 by reading. So each phase below names the test that would catch its document going
 stale.
+
+## What was built, and what was not
+
+| | |
+|---|---|
+| **6a** installations recorded, un-onboarded repositories answered rather than run | built |
+| **6b** the approval that stores a recipe, in the browser | built |
+| **6b** the *drafting* run that proposes one | **not built** — see below |
+| **6c** the read model, `npm run rebuild`, `/runs`, `/api/runs` | built |
+| **6d** `run_usage` beside the log | built |
+| **6e** redaction | built |
+| **6e** the environment-variable UI | **deliberately not built** |
+| **6f** landing page, repository list, run list, evidence view | built |
+
+**6b's drafting run is not built, and the half that matters is.** ADR-0013's flow is
+*draft, correct, confirm* — and the control is the confirmation, not the draft: "the
+approval is the only control there is on a stored command we will execute". That is what
+`/repos/<repo>/onboard` does, and it is what a person can use today. Drafting is a
+convenience that needs a model credential, and this repository does not have a working one
+— so building it would have meant shipping a button nobody had pressed.
+
+**6e's UI is not built and that is the phase's own instruction**: it "must not be built as
+a form until the decision is made". The decision — an ADR about whether a user's
+credentials may enter a sandbox that holds an untrusted agent with network egress — does
+not exist. What *was* built is the half 6e says to do first and which is worth doing
+regardless: redaction, so a secret cannot reach a payload, a blob or a log line. The leak
+was real before any UI, because a recipe carries environment inline and a failing step put
+the command into `VERIFICATION_ABORTED.reason`, which is append-only forever.
+
+**The evidence view is the point of this milestone**, and it is built: base red for the
+reported symptom, fix green, the regression arm, every confidence point beside the
+`sha256:` it rests on, and — on a Tier 3 — the gate visibly refusing to attempt a fix,
+with no diff section at all.
 
 ## What this is not
 

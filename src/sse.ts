@@ -108,18 +108,90 @@ export async function tailRun(options: TailOptions): Promise<void> {
 export type StatusServer = { port: number; close: () => Promise<void> };
 
 /**
- * The one HTTP surface v1.5 has.
+ * A route this server does not itself know how to answer.
  *
- * `GET /runs/:runId/events` and nothing else. The dashboard is M6; the user-facing
- * surface in v1.5 is the issue comment, and this exists so a run is watchable while
- * it happens rather than as a product feature.
+ * The dashboard (M6f) needs pages and JSON; this module needs to stay a thing a test can
+ * drive with no database, which is why `read` is injected rather than a `pg.Client`. So
+ * the extra surface arrives the same way: as a function the caller closes over its own
+ * client, returning what to send. `null` means "not mine", and the 404 stands.
  */
-export function startStatusServer(options: { read: ReadEvents; port?: number }): Promise<StatusServer> {
+export type Route = (request: {
+  method: string;
+  path: string;
+  query: URLSearchParams;
+  /**
+   * The request body, read on demand and bounded.
+   *
+   * A function rather than a string because every route here except one is a GET, and
+   * buffering a body for those would make the server wait on a stream that will never
+   * carry anything. The one POST is a human approving commands we will execute.
+   */
+  body: () => Promise<string>;
+}) => Promise<{ status: number; type: string; body: string; headers?: Record<string, string> } | null>;
+
+/** Ceiling on a request body. The only write takes a recipe, and a recipe is small. */
+const MAX_BODY_BYTES = 256 * 1024;
+
+/**
+ * The HTTP surface.
+ *
+ * It was `GET /runs/:runId/events` and nothing else, with a comment saying the dashboard
+ * was M6 — this is M6, so the SSE route is now one of several and the rest arrive through
+ * `routes`. The tail keeps its own branch rather than becoming a `Route`, because its
+ * response lifecycle is unlike every other: headers immediately, a body that never ends,
+ * and a completion that depends on the client hanging up.
+ */
+export function startStatusServer(options: {
+  read: ReadEvents;
+  port?: number;
+  routes?: Route;
+}): Promise<StatusServer> {
   const server: Server = createServer((request: IncomingMessage, response: ServerResponse) => {
-    const match = /^\/runs\/([^/]+)\/events$/.exec((request.url ?? '').split('?')[0] ?? '');
+    const path = (request.url ?? '').split('?')[0] ?? '';
+    const match = /^\/runs\/([^/]+)\/events$/.exec(path);
     if (request.method !== 'GET' || !match) {
-      response.writeHead(404, { 'content-type': 'text/plain' });
-      response.end('not found\n');
+      const handler = options.routes;
+      if (!handler) {
+        response.writeHead(404, { 'content-type': 'text/plain' });
+        response.end('not found\n');
+        return;
+      }
+      // Awaited out here with a catch that always answers. An unhandled rejection in a
+      // request handler takes the process down, and `startWebhookReceiver` records that
+      // reasoning for the webhook path — a dashboard query that throws must cost a 500,
+      // not the service.
+      void handler({
+        method: request.method ?? 'GET',
+        path,
+        query: new URL(request.url ?? '/', 'http://127.0.0.1').searchParams,
+        body: () =>
+          new Promise<string>((resolve, reject) => {
+            const chunks: Buffer[] = [];
+            let bytes = 0;
+            request.on('data', (chunk: Buffer) => {
+              bytes += chunk.length;
+              // Stop BUFFERING past the ceiling but keep draining, exactly as the webhook
+              // receiver does: destroying the request mid-body gives the client a reset
+              // rather than the refusal we mean to send.
+              if (bytes <= MAX_BODY_BYTES) chunks.push(chunk);
+            });
+            request.on('error', reject);
+            request.on('end', () => resolve(Buffer.concat(chunks).toString()));
+          }),
+      })
+        .then((answer) => {
+          if (!answer) {
+            response.writeHead(404, { 'content-type': 'text/plain' });
+            response.end('not found\n');
+            return;
+          }
+          response.writeHead(answer.status, { 'content-type': answer.type, ...answer.headers });
+          response.end(answer.body);
+        })
+        .catch((error: unknown) => {
+          response.writeHead(500, { 'content-type': 'text/plain' });
+          response.end(`${String((error as Error)?.message ?? error)}\n`);
+        });
       return;
     }
     const runId = decodeURIComponent(match[1]!);

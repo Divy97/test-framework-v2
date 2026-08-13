@@ -29,11 +29,14 @@ import { readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type pg from 'pg';
-import type { Intake } from './github.js';
-import { startWebhookReceiver } from './github.js';
+import type { InstallationIntake, IssueIntake } from './github.js';
+import { commentOnIssue, installationToken, startWebhookReceiver } from './github.js';
 import { MODEL, effortLevel, providerName } from './loop.js';
 import { DEFAULT_OPENROUTER_MODEL } from './openrouter.js';
+import { loadInstallation, recordInstallation, removeInstallation } from './installations.js';
+import { projectOne, saveUsage } from './readmodel.js';
 import { loadRecipe } from './recipe.js';
+import { dashboardRoutes } from './routes.js';
 import { runFromIssue } from './run.js';
 import { startStatusServer } from './sse.js';
 import { appendEvent, connect, readRunAfter } from './store.js';
@@ -164,6 +167,14 @@ export type ServeOptions = {
   client: pg.Client;
   /** Injected so a test can watch a run start without spending a model or a container. */
   run?: typeof runFromIssue;
+  /**
+   * How the service talks back to an issue, injected for the same reason `run` is.
+   *
+   * The un-onboarded reply is the first message this product ever sends, so it needs a
+   * test — and a test that mints a real installation token to assert on a sentence would
+   * be a test nobody can run.
+   */
+  comment?: (repo: string, issueNumber: number, body: string, installationId: number) => Promise<void>;
   log?: (line: string) => void;
 };
 
@@ -183,19 +194,107 @@ export async function serve(options: ServeOptions): Promise<Service> {
   const { config, client } = options;
   const log = options.log ?? ((line: string) => console.log(line));
   const start = options.run ?? runFromIssue;
+  const app = { appId: config.appId, privateKeyPem: config.privateKeyPem };
+  const comment =
+    options.comment ??
+    (async (repo: string, issueNumber: number, body: string, installationId: number) => {
+      // Minted per message, never cached — a service outlives an hour and ADR-0012 makes
+      // the mint a function for exactly that reason.
+      // `{}` rather than `app`: minting needs the key material, commenting needs only a
+      // token and takes `Pick<GitHubApp,'fetch'|'api'>` so that no key can reach it.
+      await commentOnIssue({}, await installationToken(app, installationId), repo, issueNumber, body);
+    });
   await ensureBlobRoot(config.blobRoot);
 
   // A queue of one — see the header. A resource policy, not a port constraint.
   let tail: Promise<void> = Promise.resolve();
 
-  const enqueue = (intake: Intake): void => {
+  /**
+   * Tell the reporter their repository is not set up yet, and say who can fix it.
+   *
+   * The one message that has to be right, because it is the first the product ever sends
+   * and it is about our own gap rather than their bug. It names what is missing, says
+   * plainly that nothing was attempted, and does not dress that up as a finding.
+   */
+  const sayNotOnboarded = async (intake: IssueIntake): Promise<void> => {
+    const body =
+      `This repository is connected but **not onboarded yet**, so no run was started.\n\n` +
+      `Before anything can be reproduced here, someone has to approve an environment ` +
+      `recipe — the commands that install, migrate, seed and boot this project — and ` +
+      `nothing in a repository reliably says what those are (ADR-0013).\n\n` +
+      `Until then this is the honest answer. Starting a run anyway would boot nothing, ` +
+      `reproduce nothing, and report that we could not reproduce your bug — which would ` +
+      `be a statement about our setup wearing the shape of a finding about your code.\n\n` +
+      `**Next:** approve a recipe for \`${intake.repo}\`, then re-label this issue.`;
+    await comment(intake.repo, intake.issueNumber, body, intake.installationId);
+  };
+
+  /**
+   * An installation delivery, which is how a repository first becomes known to us.
+   *
+   * Recorded rather than run: nothing is reproduced here, and the onboarding that follows
+   * needs a human to approve a recipe before any run can boot anything (ADR-0013).
+   */
+  const record = (intake: InstallationIntake): void => {
+    tail = tail.then(async () => {
+      try {
+        for (const repo of intake.repos) {
+          if (intake.action === 'added') {
+            await recordInstallation(client, {
+              repo,
+              installationId: intake.installationId,
+              account: intake.account,
+            });
+            const recipe = await loadRecipe(client, repo);
+            log(`${repo}: installed${recipe ? '' : ' — not onboarded yet, no recipe approved'}`);
+          } else {
+            await removeInstallation(client, repo);
+            log(`${repo}: removed`);
+          }
+        }
+      } catch (error) {
+        log(`installation ${intake.installationId}: could not record — ${String((error as Error).message ?? error)}`);
+      }
+    });
+  };
+
+  const enqueue = (intake: IssueIntake): void => {
     tail = tail.then(async () => {
       const label = `${intake.repo}#${intake.issueNumber}`;
       try {
-        // Per-repository, and `null` is a legitimate answer: a repo with no recipe boots
-        // nothing and the agent is told so (ADR-0013). It is not an error to be caught.
+        // THE ONBOARDING GATE (M6a). No recipe, no run — and a comment saying so.
+        //
+        // This used to start the run anyway. With `recipe: null` nothing boots, the agent
+        // is told there is no environment, and the overwhelmingly likely outcome is a
+        // Tier 3: "we could not reproduce this" written onto a stranger's issue, in an
+        // append-only log, about a bug we never had the means to look at. A user's first
+        // experience of the product was a wrong answer, and a confident one.
+        //
+        // Refusing here is not a lesser outcome than a Tier 3; it is the honest one. The
+        // gate ADR-0007 protects judges reproductions, and this failure is upstream of
+        // anything being reproduced, so no gate could have caught it.
+        // REMOVED means removed (M6a's third done-when, which was unimplemented). The
+        // gate consulted `loadRecipe` only, and `removeInstallation` deliberately leaves
+        // the `recipes` row alone — so an issue on an uninstalled repository still found
+        // its recipe, started a full five-container run, and failed minutes later at the
+        // token mint with a message about authentication rather than about not being
+        // installed.
+        //
+        // GitHub stops delivering after an uninstall, so this is not a hole anyone walks
+        // through; it is a stated done-when, and a redelivery reaches it.
+        if (!(await loadInstallation(client, intake.repo))) {
+          log(`${label}: not installed — ignoring`);
+          return;
+        }
+
         const recipe = await loadRecipe(client, intake.repo);
-        if (!recipe) log(`${label}: no recipe for this repository — nothing will be booted`);
+        if (!recipe) {
+          log(`${label}: not onboarded — commenting, and starting no run`);
+          await sayNotOnboarded(intake).catch((error) => {
+            log(`${label}: could not comment — ${String((error as Error).message ?? error)}`);
+          });
+          return;
+        }
 
         const result = await start({
           intake,
@@ -219,6 +318,29 @@ export async function serve(options: ServeOptions): Promise<Service> {
         }
         log(`${label}: phases=${(result.diagnostics ?? []).length} env=${JSON.stringify(result.state.env ?? null)}`);
 
+        // WHAT IT COST, banked rather than logged and dropped (M6d). Not an event: our
+        // spending is a fact about us, and the log is about the user's bug (ADR-0006).
+        for (const entry of result.usage ?? []) {
+          await saveUsage(client, {
+            run_id: result.runId,
+            phase: entry.phase,
+            turns: entry.usage.turns,
+            input_tokens: entry.usage.input_tokens,
+            output_tokens: entry.usage.output_tokens,
+            cache_read_input_tokens: entry.usage.cache_read_input_tokens,
+            cache_creation_input_tokens: entry.usage.cache_creation_input_tokens,
+            provider: config.loop.provider,
+            model: config.loop.model,
+          }).catch((error) => log(`${label}: could not record usage — ${String((error as Error).message ?? error)}`));
+        }
+
+        // And the read model, from the log rather than from `result` (M6c). Projecting
+        // off the events means the row is exactly what a rebuild would produce; taking it
+        // from the in-memory result would let the two drift and only a rebuild would say.
+        await projectOne(client, result.runId).catch((error) =>
+          log(`${label}: could not project — ${String((error as Error).message ?? error)}`),
+        );
+
         const spent = (result.usage ?? []).reduce((total, entry) => total + entry.usage.output_tokens, 0);
         log(
           `${label}: run ${result.runId} ended ${result.state.status}` +
@@ -238,6 +360,11 @@ export async function serve(options: ServeOptions): Promise<Service> {
     secret: config.webhookSecret,
     port: config.webhookPort,
     onIntake: (intake) => {
+      if (intake.kind === 'installation') {
+        log(`installation ${intake.installationId}: ${intake.action} ${intake.repos.join(', ')}`);
+        record(intake);
+        return;
+      }
       log(`${intake.repo}#${intake.issueNumber}: queued`);
       enqueue(intake);
     },
@@ -246,6 +373,9 @@ export async function serve(options: ServeOptions): Promise<Service> {
   const events = await startStatusServer({
     port: config.eventsPort,
     read: (runId, afterSeq) => readRunAfter(client, runId, afterSeq),
+    // The dashboard shares the tail's port rather than binding a third (M6f). One
+    // surface, one thing to expose, and the live tail a run page needs is already here.
+    routes: dashboardRoutes({ client }),
   });
 
   return {

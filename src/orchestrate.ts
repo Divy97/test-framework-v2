@@ -36,6 +36,7 @@ import { runAgentLoop, type AgentTranscript, type LoopUsage } from './loop.js';
 import type { Recipe, ReplayOutcome } from './recipe.js';
 import { isWorkerReply, type Job, type WorkerRequest } from './runner.js';
 import { get, put } from './blobs.js';
+import { redact } from './redact.js';
 import type { ReproSpec } from './verify.js';
 import { MAX_REASON_CHARS } from './verify.js';
 
@@ -523,7 +524,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
               v: 1,
               phase: 'setup',
               cause: 'environment',
-              reason: (result.envReport.failed ?? 'the environment did not come up').slice(0, MAX_REASON_CHARS),
+              reason: redact(result.envReport.failed ?? 'the environment did not come up').slice(0, MAX_REASON_CHARS),
             },
           }),
         );
@@ -572,7 +573,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
               v: 1,
               phase: 'setup',
               cause: 'handover',
-              reason: result.handoverReport.slice(0, MAX_REASON_CHARS),
+              reason: redact(result.handoverReport).slice(0, MAX_REASON_CHARS),
             },
           }),
         );
@@ -673,7 +674,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
               v: 1,
               phase: 'setup',
               cause: 'handover',
-              reason: (stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS),
+              reason: redact(stale || 'the agent handed nothing over').slice(0, MAX_REASON_CHARS),
             },
           }),
         );
@@ -706,7 +707,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
               v: 1,
               phase: 'setup',
               cause: 'handover',
-              reason: String((error as Error).message).slice(0, MAX_REASON_CHARS),
+              reason: redact(String((error as Error).message)).slice(0, MAX_REASON_CHARS),
             },
           }),
         );
@@ -1296,7 +1297,7 @@ async function runContainer(
           // Not `verify()`'s. Without saying so, the fold reads this as proof the
           // fix series completed — see the witness rule in fold.ts.
           cause: 'collection',
-          reason: collection.slice(0, MAX_REASON_CHARS),
+          reason: redact(collection).slice(0, MAX_REASON_CHARS),
         },
       }),
     );
