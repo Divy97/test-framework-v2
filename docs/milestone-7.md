@@ -155,6 +155,40 @@ and coverage instrumentation becomes *possible* in the phase container, which is
 precondition for diff-coverage — still the only measurement that would lift an
 agent-authored reproduction above Tier 2.
 
+### 7e · landed, on `feat/the-environment-is-a-snapshot`
+
+Everything above stands as the statement of the problem. The fix is not the shape it
+sketches, in three ways that matter:
+
+**The snapshot is not taken from the agent's container.** It is a build container of
+its own, from `plan.image` and never `agentImage`, so the phases cannot inherit a
+browser (ADR-0006's amendment) — and it runs *before the agent container is created*,
+from the base commit's source. That is what makes the restored gitignored paths safe:
+not that the agent was restrained, but that it did not exist yet. The cost is a second
+install, since the agent replays the recipe in its own sandbox, and it is paid
+knowingly to keep the image that judges the sealed one.
+
+**Only `install`, `migrate` and `seed` are replayed** (`services: []`). A booted
+service is a process and a process does not survive `docker commit`; what crosses into
+the phases is a filesystem.
+
+**The restore is per clone, not after the scrub.** The build records what it wrote —
+`git status --ignored`, so `vendor/`, `.venv` and `target/` are covered as well as
+`node_modules/` — and `world()` hardlinks each path into the phase's fresh clone
+before the chown. `git clean -xdff` is left doing the only job it was for. A container
+per phase is what lets both be true at once.
+
+The host commits `engine-env:<runId>`, runs base and fix from it with `--network none`
+intact, and removes it in the same `finally` that removes the workspace. A build that
+fails ends the run `errored` with `cause: 'environment'`; it never degrades quietly to
+a phase container with nothing installed.
+
+**The pinned defect did not go green, and should not have.** `verify.test.ts` calls
+`verify()` directly, with a checkout and no container to install into, so it still
+asserts exit 127 and is still correct. The claim moved one layer up: `sandbox.test.ts`
+§7e runs the same fixture and the same reproduction through the containers as a pair —
+REPRODUCED with a recipe, NOT REPRODUCED without one.
+
 ## What this milestone did not touch, and should
 
 Named here so the next session starts from the analysis rather than redoing it.
