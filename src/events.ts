@@ -229,7 +229,18 @@ export type AgentFinishedV1 = {
    * ceiling. A ceiling that reports itself as success is the failure class this project
    * exists to refuse, and it was in our own loop.
    */
-  stopped: 'exit' | 'line_cap' | 'byte_cap' | 'timeout' | 'turn_cap' | 'spawn_failed';
+  /**
+   * `malformed_tool_call` joined them for the same reason `turn_cap` did, and was found
+   * the same way — by running a real model rather than by reading.
+   *
+   * A reasoning model can end a turn *inside* its reasoning: no content, no tool call,
+   * `finish_reason: 'stop'`, nowhere near a length cap. It has not decided to stop; it
+   * has failed to emit what it was about to do. Reported as `exit`, that became "the
+   * agent handed over a commit the repository already had" — an accusation of idleness
+   * against a model that had explored the repository, driven the browser, seen the bug
+   * and written the reproduction, and got as far as planning the commit.
+   */
+  stopped: 'exit' | 'line_cap' | 'byte_cap' | 'timeout' | 'turn_cap' | 'malformed_tool_call' | 'spawn_failed';
 };
 
 /**

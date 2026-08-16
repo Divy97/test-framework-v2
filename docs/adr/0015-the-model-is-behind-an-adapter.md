@@ -96,6 +96,34 @@ reports, which is the entire point of the tier existing. A cheap model cannot ma
 engine *lie* — the gate is executed evidence, not testimony — it can only make it
 report less. That asymmetry is what makes this safe to offer.
 
+## What a working key later showed: the probe has a reach, and this is it
+
+`probeToolCalling` screens a model that **cannot** make a structured tool call. It cannot
+screen one that **stops making them**, and the difference is not academic —
+`moonshotai/kimi-k2-thinking` passed the probe and then failed two consecutive runs by
+ending a turn inside its own reasoning: once leaking its next call as text
+(`<|tool_call_begin|>functions.read…`), once stopping mid-sentence while planning the
+commit. Seven good structured calls, then nothing, `finish_reason: 'stop'`, far under any
+length cap.
+
+This ADR predicted the *shape* exactly — "a model that writes its tool call into visible
+text produces a turn that completes successfully with nothing executed… indistinguishable
+from a genuine Tier 3" — and put the defence in the wrong place. One turn at the start
+cannot see a model degrade at turn eight.
+
+So the check moved to where the evidence is: `stopped: 'malformed_tool_call'`, set when a
+turn ends with reasoning present, no content and no tool call. Narrow on purpose, with a
+negative control — a model that is genuinely done says so in `content`, and
+`prompts/repro.md` explicitly asks for that when a bug cannot be reproduced.
+
+The probe stays. It still catches the model that never could, cheaply, before a run. It is
+now documented as covering the entry case and not the degradation case.
+
+**And the adapter earned its keep in the other direction.** Swapping to
+`anthropic/claude-sonnet-5` was one environment variable and took the same issue to a
+credited Tier 2 at 98/103 in 95 seconds for $0.064. "The LLM is a replaceable component"
+stopped being a claim the moment replacing it was the fix.
+
 ## What the first real run changed
 
 This ADR was written before a key existed. One arrived, and four attempts on the

@@ -197,6 +197,48 @@ describe('the ceilings are real', () => {
     expect(transcript.exitCode).toBe(-1);
   });
 
+  it('names a turn that ended inside the reasoning, rather than calling it a finish', async () => {
+    // Measured on a real model, twice, before this existed. `moonshotai/kimi-k2-thinking`
+    // ends turns inside its own reasoning: once leaking its next call as text
+    // (`<|tool_call_begin|>functions.read…`), once stopping mid-sentence while planning
+    // the commit — both `finish_reason: 'stop'`, both far under any length cap.
+    //
+    // The second run had explored the repository, driven the browser, seen the bug and
+    // written the reproduction. It never reached `git_commit`, so the run reported "the
+    // agent handed over a commit the repository already had": an accusation of idleness
+    // against a model that had done nearly everything. That is the same failure class
+    // `turn_cap` above exists for — a fault reporting itself as a choice.
+    //
+    // `probeToolCalling` cannot catch it (ADR-0015): it is one turn, and this model makes
+    // structured calls perfectly well for seven of them first.
+    model = await fakeChat([{ reasoning: 'I will read the test file next and then commit' }]);
+    const transcript = await runOpenRouterLoop({
+      prompt: 'p',
+      invoke: recorder().invoke,
+      apiKey: 'k',
+      baseURL: model.baseURL,
+    });
+    expect(transcript.stopped).toBe('malformed_tool_call');
+    expect(transcript.exitCode).toBe(-1);
+    expect(JSON.stringify(transcript.lines)).toMatch(/failed to emit what it was about to do/);
+  });
+
+  it('leaves a model that answers in prose alone, because that is a real ending', async () => {
+    // The other half, and what keeps the check narrow. A model that is genuinely done
+    // says so in `content` — including one that thought first. Keying on "no tool call"
+    // alone would convict every honest refusal, and `prompts/repro.md` asks for exactly
+    // that when a bug cannot be reproduced: "say so plainly and commit nothing".
+    model = await fakeChat([{ reasoning: 'weighing it up', content: 'I cannot reproduce this.' }]);
+    const transcript = await runOpenRouterLoop({
+      prompt: 'p',
+      invoke: recorder().invoke,
+      apiKey: 'k',
+      baseURL: model.baseURL,
+    });
+    expect(transcript.stopped).toBe('exit');
+    expect(transcript.exitCode).toBe(0);
+  });
+
   it('does not cry turn_cap when the model simply finished', async () => {
     // The other half, and the one that makes the value mean something: a model that ends
     // its own conversation on the last permitted turn finished, and must not be recorded

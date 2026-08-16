@@ -287,6 +287,34 @@ export async function runOpenRouterLoop(options: OpenRouterOptions): Promise<Age
       break;
     }
     if (toolCalls.length === 0) {
+      // A turn that ended inside the model's own REASONING, with nothing said and
+      // nothing called, is not a model that finished — and reporting it as one is the
+      // failure class `turn_cap` below was added for.
+      //
+      // Measured, not guessed: two consecutive `moonshotai/kimi-k2-thinking` runs died
+      // exactly here. One leaked its next call as text in the reasoning
+      // (`<|tool_call_begin|>functions.read…`), the other stopped mid-sentence while
+      // planning its next action — both with `finish_reason: 'stop'`, both well under
+      // any length cap. The second had already written its reproduction and simply never
+      // reached `git_commit`, so the run reported "the agent handed over a commit the
+      // repository already had": an accusation of doing nothing, against a model that
+      // had done nearly everything.
+      //
+      // `probeToolCalling` cannot catch this (ADR-0015) — it is one turn, and this model
+      // makes structured calls perfectly well for seven of them before degrading. So the
+      // check has to be here, on the shape of the turn.
+      //
+      // Deliberately narrow: reasoning present, content empty, no calls. A model that is
+      // genuinely done says so in `content`.
+      if (message.reasoning && !message.content) {
+        stopped = 'malformed_tool_call';
+        exitCode = -1;
+        record('loop_error', {
+          message:
+            `the model ended turn ${usage.turns} inside its reasoning with no content and no ` +
+            `tool call — it did not choose to stop, it failed to emit what it was about to do`,
+        });
+      }
       modelFinished = true;
       break;
     }

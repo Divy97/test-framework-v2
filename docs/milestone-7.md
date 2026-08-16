@@ -210,13 +210,39 @@ never anybody's:
    by construction rather than by inode arithmetic. **Fixed and verified passing
    individually** — so a clean-environment run is 416/417, failing only on (1).
 
-**No real model has run against any of this.** `probeToolCalling` refused with HTTP 401 —
-the OpenRouter key is dead. Every change in 7a, 7b and 7c is a change to what we *tell*
-the agent, and [the scar tissue](../README.md#honest-limitations) is explicit that a
-scripted agent does not read its prompt: the first real run found four defects with 365
-tests green, and four of them were in the prompts. So the status of this milestone is
-**green under a scripted agent, which proves nothing about the prompts**, until
-`npx tsx scripts/real-run.mts` says otherwise.
+**A real model has now run against all of it, and every change fired.** With a working
+key, `anthropic/claude-sonnet-5` through OpenRouter took the `shipped-filter` issue to a
+credited **Tier 2** pull request in 95 seconds for **$0.064**:
 
-Hand-rendering the prompts already caught one such defect that no test could: the first
+```
+base  exit=1 symptom_matched=true      <- red twice (7c), was one draw
+base  exit=1 symptom_matched=true
+fix   exit=0 symptom_matched=false     <- symptom GONE, three times (7c)
+fix   exit=0 symptom_matched=false
+fix   exit=0 symptom_matched=false
+regression clean                       <- the second arm (7d), on both commits
+tier 2, confidence 98/103
+```
+
+The agent put the symptom on the failing path unprompted by anything but the rewritten
+`prompts/repro.md`, which is the +8 that could not have been scored before. `node --test`
+executed on base and on fix inside a sealed container, which had never happened against a
+real agent's commit. 98/103 under `scoring: 2`; the old scale's best was 80/85.
+
+Hand-rendering the prompts caught one defect no test could before any of that: the first
 draft of 7a described the snapshot's world, which is not built.
+
+**What the first two attempts found was a model, not a prompt.**
+`moonshotai/kimi-k2-thinking` failed reproducibly, 2/2, by ending turns *inside its own
+reasoning* — once leaking its next call as text (`<|tool_call_begin|>functions.read`),
+once stopping mid-sentence while planning the commit. The second attempt had explored the
+repository, driven the browser, seen the bug live and written the reproduction; it simply
+never reached `git_commit`.
+
+The engine held correctly both times — no false PR, an honest Tier 3 — but its *diagnosis*
+was ours and it was wrong: "the agent handed over a commit the repository already had",
+an accusation of idleness against a model that had done nearly everything.
+`stopped: 'malformed_tool_call'` now names it, on the narrow signal that produced it
+(reasoning present, content empty, no tool call), with a negative control so an honest
+prose refusal is still a real ending. `probeToolCalling` cannot cover this: it is one
+turn, and the model makes structured calls perfectly well for seven of them first.
