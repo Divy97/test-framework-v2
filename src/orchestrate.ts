@@ -300,6 +300,10 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // the only place a commit crosses between containers, and it crosses as a
   // bundle: objects and refs, no working tree, nothing else.
   const workspace = await mkdtemp(join(tmpdir(), 'engine-workspace-'));
+  // The environment snapshot, when one was built. Declared out here because it is
+  // an IMAGE — the largest thing a run leaves on the host — and it has to be
+  // removable from the `finally` below rather than from the end of a happy path.
+  let snapshotImage: string | null = null;
   // `finally`, because the throws between here and the end of the run are what
   // leak. This file already carried the invariant as a COMMENT — "every throw
   // between the clone and the cleanup at the end leaves a full clone of the
@@ -310,6 +314,16 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     return await run();
   } finally {
     await rm(workspace, { recursive: true, force: true }).catch(() => {});
+    // A dependency tree on top of the sandbox image, per run. Left behind that is
+    // unbounded host-disk growth exactly as the workspace is, and for the same
+    // reason it belongs here rather than beside the handover dirs: the throws are
+    // what leak. Never at the cost of the run, though — a removal that fails
+    // (something still holding the image, a daemon that went away) must not
+    // replace a completed run's events with an exception about disk hygiene. That
+    // is the evidence-loss shape this file has been bitten by three times.
+    if (snapshotImage) {
+      await execFile('docker', ['image', 'rm', '--force', snapshotImage]).catch(() => {});
+    }
   }
 
   async function run(): Promise<RunOutcome> {
@@ -396,6 +410,42 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   const agentSource = join(workspace, 'agent-source');
   await buildAgentSource(source, base, agentSource);
 
+  // THE ENVIRONMENT, BUILT BEFORE THE AGENT EXISTS.
+  //
+  // The phase containers install nothing — no recipe, no network, and a clone of a
+  // commit whose dependencies are gitignored and therefore not in it — so on any
+  // repository with dependencies the reproduction exits 127, the symptom never
+  // matches, and the reporter is told we could not reproduce their bug. One
+  // container installs, the host commits it, and the phases run from that image.
+  //
+  // The ORDERING is the security argument, and this `await` above the attempt loop
+  // is what enforces it. runner.ts warns that a gitignored directory shared with
+  // the phases is all an agent needs to fabricate a verdict — seed state a test
+  // reads, and it goes red then green while the "fix" changes nothing, with every
+  // anti-gaming check still passing because not one of them is about the
+  // environment. The answer is not another scrub. It is that these bytes were
+  // installed from the base commit's source before the agent container had been
+  // created, so there was nobody to plant them.
+  //
+  // From `plan.image` and never `plan.agentImage`: a phase container must not gain
+  // a browser (ADR-0006's amendment), and an image committed from the agent's
+  // sandbox would hand it one. The cost is a second install — the agent replays the
+  // recipe in its own container — and that is the accepted trade for the image that
+  // judges being the sealed one.
+  //
+  // Only with an `install` step to replay. Without one there is nothing a phase
+  // could be missing, and everything behaves exactly as it did.
+  const snapshot =
+    plan.recipe?.install === undefined
+      ? null
+      : await buildEnvSnapshot(plan, source, base, plan.recipe);
+  if (snapshot && 'image' in snapshot) snapshotImage = snapshot.image;
+  // The two containers that JUDGE run from the snapshot; everything else is
+  // untouched by it. `plan.image` stays what the agent falls back to, so the agent
+  // sandbox never runs from an image built out of a recipe replay it is about to
+  // perform itself.
+  const judging: RunPlan = snapshotImage === null ? plan : { ...plan, image: snapshotImage };
+
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
   // — the gate folds this run's events, and `fold()` throws on a stream that does
@@ -444,6 +494,31 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // fold refuses to pair runs at attempt 0, because runs from unrelated
     // attempts could otherwise be matched up.
     events.push(own(plan.runId, ++afterSeq, { type: 'ATTEMPT_STARTED', payload: { v: 1, n } }));
+
+    // A snapshot that could not be built ENDS the run. It must never degrade
+    // quietly to the old behaviour: a phase container with nothing installed is
+    // precisely how "we could not reproduce your bug" gets sent about a repository
+    // whose dependencies we failed to install, and it would read as a finding.
+    // `cause: 'environment'`, the same as a recipe that does not boot — our
+    // infrastructure being wrong about someone's project is not a tier about their
+    // bug (ADR-0007's v1.5 amendment). After ATTEMPT_STARTED because every event
+    // belongs to an attempt, and retrying is pointless: the next attempt would
+    // install from the same source with the same recipe.
+    if (snapshot && 'failed' in snapshot) {
+      events.push(
+        own(plan.runId, ++afterSeq, {
+          type: 'VERIFICATION_ABORTED',
+          payload: {
+            v: 1,
+            phase: 'setup',
+            cause: 'environment',
+            reason: redact(snapshot.failed).slice(0, MAX_REASON_CHARS),
+          },
+        }),
+      );
+      ended = own(plan.runId, ++afterSeq, { type: 'RUN_ENDED', payload: { v: 1, reason: 'error' } });
+      break;
+    }
 
     // The agent, if there is one, in a container torn down before the first phase
     // is ever cloned. This is what ADR-0010's "the agent's world is discarded"
@@ -731,7 +806,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       const result =
         step.phase === 'agent'
           ? await agentContainer(step.prompt!, afterSeq, overrides)
-          : await runContainer(plan, step.source, afterSeq, step.phase, overrides);
+          : await runContainer(judging, step.source, afterSeq, step.phase, overrides);
       // Record what the container reported BEFORE judging any of it. Checking
       // first and breaking discarded the transcript and the container's own
       // stream — the same mistake the abort path made: a run that could not be
@@ -825,7 +900,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         // ran anchored to nothing and aborted AFTER a perfectly good base phase —
         // the ordering was right and the spec never reached the container judging
         // the fix.
-        const fix = await runContainer(plan, source, afterSeq, 'fix', {
+        const fix = await runContainer(judging, source, afterSeq, 'fix', {
           only: 'fix',
           fixRef,
           ...(resolvedRepro ? { repro: resolvedRepro } : {}),
@@ -1010,6 +1085,117 @@ async function observedOnBase(
 }
 
 /**
+ * Build the image the phases judge from: the sealed phase image, plus this
+ * repository's dependencies, installed once.
+ *
+ * Not `--rm`, which is the whole reason this does not go through `runContainer`:
+ * the container has to survive its own exit long enough to be committed, and it
+ * has to carry a `--name` for `docker commit` to have something to name. It gets a
+ * NETWORK, on the same terms the agent sandbox does (ADR-0013): install needs a
+ * package registry. The phases it feeds keep `--network none` — that is the whole
+ * point of doing it here. They inherit the result of a network they never had.
+ *
+ * Returns the failure rather than throwing it. A repository whose install does not
+ * complete is an operational fault the caller records as `cause: 'environment'` and
+ * ends the run on; an exception here would discard the run instead of reporting why
+ * it could not start.
+ */
+async function buildEnvSnapshot(
+  plan: RunPlan,
+  source: string,
+  base: string,
+  recipe: Recipe,
+): Promise<{ image: string } | { failed: string }> {
+  // Sanitised the same way the handover ref is: a run id reaches this as a docker
+  // name and a tag, and both have a character set.
+  const id = plan.runId.replace(/[^A-Za-z0-9_-]/g, '') || 'run';
+  const container = `engine-env-${id}`;
+  const image = `engine-env:${id}`;
+  // A container left by an earlier run with this id would take the name and this
+  // build would fail on it — and committing SOMEBODY ELSE'S container would be
+  // worse: an environment nobody in this run built, judged as though we had.
+  await execFile('docker', ['rm', '--force', container]).catch(() => {});
+
+  const job: Job = {
+    runId: plan.runId,
+    afterSeq: 0,
+    sourcePath: '/src',
+    baseRef: base,
+    // Never read on this path — the Runner returns before `verify()` — and passed
+    // as base rather than left to a default so nothing here names a commit that
+    // does not exist yet.
+    fixRef: base,
+    repro: { command: '' },
+    symptomPattern: plan.symptomPattern,
+    only: 'env',
+    recipe,
+  };
+
+  const child = spawn(
+    'docker',
+    ['run', '--name', container, '-i', '-v', `${source}:/src:ro`, plan.image],
+    { stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+  child.stdin.end(`${JSON.stringify(job)}\n`);
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    // Bounded like the event channel is. This container speaks one line, so
+    // anything approaching the ceiling is a container that is not the one we asked
+    // for, and reading it into host memory unbounded is how that becomes our
+    // problem.
+    if (stdout.length < MAX_STREAM_BYTES) stdout += chunk;
+  });
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk: string) => {
+    stderr = (stderr + chunk).slice(-MAX_STDERR_CHARS);
+  });
+  const exitCode = await new Promise<number>((resolve) => {
+    child.on('close', (code) => resolve(code ?? 1));
+    child.on('error', () => resolve(1));
+  });
+
+  let env: ReplayOutcome | undefined;
+  for (const line of stdout.split('\n')) {
+    if (line.trim() === '') continue;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (isWorkerReply(parsed) && 'env' in parsed) env = parsed.env;
+    } catch {
+      // Not a reply. This container writes no events, so there is nothing else on
+      // the channel that a line could be.
+    }
+  }
+
+  // Said in the recipe's own words where there are any. `replayRecipe` already
+  // names the step that failed and redacts the command, and a paraphrase of that
+  // would be a diagnosis nobody can act on — the mistake this codebase has made
+  // twice with git's stderr.
+  const failed =
+    exitCode !== 0
+      ? `the environment build exited ${exitCode}: ${stderr.trim().split('\n').at(-1) ?? ''}`
+      : env === undefined
+        ? 'the environment build reported nothing about the recipe it replayed'
+        : env.ready
+          ? null
+          : (env.failed ?? 'the environment did not build');
+
+  try {
+    if (failed !== null) return { failed };
+    await execFile('docker', ['commit', container, image]);
+    return { image };
+  } catch (error) {
+    return { failed: `could not commit the environment: ${String(error)}` };
+  } finally {
+    // Whatever happened. The image is what the run needs; the container it was
+    // committed from is a copy of the same bytes waiting to be forgotten.
+    await execFile('docker', ['rm', '--force', container]).catch(() => {});
+  }
+}
+
+/**
  * Drives a tool-serving container from out here.
  *
  * The whole of ADR-0011 in one function type: something on the host is handed a
@@ -1077,10 +1263,11 @@ async function runContainer(
     // of over the tree. It also means the code under judgement cannot exfiltrate
     // the repository it was handed.
     //
-    // Dependency install is the thing this forecloses, and M3 already refuses it:
-    // a reproduction needing a package the base commit lacks is unrunnable today.
-    // When a `setupCommand` arrives it will need its own network decision rather
-    // than inheriting this one.
+    // Dependency install is what this used to foreclose, and for four milestones a
+    // reproduction needing a package the base commit lacked was simply unrunnable.
+    // It is not the seal that changed: the dependencies arrive in the IMAGE now,
+    // installed by a build container before the agent existed, so the phases still
+    // reach nothing and no longer need to (see `buildEnvSnapshot`).
     // NO NETWORK, for every container including the agent's.
     //
     // The phases need none. The agent needs the model API — and the transport for

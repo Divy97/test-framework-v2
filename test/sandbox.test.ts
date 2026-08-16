@@ -25,8 +25,10 @@ import {
   clean,
   HANGS_ON_FIX,
   irreproducible,
+  needsInstalledDependency,
   noOpFix,
   regression,
+  REPRO_NEEDING_DEPENDENCY,
   survivorGamed,
   demoRepo,
   demoRecipe,
@@ -2749,6 +2751,98 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(existsSync(join(process.cwd(), 'src/egress.ts'))).toBe(false);
     expect(existsSync(join(process.cwd(), 'test/egress.test.ts'))).toBe(false);
   });
+
+  // ── 7e: the environment is a snapshot ───────────────────────────────────────
+  //
+  // The engine could only certify repositories that needed no dependencies, and
+  // 352 green tests said nothing about it: every adversarial fixture is a shell
+  // script and the demo installs nothing. `verify.test.ts` pins the defect one
+  // layer down — *a reproduction that needs an installed dependency reports NOT
+  // REPRODUCED* — and stays exactly as it is, because `verify()` is handed a
+  // checkout and has no container to install into. The fix lives out here, so
+  // this is the same fixture and the same reproduction with the containers under
+  // them.
+
+  test('a reproduction that needs an installed dependency is REPRODUCED from the snapshot', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+    const blobs = hostBlobs();
+
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: blobs,
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      flakeRuns: 0,
+      baseRuns: 0,
+      symptomPattern: 'wrong',
+      repro: REPRO_NEEDING_DEPENDENCY,
+      // An install that writes a gitignored path and needs no registry. What is
+      // under test is that the phases receive what `install` wrote — reaching
+      // npm to prove it would make this test fail for the network's reasons.
+      recipe: { install: 'mkdir -p node_modules/dep && touch node_modules/dep/marker', services: [] },
+    });
+
+    const runs = outcome.events.filter((e) => e.type === 'TEST_RUN');
+    const at = (phase: string) => runs.find((e) => (e.payload as { phase: string }).phase === phase)!;
+    // Exit 1 and the symptom — the reproduction RAN. Exit 127 is the defect: the
+    // command dying on a missing dependency, which is not a verdict about
+    // anything.
+    expect(at('base').payload).toMatchObject({ exit_code: 1, symptom_matched: true });
+    expect(at('fix').payload).toMatchObject({ exit_code: 0 });
+    expect(fold(outcome.events).reproduced).toBe(true);
+
+    // Both containers had it, not just base. A snapshot restored into one phase
+    // and not the other would be a fix that reads as red-then-green for our own
+    // reason.
+    const outputs = await Promise.all(
+      runs.map((e) => get(blobs, (e.payload as { stdout_hash: ArtifactRef }).stdout_hash)),
+    );
+    // Which containers those outputs came from, stated rather than counted: a
+    // length assertion over a mapped array is satisfied by nothing having run.
+    expect(runs.map((e) => (e.payload as { phase: string }).phase)).toEqual(['base', 'fix']);
+    expect(outputs.map((b) => b.toString()).join('\n')).not.toMatch(/dep: not found/);
+
+    // And the image does not outlive the run. It is the largest thing a run puts
+    // on the host — a dependency tree per run — so a build that leaks one fills
+    // the disk of whoever operates this.
+    expect(
+      execFileSync('docker', ['images', '-q', `engine-env:${RUN_ID}`], { encoding: 'utf8' }).trim(),
+    ).toBe('');
+  }, 900_000);
+
+  test('and is NOT reproduced without one, which is what the snapshot is for', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+
+    // The engine as it was, on the same fixture: no recipe, so no snapshot, so the
+    // phase clone has no `node_modules` and nowhere to get one. Without this
+    // control the test above could pass on a fixture that never needed the
+    // dependency at all.
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: hostBlobs(),
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      flakeRuns: 0,
+      baseRuns: 0,
+      symptomPattern: 'wrong',
+      repro: REPRO_NEEDING_DEPENDENCY,
+    });
+
+    const base = outcome.events
+      .filter((e) => e.type === 'TEST_RUN')
+      .find((e) => (e.payload as { phase: string }).phase === 'base')!;
+    expect(base.payload).toMatchObject({ exit_code: 127, symptom_matched: false });
+    expect(fold(outcome.events).reproduced).toBe(false);
+    // The gate holds, correctly, on a bug that is real. That is the false Tier 3
+    // this milestone is about.
+    expect(outcome.phases.map((p) => p.phase)).toEqual(['base']);
+  }, 900_000);
 });
 
 // ── 5f: the browser ──────────────────────────────────────────────────────────

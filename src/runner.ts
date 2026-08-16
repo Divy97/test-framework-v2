@@ -9,7 +9,7 @@
 // non-deterministic in the loop.
 
 import { closeSync, openSync, writeSync } from 'node:fs';
-import { appendFile, chmod, lstat, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { basename, dirname } from 'node:path';
 import { promisify } from 'node:util';
@@ -79,8 +79,12 @@ export type Job = {
    * between phases. Every channel ADR-0010 enumerates comes from base and fix
    * sharing a machine; this removes the sharing rather than scrubbing it, which
    * is the only move here that has not needed a follow-up fix.
+   *
+   * `env` is not a phase at all: it observes nothing, judges nothing and emits no
+   * event. It installs this repository's dependencies so the host can commit the
+   * result into the image the phases then run from — see `buildEnvironment`.
    */
-  only?: 'base' | 'fix' | 'agent';
+  only?: 'base' | 'fix' | 'agent' | 'env';
   flakeRuns?: number;
   baseRuns?: number;
   /**
@@ -107,6 +111,18 @@ const BLOBS = '/blobs';
 /** Matches the `repro` user created in the Dockerfile. */
 const REPRO_UID = 1000;
 const REPRO_GID = 1000;
+
+/**
+ * Where the environment build leaves what it built, and the list of what it wrote.
+ *
+ * Outside `/work` on purpose: `/work` is per-participant scratch that the agent
+ * teardown deletes wholesale, and this has to survive into a DIFFERENT container —
+ * it is committed into an image, and the phases read it out of that image at clone
+ * time. Nothing under here is ever handed to the repro user.
+ */
+const ENV = '/opt/env';
+const ENV_REPO = `${ENV}/repo`;
+const ENV_IGNORED = `${ENV}/ignored.txt`;
 
 /**
  * What the exit status tells a caller, and specifically whether there is
@@ -400,6 +416,133 @@ async function handOverCommits(world: { tree: string; gitDir: string }): Promise
 }
 
 /**
+ * Install this repository's dependencies once, in a container the host commits
+ * into the image the phases run from.
+ *
+ * Until this existed the engine could only certify repositories that needed no
+ * dependencies. The phase containers replay nothing, hold no recipe and run
+ * `--network none`; a dependency is a gitignored path, so it is not in the commit
+ * they clone either. `npm test` there is exit 127, the output carries no symptom,
+ * the fold refuses it and the reporter is told **we could not reproduce your
+ * bug** — every step correct and the conclusion false, on every React or Next.js
+ * repository this is aimed at.
+ *
+ * `install`, `migrate` and `seed` only, with `services: []`. A booted service is a
+ * PROCESS and a process does not survive `docker commit`; replaying one here would
+ * spend a healthcheck proving something that dies with this container. What crosses
+ * into the phases is a filesystem, so only the half of the recipe that builds one
+ * runs.
+ *
+ * Reports rather than throws, for the same reason `replayRecipe` does: a recipe
+ * that does not build is an operational fault the host records as one. The host
+ * ends the run `errored` on it and never silently falls back to a phase image with
+ * nothing installed.
+ */
+async function buildEnvironment(job: Job, emit: (line: string) => void): Promise<number> {
+  if (!job.recipe) {
+    throw new ObservationFailed('an environment build arrived with no recipe; there is nothing to install');
+  }
+  await mkdir(ENV, { recursive: true });
+  try {
+    // `--` so a sourcePath cannot be read as an option, exactly as `world()` does:
+    // `--upload-pack=…` and `ext::sh -c …` are both command execution.
+    await execFileAsync('git', ['clone', '--quiet', '--no-local', '--', job.sourcePath, ENV_REPO]);
+    // At BASE, not at whatever the source's HEAD happens to name. The dependency
+    // tree has to be the one the base commit's manifest asks for, or every phase
+    // judges a commit against another commit's `node_modules`.
+    //
+    // Which is also the limit of this: a fix that ADDS a dependency is judged
+    // against base's tree and will not resolve it. The phases install nothing and
+    // this does not change that — it moves the install to a container that runs
+    // before them, and there is only one, from one commit.
+    await execFileAsync('git', ['-C', ENV_REPO, 'checkout', '--quiet', '--detach', job.baseRef]);
+  } catch (error) {
+    throw new ObservationFailed(`could not clone ${job.sourcePath} to build the environment`, { cause: error });
+  }
+
+  // As root, and not as the repro user. Nothing untrusted runs in this container —
+  // it exists before the agent does — and the phases receive these bytes through
+  // `chown -R` on their own clone, so ownership here decides nothing downstream.
+  const host = new ToolHost({ root: ENV_REPO, gitDir: `${ENV_REPO}/.git`, env: { TMPDIR: '/tmp', HOME: '/root' } });
+  let env: ReplayOutcome;
+  try {
+    env = await replayRecipe(host, { ...job.recipe, services: [] });
+  } finally {
+    await host.close();
+  }
+
+  // Only over a world worth keeping. A failed install leaves a half-written
+  // dependency tree, and a manifest over that would hardlink it into every phase
+  // and present it as the environment.
+  if (env.ready) await recordIgnored();
+  // On the channel as a REPORT, exactly as the agent container's replay is: this
+  // container writes no events, and the host is the only thing that can allocate a
+  // seq (ADR-0006's amendment).
+  emit(`${JSON.stringify({ env } satisfies WorkerReply)}\n`);
+  return EXIT.complete;
+}
+
+/**
+ * What the install actually wrote, as git sees it.
+ *
+ * The IGNORED set rather than a hard-coded `node_modules`: dependencies live
+ * wherever an ecosystem puts them — `vendor/`, `.venv`, `target/`, `.next/` — and
+ * the one authority on which paths those are is the `.gitignore` the repository
+ * ships. It is also exactly the set the phase clone cannot obtain for itself,
+ * since ignored paths are not in the commit.
+ *
+ * `core.quotePath=false`, or a non-ASCII path arrives as git's octal escape and
+ * the restore looks for a file whose name is the escape.
+ */
+async function recordIgnored(): Promise<void> {
+  const { stdout } = await execFileAsync('git', [
+    '-C', ENV_REPO, '-c', 'core.quotePath=false', 'status', '--ignored', '--porcelain',
+  ]);
+  const ignored = stdout.split('\n').filter((line) => line.startsWith('!! ')).map((line) => line.slice(3));
+  await writeFile(ENV_IGNORED, ignored.map((path) => `${path}\n`).join(''));
+}
+
+/**
+ * Put the built environment into a fresh clone, before anything runs in it.
+ *
+ * A no-op in every container that runs from the plain sandbox image — the manifest
+ * exists only in the committed snapshot, which only the judging containers run
+ * from. That is what keeps the agent's world free of it: the agent replays the
+ * recipe itself.
+ *
+ * `cp -al`. One filesystem, so a dependency tree costs directory entries rather
+ * than a copy of `node_modules` per phase.
+ *
+ * Per CLONE, and deliberately not after the phase-boundary scrub. `git clean -xdff`
+ * between base and fix exists to stop base leaving state the fix run reads, and
+ * restoring after it would hand back the very thing it removed. A container per
+ * phase is what makes both true at once: each phase gets the environment from the
+ * image, and nothing at all from the other phase.
+ *
+ * A path that will not restore is skipped. These bytes are a convenience the
+ * reproduction may not even need, and losing a run over one unlinkable directory
+ * would trade a verdict for tidiness.
+ */
+async function restoreEnvironment(tree: string): Promise<void> {
+  const manifest = await readFile(ENV_IGNORED, 'utf8').catch(() => null);
+  if (manifest === null) return;
+  for (const line of manifest.split('\n')) {
+    if (line.trim() === '') continue;
+    try {
+      // Confined like any other path the engine did not construct. It came out of
+      // git rather than out of an agent, but the check costs nothing and `.git` is
+      // among the things it refuses — a restore into the phases' own git state
+      // would be a hook the Runner then executes.
+      const { rel, target } = await confine(tree, line, { subject: 'ignored path' });
+      await mkdir(dirname(target), { recursive: true });
+      await execFileAsync('cp', ['-al', `${ENV_REPO}/${rel}`, target]);
+    } catch {
+      // Skipped, and the phase runs without it. See above.
+    }
+  }
+}
+
+/**
  * Execute the host's tool calls until it says it is finished.
  *
  * One at a time, in arrival order. The model's loop is sequential by construction
@@ -503,6 +646,13 @@ export async function runJob(
   // which the Runner then executes as root — so uid 1000 was never the boundary
   // it looked like. GIT_DIR is passed explicitly so git never consults the
   // `.git` file left in the worktree either.
+
+  // The environment build, before anything else and before the store check below.
+  // It produces no facts — no phase, no reproduction, no event — so demanding
+  // somewhere durable to put them would be demanding a mount for a stream that
+  // does not exist. What it produces is a filesystem the host commits into an
+  // image.
+  if (job.only === 'env') return await buildEnvironment(job, emit);
 
   // Refuse rather than silently write into the container layer. Without the
   // mount the run still produces a complete, plausible event stream whose
@@ -613,6 +763,11 @@ export async function runJob(
         job.sourcePath, tree,
       ]),
     );
+    // The environment, hardlinked in from the snapshot image if this container is
+    // running from one — BEFORE the chown, so the dependency tree is handed to the
+    // repro user with the rest of the tree. Restored after it, `node_modules` would
+    // be root-owned inside a tree the repro's own commands have to be able to write.
+    await restoreEnvironment(tree);
     // The worktree, the temp dir and the home dir. NOT the root, and above all
     // not the gitdir under it — an earlier version of this chowned `${root}`
     // wholesale, which handed the repro `gitdir/hooks/post-checkout` and had the

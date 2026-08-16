@@ -888,9 +888,15 @@ async function observe(
   // are usually installed dependencies, and removing them changes what is under
   // test — but between the phases of one repo they are simply the easiest place
   // for the base run to leave a flag the fix run reads, and `node_modules/`,
-  // `dist/` and `coverage/` are ignored in every real repository. Nothing
-  // installs dependencies yet (M2 deferred it), so today this costs nothing; a
-  // `setupCommand` must run per phase rather than once.
+  // `dist/` and `coverage/` are ignored in every real repository.
+  //
+  // Something DOES install dependencies now — the environment snapshot, which the
+  // Runner hardlinks into each clone — and this line would take them with it. That
+  // is why the restore happens per CLONE and why the orchestrator runs a container
+  // per phase: each phase gets the environment from the image, and this scrub is
+  // left to do the only job it was ever for, which is stopping base handing the fix
+  // run a flag. Collapse the phases back into one container and this becomes a fix
+  // phase with no dependencies again.
     await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
     // The same scrub, one step further out. Whatever the base run left behind
     // outside the tree — state on disk, or a process still running — is what the
