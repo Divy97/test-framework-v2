@@ -137,6 +137,8 @@ export type ReplayOutcome = {
 const STEP_TIMEOUT_MS = 600_000;
 const HEALTH_TIMEOUT_MS = 60_000;
 const HEALTH_INTERVAL_MS = 250;
+/** How much of a failing step's output travels with the reason. The end, where the cause is. */
+const MAX_FAILURE_CHARS = 1200;
 
 /**
  * Replay a recipe in a container and report what happened.
@@ -173,7 +175,28 @@ export async function replayRecipe(host: ToolHost, recipe: Recipe): Promise<Repl
       // immutable: a recipe carries environment inline (`PORT=8080 node server.mjs`), and
       // failure is exactly when a misconfigured credential appears in one. A secret
       // written here could never be deleted (M6e).
-      return { ready: false, steps, services, failed: redact(`recipe step ${step} failed: ${command}`) };
+      // WITH THE OUTPUT, not just the command.
+      //
+      // It said only `recipe step install failed: <command>`, and the reason was sitting
+      // in `result.output` two lines above, discarded. Diagnosing one real failure took
+      // four separate container runs to rediscover a message the engine had already
+      // captured: `corepack enable` needs to write `/usr/local/bin`, which is root, and
+      // the agent sandbox runs as uid 1000 by design — so the same recipe succeeds in the
+      // environment build and fails in the agent container. Nothing in the abort said so.
+      //
+      // "An operational failure with no diagnosis is the wrong thing to ship" is this
+      // project's own rule about `PhaseResult.stderr`; the recipe path broke it.
+      //
+      // The tail, because a failure is at the end, and bounded because this becomes an
+      // append-only event. `redact` covers it: a recipe carries environment inline, and a
+      // failing step is exactly where a misconfigured credential shows up.
+      const why = result.output.slice(-MAX_FAILURE_CHARS).trim();
+      return {
+        ready: false,
+        steps,
+        services,
+        failed: redact(`recipe step ${step} failed: ${command}\n${why}`),
+      };
     }
   }
 
