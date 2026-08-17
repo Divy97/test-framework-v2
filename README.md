@@ -66,6 +66,16 @@ and on a Tier 3 it shows the gate **refusing to attempt a fix**, with no diff at
 Every other product in this category has a run list; the screen that is rare is the one
 where a refusal is as legible as a success.
 
+It has exactly **one write** — a human approving a recipe — and that asymmetry is the
+design: everything else on it is a projection that can be rebuilt, so a dashboard that
+could start runs or edit evidence would be a second producer, and ADR-0009 has one. The
+write is refused unless it comes from the dashboard's own page. Binding to `127.0.0.1` is
+not a defence there and it is worth saying why, because the intuition is exactly what
+makes the bug easy to ship: the same-origin policy stops another page *reading* our
+response, never stops it *sending* the request. Approving a recipe stores commands the
+engine executes verbatim, so a forged POST would be a stored command no human approved —
+which is precisely the control ADR-0013 says onboarding rests on.
+
 **Delete the entire dashboard database and it rebuilds from the log.** `npm run rebuild`
 drops `run_projection` and replays `events` into byte-identical rows. That is the property
 that makes "there is no runs table" still true with a runs table in the schema: the table

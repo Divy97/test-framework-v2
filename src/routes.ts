@@ -20,6 +20,43 @@ import { readRun } from './store.js';
 import type { Route } from './sse.js';
 import { escapeHtml, evidencePage, landingPage, onboardPage, repositoriesPage, runsPage } from './web.js';
 
+/**
+ * Is this state-changing request coming from our own page?
+ *
+ * The one POST here stores a recipe — **arbitrary shell commands the engine later
+ * executes verbatim** in a sandbox with a package registry reachable. Without this check
+ * it was a textbook CSRF, and binding to `127.0.0.1` bought nothing: the same-origin
+ * policy stops another page READING our response, never stops it sending the request, and
+ * `application/x-www-form-urlencoded` is a CORS "simple" content type so no preflight
+ * ever happens. Any page the operator visited could have silently stored a recipe, and
+ * the next run on that repository would have executed it.
+ *
+ * Worse than the execution: it defeats the claim onboarding rests on. ADR-0013 says the
+ * approval "is the only control there is on a stored command we will execute" — and a
+ * forged POST is a stored command no human approved.
+ *
+ * `Sec-Fetch-Site` is the primary check because every current browser sends it and it
+ * cannot be set by script. `Origin` is the fallback for anything older. A request with
+ * NEITHER is not a browser — curl, the CLI, a test — and cannot be cross-site forged,
+ * because forging one already requires code execution on the machine.
+ */
+const sameOrigin = (headers: Record<string, string | string[] | undefined>): boolean => {
+  const one = (name: string): string | undefined => {
+    const value = headers[name];
+    return Array.isArray(value) ? value[0] : value;
+  };
+  const site = one('sec-fetch-site');
+  if (site !== undefined) return site === 'same-origin' || site === 'none';
+  const origin = one('origin');
+  if (origin === undefined) return true;
+  const host = one('host');
+  try {
+    return host !== undefined && new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+};
+
 const html = (body: string, status = 200) => ({ status, type: 'text/html; charset=utf-8', body });
 const json = (body: unknown, status = 200) => ({
   status,
@@ -48,8 +85,20 @@ export function dashboardRoutes(options: {
   const { client } = options;
   const install = options.installUrl ?? installUrl();
 
-  return async ({ method, path, query, body }) => {
+  return async ({ method, path, query, body, headers }) => {
     if (method !== 'GET' && method !== 'POST') return null;
+    // Before any routing, so a route added later cannot forget it. Every GET here is a
+    // projection that can be rebuilt from the log; the writes are what need a human.
+    if (method === 'POST' && !sameOrigin(headers)) {
+      return {
+        status: 403,
+        type: 'text/plain',
+        body:
+          'refused: this looks like a cross-site request.\n\n' +
+          'Approving a recipe stores commands this engine executes verbatim, so it is only\n' +
+          'accepted from its own page (ADR-0013: the approval is the control).\n',
+      };
+    }
 
     if (method === 'GET' && (path === '/' || path === '')) return html(landingPage(install));
 

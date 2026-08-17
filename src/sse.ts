@@ -120,6 +120,15 @@ export type Route = (request: {
   path: string;
   query: URLSearchParams;
   /**
+   * The request headers, lowercased by Node.
+   *
+   * A route that changes state has to be able to tell a browser form POST from another
+   * origin apart from one of its own — `Origin` and `Sec-Fetch-Site` are the only things
+   * that carry that, and binding to 127.0.0.1 does not: the same-origin policy stops a
+   * page READING our response, never sending the request.
+   */
+  headers: Record<string, string | string[] | undefined>;
+  /**
    * The request body, read on demand and bounded.
    *
    * A function rather than a string because every route here except one is a GET, and
@@ -164,6 +173,7 @@ export function startStatusServer(options: {
         method: request.method ?? 'GET',
         path,
         query: new URL(request.url ?? '/', 'http://127.0.0.1').searchParams,
+        headers: request.headers,
         body: () =>
           new Promise<string>((resolve, reject) => {
             const chunks: Buffer[] = [];
