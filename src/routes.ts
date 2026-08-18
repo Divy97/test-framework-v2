@@ -12,6 +12,7 @@
 
 import type pg from 'pg';
 import { confidence } from './confidence.js';
+import { clearDraft, loadDraft } from './drafts.js';
 import { fold } from './fold.js';
 import { listInstallations, loadInstallation } from './installations.js';
 import { listRuns, readRunRow, readUsage } from './readmodel.js';
@@ -157,7 +158,11 @@ export function dashboardRoutes(options: {
       }
 
       if (method === 'GET') {
-        return html(onboardPage(repo, await loadRecipe(client, repo)));
+        // `loadDraft` even when a recipe already exists: `onboardPage` is the one that
+        // decides `current` wins, and computing that here would be a second copy of a
+        // rule that already lives in one place.
+        const [recipe, draft] = await Promise.all([loadRecipe(client, repo), loadDraft(client, repo)]);
+        return html(onboardPage(repo, recipe, draft?.draft));
       }
 
       // THE ONE WRITE. A human is approving commands the engine will execute verbatim in
@@ -168,6 +173,12 @@ export function dashboardRoutes(options: {
       try {
         const draft = parseRecipe(JSON.parse(new URLSearchParams(raw).get('recipe') ?? ''));
         await saveRecipe(client, repo, draft);
+        // Best-effort, and after the write it can never invalidate: the draft row is
+        // advisory (`recipe_drafts`'s own comment says losing it costs nothing but a
+        // re-draft), so a failure here must not turn a successful approval into an error
+        // response. Cleared rather than left behind because a stale draft shown beside the
+        // recipe now actually in force reads as a second, live proposal.
+        await clearDraft(client, repo).catch(() => {});
         // 303 with a Location, so a refresh re-renders the recipe rather than re-posting
         // it. Without the header this was a status code pretending to be a redirect.
         return {
@@ -180,7 +191,7 @@ export function dashboardRoutes(options: {
         // Rendered back with the message, never swallowed: `parseRecipe` refuses a shape
         // that would fail later inside a container, where it reads as the user's project
         // being broken rather than as their recipe being wrong.
-        return html(onboardPage(repo, null, String((error as Error).message ?? error)), 400);
+        return html(onboardPage(repo, null, undefined, String((error as Error).message ?? error)), 400);
       }
     }
 

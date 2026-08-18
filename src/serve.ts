@@ -26,14 +26,17 @@
 //      configuration change, not a redesign.
 
 import { readFileSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type pg from 'pg';
+import { saveDraft } from './drafts.js';
 import type { InstallationIntake, IssueIntake } from './github.js';
-import { commentOnIssue, installationToken, startWebhookReceiver } from './github.js';
+import { cloneRepository, commentOnIssue, installationToken, repoUrl, startWebhookReceiver } from './github.js';
 import { MODEL, effortLevel, providerName } from './loop.js';
 import { DEFAULT_OPENROUTER_MODEL } from './openrouter.js';
 import { loadInstallation, recordInstallation, removeInstallation } from './installations.js';
+import { draftRecipe } from './orchestrate.js';
 import { projectOne, saveUsage } from './readmodel.js';
 import { loadRecipe } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
@@ -176,6 +179,18 @@ export type ServeOptions = {
    */
   comment?: (repo: string, issueNumber: number, body: string, installationId: number) => Promise<void>;
   log?: (line: string) => void;
+  /**
+   * Get the drafting agent a checkout to explore (M6b), injected for the same reason
+   * `comment` is: the default mints a real installation token and clones over the
+   * network, and a test asserting on what a draft turns into should need neither a
+   * registered GitHub App nor a reachable remote.
+   */
+  cloneForDraft?: (repo: string, installationId: number, into: string) => Promise<void>;
+  /**
+   * The drafting session itself, injected so a test can watch what gets stored without
+   * spending a container or a model credential.
+   */
+  draft?: typeof draftRecipe;
 };
 
 /**
@@ -204,6 +219,15 @@ export async function serve(options: ServeOptions): Promise<Service> {
       // token and takes `Pick<GitHubApp,'fetch'|'api'>` so that no key can reach it.
       await commentOnIssue({}, await installationToken(app, installationId), repo, issueNumber, body);
     });
+  // Same reasoning as `comment` above, for the same reason: the default mints a real
+  // token and clones over the network, and a test that only cares what a draft turns
+  // into should need neither a registered GitHub App nor a reachable remote.
+  const cloneForDraft =
+    options.cloneForDraft ??
+    (async (repo: string, installationId: number, into: string) => {
+      await cloneRepository(repoUrl(repo), into, await installationToken(app, installationId));
+    });
+  const draft = options.draft ?? draftRecipe;
   await ensureBlobRoot(config.blobRoot);
 
   // A queue of one — see the header. A resource policy, not a port constraint.
@@ -230,6 +254,44 @@ export async function serve(options: ServeOptions): Promise<Service> {
   };
 
   /**
+   * Explore a freshly-installed, un-onboarded repository and propose a recipe (M6b).
+   *
+   * A convenience, never a control: ADR-0013's control is the human approving at
+   * `/repos/<repo>/onboard`, and nothing here runs anything that human has not seen —
+   * the draft only changes what is pre-filled in that box. `saveDraft` stores whatever
+   * the agent produced, unvalidated, and deliberately: `parseRecipe` is the gate a
+   * human's approval runs through, and pre-filtering here would as often discard a
+   * proposal a human would have accepted with one field corrected.
+   *
+   * Failing quietly is the point, not a gap in it. A repository too large to clone, an
+   * agent that produced garbage, a model that never answered — none of those may cost
+   * the installation record itself, because `recipe_drafts` losing this row costs
+   * nothing but asking the agent again.
+   */
+  const draftForRepo = async (repo: string, installationId: number): Promise<void> => {
+    const workspace = await mkdtemp(join(tmpdir(), 'engine-draft-clone-'));
+    try {
+      const source = join(workspace, 'source');
+      await cloneForDraft(repo, installationId, source);
+      const outcome = await draft({
+        runId: crypto.randomUUID(),
+        repoPath: source,
+        image: config.image,
+        agentImage: config.agentImage,
+        loop: config.loop,
+      });
+      if (!outcome.ok) {
+        log(`${repo}: drafting produced nothing — ${outcome.reason}`);
+        return;
+      }
+      await saveDraft(client, repo, outcome.draft);
+      log(`${repo}: drafted a recipe for a human to review at /repos/${repo}/onboard`);
+    } finally {
+      await rm(workspace, { recursive: true, force: true }).catch(() => {});
+    }
+  };
+
+  /**
    * An installation delivery, which is how a repository first becomes known to us.
    *
    * Recorded rather than run: nothing is reproduced here, and the onboarding that follows
@@ -247,6 +309,14 @@ export async function serve(options: ServeOptions): Promise<Service> {
             });
             const recipe = await loadRecipe(client, repo);
             log(`${repo}: installed${recipe ? '' : ' — not onboarded yet, no recipe approved'}`);
+            // DRAFTING (M6b). Its own failure is caught right here rather than by the
+            // `catch` around this whole loop — a repository this cannot draft for must
+            // not stop the NEXT repository in the same delivery from being recorded.
+            if (!recipe) {
+              await draftForRepo(repo, intake.installationId).catch((error) => {
+                log(`${repo}: could not draft a recipe — ${String((error as Error).message ?? error)}`);
+              });
+            }
           } else {
             await removeInstallation(client, repo);
             log(`${repo}: removed`);

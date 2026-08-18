@@ -120,3 +120,17 @@ create table if not exists run_projection (
 );
 
 create index if not exists run_projection_repo on run_projection (repo, started_at desc);
+
+-- A recipe an agent PROPOSED, before any human has approved it (M6b, ADR-0013).
+--
+-- Current configuration, like `recipes` and `installations`: mutable, keyed by
+-- repository, and not a fact about a run. Unlike `recipes`, this row is advisory
+-- testimony from an agent and is NEVER read by anything that executes a command — only
+-- `recipes`, populated by a human approving one at `/repos/<repo>/onboard`, is ever
+-- replayed. Losing this table costs nothing but a re-draft: the agent can always be asked
+-- again, which is why it gets no more durability than an upsert and a delete.
+create table if not exists recipe_drafts (
+  repo       text        primary key,
+  draft      jsonb       not null,
+  drafted_at timestamptz not null default now()
+);

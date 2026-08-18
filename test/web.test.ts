@@ -532,7 +532,7 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     // `parseRecipe`'s message arriving bare would read as this system finding something wrong
     // with someone's repository — the one presentation ADR-0007's amendment forbids, and here
     // it would not even be true.
-    const html = onboardPage('acme/widgets', null, 'service web needs a port');
+    const html = onboardPage('acme/widgets', null, undefined, 'service web needs a port');
     expect(html).toContain('This recipe was not stored.');
     expect(html).toContain('Nothing is wrong with your project');
     expect(html).toContain('service web needs a port');
@@ -558,6 +558,7 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     const html = onboardPage(
       'acme/<script>alert(1)</script>',
       null,
+      undefined,
       'recipe.install must be a string </textarea><script>alert(2)</script>',
     );
     expect(html).not.toContain('<script>');
@@ -565,6 +566,64 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     expect(count(html, '<textarea')).toBe(1);
     expect(count(html, '</textarea>')).toBe(1);
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expectWellFormed(html);
+  });
+});
+
+describe('an unreviewed draft, pre-filled by an agent nobody has checked (M6b)', () => {
+  const DRAFT = { install: 'yarn install', services: [{ name: 'api', command: 'yarn start', port: 3000 }] };
+
+  test('a draft pre-fills the box and is labelled as unreviewed', () => {
+    const html = onboardPage('acme/widgets', null, DRAFT);
+    expect(html).toContain(escapeHtml(JSON.stringify(DRAFT, null, 2)));
+    // Distinct copy from "Read this before you approve" — this box exists to say why the
+    // one below is not empty, not to restate what approving means.
+    expect(html).toContain('This box is pre-filled by an agent, not by a person.');
+    expect(html).toContain('Read this before you approve.');
+    expectWellFormed(html);
+  });
+
+  test('an approved recipe wins outright, even with a draft sitting beside it', () => {
+    const RECIPE: Recipe = { install: 'npm ci', services: [], test: 'npm test' };
+    const html = onboardPage('acme/widgets', RECIPE, DRAFT);
+    expect(html).toContain(escapeHtml(JSON.stringify(RECIPE, null, 2)));
+    expect(html).not.toContain(escapeHtml(JSON.stringify(DRAFT, null, 2)));
+    // No "unreviewed" callout either — a draft that lost has no business being labelled.
+    expect(html).not.toContain('This box is pre-filled by an agent, not by a person.');
+    expectWellFormed(html);
+  });
+
+  test('neither a recipe nor a draft still falls back to the empty skeleton', () => {
+    const withNoArgs = onboardPage('acme/widgets', null);
+    const withUndefinedDraft = onboardPage('acme/widgets', null, undefined);
+    expect(withNoArgs).toEqual(withUndefinedDraft);
+    expect(withNoArgs).not.toContain('This box is pre-filled by an agent, not by a person.');
+    const box = /<textarea[^>]*>([\s\S]*?)<\/textarea>/.exec(withNoArgs);
+    expect(parseRecipe(JSON.parse(box![1]!.replaceAll('&quot;', '"')))).toEqual({ services: [] });
+  });
+
+  test('a draft that cannot even be stringified falls back to the skeleton rather than breaking the page', () => {
+    // `draft` is `unknown` — an agent's own words, never run through `parseRecipe` — so a
+    // circular structure or a BigInt is a real possibility, and `JSON.stringify` throws on
+    // both. A draft that cannot be displayed is worth exactly as much as no draft.
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const html = onboardPage('acme/widgets', null, circular);
+    expect(html).not.toContain('This box is pre-filled by an agent, not by a person.');
+    const box = /<textarea[^>]*>([\s\S]*?)<\/textarea>/.exec(html);
+    expect(parseRecipe(JSON.parse(box![1]!.replaceAll('&quot;', '"')))).toEqual({ services: [] });
+    expectWellFormed(html);
+  });
+
+  test('a script tag inside the draft cannot break out of the textarea', () => {
+    const html = onboardPage('acme/widgets', null, {
+      install: '</textarea><script>alert(1)</script>',
+      services: [],
+    });
+    expect(html).not.toContain('<script>');
+    expect(html).not.toContain('</textarea><');
+    expect(count(html, '<textarea')).toBe(1);
+    expect(count(html, '</textarea>')).toBe(1);
     expectWellFormed(html);
   });
 });

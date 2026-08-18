@@ -114,6 +114,12 @@ const fixtureClient = (): pg.Client => {
     if (sql.includes('from recipes where repo = $1')) {
       return params[0] === REPO ? [{ recipe: RECIPE }] : [];
     }
+    // The onboarding GET now also asks for a draft (M6b) — neither fixture repository has
+    // one, so this fixture's answer is simply "no row", the same as every other lookup
+    // this repository has nothing to say about.
+    if (sql.includes('from recipe_drafts where repo = $1')) {
+      return [];
+    }
     if (sql.includes('from run_projection where run_id = $1')) {
       return params[0] === DEMO_RUN_ID ? [RUN_ROW] : [];
     }

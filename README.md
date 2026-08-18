@@ -189,12 +189,10 @@ Two earlier attempts found a **model** rather than a prompt, and are worth recor
 
 **Milestone 6 landed the product around the run** — installations recorded so an
 un-onboarded repository is answered rather than run against, recipe approval in the
-browser, the read model and its rebuild, what a run cost, redaction, and the dashboard
-([milestone 6](docs/milestone-6.md)). Two things in it are deliberately absent and both
-are named there: the drafting run that *proposes* a recipe (the approval is the control,
-and drafting needs a model credential this repository does not have), and the
-environment-variable UI, which that phase itself blocks on a security ADR that does not
-exist.
+browser, the drafting run that proposes one, the read model and its rebuild, what a run
+cost, redaction, and the dashboard ([milestone 6](docs/milestone-6.md)). One thing in it
+is deliberately absent and named there: the environment-variable UI, which that phase
+itself blocks on a security ADR that does not exist.
 
 **Deliberately not in v1.5:** Slack and CLI connectors · deployment and preview URLs · multi-repo runs · LSP tools · diff-coverage · observability-triggered runs. The dashboard was on this list until milestone 6 built it — struck rather than quietly deleted, because this is the second time a stale line here has said the opposite of what the code does.
 
