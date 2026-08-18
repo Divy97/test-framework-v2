@@ -196,7 +196,7 @@ and drafting needs a model credential this repository does not have), and the
 environment-variable UI, which that phase itself blocks on a security ADR that does not
 exist.
 
-**Deliberately not in v1.5:** Slack and CLI connectors · the dashboard · deployment and preview URLs · multi-repo runs · LSP tools · diff-coverage · observability-triggered runs.
+**Deliberately not in v1.5:** Slack and CLI connectors · deployment and preview URLs · multi-repo runs · LSP tools · diff-coverage · observability-triggered runs. The dashboard was on this list until milestone 6 built it — struck rather than quietly deleted, because this is the second time a stale line here has said the opposite of what the code does.
 
 ## Prior work
 

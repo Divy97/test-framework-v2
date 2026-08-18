@@ -253,10 +253,16 @@ stated it to the party it binds.
 
 ## Not in v1.5
 
-Slack and CLI connectors · the dashboard UI (SSE and issue comments only) ·
-deployment and preview URLs · multi-repo runs · `code-server` · a streamed
-browser · LSP tools · autonomous Sentry-triggered runs · diff-coverage
-instrumentation.
+Slack and CLI connectors · deployment and preview URLs · multi-repo runs ·
+`code-server` · a streamed browser · LSP tools · autonomous Sentry-triggered runs ·
+diff-coverage instrumentation.
+
+**The dashboard UI was on this list and is struck, not silently removed.** Milestone 6
+built it — landing page, repository list, run list, and the evidence view that is the
+point of that milestone — as server-rendered HTML beside the SSE tail rather than as the
+separate `web/` package this document once implied. No framework, no build step, for the
+same reason `src/github.ts` and `src/browser.ts` are hand-rolled: a dependency here would
+be a large surface for a few pages.
 
 The dashboard is the one that will itch, because [Q5](../SHARED-UNDERSTANDING.md)
 made it the demo. It is deferred rather than cut: v1.5 exists to make a run that
