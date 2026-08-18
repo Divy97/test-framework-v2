@@ -38,6 +38,7 @@ import { isWorkerReply, type Job, type WorkerRequest } from './runner.js';
 import { get, put } from './blobs.js';
 import { redact } from './redact.js';
 import type { ReproSpec } from './verify.js';
+import { describeDraftingEnvironment, extractRecipeDraft, renderPrompt } from './prompts.js';
 import { MAX_REASON_CHARS } from './verify.js';
 
 /**
@@ -197,6 +198,30 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * responsibility for that being a repository it owns too.
    */
   exportTo?: string;
+  /**
+   * Give the agent sandbox a network with NO recipe to replay (M6b, ADR-0013's
+   * drafting run).
+   *
+   * The rule this widens: "the agent sandbox gets a network when, and only when,
+   * there is a recipe to replay" (see the docker args in `runContainer`) — written
+   * when the only agent that could exist was one replaying a recipe a human had
+   * already approved. A drafting agent is the one PROPOSING that recipe, and
+   * `prompts/recipe.md` tells it to install what it proposes, boot what it
+   * proposes, and prove both before it writes anything down — which needs a
+   * registry and localhost for the identical reason replaying an approved recipe
+   * does.
+   *
+   * This is not a new trust boundary, and it is worth being precise about why: it
+   * is the SAME agent sandbox the repro/fix agent already gets with a network, on
+   * the terms the README already states — "nothing worth stealing lives there and
+   * nothing it produces is trusted" (ADR-0010's v1.5 amendment). What changes is
+   * whose commands are running: a recipe a human read, or one this container is in
+   * the middle of writing. Nothing it produces reaches a human unreviewed either
+   * way — a draft is stored beside `recipes`, never inside it, and only a human
+   * approving it at `/repos/<repo>/onboard` (ADR-0013's control) can promote it to
+   * something a real run will ever replay.
+   */
+  draftingEnvironment?: boolean;
 } & (
   | { repro: Job['repro']; reproPrompt?: never }
   | { reproPrompt: string; repro?: never }
@@ -1004,6 +1029,169 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
 }
 
 /**
+ * What one drafting session needs. Not a `RunPlan`: there is no reproduction, no
+ * fix, no attempt loop, no gate — a draft is one agent turn, and the deliverable
+ * is text in its transcript, not a judged commit.
+ */
+export type DraftPlan = {
+  runId: string;
+  /** Host path to the repository, mounted read-only. Never written to. */
+  repoPath: string;
+  image: string;
+  /** The image with a browser in it, if the agent should have one while drafting. */
+  agentImage?: string;
+  loop: NonNullable<RunPlan['loop']>;
+};
+
+export type DraftOutcome =
+  | { ok: true; draft: unknown; transcriptText: string; usage: LoopUsage }
+  | { ok: false; reason: string; transcriptText: string; usage: LoopUsage };
+
+/**
+ * Run one drafting session and return what the agent wrote, unvalidated.
+ *
+ * "Unvalidated" is deliberate: this function's job is to run the agent and hand
+ * back its words, not to decide whether they are a recipe a human should see.
+ * `parseRecipe` — which this function does not call — is what checks shape, and
+ * it runs at the point a human is about to be shown the result, which is also
+ * where a malformed draft has to be explained rather than silently discarded.
+ *
+ * No `RunEvent` is emitted and nothing is appended to the log. A draft is
+ * configuration on its way to existing, like `recipes` and `installations`
+ * already are (M6a, ADR-0013) — current, mutable, and not a fact about a run,
+ * because until a human approves it nothing has run against it at all.
+ */
+export async function draftRecipe(plan: DraftPlan): Promise<DraftOutcome> {
+  const empty: LoopUsage = {
+    turns: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
+
+  // A throwaway store, created and destroyed here rather than borrowed from a real
+  // run's durable one. Nothing about a draft is evidence — the deliverable is text
+  // in the transcript, never a blob anyone will fetch by hash — so there is nothing
+  // this store needs to outlive the call.
+  const store = await mkdtemp(join(tmpdir(), 'engine-draft-blobs-'));
+  await writeFile(join(store, '.evidence-store'), '');
+
+  try {
+    const { stdout } = await execFile('git', ['-C', plan.repoPath, 'rev-parse', 'HEAD']);
+    const baseRef = stdout.trim();
+
+    const draftPlan: RunPlan = {
+      runId: plan.runId,
+      repoPath: plan.repoPath,
+      blobRoot: store,
+      image: plan.image,
+      agentImage: plan.agentImage,
+      baseRef,
+      // Dead on the `only: 'agent'` path — `verify()` never runs — and required by
+      // `Job`'s shape regardless. `buildEnvSnapshot` sets the same placeholder for
+      // the same reason.
+      symptomPattern: 'x',
+      repro: { command: '' },
+      loop: plan.loop,
+      draftingEnvironment: true,
+    };
+
+    let transcript: AgentTranscript = {
+      lines: [],
+      stopped: 'spawn_failed',
+      exitCode: -1,
+      usage: empty,
+    };
+
+    // No ancestry stripping, unlike the repro/fix agent's `agentSource`. That
+    // machinery exists to stop an agent claiming authorship of content it cannot
+    // prove it wrote, because that commit is what gets JUDGED (ADR-0008). A
+    // drafting agent authors no judged commit — its only deliverable is the text
+    // above, and its whole world, committed or not, is discarded the moment this
+    // container exits (ADR-0010). There is nothing here for stripped ancestry to
+    // protect, so `plan.repoPath` is mounted as it is.
+    const result = await runContainer(
+      draftPlan,
+      plan.repoPath,
+      0,
+      'agent',
+      {
+        only: 'agent',
+        baseRef,
+        serveTools: true,
+      },
+      async ({ invoke }) => {
+        const prompt = await renderPrompt('recipe', {
+          environment: describeDraftingEnvironment({ browser: plan.agentImage !== undefined }),
+        });
+        transcript = await runAgentLoop({ prompt, invoke, ...plan.loop });
+      },
+    );
+
+    // This function's own version of the cleanup `orchestrate()` does for every
+    // phase it runs — `runContainer` always opens a handover directory for an
+    // `agent` phase, and nothing past this point will ever read it, so nothing
+    // past this point will clean it up if this does not.
+    if (result.handover) await rm(result.handover, { recursive: true, force: true }).catch(() => {});
+
+    // Two different texts, on purpose. `assistantText` is what the agent SAID, and it
+    // is the only thing `extractRecipeDraft` may ever read — a tool result can contain
+    // a fenced block that is not the agent's proposal at all (a file it `read`, a
+    // README quoting an example), and the LAST-fenced-block rule that protects against
+    // the agent's own rejected drafts offers no protection against someone else's json
+    // block arriving from a tool. `debugText` is everything, in order, and it exists
+    // because a caller trying to understand why a session failed needs to see what the
+    // agent RAN, not only what it wrote at the end.
+    const assistantText = transcript.lines
+      .filter((line) => line.claimed_type === 'assistant')
+      .map((line) => {
+        try {
+          return String((JSON.parse(line.raw) as { text?: unknown }).text ?? '');
+        } catch {
+          return '';
+        }
+      })
+      .join('\n\n');
+
+    const debugText = transcript.lines
+      .map((line) => {
+        let payload: Record<string, unknown>;
+        try {
+          payload = JSON.parse(line.raw) as Record<string, unknown>;
+        } catch {
+          return `[${line.claimed_type}] ${line.raw}`;
+        }
+        if (line.claimed_type === 'assistant') return String(payload.text ?? '');
+        if (line.claimed_type === 'tool_use') return `[tool_use] ${String(payload.name)}(${JSON.stringify(payload.input)})`;
+        if (line.claimed_type === 'tool_result') return `[tool_result] ${String(payload.name)} -> ${String(payload.output)}`;
+        if (line.claimed_type === 'thinking') return `[thinking] ${String(payload.thinking)}`;
+        if (line.claimed_type === 'loop_error') return `[loop_error] ${String(payload.message)}`;
+        return '';
+      })
+      .filter((line) => line !== '')
+      .join('\n');
+
+    if (transcript.stopped === 'spawn_failed' || transcript.lines.length === 0) {
+      return { ok: false, reason: 'the drafting agent never ran', transcriptText: debugText, usage: transcript.usage };
+    }
+
+    try {
+      return { ok: true, draft: extractRecipeDraft(assistantText), transcriptText: debugText, usage: transcript.usage };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: String((error as Error).message ?? error),
+        transcriptText: debugText,
+        usage: transcript.usage,
+      };
+    }
+  } finally {
+    await rm(store, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
  * Fetch the agent's bundle into the workspace and report the commit it left.
  *
  * Onto a BRANCH of its own. `refs/agent/*` was the instinct — keep the agent
@@ -1296,7 +1484,12 @@ async function runContainer(
     // longer needs to be" — nothing worth stealing lives there and nothing it
     // produces is trusted. What makes that affordable is what LEFT it: no model
     // credential, no GitHub token, no event channel.
-    ...(phase === 'agent' && plan.recipe ? [] : ['--network', 'none']),
+    // `|| plan.draftingEnvironment` is the one addition M6b makes to this line, and
+    // the comment above the field it reads explains why it belongs beside the
+    // recipe check rather than as a separate rule: both are "this agent needs to
+    // install and boot something", and a recipe existing is just the other way
+    // that need can be true.
+    ...(phase === 'agent' && (plan.recipe || plan.draftingEnvironment) ? [] : ['--network', 'none']),
     '-v', `${source}:/src:ro`,
     '-v', `${store}:/blobs`,
     ...(handover ? ['-v', `${handover}:/out`] : []),

@@ -1,5 +1,5 @@
 ---
-status: built, except 6e's UI and 6b's drafting run
+status: built, except 6e's UI
 ---
 
 # Milestone 6 — the product around the run
@@ -22,19 +22,23 @@ stale.
 |---|---|
 | **6a** installations recorded, un-onboarded repositories answered rather than run | built |
 | **6b** the approval that stores a recipe, in the browser | built |
-| **6b** the *drafting* run that proposes one | **not built** — see below |
+| **6b** the *drafting* run that proposes one | built |
 | **6c** the read model, `npm run rebuild`, `/runs`, `/api/runs` | built |
 | **6d** `run_usage` beside the log | built |
 | **6e** redaction | built |
 | **6e** the environment-variable UI | **deliberately not built** |
 | **6f** landing page, repository list, run list, evidence view | built |
 
-**6b's drafting run is not built, and the half that matters is.** ADR-0013's flow is
-*draft, correct, confirm* — and the control is the confirmation, not the draft: "the
-approval is the only control there is on a stored command we will execute". That is what
-`/repos/<repo>/onboard` does, and it is what a person can use today. Drafting is a
-convenience that needs a model credential, and this repository does not have a working one
-— so building it would have meant shipping a button nobody had pressed.
+**6b's drafting run is now built.** ADR-0013's flow is *draft, correct, confirm* — and the
+control is the confirmation, not the draft: "the approval is the only control there is on a
+stored command we will execute". `/repos/<repo>/onboard` was always where that confirmation
+happens; what changed is that a repository with no recipe and no draft now gets one proposed
+automatically, the moment the GitHub App is installed on it — `draftForRepo` clones the
+default branch into a throwaway workspace, gives an agent a network and nothing else
+(`draftRecipe`, `describeDraftingEnvironment`), and stores whatever it proposes, unvalidated,
+in `recipe_drafts`. A human still has to read it and press approve; nothing here replays a
+draft or trusts it. Validated end-to-end with a real model (`draftRecipe` against a live
+repository, not a scripted one) before being wired into the installation webhook.
 
 **6e's UI is not built and that is the phase's own instruction**: it "must not be built as
 a form until the decision is made". The decision — an ADR about whether a user's
@@ -98,15 +102,17 @@ against the code.
 
 ## 6b · onboarding, where the recipe already has a place to live
 
-ADR-0013's flow exists on paper and has no trigger: *an agent drafts a recipe, the
-user corrects and confirms it, we store it keyed by repository.* Today
-`cli.ts recipe approve` reads a JSON file a human wrote.
+ADR-0013's flow is *an agent drafts a recipe, the user corrects and confirms it, we
+store it keyed by repository.* It now has a trigger: installation (6a) is it, not the
+first issue.
 
-- Installation (6a) is the trigger, not the first issue.
-- A drafting run: the agent explores the repository and writes a recipe draft. This
-  is `extractRecipeDraft` and `prompts/recipe.md`, which already exist.
-- The draft is shown for confirmation and only then stored. `saveRecipe` already
-  does the storing.
+- **Built.** `draftForRepo` runs the moment a repository with no recipe and no draft is
+  installed: a throwaway clone, an agent with a network and nothing else
+  (`draftRecipe`, `describeDraftingEnvironment`), and whatever it proposes lands
+  unvalidated in `recipe_drafts` — advisory testimony, never replayed.
+- The draft is shown for confirmation and only then stored. `onboardPage` prefills it,
+  labelled as agent-written, not human-approved; `saveRecipe` does the storing and
+  `clearDraft` removes the draft once approved.
 
 **Done when:** connecting a repository with no recipe produces a draft the user can
 edit and approve in the browser, and the approved recipe is byte-identical to what

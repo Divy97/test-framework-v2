@@ -283,9 +283,36 @@ const SKELETON = JSON.stringify(
  * README's "nothing worth stealing lives there", which is the justification the rest of the
  * architecture rests on. A form is the easiest half of that problem and shipping it first
  * would settle the question by accident.
+ *
+ * `draft` is the other half of ADR-0013's flow (M6b): an agent explored the repository
+ * unattended and proposed a starting point, stored in `recipe_drafts` and never in
+ * `recipes` itself. It only pre-fills the box — `current` still wins outright when both
+ * exist, because an approved recipe is the one actually in force and a draft beside it
+ * would be a stale second opinion nobody asked for. Showing it changes what the box
+ * contains; it changes nothing about who is the control.
  */
-export function onboardPage(repo: string, current: Recipe | null, error?: string): string {
+export function onboardPage(repo: string, current: Recipe | null, draft?: unknown, error?: string): string {
   const action = `/repos/${urlPath(repo)}/onboard`;
+
+  // What fills the box, in priority order. An approved recipe always wins — it is the
+  // one actually in force, and `draft` is stale the moment one exists. Failing that, an
+  // unreviewed draft is still worth more than a blank box, PROVIDED it can be printed at
+  // all: `draft` arrived as `unknown` off an agent's own words, never through
+  // `parseRecipe`, so stringifying it can throw and a draft that cannot even be
+  // displayed is worth exactly as much as no draft.
+  let prefill = SKELETON;
+  let isDraft = false;
+  if (current) {
+    prefill = JSON.stringify(current, null, 2);
+  } else if (draft !== undefined) {
+    try {
+      prefill = JSON.stringify(draft, null, 2);
+      isDraft = true;
+    } catch {
+      prefill = SKELETON;
+    }
+  }
+
   const body =
     `<h1>Onboard ${escapeHtml(repo)}</h1>
 <p class="hero">Every repository boots differently and nothing in a repository reliably says
@@ -301,6 +328,18 @@ repository — never as a pull request against your code.</p>` +
 <p>Nothing is wrong with your project. The document below did not validate:</p>
 <p><code>${escapeHtml(error)}</code></p>
 <p>Correct it and approve again. Nothing was saved, and no run has been started.</p>
+</div>`
+      : '') +
+    (isDraft
+      ? // A DIFFERENT concern from the box below: that one states what approving means for
+        // any recipe, hand-typed or not. This one says why the box is not empty — nobody
+        // read what is in it yet, and "an agent wrote it" is not "a human checked it".
+        `<div class="warning">
+<h2>This box is pre-filled by an agent, not by a person.</h2>
+<p>It explored this repository and proposed what follows — nobody here has reviewed it.
+Treat it as a first draft, not a recommendation: check every command, every port and
+every service name against what you actually know about this project before you approve
+anything below.</p>
 </div>`
       : '') +
     `<div class="warning refusal">
@@ -320,9 +359,7 @@ list of long-lived processes, each with a lowercase <code>name</code>, a
 <code>healthcheck</code> URL the engine polls until it answers. <code>test</code> is your
 project's own suite — it is the regression arm, not the reproduction, which the agent
 writes.</p>
-<textarea name="recipe" rows="20" spellcheck="false" aria-label="recipe">${escapeHtml(
-      current ? JSON.stringify(current, null, 2) : SKELETON,
-    )}</textarea>
+<textarea name="recipe" rows="20" spellcheck="false" aria-label="recipe">${escapeHtml(prefill)}</textarea>
 <button type="submit">${current ? 'Approve this recipe' : 'Approve and store'}</button>
 </form>
 <h2>Environment variables are not supported yet</h2>

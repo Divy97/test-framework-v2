@@ -45,6 +45,34 @@ export function extractRecipeDraft(text: string): unknown {
 export type PromptVars = Record<string, string>;
 
 /**
+ * You are not root. Say so, in these words, because the alternative is a run whose
+ * agent silently guessed wrong.
+ *
+ * Found by running a real drafting-shaped session against a real repository, not by
+ * reading: `corepack enable` — the standard first line of any pnpm or yarn project's
+ * setup — writes into `/usr/local/bin`, which needs root, and the agent sandbox runs
+ * as uid 1000 by construction (ADR-0006: root in this PID namespace could reach the
+ * event channel through `/proc/1/fd/N`). The identical recipe succeeds in a
+ * root-run environment build and fails here, silently, with no hint that the two
+ * containers disagree about who is allowed to write where.
+ *
+ * Every agent that gets a shell needs to know this, not only the one drafting a
+ * recipe — a fix agent replaying an approved recipe hits the same wall the moment
+ * that recipe assumes root.
+ */
+const UNPRIVILEGED_NOTE = [
+  '',
+  'You are not root here, and nothing you run will be. Anything that needs root —',
+  '`corepack enable`, a global `npm install -g` or `yarn global add`, `apt-get`, writing',
+  'outside this checkout — fails with a permission error, silently as far as your exit',
+  'code is concerned: nothing distinguishes that failure from any other. Prefer what the',
+  'project can already reach without asking for more than it has: `npx <package>@<version>`,',
+  '`./node_modules/.bin/<tool>` once something has installed it, or a package manager',
+  'already vendored in the repository. If a step truly needs root, say so plainly — that is',
+  'a fact about this environment, not a fix you are expected to find.',
+].join('\n');
+
+/**
  * Load a prompt and fill it in.
  *
  * Throws when a placeholder is left unfilled, which is the whole reason this is a
@@ -90,6 +118,7 @@ export function describeEnvironment(options: {
     'The repository is checked out at your working directory. Your tools are the only way to act on it:',
     '`shell_create` / `shell_write` (named sessions that stay alive), `read`, `write`, `edit`, `grep`,',
     '`glob`, and `git_commit`.',
+    UNPRIVILEGED_NOTE,
   ];
 
   // THE ASYMMETRY, stated first, because it is the fact that decides whether a
@@ -172,6 +201,49 @@ export function describeEnvironment(options: {
       'command you register, and that command runs in a container with no browser in it. So use the',
       'browser to see what is wrong, then register something that does not need one — assert on the',
       'HTML the code produces rather than on what a page looks like.',
+    );
+  }
+  return lines.join('\n');
+}
+
+/**
+ * What a DRAFTING agent is told about the world it is in — a real, different world
+ * from `describeEnvironment`'s, not a variant of it.
+ *
+ * `describeEnvironment` is about a container that either replays an approved recipe
+ * or does not, and always contrasts itself against a second container that judges
+ * it. Neither half of that applies here: nothing has been approved yet — there is
+ * nothing to replay — and nothing here is judged at all. A drafting session has one
+ * container, a network, and a human reading whatever gets written down. Reusing
+ * `describeEnvironment` for this would have to either claim "there is no network"
+ * while `orchestrate.ts` hands the container a bridge (M6b needs one for the same
+ * reason a recipe replay does), or invent a "judge" that does not exist for a
+ * drafting session — both false, and both the exact class of prompt/engine
+ * disagreement this project has already found expensive more than once.
+ */
+export function describeDraftingEnvironment(options: { browser?: boolean } = {}): string {
+  const lines: string[] = [
+    'The repository is checked out at your working directory, on its default branch. Your',
+    'tools are the only way to act on it: `shell_create` / `shell_write` (named sessions',
+    'that stay alive), `read`, `write`, `edit`, `grep`, `glob`, and `git_commit`.',
+    UNPRIVILEGED_NOTE,
+    '',
+    'You have a network, and nothing else. Nothing is installed, nothing is running, and',
+    'nothing has been booted for you — working that out is why you are here. Install what',
+    'the project needs, start what it needs started, in a named session so it outlives the',
+    'tool call, and prove each one came up before you write it down.',
+    '',
+    'There is no second container here, and nothing you propose is judged by an exit code.',
+    'A human reads what you write, corrects anything you got wrong, and only then is it',
+    'stored — which is why this session has no gate: the gate is the human, at the moment',
+    'they approve or reject what you hand them (ADR-0013).',
+  ];
+  if (options.browser) {
+    lines.push(
+      '',
+      'A headless browser is available through `browser_navigate`, `browser_click`,',
+      '`browser_type` and `browser_screenshot`, if you need to see a page actually render to',
+      'know a service came up the way you think it did.',
     );
   }
   return lines.join('\n');

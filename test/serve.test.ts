@@ -332,6 +332,137 @@ describe('a signed issue becomes a run', () => {
   });
 });
 
+describe('drafting a recipe for a freshly-installed, un-onboarded repository (M6b)', () => {
+  const installedPayload = (repo = 'o/r') => ({
+    action: 'created',
+    installation: { id: 987654, account: { login: 'o' } },
+    repositories: [{ full_name: repo }],
+  });
+
+  const EMPTY_USAGE = {
+    turns: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  };
+
+  /** Whichever `client.query` call, if any, inserted a draft — `saveDraft`'s own SQL. */
+  const draftInsert = (client: pg.Client): unknown[] | undefined =>
+    (client.query as ReturnType<typeof vi.fn>).mock.calls.find(
+      (args: unknown[]) => typeof args[0] === 'string' && args[0].includes('insert into recipe_drafts'),
+    );
+
+  it('clones the repository, runs the drafting agent, and stores whatever it proposed', async () => {
+    const cloned: { repo: string; installationId: number; into: string }[] = [];
+    const drafted: { repoPath: string; image: string; agentImage?: string }[] = [];
+    const client = fakeClient();
+    const service = await serve({
+      config: config(),
+      client,
+      log: () => {},
+      cloneForDraft: async (repo, installationId, into) => {
+        cloned.push({ repo, installationId, into });
+      },
+      draft: async (plan) => {
+        drafted.push(plan);
+        return {
+          ok: true,
+          draft: { install: 'npm ci', services: [] },
+          transcriptText: 'looks like a node project',
+          usage: EMPTY_USAGE,
+        };
+      },
+    });
+    services.push(service);
+
+    await deliver(service.webhookPort, installedPayload(), { event: 'installation' });
+    await service.drain();
+
+    expect(cloned).toEqual([{ repo: 'o/r', installationId: 987654, into: cloned[0]!.into }]);
+    expect(drafted).toHaveLength(1);
+    // The config actually reaches the drafting session, rather than it inventing its own.
+    expect(drafted[0]).toMatchObject({ image: 'sandbox:test', agentImage: 'agent:test' });
+
+    // Stored, not merely computed — `saveDraft`'s own upsert, seen on the fake client.
+    const insert = draftInsert(client);
+    expect(insert).toBeDefined();
+    expect(JSON.parse((insert as [string, unknown[]])[1][1] as string)).toEqual({ install: 'npm ci', services: [] });
+  });
+
+  it('drafts nothing for a repository that already has an approved recipe', async () => {
+    const cloned: unknown[] = [];
+    const drafted: unknown[] = [];
+    const service = await serve({
+      config: config(),
+      client: fakeClient({ recipe: { install: 'npm ci', services: [] } }),
+      log: () => {},
+      cloneForDraft: async (...args) => void cloned.push(args),
+      draft: async (plan) => {
+        drafted.push(plan);
+        return { ok: true, draft: {}, transcriptText: '', usage: EMPTY_USAGE };
+      },
+    });
+    services.push(service);
+
+    await deliver(service.webhookPort, installedPayload(), { event: 'installation' });
+    await service.drain();
+
+    expect(cloned).toEqual([]);
+    expect(drafted).toEqual([]);
+  });
+
+  it('a failed clone or a refusing agent is logged and stores nothing, without losing the installation record', async () => {
+    const lines: string[] = [];
+    const client = fakeClient();
+    const service = await serve({
+      config: config(),
+      client,
+      log: (line) => lines.push(line),
+      cloneForDraft: async () => {
+        throw new Error('could not clone: repository too large');
+      },
+      draft: async () => {
+        throw new Error('must not be called once the clone has failed');
+      },
+    });
+    services.push(service);
+
+    await deliver(service.webhookPort, installedPayload(), { event: 'installation' });
+    await service.drain();
+
+    // The installation is still recorded — a drafting failure is not an installation
+    // failure, and the two must not be conflated into one log line either.
+    expect(lines.join('\n')).toContain('o/r: installed');
+    expect(lines.join('\n')).toContain('could not draft a recipe');
+    expect(draftInsert(client)).toBeUndefined();
+  });
+
+  it('an agent that refuses to draft is logged by its own reason, and stores nothing', async () => {
+    const lines: string[] = [];
+    const client = fakeClient();
+    const service = await serve({
+      config: config(),
+      client,
+      log: (line) => lines.push(line),
+      cloneForDraft: async () => {},
+      draft: async () => ({
+        ok: false,
+        reason: 'the drafting agent never ran',
+        transcriptText: '',
+        usage: EMPTY_USAGE,
+      }),
+    });
+    services.push(service);
+
+    await deliver(service.webhookPort, installedPayload(), { event: 'installation' });
+    await service.drain();
+
+    expect(lines.join('\n')).toContain('the drafting agent never ran');
+    expect(draftInsert(client)).toBeUndefined();
+  });
+});
+
 describe('the queue is the boundary, not an optimisation', () => {
   // REMOVED: a test named "answers GitHub before the run finishes".
   //

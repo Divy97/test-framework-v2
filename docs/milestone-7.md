@@ -268,8 +268,9 @@ knowledge is in the transcript and is discarded; the comment ships the transcrip
 *length*. An info request is not a verdict, so testimony is admissible here —
 ADR-0006 forbids testimony becoming *facts*, not testimony being displayed as a question.
 
-**Onboarding proves nothing today.** 6b's drafting run has no trigger. Beyond the trigger,
-the connect-time job is not "draft a recipe" but *prove the repo runs and record what
+**Onboarding proves a recipe, not a repository.** 6b's drafting run has a trigger now —
+installation — and a human still has to approve what it proposes. What it does not do is
+the fuller connect-time job: not "draft a recipe" but *prove the repo runs and record what
 could not be proved*: boot it, snapshot it, run the suite and **record its colour at
 HEAD** (which decides whether every future regression arm is interpretable), discover the
 single-test invocation by executing it, screenshot the booted app as a UI baseline. Then

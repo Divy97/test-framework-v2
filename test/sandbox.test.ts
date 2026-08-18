@@ -17,7 +17,7 @@ import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { confidence } from '../src/confidence.js';
 import { fold } from '../src/fold.js';
-import { orchestrate } from '../src/orchestrate.js';
+import { draftRecipe, orchestrate } from '../src/orchestrate.js';
 import { SHARED_WRITABLE } from '../src/runner.js';
 import {
   APPLIED_REPRO,
@@ -2842,6 +2842,65 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // The gate holds, correctly, on a bug that is real. That is the false Tier 3
     // this milestone is about.
     expect(outcome.phases.map((p) => p.phase)).toEqual(['base']);
+  }, 900_000);
+
+  // ── 6b: the drafting agent gets a network with nothing to replay ────────────
+  //
+  // ADR-0013's rule used to have one shape: an agent gets a network when, and only
+  // when, there is a recipe to replay. A drafting agent is PROPOSING that recipe —
+  // there is nothing to replay yet — and `prompts/recipe.md` tells it to install and
+  // boot what it proposes and prove both. Without the flag this asserts, that
+  // instruction is unsatisfiable: the container would be sealed, every install would
+  // fail, and the one thing 6b's done-when requires — a draft a human can approve —
+  // would never exist.
+
+  test('a drafting session reaches the network, though no recipe has ever existed for this repo', async () => {
+    if (!haveDocker) return;
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+
+    // Scripted rather than real: the point under test is the DOCKER ARGS `draftRecipe`
+    // constructs, not what a model would actually propose. `getent hosts` is the same
+    // probe `the phase containers stay sealed while the agent sandbox has a network`
+    // already uses two sections up, for the identical reason — a name that resolves is
+    // proof of a route out, and one that does not is proof there is none.
+    const model = await fakeModel([
+      { content: [call('shell_create', { name: 'probe' })], stop_reason: 'tool_use' },
+      {
+        content: [
+          call(
+            'shell_write',
+            { name: 'probe', input: 'getent hosts registry.npmjs.org >/dev/null 2>&1 && echo DRAFT-HAS-DNS || echo DRAFT-NO-DNS' },
+            'toolu_probe',
+          ),
+        ],
+        stop_reason: 'tool_use',
+      },
+      { content: [{ type: 'text', text: 'I could not fully verify this one:\n\n```json\n{"services":[]}\n```' }], stop_reason: 'end_turn' },
+    ]);
+    try {
+      const outcome = await draftRecipe({
+        runId: RUN_ID,
+        repoPath: fixture.repo,
+        image: IMAGE,
+        loop: { provider: 'anthropic', apiKey: 'sk-ant-not-a-real-key', baseURL: model.baseURL, timeoutMs: 120_000 },
+      });
+
+      // The outcome itself is not the point of this test — `extractRecipeDraft` and
+      // `parseRecipe` have their own tests — but it has to have RUN, or a probe that
+      // never executed would prove nothing about the network it never touched.
+      expect(outcome.transcriptText).toMatch(/DRAFT-HAS-DNS|DRAFT-NO-DNS/);
+      // And it is specifically the HAS case: a network genuinely reached the registry
+      // resolver, in a container backing a repository with no approved recipe at all.
+      // The RESULT line, not the whole transcript: the scripted command's own text
+      // names both branches ("echo DRAFT-HAS-DNS || echo DRAFT-NO-DNS"), so asserting
+      // on the full text would fail on the command being echoed back, never on the
+      // resolver actually failing.
+      expect(outcome.transcriptText).toContain('shell_write -> DRAFT-HAS-DNS');
+      expect(outcome.transcriptText).not.toContain('shell_write -> DRAFT-NO-DNS');
+    } finally {
+      await model.close();
+    }
   }, 900_000);
 });
 
