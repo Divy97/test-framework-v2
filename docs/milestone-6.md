@@ -40,13 +40,16 @@ in `recipe_drafts`. A human still has to read it and press approve; nothing here
 draft or trusts it. Validated end-to-end with a real model (`draftRecipe` against a live
 repository, not a scripted one) before being wired into the installation webhook.
 
-**6e's UI is not built and that is the phase's own instruction**: it "must not be built as
-a form until the decision is made". The decision — an ADR about whether a user's
-credentials may enter a sandbox that holds an untrusted agent with network egress — does
-not exist. What *was* built is the half 6e says to do first and which is worth doing
-regardless: redaction, so a secret cannot reach a payload, a blob or a log line. The leak
-was real before any UI, because a recipe carries environment inline and a failing step put
-the command into `VERIFICATION_ABORTED.reason`, which is append-only forever.
+**6e's UI is still not built, but the decision it was blocked on is now made.**
+[ADR-0017](adr/0017-environment-secrets-and-the-network-that-has-to-close.md) records it:
+no production-shaped secret enters a container that has a network route, not behind an
+allowlist — an absence, until the agent sandbox's `install` step is pre-warmed out of a
+snapshot the way the phase containers already are. That prerequisite doesn't exist, so the
+form stays unbuilt — now on named infrastructure, not an open question. What *was* built
+already, ahead of the ADR: redaction, so a secret cannot reach a payload, a blob or a log
+line. The leak was real before any UI, because a recipe carries environment inline and a
+failing step put the command into `VERIFICATION_ABORTED.reason`, which is append-only
+forever.
 
 **The evidence view is the point of this milestone**, and it is built: base red for the
 reported symptom, fix green, the regression arm, every confidence point beside the
@@ -157,8 +160,10 @@ to describe our own spending would put a fact about us in a log about the user's
 
 ## 6e · secrets, and the boundary that has to move first
 
-**This phase is blocked on a decision, not on code**, and it must not be built as a
-form until the decision is made.
+**This phase was blocked on a decision, not on code, and the decision is now made** —
+[ADR-0017](adr/0017-environment-secrets-and-the-network-that-has-to-close.md). What it
+must not be built as a form until is a piece of infrastructure the decision names and
+that does not exist yet (below).
 
 Injecting a user's environment variables into the agent sandbox breaks the
 justification the architecture rests on. Three facts:
@@ -189,13 +194,20 @@ What this phase must include, in this order:
   encrypted table, referenced by name, resolved at injection.
 - Env scoped **per service**, plus separately for `install`/`migrate` — a monorepo
   has a different `.env` per folder, so one global map does not model the real case.
-- The UI states the contract in its own copy: **non-production values only.**
-- An ADR recording that this breaks "nothing worth stealing", and naming the real
-  fix: pre-warm dependencies into the agent image so the recipe needs no registry,
-  then `--network none` everywhere. Only then are production values defensible.
+- ~~The UI states the contract in its own copy: non-production values only.~~
+  **Rejected by the ADR**, not merely skipped: a label is not a control, and the
+  sandbox cannot tell a test key from a production one, so this bullet is not
+  something to still build.
+- **Built.** An ADR recording that raw injection breaks "nothing worth stealing", and
+  naming the real fix: pre-warm dependencies into the agent image so the recipe needs
+  no registry, then `--network none` everywhere. Only then are production values
+  defensible — [ADR-0017](adr/0017-environment-secrets-and-the-network-that-has-to-close.md).
 
 **Done when:** a redaction test proves a secret-shaped value in a failing recipe
-step does not appear in any event, blob, or log line — and the ADR exists.
+step does not appear in any event, blob, or log line — and the ADR exists. **Both
+true.** What remains — the encrypted secrets table and the UI itself — waits on the
+ADR's own precondition: pre-warming the agent sandbox's dependencies so it needs no
+network at all. That is unscoped work, not an open decision.
 
 ---
 
