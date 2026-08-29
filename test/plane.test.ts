@@ -10,13 +10,22 @@
 // silently drops its only coverage of an authorization rule is the false green this
 // project exists to refuse.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import type pg from 'pg';
 import type { RunEvent } from '../src/events.js';
+import { digest, get } from '../src/blobs.js';
+import type { ArtifactRef } from '../src/events.js';
 import { enqueueJob, pairRunner, revokeRunner, type Runner } from '../src/plane.js';
 import { runnerRoutes } from '../src/runner-api.js';
 import { connect } from '../src/store.js';
+
+/** One blob root for the file, made on demand so a run with no upload makes no directory. */
+let blobs: string | null = null;
+const blobRoot = (): string => (blobs ??= mkdtempSync(join(tmpdir(), 'engine-plane-blobs-')));
 
 let client: pg.Client | null = null;
 let why = '';
@@ -48,6 +57,7 @@ afterAll(async () => {
     await client.query('delete from runners where id = any($1)', [madeRunners]).catch(() => {});
   }
   await client?.end();
+  if (blobs) rmSync(blobs, { recursive: true, force: true });
 });
 
 /** A fresh installation id per test, so nothing here can claim another test's work. */
@@ -74,19 +84,27 @@ const call = async (
   token: string | undefined,
   method: string,
   path: string,
-  options: { body?: unknown; query?: string } = {},
+  options: { body?: unknown; raw?: Buffer; query?: string } = {},
 ) => {
-  const route = runnerRoutes({ client: client! });
+  const route = runnerRoutes({ client: client!, blobRoot: blobRoot() });
+  const text = options.body === undefined ? '' : JSON.stringify(options.body);
   const response = await route({
     method,
     path,
     query: new URLSearchParams(options.query ?? ''),
     headers: token === undefined ? {} : { authorization: `Bearer ${token}` },
-    body: async () => (options.body === undefined ? '' : JSON.stringify(options.body)),
+    body: async () => text,
+    // The ceiling is the ROUTE's to choose, so the fake honours it the way the server
+    // does: over the limit is `null`, never a truncated buffer.
+    raw: async (limit = 256 * 1024) => {
+      const bytes = options.raw ?? Buffer.from(text);
+      return bytes.length > limit ? null : bytes;
+    },
   });
+  const body = response?.body;
   return {
     status: response?.status ?? 0,
-    body: response?.body ? (JSON.parse(response.body) as Record<string, unknown>) : {},
+    body: body ? (JSON.parse(body.toString()) as Record<string, unknown>) : {},
   };
 };
 
@@ -303,5 +321,106 @@ describe('an append is idempotent, and history is not', () => {
     await call(token, 'GET', '/runner/jobs');
     const response = await call(token, 'POST', `/runner/runs/${runId}/events`, { body });
     expect(response.status).toBe(400);
+  });
+});
+
+describe('blobs cross the boundary, or do not land at all (9b)', () => {
+  /** A dispatched run, which is the only thing a blob can be uploaded under. */
+  const dispatched = async () => {
+    const id = installation();
+    const runId = await queue(id);
+    const { token } = await pair(id);
+    await call(token, 'GET', '/runner/jobs');
+    return { runId, token, id };
+  };
+
+  test('bytes upload under the run that owns them, and are readable by ref', async () => {
+    if (skipped()) return;
+    const { runId, token } = await dispatched();
+    const bytes = Buffer.from('not ok 3 - totals\n  expected 300, got 297\n');
+    const ref = digest(bytes);
+
+    const response = await call(token, 'PUT', `/runner/runs/${runId}/blobs/${ref}`, { raw: bytes });
+    expect(response.status).toBe(201);
+    expect(response.body['ref']).toBe(ref);
+
+    // Through `get`, which re-verifies the digest on read — so this asserts the bytes
+    // are both present and the bytes that ref names.
+    expect((await get(blobRoot(), ref)).toString()).toContain('expected 300, got 297');
+  });
+
+  test('a screenshot survives, which the string body would have destroyed', async () => {
+    if (skipped()) return;
+    // The reason `Route` grew a bytes body at all. Every value 0x00–0xFF, which is what
+    // a PNG is and what UTF-8 decoding silently rewrites — the old `body()` would have
+    // hashed to something else and been refused as a forgery.
+    const { runId, token } = await dispatched();
+    const bytes = Buffer.from(Array.from({ length: 256 }, (_, n) => n));
+    const ref = digest(bytes);
+
+    expect((await call(token, 'PUT', `/runner/runs/${runId}/blobs/${ref}`, { raw: bytes })).status).toBe(201);
+    expect(Buffer.compare(await get(blobRoot(), ref), bytes)).toBe(0);
+  });
+
+  test('bytes that are not what they claim to be are refused, and nothing is written', async () => {
+    if (skipped()) return;
+    const { runId, token } = await dispatched();
+    const honest = Buffer.from('what actually happened');
+    const lie = digest(Buffer.from('what somebody would rather had happened'));
+
+    const response = await call(token, 'PUT', `/runner/runs/${runId}/blobs/${lie}`, { raw: honest });
+    expect(response.status).toBe(400);
+
+    // Neither name resolves: not the claimed one, and not the true one either. Storing
+    // first and refusing afterwards would leave the honest bytes on our disk under a
+    // name nobody asked for.
+    await expect(get(blobRoot(), lie)).rejects.toThrow();
+    await expect(get(blobRoot(), digest(honest))).rejects.toThrow();
+  });
+
+  test('a blob for somebody else s run is refused', async () => {
+    if (skipped()) return;
+    const id = installation();
+    const runId = await queue(id);
+    const mine = await pair(id, 'mine');
+    const theirs = await pair(id, 'theirs');
+    await call(mine.token, 'GET', '/runner/jobs');
+
+    const bytes = Buffer.from('planted');
+    const response = await call(theirs.token, 'PUT', `/runner/runs/${runId}/blobs/${digest(bytes)}`, { raw: bytes });
+    expect(response.status).toBe(403);
+    await expect(get(blobRoot(), digest(bytes))).rejects.toThrow();
+  });
+
+  test('an oversized body says it is too large, rather than failing its digest', async () => {
+    if (skipped()) return;
+    // The failure this closes: the old reader truncated silently at its ceiling, so an
+    // oversized upload arrived as a digest mismatch — an operational limit wearing a
+    // tamper signal's clothes, on the one check that is supposed to mean tampering.
+    const { runId, token } = await dispatched();
+    const bytes = Buffer.alloc(17 * 1024 * 1024, 7);
+    const response = await call(token, 'PUT', `/runner/runs/${runId}/blobs/${digest(bytes)}`, { raw: bytes });
+    expect(response.status).toBe(413);
+    expect(String(response.body['error'])).toContain('may not exceed');
+  });
+
+  test('a re-upload is a no-op that succeeds, because a retry must not be an error', async () => {
+    if (skipped()) return;
+    const { runId, token } = await dispatched();
+    const bytes = Buffer.from('the same output twice');
+    const ref = digest(bytes) as ArtifactRef;
+
+    expect((await call(token, 'PUT', `/runner/runs/${runId}/blobs/${ref}`, { raw: bytes })).status).toBe(201);
+    expect((await call(token, 'PUT', `/runner/runs/${runId}/blobs/${ref}`, { raw: bytes })).status).toBe(201);
+    expect((await get(blobRoot(), ref)).toString()).toBe('the same output twice');
+  });
+
+  test('a ref that is not content-addressed is not a route at all', async () => {
+    if (skipped()) return;
+    const { runId, token } = await dispatched();
+    const response = await call(token, 'PUT', `/runner/runs/${runId}/blobs/sha256:nope`, {
+      raw: Buffer.from('x'),
+    });
+    expect(response.status).toBe(404);
   });
 });

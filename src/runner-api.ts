@@ -11,7 +11,8 @@
 // start disagreeing.
 
 import type pg from 'pg';
-import type { RunEvent } from './events.js';
+import { digest, put } from './blobs.js';
+import type { ArtifactRef, RunEvent } from './events.js';
 import {
   appendFromRunner,
   claimJob,
@@ -27,6 +28,17 @@ const MAX_WAIT_MS = 30_000;
 
 /** A batch bigger than this is a client that has stopped streaming and started dumping. */
 const MAX_BATCH = 500;
+
+/**
+ * The largest blob this accepts in one request.
+ *
+ * ponytail: buffered in memory, so the ceiling is a memory decision rather than a
+ * storage one. It covers every blob this engine actually produces — an 8KB stdout tail,
+ * a diff, a screenshot — and refuses the pathological case loudly instead of quietly
+ * inventing a swap file. Stream to a temp file and rename if a real repository ever
+ * produces a 64MB test log worth keeping.
+ */
+const MAX_BLOB_BYTES = 16 * 1024 * 1024;
 
 const json = (body: unknown, status = 200) => ({
   status,
@@ -67,10 +79,10 @@ const asEvents = (value: unknown): RunEvent[] | null => {
  * `null` for anything else, so this composes with the dashboard's routes and neither
  * has to know about the other.
  */
-export function runnerRoutes(options: { client: pg.Client }): Route {
-  const { client } = options;
+export function runnerRoutes(options: { client: pg.Client; blobRoot: string }): Route {
+  const { client, blobRoot } = options;
 
-  return async ({ method, path, query, headers, body }) => {
+  return async ({ method, path, query, headers, body, raw }) => {
     if (!path.startsWith('/runner/')) return null;
 
     // One authentication, before any routing below it, so a route added later cannot
@@ -117,6 +129,33 @@ export function runnerRoutes(options: { client: pg.Client }): Route {
         return json({ error: result.refused, appended: result.appended ?? 0 }, status);
       }
       return json(result);
+    }
+
+    // Blobs (9b). Under the RUN they belong to, not a bare content-addressed endpoint:
+    // the store dedups by hash anyway, and routing the upload through the run makes it
+    // the same authorization question as an append rather than a second, weaker one.
+    const blob = /^\/runner\/runs\/([^/]+)\/blobs\/(sha256:[0-9a-f]{64})$/.exec(path);
+    if (method === 'PUT' && blob) {
+      const runId = decodeURIComponent(blob[1]!);
+      const claimed = blob[2] as ArtifactRef;
+      const authorized = await appendFromRunner(client, runner, runId, []);
+      if ('refused' in authorized) {
+        return json({ error: authorized.refused }, authorized.refused.includes('no such run') ? 404 : 403);
+      }
+
+      const bytes = await raw(MAX_BLOB_BYTES);
+      if (bytes === null) return json({ error: `a blob may not exceed ${MAX_BLOB_BYTES} bytes` }, 413);
+
+      // Named BEFORE stored, and the order is the point. `digest` says what these bytes
+      // are; if that is not what the runner claimed, nothing is written at all. Storing
+      // first and refusing afterwards would be a check that reports rather than one that
+      // holds — the bytes would already be on our disk, under a name nobody asked for.
+      const actual = digest(bytes);
+      if (actual !== claimed) {
+        return json({ error: `these bytes are ${actual}, not ${claimed}` }, 400);
+      }
+      const stored = await put(blobRoot, bytes);
+      return json({ ref: stored, bytes: bytes.length }, 201);
     }
 
     const finished = /^\/runner\/runs\/([^/]+)\/finished$/.exec(path);

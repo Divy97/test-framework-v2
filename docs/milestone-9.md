@@ -16,7 +16,7 @@ are different requirements, and this milestone is the seam between them.
 | | | |
 |---|---|---|
 | **9a** the runner dials out — pairing, dispatch, authorized append | built |
-| **9b** blobs cross the boundary | |
+| **9b** blobs cross the boundary | built |
 | **9c** GitHub OAuth, and the human surface | |
 | **9d** the runner daemon | |
 | **9e** deletion, as a tombstone rather than a hole | |
@@ -99,10 +99,42 @@ unavailable — runner offline"* is not one. The privacy objection is weaker tha
 here specifically: the engine already pushes a branch and opens a pull request, so the
 content leaves the machine by design.
 
-It is not in 9a for a mechanical reason. `Route`'s body is `() => Promise<string>`,
+It was not in 9a for a mechanical reason. `Route`'s body was `() => Promise<string>`,
 bounded at 256KB — a decoded string, which mangles a PNG, and a ceiling far below a
-64MB stdout. Blob transport needs a `Buffer` path with its own limit, which is a change
-to `sse.ts`, which is one idea and therefore one PR.
+64MB stdout.
+
+`Route` has `raw(limit)` now, returning `Buffer | null`. **`null`, never a truncated
+buffer**, and that is the interesting half: the old reader stopped buffering at its
+ceiling and returned what it had, so an oversized upload would have arrived as a
+**digest mismatch** — an operational limit wearing a tamper signal's clothes, on the one
+check in this system that is supposed to mean tampering. A route can now say "too large"
+because it can tell.
+
+**Named before stored.** `digest(bytes)` says what a body is; if that is not the ref the
+runner claimed, nothing is written at all. Storing first and refusing afterwards is a
+check that reports rather than one that holds — the bytes would already be on our disk,
+under a name nobody asked for.
+
+Uploads go **under the run** (`PUT /runner/runs/:id/blobs/:ref`) rather than to a bare
+content-addressed endpoint. The store dedups by hash regardless, and routing through the
+run makes it the same authorization question as an append instead of a second, weaker
+one.
+
+`get()` already re-verifies the digest on read, so a blob fetched from anywhere is
+self-verifying, and `blobs.ts` was written for this: *"S3 becomes one adapter behind
+put/get … no event schema changes when it does."*
+
+### What is asserted
+
+Seven more tests in `test/plane.test.ts`, and two of them are the reason the contract
+changed: **every byte value 0x00–0xFF survives the round trip** (a PNG through the old
+string body hashes to something else and is refused as a forgery), and **an oversized
+body answers 413 rather than 400**. Plus: bytes that are not what they claim are refused
+and neither name resolves afterwards; a blob for another runner's run is refused; a
+re-upload succeeds, because a retry must not be an error.
+
+The read side is deliberately absent. Serving a blob to a human is authorized by a human
+session, which is 9c.
 
 `get()` already re-verifies the digest on read, so a blob fetched from anywhere is
 self-verifying, and `blobs.ts` was written for this: *"S3 becomes one adapter behind
