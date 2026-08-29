@@ -291,7 +291,80 @@ const SKELETON = JSON.stringify(
  * would be a stale second opinion nobody asked for. Showing it changes what the box
  * contains; it changes nothing about who is the control.
  */
-export function onboardPage(repo: string, current: Recipe | null, draft?: unknown, error?: string): string {
+/**
+ * What the proving run found (8f), rendered for the human who approved the recipe.
+ *
+ * Defensive about every field, because `proof` is stored as opaque JSON and read
+ * back the same way: a proof written by an older engine has to render as what it is
+ * rather than throw on a field that did not exist yet. Everything is escaped — the
+ * caveats quote the recipe's own commands and a container's output.
+ */
+function proofBlock(proof: unknown): string {
+  if (proof === null || typeof proof !== 'object') {
+    return `<div class="panel"><h2>Not proved yet</h2>
+<p class="muted">Approving a recipe starts a proving run: it builds this repository's
+environment and runs the project's own test command in the sealed container that judges
+a fix. Reload in a minute.</p></div>`;
+  }
+  const it = proof as {
+    state?: unknown;
+    commit?: unknown;
+    environment?: { built?: unknown; failed?: unknown };
+    suite?: { command?: unknown; exitCode?: unknown; failed?: unknown };
+    caveats?: unknown;
+    unproved?: unknown;
+    provedAt?: unknown;
+  };
+  const list = (value: unknown): string[] =>
+    Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  const headline =
+    it.state === 'ready'
+      ? '<b class="ok">Ready.</b> The environment built and the project’s own tests pass in the container that judges a fix.'
+      : it.state === 'blocked'
+        ? '<b class="fail">Blocked.</b> This repository’s environment did not build, so no run here can reproduce anything.'
+        : '<b>Ready, with caveats.</b> The environment built. What follows is what a run here will and will not be able to say.';
+
+  const suite =
+    it.suite === undefined || it.suite === null
+      ? ''
+      : `<p>The project’s own test command, run in the sealed container: <code>${escapeHtml(
+          String(it.suite.command ?? '',
+        ))}</code> — ${
+          typeof it.suite.exitCode === 'number'
+            ? `exit ${escapeHtml(String(it.suite.exitCode))}`
+            : `could not be run (${escapeHtml(String(it.suite.failed ?? 'no reason recorded'))})`
+        }.</p>`;
+
+  return `<div class="panel">
+<h2>What onboarding proved</h2>
+<p>${headline}</p>
+${it.environment && it.environment.built === false ? `<p class="fail">${escapeHtml(String(it.environment.failed ?? ''))}</p>` : ''}
+${suite}
+${
+  list(it.caveats).length === 0
+    ? ''
+    : `<p>Caveats:</p><ul>${list(it.caveats).map((c) => `<li>${escapeHtml(c)}</li>`).join('')}</ul>`
+}
+${
+  list(it.unproved).length === 0
+    ? ''
+    : `<p class="muted small">Not checked by this engine at all:</p><ul class="muted small">${list(it.unproved)
+        .map((c) => `<li>${escapeHtml(c)}</li>`)
+        .join('')}</ul>`
+}
+<p class="muted small">Proved at ${escapeHtml(String(it.provedAt ?? 'an unrecorded time'))}${
+    it.commit ? `, on <code>${escapeHtml(String(it.commit).slice(0, 12))}</code>` : ''
+  }. Approving a new recipe clears this, because a proof is about the commands it ran.</p>
+</div>`;
+}
+
+export function onboardPage(
+  repo: string,
+  current: Recipe | null,
+  draft?: unknown,
+  error?: string,
+  proof?: unknown,
+): string {
   const action = `/repos/${urlPath(repo)}/onboard`;
 
   // What fills the box, in priority order. An approved recipe always wins — it is the
@@ -318,6 +391,9 @@ export function onboardPage(repo: string, current: Recipe | null, draft?: unknow
 <p class="hero">Every repository boots differently and nothing in a repository reliably says
 how, so this is asked once and replayed forever. It is stored on our side, keyed by
 repository — never as a pull request against your code.</p>` +
+    // Only with a recipe in force: there is nothing to prove about a proposal, and
+    // proving happens at approval for exactly that reason (8f).
+    (current ? proofBlock(proof ?? null) : '') +
     (error
       ? // The refusal is about the document in the box, and the sentence says so first.
         // `parseRecipe` validates shape and nothing else; letting its message arrive bare

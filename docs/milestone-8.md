@@ -21,7 +21,7 @@ wedged suite.
 | **8c** the info request says what was actually missing | M7: "the info-request is a template" | built |
 | **8d** a suite that is already red on the reported behaviour | M7: "an existing failing test is a free Tier 1" | built |
 | **8e** triage, before a container starts | M7: "the cheapest available reduction in false Tier 3s" | built |
-| **8f** onboarding proves the repository, not just the recipe | M7: "onboarding proves a recipe" | |
+| **8f** onboarding proves the repository, not just the recipe | M7: "onboarding proves a recipe" | built |
 | **8g** the sham-fix control survives a repository with dependencies | M7's predicted limitation, observed | |
 
 ## 8a · a container that will not finish is stopped
@@ -252,3 +252,59 @@ through the OpenRouter branch as `null`. Every assertion expecting `null` passed
 It is written down because it is the same shape the project has hit repeatedly — a
 test passing for a reason unrelated to the code — and because the thing that caught
 it was having the positive case at all.
+
+## 8f · onboarding proves the repository, not just the recipe
+
+6b gave the drafting run a trigger and a human an approve button. What neither gave
+anyone was an answer: the first time it was known whether those commands actually
+work was in the middle of a real run, twenty minutes after a stranger filed an
+issue — where it arrives dressed as a finding about their bug.
+
+Approving a recipe now starts a **proving run**: it builds the environment from that
+recipe and runs the project's own test command in the sealed container that judges a
+fix. Three states come out — `ready`, `ready_with_caveats`, `blocked` — and the state
+is derived from those two observations rather than asserted beside them.
+
+**The same two containers a real run uses**, and not a cheaper approximation. The
+whole value is that the answer is the one a run will get: an onboarding check that
+passes where runs fail is worse than no check, because it certifies a repository into
+a false Tier 3.
+
+**At approval, not at drafting.** A draft is a proposal, and there is nothing to
+prove about commands nobody has agreed to. The moment they become the commands this
+engine will execute verbatim is the moment they are worth executing once, while a
+human is still looking at the page.
+
+### The caveat that was the point
+
+*"Run the suite and record its colour at HEAD — which decides whether every future
+regression arm is interpretable."* A repository whose suite is already red at HEAD
+gets `already_red` from 7d's second arm forever, and 7d's own rule is that such a
+repository must never be told its own state is a fix's fault. Now the human is told
+at connect time, in those words: what it costs, and that nothing here is a claim
+their project is wrong.
+
+The other two caveats are the same shape: a recipe that installs nothing (correct for
+a project with no dependencies, a false "could not reproduce" for one that has them),
+and a test command that cannot run sealed (8b's finding, surfaced at the moment
+somebody can still fix it).
+
+### What is stored, and what is not built
+
+The proof lives in the `recipes` row, not a table of its own — a proof is an
+observation about a specific set of commands, so approving a new recipe has to
+invalidate it, and here that is a fact about where the bytes live rather than an
+invariant to remember. It is read back as opaque JSON and rendered defensively: a
+proof written before a field existed is still the best thing anyone has about that
+repository.
+
+Milestone 7's list had two more items, and they are **named rather than silently
+absent** — the page prints them under "not checked by this engine at all", apart from
+the repository's own caveats, because collapsing the two would tell someone their
+project is missing something that is ours:
+
+- **the single-test invocation**, which nothing has executed;
+- **a screenshot of the booted app** as a UI baseline.
+
+Both need an agent session with a network and a browser — a drafting-shaped run —
+which is a different thing from the two sealed containers this is.
