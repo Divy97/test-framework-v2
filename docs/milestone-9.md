@@ -318,3 +318,33 @@ because hiding them would be the edit that was just refused, one layer up.
 blob shared only with a forgotten run goes; forgetting twice does not rewrite who asked
 or when. `web.test.ts` covers the tombstone and its absence, and `authz.test.ts` covers
 the one that matters — deleting the evidence of a run you cannot see deletes nothing.
+
+## What GitHub accepted
+
+On 2026-08-30, for the first time, an issue filed on GitHub reached this engine through
+a real webhook delivery and came back as a real pull request:
+[Divy97/test-framework-v2-demo#4](https://github.com/Divy97/test-framework-v2-demo/pull/4)
+— **Tier 2, 90/103**, `+13/-0` in `orders.mjs`, from
+[issue #3](https://github.com/Divy97/test-framework-v2-demo/issues/3).
+
+The whole chain, each link of which had only ever been exercised by a fixture: delivery
+signed and verified (`202`), the onboarding gate passed, the recipe replayed with its
+service answering a healthcheck, the sealed probe, the repro agent, base red twice with
+the reported symptom, the fix agent, fix green three times, the project's own suite green
+on both commits, a branch pushed and a pull request opened.
+
+**Two honest limits on what that proves.** It went through `serve.ts` — the
+single-machine path — so the plane and the runner built in this milestone are merged and
+tested and have never been deployed. And the tunnel in front of it dies with the process,
+which is the argument for the plane rather than a counterexample to it.
+
+**And it found something no test here could.** The first delivery failed in the
+environment build: *"/blobs is not a host store"*. The deployed `test-framework-v2-*:latest`
+images were **two weeks old** — the suite builds `:test`, so nothing had ever run against
+what is actually deployed, and that image predates 7e's `only: 'env'` mode. Rebuilt, and
+the re-fired delivery went the whole way.
+
+Worth naming as a gap rather than a war story: **nothing checks that the images a
+deployment runs are the images this repository builds.** A run against a stale image is
+an operational failure that reads, from the log, exactly like an environment that would
+not build.
