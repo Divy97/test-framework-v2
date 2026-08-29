@@ -142,7 +142,7 @@ describe('a machine has to be paired to say anything', () => {
     const { runner, token } = await pair(id);
     expect((await call(token, 'GET', '/runner/jobs')).status).toBe(204);
 
-    await revokeRunner(client!, runner.id);
+    expect(await revokeRunner(client!, runner.id, runner.installationId)).toBe(true);
     expect((await call(token, 'GET', '/runner/jobs')).status).toBe(401);
 
     // The row survives: the events it wrote are in the log forever, and a reader
@@ -150,6 +150,28 @@ describe('a machine has to be paired to say anything', () => {
     const { rows } = await client!.query('select revoked_at from runners where id = $1', [runner.id]);
     expect(rows).toHaveLength(1);
     expect(rows[0].revoked_at).not.toBeNull();
+  });
+
+  test('a runner belonging to another installation cannot be revoked by id', async () => {
+    // Found by review after it shipped. The route authorized the REPOSITORY in its path
+    // and then passed the runner id from the URL straight through, so anyone with access
+    // to any repository could revoke somebody else's machine — a cross-tenant denial of
+    // service, and the same shape as the run-id checks that were done correctly two
+    // routes away.
+    //
+    // Asserted here rather than only at the route, because the fix is that the data
+    // layer requires the installation: a future caller cannot forget an argument it has
+    // to supply.
+    const victim = await pair(installation(), 'somebody else s laptop');
+    const attacker = installation();
+
+    expect(await revokeRunner(client!, victim.runner.id, attacker)).toBe(false);
+
+    const { rows } = await client!.query('select revoked_at from runners where id = $1', [victim.runner.id]);
+    expect(rows[0].revoked_at).toBeNull();
+    // And it still works, which is what makes the refusal above about ownership rather
+    // than about the runner being unrevokable.
+    expect((await call(victim.token, 'GET', '/runner/jobs')).status).toBe(204);
   });
 
   test('polling stamps presence, so "nobody is online" is different from "nobody is paired"', async () => {

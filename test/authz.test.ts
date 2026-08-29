@@ -159,6 +159,22 @@ describe('being signed in is not being allowed', () => {
     expect(writes.some((sql) => sql.includes('insert into forgotten'))).toBe(false);
   });
 
+  it('revoking a runner by id does not reach another installation s machine', async () => {
+    // The IDOR this closes: the gate authorized `mine/repo` in the path and the runner
+    // id came from the URL unchecked, so a valid session on any repository could revoke
+    // any machine whose id it knew. The fake below records the SQL, and the assertion is
+    // that the update is scoped rather than that it happened.
+    const writes: string[] = [];
+    const response = await call(surface({ writes }), 'POST', '/repos/mine%2Frepo/runners/somebody-elses-id/revoke');
+
+    // Nothing matched, so nothing was revoked, and the answer is the one a runner that
+    // does not exist gets.
+    expect(response?.status).toBe(404);
+    const revokes = writes.filter((sql) => sql.includes('set revoked_at'));
+    expect(revokes).toHaveLength(1);
+    expect(revokes[0]).toContain('installation_id = $2');
+  });
+
   it('a GitHub that will not answer denies rather than admits', async () => {
     // `installationsFor` returns an empty list when GitHub is unreachable, and this is
     // what that means at the surface: an outage must not become an authorization.
