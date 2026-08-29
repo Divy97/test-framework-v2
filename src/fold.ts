@@ -79,6 +79,12 @@ export type RegisteredRepro = {
   command: string;
   files: Record<string, ArtifactRef>;
   applied: string[];
+  /**
+   * Which of the registered paths git had at the base commit, as the engine
+   * observed them there. Empty on a log written before 8d, which reads as "not
+   * observed" and denies the provenance claim rather than granting it.
+   */
+  committed: string[];
 };
 
 export type RunState = {
@@ -284,6 +290,7 @@ export function apply(state: RunState, event: RunEvent): RunState {
         command: event.payload.command,
         files: event.payload.files,
         applied: event.payload.applied,
+        committed: event.payload.committed ?? [],
       };
       const registrations = [...state.registrations, registration];
       return {

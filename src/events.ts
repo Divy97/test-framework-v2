@@ -67,8 +67,24 @@ export type ReproRegisteredV1 = {
   command: string;
   /** Every path the reproduction depends on → sha256 observed at the base checkout. */
   files: Record<string, ArtifactRef>;
-  /** Which of those the engine wrote itself. The remainder were already committed. */
+  /** Which of those the engine wrote itself. The rest it only read. */
   applied: string[];
+  /**
+   * Which of those paths git had at the BASE commit — observed at registration,
+   * against the base tree, before anything ran.
+   *
+   * An observation rather than the conclusion drawn from it (ADR-0001): "the
+   * repository authored this reproduction" is an interpretation, and it belongs in
+   * the fold, which combines this with `applied` and with the project's own test
+   * command. What could not live in the fold is this: a log carries no tree, so
+   * nothing downstream can ask git what was tracked at a commit that no longer
+   * exists on any disk.
+   *
+   * Optional because it did not exist before 8d, and a log written by an older
+   * engine is still a valid log — its absence reads as "not observed", which is
+   * exactly what it means.
+   */
+  committed?: string[];
 };
 
 export type TestRunV1 = {

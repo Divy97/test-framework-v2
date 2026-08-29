@@ -19,7 +19,7 @@ wedged suite.
 | **8a** a container that will not finish is stopped | M7: "`runContainer` has no timeout" | built |
 | **8b** the recipe's own test command is judged where the agent will be judged | M7 defect 3, "still open" | built |
 | **8c** the info request says what was actually missing | M7: "the info-request is a template" | built |
-| **8d** a suite that is already red on the reported behaviour | M7: "an existing failing test is a free Tier 1" | |
+| **8d** a suite that is already red on the reported behaviour | M7: "an existing failing test is a free Tier 1" | built |
 | **8e** triage, before a container starts | M7: "the cheapest available reduction in false Tier 3s" | |
 | **8f** onboarding proves the repository, not just the recipe | M7: "onboarding proves a recipe" | |
 | **8g** the sham-fix control survives a repository with dependencies | M7's predicted limitation, observed | |
@@ -162,3 +162,42 @@ fine and the bug is ours."*
 - `run.test.ts` — end to end, through `runFromIssue`. The assertion that used to
   pin the checklist now pins what the agent actually said: *"There is no Export
   control anywhere in this project."*
+
+## 8d · a reproduction the repository already had
+
+Milestone 7: *"A repository whose suite is already red on the reported behaviour
+contains the reproduction, authored by a maintainer — the strongest provenance the
+design recognises, and unreachable today because nothing looks."*
+
+Two things were missing, and only one of them was looking.
+
+**The agent had no way to say it.** The manifest format accepted `files` and
+nothing else — paths whose bytes the engine reads out of the agent's commit and
+writes over both checkouts. There was no way to name a test that is *already there*,
+and the prompt correctly told the agent that naming a tracked path would be refused.
+`pinned` is now part of the manifest: names, never bytes, read from the base
+checkout and hashed there. A path cannot be in both lists, and the manifest is
+refused if it tries.
+
+**The engine had no way to credit it.** [ADR-0018](adr/0018-a-reproduction-the-repository-already-had.md)
+records the decision and its four clauses, each one an observation rather than a
+claim: nothing applied, every path tracked at the base commit, the command is the
+project's own test command over those paths, and there is a project test command at
+all. `REPRO_REGISTERED` now carries `committed` — which of the registered paths git
+had at base — because a log carries no tree and nothing downstream could ever ask.
+
+The clause that matters most is the one that looks pedantic: **being in the tree is
+not provenance.** Since 7e every phase container is handed a restored dependency
+tree, and a file in `node_modules/` is present in both phases, identical in both,
+and authored by nobody. `test/verify.test.ts` pins that with a gitignored test that
+satisfies every other clause and is still refused.
+
+### What it does not claim
+
+- **The runner is not anchored.** The test is hashed on every run; what runs it is
+  not. Stated in the score's own `unmeasured` list rather than left for a reader to
+  work out, and the fix diff is the mitigation.
+- **The symptom rule still decides most cases.** A maintainer's test that fails for
+  the right reason in its own words is not credited, and `prompts/repro.md` says so
+  rather than inviting the agent to contort someone else's test into printing our
+  string. The ordinary run stays Tier 2, and that is the honest expectation.

@@ -159,7 +159,11 @@ export function pullRequestBody(state: RunState, context: ReportContext): string
       score.grounds.map((ground) => `- +${ground.points} ${ground.claim}`).join('\n') +
       `\n\nNot measured:\n\n` +
       score.unmeasured.map((gap) => `- ${gap}`).join('\n') +
-      (state.reproAuthoredByAgent
+      // `score.tier`, not `reproAuthoredByAgent` alone. A reproduction the repository
+      // already contained is Tier 1 with an agent in the run (ADR-0018), and keying
+      // this paragraph on the agent's presence made the document tell a reviewer the
+      // tier could not be 1 directly underneath the line saying it was.
+      (state.reproAuthoredByAgent && score.tier === 2
         ? `\n\nTier 1 is **not available** here: the reproduction was written by the party under ` +
           `judgement, so it could be an oracle over the commit rather than over the bug. That cap ` +
           `does not depend on any control working, and it is the reason this says 2 and not 1.\n`

@@ -2037,22 +2037,32 @@ export async function readReproFromCommit(source: string, commit: string): Promi
   if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
     throw new Error('the reproduction manifest is not an object');
   }
-  const { command, files } = manifest as { command?: unknown; files?: unknown };
+  const { command, files, pinned } = manifest as {
+    command?: unknown;
+    files?: unknown;
+    pinned?: unknown;
+  };
   if (typeof command !== 'string' || command.trim() === '') {
     throw new Error('the reproduction manifest names no command');
   }
-  if (!Array.isArray(files) || files.length === 0) {
+  // `files` may be empty now, and only when `pinned` is not. A reproduction that
+  // is a test the REPOSITORY already contains writes nothing into the tree — that
+  // is the whole of what makes it strong (8d) — so demanding a file to apply would
+  // force the agent to invent one.
+  const written = Array.isArray(files) ? files : [];
+  const held = Array.isArray(pinned) ? pinned : [];
+  if (written.length === 0 && held.length === 0) {
     throw new Error('the reproduction manifest names no files');
   }
-  if (files.length > MAX_REPRO_FILES) {
+  if (written.length + held.length > MAX_REPRO_FILES) {
     throw new Error(
-      `the reproduction names ${files.length} files, past the ${MAX_REPRO_FILES} ceiling`,
+      `the reproduction names ${written.length + held.length} files, past the ${MAX_REPRO_FILES} ceiling`,
     );
   }
 
   const contents: Record<string, string> = {};
   let total = 0;
-  for (const path of files) {
+  for (const path of written) {
     if (typeof path !== 'string') {
       throw new Error('the reproduction manifest names a non-string path');
     }
@@ -2063,5 +2073,27 @@ export async function readReproFromCommit(source: string, commit: string): Promi
     }
     contents[path] = body;
   }
-  return { command, files: contents };
+
+  // Pinned paths are NAMES and nothing else: never read out of the agent's commit,
+  // never written anywhere. `verify()` reads them from the base checkout and hashes
+  // them there, which is what makes a pinned path evidence about the repository
+  // rather than about the agent — the same distinction `show()` above exists to
+  // keep, one level up. Validated with the same regex so a name that is an option
+  // or an escape cannot reach a git argument later.
+  const names: string[] = [];
+  for (const path of held) {
+    if (typeof path !== 'string') {
+      throw new Error('the reproduction manifest names a non-string path');
+    }
+    if (!/^[A-Za-z0-9._][A-Za-z0-9._/-]*$/.test(path) || path.split('/').includes('..')) {
+      throw new Error(`the manifest names an unusable path: ${path.slice(0, 120)}`);
+    }
+    // Both lists naming the same path would apply the agent's copy over the
+    // repository's and then call the result pre-existing.
+    if (path in contents) {
+      throw new Error(`the manifest both writes and pins ${path.slice(0, 120)}`);
+    }
+    names.push(path);
+  }
+  return { command, files: contents, ...(names.length === 0 ? {} : { pinned: names }) };
 }

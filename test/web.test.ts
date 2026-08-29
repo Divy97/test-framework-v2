@@ -93,6 +93,9 @@ const REPRO = {
   command: 'node --test test/repro.test.mjs',
   files: { 'test/repro.test.mjs': 'sha256:repro0001' as const },
   applied: ['test/repro.test.mjs'],
+  // The agent wrote it, so git had nothing at base. A reproduction the repository
+  // already contained lists it here instead (8d) and applies nothing.
+  committed: [],
 };
 
 const baseRun = (repeat: number) => ({

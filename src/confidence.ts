@@ -10,7 +10,7 @@
 // stops short of 100 (`CEILING`) and says what the missing points were for.
 
 import type { ArtifactRef } from './events.js';
-import type { RunState } from './fold.js';
+import type { RegisteredRepro, RunState } from './fold.js';
 
 /**
  * ADR-0007's ladder, as amended by that ADR's own M3.2b note.
@@ -270,6 +270,24 @@ export function confidence(state: RunState): Confidence {
     evidence: state.fixDiff ? [state.fixDiff.diff_hash] : [],
   });
 
+  // Unless the repository wrote it. 8d, and the one exception the cap below has.
+  //
+  // Every clause is an observation the engine made, not a claim the agent made:
+  // nothing was applied, every registered path is one git had at the BASE commit,
+  // and the command is the project's own test command over those paths. What is
+  // left for the agent to have chosen is WHICH existing test to point at — and a
+  // test it did not write, cannot rewrite (the anchor re-hashes it on every run,
+  // and the fold refuses a divergence), and runs through the project's own runner
+  // is not a command that can test which commit it is standing on.
+  //
+  // It costs 7 points on the anchoring ground above, and that is right: a pinned
+  // path is hashed rather than overwritten, so tampering is detectable rather than
+  // prevented. Stronger provenance, weaker anchor, and the score says both.
+  const suiteCommand = state.suiteRuns.find(
+    (r) => r.attempt === attempt && r.phase === 'base',
+  )?.command;
+  const fromRepository = repositoryAuthored(registration, suiteCommand);
+
   // Tier 1 is not available when the AGENT wrote the reproduction.
   //
   // Not a penalty for the agent's work — a statement about what this engine can
@@ -289,7 +307,7 @@ export function confidence(state: RunState): Confidence {
   // diff-coverage exists, which is the one measurement that separates a
   // reproduction of the bug from a test of the commit's identity, because an
   // identity oracle executes none of the lines the fix changed.
-  if (state.reproAuthoredByAgent) {
+  if (state.reproAuthoredByAgent && !fromRepository) {
     return {
       scoring: 2,
       tier: 2,
@@ -319,9 +337,74 @@ export function confidence(state: RunState): Confidence {
     tier: 1,
     ceiling: CEILING,
     score: grounds.reduce((total, ground) => total + ground.points, 0),
-    grounds,
-    unmeasured,
+    grounds: fromRepository
+      ? [
+          ...grounds,
+          {
+            claim:
+              'the reproduction is a test this repository already contained: nothing was written ' +
+              'into the tree, every path was tracked at the base commit, and it was run by the ' +
+              "project's own test command — so the agent under judgement chose which test to " +
+              'point at and authored none of it',
+            // Zero, deliberately. What this earns is the TIER, and pricing it again
+            // in points would be counting one fact twice — the anchoring ground has
+            // already docked it 7 for being pinned rather than applied.
+            points: 0,
+            evidence: Object.values(registration.files),
+          },
+        ]
+      : grounds,
+    unmeasured: fromRepository
+      ? [
+          ...unmeasured,
+          "what the project's own test command actually does: the test it ran is hashed on every " +
+            'run and a change there would be caught, but the runner around it — the script, the ' +
+            'task definition, the config it reads — is not anchored, so a fix that changes what ' +
+            'that command does is visible only in the diff a human reads',
+        ]
+      : unmeasured,
   };
+}
+
+/**
+ * Did the REPOSITORY author this reproduction, rather than the agent?
+ *
+ * An interpretation over four observations, which is why it lives here and not in
+ * an event: `applied` and `committed` come off the registration, and the project's
+ * own test command comes off a `SUITE_RUN`. The fold could compute it; only the
+ * confidence projection needs it.
+ *
+ * Every clause has to hold, and each one closes a way the claim could be false:
+ *
+ * - **Nothing applied.** An applied file is bytes out of the agent's commit.
+ * - **Every path tracked at base.** Being in the tree is not enough: a restored
+ *   `node_modules/` entry is untracked, present in both phases and authored by
+ *   nobody, and pinning one would otherwise read as provenance.
+ * - **The command is the project's own.** The strongest test file in the world is
+ *   no help if the command around it is `… || git rev-parse HEAD | grep -q <sha>`.
+ *   Only the suite command, optionally followed by `--` and the pinned paths
+ *   themselves, leaves the agent nothing to express.
+ * - **A suite command exists at all.** Without one there is nothing to compare
+ *   against, and a repository with no recipe gets the cap, which is honest.
+ */
+function repositoryAuthored(
+  registration: RegisteredRepro,
+  suiteCommand: string | undefined,
+): boolean {
+  if (suiteCommand === undefined || suiteCommand.trim() === '') return false;
+  if (registration.applied.length > 0) return false;
+  const paths = Object.keys(registration.files);
+  if (paths.length === 0) return false;
+  const committed = new Set(registration.committed);
+  if (!paths.every((path) => committed.has(path))) return false;
+
+  const command = registration.command.trim();
+  const suite = suiteCommand.trim();
+  if (!command.startsWith(suite)) return false;
+  const rest = command.slice(suite.length).trim();
+  if (rest === '') return true;
+  const named = new Set(paths);
+  return rest.split(/\s+/).every((token: string) => token === '--' || named.has(token));
 }
 
 /**

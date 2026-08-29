@@ -27,6 +27,8 @@ import {
   cleanupFixtures,
   clean,
   committedTest,
+  ignoredTest,
+  IGNORED_PINNED_REPRO,
   divergentHistory,
   FLAKY_REPRO,
   helperOnlyInFix,
@@ -223,6 +225,27 @@ describe('the anchor holds', () => {
 
     expect(registration(events).applied).toEqual([]);
     expect(conclude(events).reproduced).toBe(true);
+    // 8d: and the engine says where that path came from. `applied: []` has always
+    // meant "the engine did not write these", and its comment claimed the rest
+    // "were already committed" — which nothing had ever checked.
+    expect(registration(events).committed).toEqual(['tests/existing.sh']);
+  });
+
+  test('a pinned path that is merely in the tree is not recorded as committed', async () => {
+    // The control for the claim above, and the case an attacker reaches for: `deps/`
+    // is gitignored, so the file is present, identical in both phases, and anchors
+    // perfectly well — it is simply not something anyone committed. In production
+    // that is the shape of a RESTORED DEPENDENCY, which every phase container now
+    // gets handed (7e). Being in the tree is not provenance.
+    //
+    // `only: 'base'` because a single-container run cleans ignored paths at the
+    // phase boundary and the fix half could not read it — the same limitation 8g is
+    // about. The claim here is about what registration OBSERVED, and registration
+    // happens on base.
+    const events = await observe(ignoredTest(), { repro: IGNORED_PINNED_REPRO, only: 'base' });
+
+    expect(registration(events).applied).toEqual([]);
+    expect(registration(events).committed).toEqual([]);
   });
 });
 

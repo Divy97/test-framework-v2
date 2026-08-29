@@ -51,6 +51,53 @@ describe('the reproduction the agent committed', () => {
     expect(spec.files).toEqual({ 'repro.sh': 'grep -q right src.txt\n' });
   });
 
+  test('pins a path it names and never reads its bytes out of the commit', async () => {
+    // 8d. A pinned path is a NAME. The engine reads it from the base checkout and
+    // hashes it there, which is the whole reason a pinned reproduction can be the
+    // repository's work rather than the agent's — reading the agent's copy would
+    // make it the agent's again, silently.
+    //
+    // The agent's commit here carries a DIFFERENT `test/theirs.test.js` from the one
+    // the repository has. Nothing in the returned spec may contain these bytes.
+    const repo = committed({
+      [REPRO_MANIFEST]: manifest({
+        command: 'node --test test/theirs.test.js',
+        pinned: ['test/theirs.test.js'],
+      }),
+      'test/theirs.test.js': 'the agent\'s own version, which must not travel\n',
+    });
+
+    const spec = await readReproFromCommit(repo.path, repo.head);
+    expect(spec.pinned).toEqual(['test/theirs.test.js']);
+    expect(spec.files).toEqual({});
+    expect(JSON.stringify(spec)).not.toContain('must not travel');
+  });
+
+  test('refuses a manifest that both writes and pins the same path', async () => {
+    // Applied bytes are written over the checkout; pinned bytes are read from it.
+    // The same path in both lists is the agent's copy landing on disk and then
+    // being hashed as though the repository had put it there.
+    const repo = committed({
+      [REPRO_MANIFEST]: manifest({
+        command: 'node --test test/theirs.test.js',
+        files: ['test/theirs.test.js'],
+        pinned: ['test/theirs.test.js'],
+      }),
+      'test/theirs.test.js': 'either way\n',
+    });
+    await expect(readReproFromCommit(repo.path, repo.head)).rejects.toThrow(/both writes and pins/);
+  });
+
+  test('refuses a pinned path that could be an argument or an escape', async () => {
+    // The same regex the applied paths get, for the same reason: a pinned name
+    // reaches `git ls-tree` and `git status` later on.
+    const repo = committed({
+      [REPRO_MANIFEST]: manifest({ command: 'node --test', pinned: ['../../etc/passwd'] }),
+      'src.txt': 'wrong\n',
+    });
+    await expect(readReproFromCommit(repo.path, repo.head)).rejects.toThrow(/unusable path/);
+  });
+
   test('refuses a commit that carries no manifest', async () => {
     const repo = committed({ 'src.txt': 'wrong\n' });
     await expect(readReproFromCommit(repo.path, repo.head)).rejects.toThrow(/committed no reproduction/);

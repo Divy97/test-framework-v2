@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { get } from '../src/blobs.js';
 import { confidence } from '../src/confidence.js';
+import { pullRequestBody } from '../src/report.js';
 import type { RunEvent } from '../src/events.js';
 import { fold, type RunState } from '../src/fold.js';
 import { DEMO_RUN_ID, demoRunEvents } from '../src/fixtures/demo-run.js';
@@ -53,6 +54,29 @@ const observe = (fixture: Fixture, overrides: Partial<VerifyOptions> = {}) =>
     flakeRuns: 2,
     ...overrides,
   });
+
+/**
+ * A sham-fix control run, appended to a real observation.
+ *
+ * The engine asks for one only when the AGENT wrote the reproduction, so its
+ * presence in a log is what tells the fold the cap applies — see `fold.ts`, where
+ * keying on the handover alone failed open exactly where the handover was absent.
+ */
+const control = (seq: number): RunEvent => ({
+  run_id: RUN_ID,
+  seq,
+  ts: 'T',
+  type: 'TEST_RUN',
+  payload: {
+    v: 1,
+    phase: 'control',
+    commit_sha: 'c'.repeat(40),
+    exit_code: 1,
+    stdout_hash: `sha256:${'c'.repeat(64)}`,
+    duration_ms: 1,
+    repeat: 0,
+  },
+});
 
 const conclude = (events: RunEvent[]): RunState =>
   fold([
@@ -344,6 +368,62 @@ describe('a handover that never arrived', () => {
     // doing the work, not something incidental in the fixture.
     const plain = fold(control().slice(0, -1));
     expect(confidence(plain).tier).toBe(1);
+  });
+
+  test('a reproduction the REPOSITORY already contained is Tier 1, agent or no agent', async () => {
+    // 8d. The cap exists because "a command the agent chose can test which commit it
+    // is standing on". Here the agent chose nothing but which existing test to point
+    // at: nothing was applied, the path was tracked at the base commit, and the
+    // command is the project's own test command. It did not write the test, and it
+    // cannot rewrite it — every run re-hashes it and the fold refuses a divergence.
+    const observed = await observe(committedTest(), {
+      repro: PINNED_REPRO,
+      suiteCommand: 'sh tests/existing.sh',
+    });
+    // The control run is what marks a reproduction as the agent's, and it is left
+    // IN: the claim is not "there was no agent", it is "the agent authored none of
+    // this". Without it the test would prove nothing about the cap.
+    const state = conclude([...observed, control(observed.length + 2)]);
+
+    expect(state.reproAuthoredByAgent).toBe(true);
+    expect(confidence(state).tier).toBe(1);
+    expect(
+      confidence(state).grounds.some((g) => g.claim.includes('already contained')),
+    ).toBe(true);
+    // And it says what it still cannot see. The test is anchored; the runner around
+    // it is not, and a fix that changes what `sh tests/existing.sh` DOES would not
+    // be caught by hashing the file it ran.
+    expect(confidence(state).unmeasured.some((u) => u.includes('the runner around it'))).toBe(true);
+
+    // And the document a reviewer actually reads agrees with the projection. That
+    // paragraph used to key on "an agent was involved", which would have printed
+    // "Tier 1 is not available here" directly under the line saying Tier 1.
+    const body = pullRequestBody(state, { issue: 'it is wrong', threadRef: 'o/r#1' });
+    expect(body).toContain('**Tier 1**');
+    expect(body).not.toContain('not available');
+  });
+
+  test.each([
+    [
+      'a file the agent wrote is in the reproduction',
+      { repro: { ...PINNED_REPRO, files: { 'extra.sh': 'echo hi\n' } }, suiteCommand: 'sh tests/existing.sh' },
+    ],
+    [
+      'the command is not the project\'s own',
+      { repro: PINNED_REPRO, suiteCommand: 'sh tests/other.sh' },
+    ],
+    [
+      'the repository declares no test command at all',
+      { repro: PINNED_REPRO },
+    ],
+  ])('but not when %s', async (_name, overrides) => {
+    // The negative controls, and they are the point: without them the assertion
+    // above passes on a projection that hands out Tier 1 to everything with a
+    // pinned path in it. Each of these is one clause of the claim being false.
+    const observed = await observe(committedTest(), overrides as Partial<VerifyOptions>);
+    const state = conclude([...observed, control(observed.length + 2)]);
+    expect(state.reproAuthoredByAgent).toBe(true);
+    expect(confidence(state).tier).toBe(2);
   });
 
   test('describes the attempt that ended the run, not an earlier one', () => {
