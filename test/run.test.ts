@@ -440,9 +440,17 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
     // the work back on the reporter with no direction.
     const comment = calls.find((c) => c.url.includes('/comments'))!.body as { body: string };
     expect(comment.body).toContain('**no fix was attempted**');
-    expect(comment.body).toMatch(/1\. The exact steps/);
     expect(comment.body).toMatch(/label it again to start a new run/);
     expect(comment.body).not.toMatch(/sorry|apolog/i);
+
+    // 8c, end to end: this used to assert the four-item checklist, and the checklist
+    // was the defect. The agent said in its own words which fact it lacked — there is
+    // no Export control in this project at all — and that sentence was thrown away
+    // while the reporter got the same list everyone else got. It is quoted now, and
+    // quoted as an account rather than as a finding.
+    expect(comment.body).toContain('> There is no Export control anywhere in this project');
+    expect(comment.body).toMatch(/not a finding: nothing here checked it/);
+    expect(comment.body).not.toMatch(/1\. The exact steps/);
   }, 900_000);
 
   test('total-rounding: a reproduction that passes on base shuts the gate, and no fix agent is spawned', async () => {

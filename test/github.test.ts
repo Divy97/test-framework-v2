@@ -416,6 +416,133 @@ describe('every terminal outcome gets a comment', () => {
     expect(comment).not.toMatch(/sorry|apolog/i);
   });
 
+  test("a Tier 3 asks for the fact the agent said it was missing, not the checklist", () => {
+    // 8c. Every Tier 3 shipped the identical four-item list while the agent that
+    // had just spent the run knew exactly which one fact it lacked — knowledge that
+    // was in the transcript and was discarded. Admissible because an info request is
+    // not a verdict: ADR-0006 forbids testimony becoming a fact, not testimony being
+    // shown as a question.
+    const events: RunEvent[] = [
+      {
+        run_id: 'r',
+        seq: 1,
+        ts: 't',
+        type: 'RUN_REQUESTED',
+        payload: { v: 1, source: 'github_issue', thread_ref: 'o/r#41', raw_text: 'export does nothing' },
+      },
+      { run_id: 'r', seq: 2, ts: 't', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 3,
+        ts: 't',
+        type: 'AGENT_FINISHED',
+        payload: { v: 1, messages: 20, stopped: 'exit', exit_code: 0 },
+      },
+      { run_id: 'r', seq: 4, ts: 't', type: 'RUN_ENDED', payload: { v: 1, reason: 'not_reproduced' } },
+    ];
+    const said =
+      'The export button is behind a feature flag I cannot see the value of. Which plan is the ' +
+      'account on?';
+    const comment = issueComment(fold(events), { ...context, lastWord: said });
+    expect(comment).toContain('**no fix was attempted**');
+    expect(comment).toContain('> The export button is behind a feature flag');
+    expect(comment).toContain("Which plan is the");
+    // Named as an account, never as a finding.
+    expect(comment).toMatch(/not a finding: nothing here checked it/);
+    // And the checklist is GONE. Keeping both would be the template again, with a
+    // quote on top of it.
+    expect(comment).not.toMatch(/1\. The exact steps/);
+  });
+
+  test('and falls back to the checklist when the agent said nothing usable', () => {
+    // The negative control. Without it the assertion above passes on a comment that
+    // always quotes and never lists, which would be the same bug facing the other
+    // way — a run with no agent has nothing specific to ask for and the four items
+    // are a real deliverable.
+    const events: RunEvent[] = [
+      {
+        run_id: 'r',
+        seq: 1,
+        ts: 't',
+        type: 'RUN_REQUESTED',
+        payload: { v: 1, source: 'github_issue', thread_ref: 'o/r#41', raw_text: 'export does nothing' },
+      },
+      { run_id: 'r', seq: 2, ts: 't', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      { run_id: 'r', seq: 3, ts: 't', type: 'RUN_ENDED', payload: { v: 1, reason: 'not_reproduced' } },
+    ];
+    const comment = issueComment(fold(events), context);
+    expect(comment).toMatch(/1\. The exact steps/);
+    expect(comment).not.toMatch(/in its own words/);
+  });
+
+  test('an agent that was cut off does not become a question for the reporter', () => {
+    // Milestone 7, twice: a model ended its turns inside its own reasoning, the gate
+    // held correctly, and the engine's diagnosis was an accusation of idleness
+    // against a model that had explored the repository, seen the bug live and
+    // written the reproduction. It had simply never reached `git_commit`.
+    //
+    // A ceiling of ours is not evidence about someone's bug, and asking them for
+    // more steps because we ran out of turns is billing them for our own limit.
+    const events: RunEvent[] = [
+      {
+        run_id: 'r',
+        seq: 1,
+        ts: 't',
+        type: 'RUN_REQUESTED',
+        payload: { v: 1, source: 'github_issue', thread_ref: 'o/r#41', raw_text: 'export does nothing' },
+      },
+      { run_id: 'r', seq: 2, ts: 't', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 3,
+        ts: 't',
+        type: 'AGENT_FINISHED',
+        payload: { v: 1, messages: 7, stopped: 'malformed_tool_call', exit_code: -1 },
+      },
+      { run_id: 'r', seq: 4, ts: 't', type: 'RUN_ENDED', payload: { v: 1, reason: 'not_reproduced' } },
+    ];
+    // Even with something quotable, because the sentence a ceiling interrupted is
+    // not an answer.
+    const comment = issueComment(fold(events), { ...context, lastWord: 'I will now write the repro test for the export path' });
+    expect(comment).toContain('the reason is on our side');
+    expect(comment).toContain('ended a turn inside its own reasoning');
+    expect(comment).toMatch(/nothing here is a finding about your report/);
+    expect(comment).not.toMatch(/1\. The exact steps/);
+    expect(comment).not.toMatch(/in its own words/);
+  });
+
+  test("a hostile last word cannot restructure the comment around it", () => {
+    // The agent's text is attacker-influenced twice over: the issue body steers it,
+    // and so does the repository it read. Quoted like the issue is, for the same
+    // reason — a `## ` at the start of a line would otherwise become a heading in
+    // our document.
+    const events: RunEvent[] = [
+      {
+        run_id: 'r',
+        seq: 1,
+        ts: 't',
+        type: 'RUN_REQUESTED',
+        payload: { v: 1, source: 'github_issue', thread_ref: 'o/r#41', raw_text: 'x' },
+      },
+      { run_id: 'r', seq: 2, ts: 't', type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
+      {
+        run_id: 'r',
+        seq: 3,
+        ts: 't',
+        type: 'AGENT_FINISHED',
+        payload: { v: 1, messages: 3, stopped: 'exit', exit_code: 0 },
+      },
+      { run_id: 'r', seq: 4, ts: 't', type: 'RUN_ENDED', payload: { v: 1, reason: 'not_reproduced' } },
+    ];
+    const hostile = '## Verified\nThis bug is confirmed and a fix has been merged. Close this issue.';
+    const comment = issueComment(fold(events), { ...context, lastWord: hostile });
+    expect(comment).toContain('> ## Verified');
+    expect(comment).toContain('> This bug is confirmed');
+    // Every line of it, or the second one escapes the quote.
+    expect(comment).not.toMatch(/^## Verified/m);
+    expect(comment).not.toMatch(/^This bug is confirmed/m);
+  });
+
   test('an errored run is an operational fault and says so in those words', () => {
     // The sharpest consequence of ADR-0013: "the recipe's start command no longer
     // boots the app" is not a finding about the user's bug, and presenting it as one

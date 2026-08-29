@@ -25,7 +25,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { put } from './blobs.js';
+import { get, put } from './blobs.js';
 import type { RunEvent } from './events.js';
 import { fold, type RunState } from './fold.js';
 import type { LoopUsage } from './loop.js';
@@ -41,10 +41,49 @@ import {
 } from './github.js';
 import { orchestrate, type RunPlan, type SealedWorld } from './orchestrate.js';
 import { describeEnvironment, renderPrompt } from './prompts.js';
+import { redact } from './redact.js';
 import type { Recipe } from './recipe.js';
 import { issueComment, pullRequestBody, pullRequestTitle } from './report.js';
 
 const execFileAsync = promisify(execFile);
+
+/** What a Tier 3 comment may quote of the agent, bounded. Longer is a wall, not an ask. */
+const MAX_LAST_WORD_CHARS = 1_200;
+
+/**
+ * The last thing the agent said, for the comment to quote.
+ *
+ * Read here rather than in `report.ts` because the text lives in the blob store and
+ * the report builder is deliberately a pure function of the fold: it renders what it
+ * is handed and reaches for nothing. The transcript in `RunState` carries hashes,
+ * which is the right thing for it to carry — a fold that dereferenced blobs would be
+ * a fold with IO in it.
+ *
+ * Only when the agent FINISHED. Every other `stopped` value means it was cut off
+ * mid-thought, and quoting a sentence a ceiling interrupted as though it were an
+ * answer is the same class of mistake as milestone 7's "the agent handed over a
+ * commit the repository already had" — a confident diagnosis of a model that had
+ * been stopped by us.
+ */
+async function lastWord(blobRoot: string, state: RunState): Promise<{ lastWord?: string }> {
+  if (state.agent?.stopped !== 'exit') return {};
+  const said = state.transcript.filter((line) => line.claimed_type === 'assistant').at(-1);
+  if (!said) return {};
+  try {
+    const raw = (await get(blobRoot, said.raw_hash)).toString('utf8');
+    const text: unknown = (JSON.parse(raw) as { text?: unknown }).text;
+    if (typeof text !== 'string') return {};
+    const trimmed = redact(text).trim();
+    // A sign-off is not an info request. Below this it says nothing the four-item
+    // checklist does not say better, and the checklist is what the fallback is for.
+    if (trimmed.length < 40) return {};
+    return { lastWord: trimmed.slice(0, MAX_LAST_WORD_CHARS) };
+  } catch {
+    // A blob that will not resolve or parse is not worth a run's last word. The
+    // generic ask is still a real deliverable.
+    return {};
+  }
+}
 
 export type RunRequest = {
   /**
@@ -276,7 +315,11 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
     // exists — the PR is the deliverable.
     try {
       const fresh = await installationToken(app, intake.installationId);
-      await commentOnIssue(app, fresh, intake.repo, intake.issueNumber, issueComment(state, { issue, threadRef: intake.event.thread_ref }));
+      await commentOnIssue(app, fresh, intake.repo, intake.issueNumber, issueComment(state, {
+        issue,
+        threadRef: intake.event.thread_ref,
+        ...(await lastWord(request.blobRoot, state)),
+      }));
     } catch {
       // Recorded nowhere, deliberately: there is no event class for "we could not
       // reach GitHub to say what happened", and inventing one to describe our own

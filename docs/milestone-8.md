@@ -18,7 +18,7 @@ wedged suite.
 |---|---|---|
 | **8a** a container that will not finish is stopped | M7: "`runContainer` has no timeout" | built |
 | **8b** the recipe's own test command is judged where the agent will be judged | M7 defect 3, "still open" | built |
-| **8c** the info request says what was actually missing | M7: "the info-request is a template" | |
+| **8c** the info request says what was actually missing | M7: "the info-request is a template" | built |
 | **8d** a suite that is already red on the reported behaviour | M7: "an existing failing test is a free Tier 1" | |
 | **8e** triage, before a container starts | M7: "the cheapest available reduction in false Tier 3s" | |
 | **8f** onboarding proves the repository, not just the recipe | M7: "onboarding proves a recipe" | |
@@ -117,3 +117,48 @@ there is described as something not to imitate.
   exists only in what `install` wrote: it exits 0 in the probe, which no bare clone
   and no build container could report. And its pair, a test command that reaches for
   a registry, which does not.
+
+## 8c · the info request says what was actually missing
+
+Every Tier 3 shipped the same four-item checklist — exact steps, expected versus
+actual, account state, environment — while the agent that had just spent twenty
+turns on the issue knew precisely which single fact it lacked. That knowledge was
+in the transcript and was discarded; what the comment shipped of it was the
+transcript's *length*.
+
+**Testimony is admissible here, and it is worth being exact about why.**
+[ADR-0006](adr/0006-testimony-vs-evidence.md) forbids testimony becoming a *fact* —
+the agent cannot append events, and no verdict may rest on what it says. An info
+request is not a verdict. It is a question, and the run that just looked is the only
+thing in the system that knows what to ask. So the agent's last message is quoted,
+labelled as its account, and explicitly marked as unchecked. The checklist stays as
+the fallback for a run that had no agent or whose agent said nothing usable — which
+is the negative control, because a comment that always quotes and never lists is the
+same bug facing the other way.
+
+Read in `run.ts` rather than `report.ts`: the text lives in the blob store, and the
+report builder is a pure function of the fold that reaches for nothing. `RunState`'s
+transcript carries hashes, which is the right thing for a fold to carry.
+
+### The half that was not in the plan
+
+**An agent that was cut off does not become a question for the reporter.** Every
+`stopped` value but `exit` means a ceiling of ours ended the run — and milestone 7
+hit exactly that twice, when a model ended its turns inside its own reasoning and
+the engine's diagnosis accused it of handing over a commit the repository already
+had. Asking that reporter for better steps bills them for our limit. A cut-off run
+now says so, names what stopped it in plain words, states that nothing here is a
+finding about the report, and asks for nothing but a re-run.
+
+Its last sentence is the honest one: *"If it stops here twice, the report is probably
+fine and the bug is ours."*
+
+### What is asserted
+
+- `github.test.ts` — the quote, the label, the missing checklist; the fallback when
+  there is nothing to quote; the cut-off run; and a hostile last word, which is
+  quoted line by line because the agent's text is attacker-influenced twice over
+  (the issue steers it, and so does the repository it read).
+- `run.test.ts` — end to end, through `runFromIssue`. The assertion that used to
+  pin the checklist now pins what the agent actually said: *"There is no Export
+  control anywhere in this project."*
