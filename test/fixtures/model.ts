@@ -34,7 +34,11 @@ export type FakeModel = {
  * four has learned something about the runner, and hanging or 500ing would hide
  * it behind a timeout.
  */
-export function fakeModel(turns: Turn[], options: { status?: number; body?: string } = {}): Promise<FakeModel> {
+export function fakeModel(
+  turns: Turn[],
+  /** `answer` is what a TOOL-LESS request gets — `askOnce`, not the agent loop. */
+  options: { status?: number; body?: string; answer?: string } = {},
+): Promise<FakeModel> {
   const requests: Record<string, unknown>[] = [];
   let served = 0;
 
@@ -53,8 +57,16 @@ export function fakeModel(turns: Turn[], options: { status?: number; body?: stri
         response.end(options.body ?? '{"type":"error","error":{"type":"api_error","message":"scripted"}}');
         return;
       }
-      const turn = turns[served] ?? { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' as const };
-      served += 1;
+      // A request carrying NO tools is not the agent loop — it is `askOnce`, which is
+      // one prompt and one answer (8e's triage). Answering it out of the scripted
+      // turns would shift every agent turn by one and quietly rewrite what each test
+      // is asserting, so it gets its own reply and consumes nothing.
+      const asked = requests.at(-1);
+      const oneShot = asked !== undefined && !Array.isArray(asked['tools']);
+      const turn = oneShot
+        ? { content: [{ type: 'text', text: options.answer ?? 'ENOUGH' }], stop_reason: 'end_turn' as const }
+        : turns[served] ?? { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' as const };
+      if (!oneShot) served += 1;
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(
         JSON.stringify({

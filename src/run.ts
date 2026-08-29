@@ -43,7 +43,8 @@ import { orchestrate, type RunPlan, type SealedWorld } from './orchestrate.js';
 import { describeEnvironment, renderPrompt } from './prompts.js';
 import { redact } from './redact.js';
 import type { Recipe } from './recipe.js';
-import { issueComment, pullRequestBody, pullRequestTitle } from './report.js';
+import { issueComment, pullRequestBody, pullRequestTitle, triageComment } from './report.js';
+import { triage } from './triage.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -110,6 +111,12 @@ export type RunRequest = {
   /** Override for tests: the git remote to clone and push. Defaults to GitHub. */
   remote?: (token: string) => string;
   loop?: RunPlan['loop'];
+  /**
+   * The model that triage asks (8e), when the default is not wanted. Its credential
+   * is the run's; only the model differs, because reading an issue and answering in
+   * one sentence is not the job the run's model was chosen for.
+   */
+  triageModel?: string;
   flakeRuns?: number;
 };
 
@@ -188,6 +195,46 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
         booted: request.recipe !== null,
       });
     const issue = intake.event.raw_text;
+
+    // TRIAGE, before a container starts (8e). The reporter is at the keyboard now and
+    // nowhere near it in twenty minutes, so this is the only moment a question is
+    // cheap.
+    //
+    // It never gates. Whatever comes back, the run proceeds — the question and the
+    // run are not alternatives, and a cheap model's opinion of somebody's bug report
+    // is the last thing that should be able to stop one (7c's precedent).
+    //
+    // Awaited rather than fired, because it is one bounded call before the first
+    // container and ordering it ahead of the sandbox is the entire point. `askOnce`
+    // carries its own 30s ceiling for exactly this reason: an unbounded wait in front
+    // of a run is what 8a removed from the layer below.
+    //
+    // Wrapped, because everything in it is optional to the run and none of it is
+    // allowed to cost one — a model that is down, a repository that will not list, a
+    // GitHub that will not take the comment.
+    try {
+      const { stdout: listing } = await execFileAsync('git', [
+        '-C', source, 'ls-tree', '-r', '--name-only', baseRef,
+      ]);
+      const question = await triage({
+        issue,
+        tree: listing.split('\n').filter((path) => path !== ''),
+        // The run's credential, and deliberately NOT the run's model: this reads an
+        // issue and answers in one sentence, and `askOnce` defaults to the cheap one.
+        ...(request.loop?.provider === undefined ? {} : { provider: request.loop.provider }),
+        ...(request.loop?.apiKey === undefined ? {} : { apiKey: request.loop.apiKey }),
+        ...(request.loop?.authToken === undefined ? {} : { authToken: request.loop.authToken }),
+        ...(request.loop?.baseURL === undefined ? {} : { baseURL: request.loop.baseURL }),
+        ...(request.triageModel === undefined ? {} : { model: request.triageModel }),
+      });
+      if (question !== null) {
+        await commentOnIssue(app, token, intake.repo, intake.issueNumber, triageComment(question));
+      }
+    } catch {
+      // Recorded nowhere, for the reason the final comment's failure is: there is no
+      // event class for "we could not ask", and inventing one to describe our own
+      // outage would put a fact about us in a log about the user's bug.
+    }
 
     // The fix prompt cannot be rendered yet: it names the registered command, and
     // nothing has registered one. `orchestrate` defers the fix agent until after the
