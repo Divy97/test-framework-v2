@@ -68,6 +68,17 @@ export type FixContext = {
    * measured against. Absent when the recipe declares no test command.
    */
   suite?: { command: string; exitCode: number };
+  /**
+   * What the recipe's own test command did in the sealed world, observed before
+   * either agent ran. Absent when the recipe declares no test command.
+   *
+   * The fix agent already gets `suite` — the base container's real SUITE_RUN — so
+   * this looks redundant and is not: `suite` says how the project's tests fared on
+   * a commit, and this says whether that command is RUNNABLE where the judging
+   * happens at all. A repository whose test command resolves from a registry has
+   * no suite result to report and every reason to be told why.
+   */
+  sealed?: SealedWorld;
 };
 
 /** Tail of base's output handed to the fix agent. The failure is at the end. */
@@ -137,8 +148,12 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * repro is registered by the base container, and the FIX agent does not start
    * until after that, so `REPRO_REGISTERED` provably precedes the fix agent's
    * first message by seq. Nobody has to trust that it did.
+   *
+   * A FUNCTION when the caller wants to say something about the world this agent
+   * will be judged in: the sealed-world probe runs after the plan is built and
+   * before the agent starts, so a string here was written before anyone looked.
    */
-  reproPrompt?: string;
+  reproPrompt?: string | ((sealed?: SealedWorld) => string | Promise<string>);
   /**
    * The commit the fix is judged at. Omitted when an agent is writing it: the
    * orchestrator then uses whatever the agent committed, which is the only
@@ -253,7 +268,13 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   draftingEnvironment?: boolean;
 } & (
   | { repro: Job['repro']; reproPrompt?: never }
-  | { reproPrompt: string; repro?: never }
+  /**
+   * A FUNCTION when the caller wants to say something about the world the agent is
+   * being judged in — the same reason `agentPrompt` is one. The probe runs after
+   * the plan is built and before this agent starts, so a string here is a prompt
+   * written before anyone looked.
+   */
+  | { reproPrompt: string | ((sealed?: SealedWorld) => string | Promise<string>); repro?: never }
 );
 
 /** What one container reported, and how it exited. */
@@ -500,6 +521,18 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // perform itself.
   const judging: RunPlan = snapshotImage === null ? plan : { ...plan, image: snapshotImage };
 
+  // Before the agent, because the agent is who it is for — and skipped entirely when
+  // there is no agent to tell. A caller who supplies the reproduction has already
+  // decided what runs, and spending a container on prose nobody will read is the
+  // kind of cost that gets a good check deleted later.
+  //
+  // A run whose environment failed to build never gets here either: `snapshot.failed`
+  // ends it inside the attempt loop below, so this only probes a world that exists.
+  const sealed =
+    (snapshot && 'failed' in snapshot) || !(plan.reproPrompt || plan.agentPrompt)
+      ? undefined
+      : await probeSealedWorld(judging, source, base);
+
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
   // — the gate folds this run's events, and `fold()` throws on a stream that does
@@ -723,8 +756,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // fold stricter rather than wrong.
     // The repro agent, when there is one, runs before everything: base cannot be
     // judged against a reproduction that does not exist yet.
-    if (plan.reproPrompt) {
-      steps.push({ phase: 'agent', job: {}, source: agentSource, kind: 'repro', prompt: plan.reproPrompt });
+    // Read out of the plan once. Narrowing `plan.reproPrompt` in place narrows the
+    // whole plan union with it, and the string branch then has no member left.
+    const authored = plan.reproPrompt;
+    if (authored) {
+      const prompt = typeof authored === 'function' ? await authored(sealed) : authored;
+      steps.push({ phase: 'agent', job: {}, source: agentSource, kind: 'repro', prompt });
     }
     // The FIX agent. With a repro agent present it is DEFERRED to after the base
     // container has registered the reproduction, so ADR-0008's ordering invariant
@@ -754,7 +791,10 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         // watched it fail yet.
         prompt:
           typeof plan.agentPrompt === 'function'
-            ? await plan.agentPrompt({ repro: plan.repro! })
+            ? await plan.agentPrompt({
+                repro: plan.repro!,
+                ...(sealed === undefined ? {} : { sealed }),
+              })
             : plan.agentPrompt,
       });
     }
@@ -925,6 +965,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
             typeof plan.agentPrompt === 'function'
               ? await plan.agentPrompt({
                   repro: resolvedRepro!,
+                  ...(sealed === undefined ? {} : { sealed }),
                   ...(await observedOnBase(plan.blobRoot, events, n)),
                 })
               : plan.agentPrompt;
@@ -1432,6 +1473,85 @@ async function buildEnvSnapshot(
     // committed from is a copy of the same bytes waiting to be forgotten.
     await execFile('docker', ['rm', '--force', container]).catch(() => {});
   }
+}
+
+/**
+ * What the project's own test command does in the world that judges — observed
+ * there, not believed about it.
+ *
+ * Two sentences in `describeEnvironment` used to be assertions. 7a deleted one of
+ * them ("The project's own test command is `X`. It passes on this commit.") for
+ * the honest reason that nothing had ever executed it, and left the other
+ * standing: that the judging container has nothing installed. 7e made that one
+ * false too — the phases run from a snapshot with the repository's dependencies
+ * in it — and nothing noticed, because a prompt is the one thing this suite
+ * cannot check (see the scripted-agent limitation in ADR-0015's amendment).
+ *
+ * So the engine runs it. `test` is a command a human approved for THIS repository
+ * and it is the template the agent imitates: milestone 7's third defect was a
+ * recipe whose test command resolved from the registry, in a container that has no
+ * network, which taught the agent to write a reproduction that needed one. That
+ * cost three model runs to diagnose and one sealed container to have prevented.
+ */
+export type SealedWorld = { command: string } & (
+  | { exitCode: number; output: string }
+  | { failed: string }
+);
+
+/**
+ * Run the recipe's test command exactly where a reproduction will be judged.
+ *
+ * It IS a base phase — same container, same image, same `--network none`, same
+ * clone, same restored dependencies, same uid — with the project's test command in
+ * the place of a reproduction. Nothing cheaper is honest: milestone 7's first
+ * defect was `corepack enable` succeeding as root in the environment build and
+ * failing as uid 1000 in the agent sandbox, so an approximation of the phase
+ * container is exactly the thing that does not answer this question.
+ *
+ * Its events are DISCARDED, and that is deliberate rather than wasteful. They
+ * describe our environment, not the user's bug, and a `TEST_RUN` here would be a
+ * second base-phase observation for the fold to pair against the real one. The
+ * ReplayOutcome precedent already covers this: what the engine learns about its own
+ * world travels on the reply channel, never on the log (ADR-0006).
+ */
+async function probeSealedWorld(
+  judging: RunPlan,
+  source: string,
+  base: string,
+): Promise<SealedWorld | undefined> {
+  const command = judging.recipe?.test;
+  if (command === undefined) return undefined;
+  const result = await runContainer(judging, source, 0, 'base', {
+    only: 'base',
+    baseRef: base,
+    fixRef: base,
+    // No files: the command is the whole reproduction here, and an empty manifest
+    // is what keeps this from writing anything into the tree it is measuring.
+    repro: { command },
+    // Once. The question is "does this run at all here", and the answer does not
+    // get truer on a second draw — that is what base's own repeat is for (7c).
+    baseRuns: 1,
+    flakeRuns: 0,
+    // Off. `runContainer` fills this from `recipe.test`, which is the command we
+    // are already running as the reproduction — the suite arm would run it a
+    // second time, in the same container, for nothing.
+    suiteCommand: undefined,
+  });
+  const observed = result.events.find((event) => event.type === 'TEST_RUN');
+  if (observed === undefined || observed.type !== 'TEST_RUN') {
+    // No observation at all: the container could not stand up, or the command
+    // never returned. Reported as prose, because an unrun command must not read
+    // as a passing one.
+    return { command, failed: result.stderr.trim() || 'the engine could not run it there' };
+  }
+  const output = await get(judging.blobRoot, observed.payload.stdout_hash)
+    .then((bytes) => bytes.toString('utf8'))
+    .catch(() => '');
+  return {
+    command,
+    exitCode: observed.payload.exit_code,
+    output: output.length > MAX_OBSERVED_CHARS ? output.slice(-MAX_OBSERVED_CHARS) : output,
+  };
 }
 
 /**

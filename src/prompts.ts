@@ -15,6 +15,10 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// Type-only, so the cycle with `orchestrate.ts` is a compile-time one and there is
+// no import at runtime. The observation is the engine's to produce; this file's job
+// is only to say it in words.
+import type { SealedWorld } from './orchestrate.js';
 
 /** Where the prompts live. Resolved from this module, not from the process cwd. */
 export const PROMPT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'prompts');
@@ -100,6 +104,12 @@ export async function renderPrompt(name: PromptName, vars: PromptVars): Promise<
  * healthcheck that passed, and this describes the same facts.
  */
 export function describeEnvironment(options: {
+  /**
+   * What the recipe's own test command did in the judging container, observed
+   * before this agent started. Absent when there is no test command to run, or
+   * when there was no environment to run it in.
+   */
+  sealed?: SealedWorld;
   services?: { name: string; port: number; healthcheck?: string }[];
   testCommand?: string;
   browser?: boolean;
@@ -138,18 +148,27 @@ export function describeEnvironment(options: {
       'Here, you have a network, and the project’s dependencies are installed — the recipe’s',
       '`install` step ran and was observed to succeed before you started.',
       '',
-      'The container that judges your work has **none of that**. It is a different container: it',
-      'clones the commit, it has no network, nothing is installed in it, and no services are running.',
-      'It runs your registered command against a bare checkout and takes the exit code. So a',
-      'reproduction is only judgeable if it runs with:',
+      'The container that judges your work is a different one. It clones the commit, it has **no',
+      'network**, and **nothing is running** in it — no services, no processes of yours, nothing you',
+      'started here. What it does have is the same installed dependencies: they were captured from a',
+      'build of this recipe before you existed and are restored into its clone, so the project’s own',
+      'test runner is there. It runs your registered command and takes the exit code.',
+      '',
+      'So a reproduction is judgeable if, and only if, it runs with:',
       '',
       '- the files committed in this repository, and',
-      '- the language runtime and standard library, and nothing else.',
+      '- the language runtime and the dependencies the recipe’s `install` step puts in the tree, and',
+      '- nothing that has to be fetched, and nothing that has to be already running.',
       '',
-      'This is the single most common way a correct reproduction fails: it works here, where the',
-      'dependencies exist, and exits "command not found" there. If the bug genuinely cannot be shown',
-      'without an installed package, say so plainly in your final message and commit nothing — that is',
-      'a true answer about our limitation, and it is far better than a reproduction that cannot run.',
+      'Two things do not cross, and they are the common ways a correct reproduction fails there.',
+      'Anything YOU install after this point is not in that image. And any command that resolves a',
+      'package when it runs — `npx --yes …`, `pnpm dlx …`, `yarn dlx …` — needs a registry, and there',
+      'is no network to reach one: invoke the binary the install step already put in the tree instead',
+      '(`./node_modules/.bin/…`, `.venv/bin/…`).',
+      '',
+      'If the bug genuinely cannot be shown under those terms, say so plainly in your final message',
+      'and commit nothing — that is a true answer about our limitation, and it is far better than a',
+      'reproduction that cannot run.',
     );
   } else {
     lines.push(
@@ -183,9 +202,45 @@ export function describeEnvironment(options: {
     lines.push('', 'No services are running. This repository has no recipe, or its recipe declares none.');
   }
 
-  // NOT "it passes on this commit". Nothing had ever executed this command, and the
-  // sentence asserted its result to the one party we then judge on it.
-  if (options.testCommand) {
+  // NOT "it passes on this commit" — that sentence asserted a result nothing had
+  // ever executed, to the one party we then judge on it. It is allowed to say what
+  // happened only because the engine now runs it, in the judging container, before
+  // this prompt is written. `sealed` absent means it was not run; the disclaimer
+  // stands in that case and must, because the alternative is the same lie again.
+  if (options.sealed) {
+    const sealed = options.sealed;
+    lines.push(
+      '',
+      `The project's own test command is \`${sealed.command}\`, and the engine ran it **in the`,
+      'container that will judge you** before you started. That is not a claim about this container;',
+      'it is what the judge did with it:',
+    );
+    if ('failed' in sealed) {
+      lines.push(
+        '',
+        `- it could not be run there: ${sealed.failed}`,
+        '',
+        'So do not build your reproduction out of that command, and do not imitate its style — the',
+        'judge cannot run it. Register something that stands on the committed files and the installed',
+        'dependencies alone.',
+      );
+    } else if (sealed.exitCode === 0) {
+      lines.push(
+        '',
+        `- it exited 0 there. The suite is green on this commit, in that container, so a test you add`,
+        '  in the same runner will be run the same way — and a failure there will be yours.',
+        ...(sealed.output.trim() ? ['', '```', sealed.output.trim(), '```'] : []),
+      );
+    } else {
+      lines.push(
+        '',
+        `- it exited ${sealed.exitCode} there. That is the repository's own baseline, not something`,
+        '  you caused, and it is worth reading before you write anything: what is already failing may',
+        '  be the bug you were asked about.',
+        ...(sealed.output.trim() ? ['', '```', sealed.output.trim(), '```'] : []),
+      );
+    }
+  } else if (options.testCommand) {
     lines.push(
       '',
       `The project's own test command is \`${options.testCommand}\`. Whether it currently passes has`,
