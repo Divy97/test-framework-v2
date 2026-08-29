@@ -9,7 +9,26 @@
 
 ---
 
-## The optimization target (decided Q5-reveal)
+## The optimization target (decided Q5-reveal — **superseded, see below**)
+
+> **Amended at milestone 9.** The filter below governed every decision through
+> milestone 8 and is the reason this repository is shaped the way it is: one problem,
+> deep, with the ADRs to show for it. It is no longer the target. Milestone 9 builds a
+> hosted control plane so that people other than its author can run this, and that is
+> breadth by the old filter's own definition — which is why the change is recorded here
+> rather than absorbed quietly.
+>
+> **The filter now: does this make the engine usable by someone who did not write it,
+> without weakening a claim it makes?** The second clause is the whole of what carries
+> over. Depth was never the point in itself; the point was that every claim is backed by
+> something executed, and a product that dilutes that is worse than no product.
+> [ADR-0019](docs/adr/0019-who-writes-when-the-runner-is-not-ours.md) is the first test
+> of it: hosting cost the engine a claim, and the response was to write down which claim
+> and stop making it, not to keep saying it from a machine we no longer own.
+>
+> What does not change: the reproduce-first gate never bends, testimony never becomes
+> evidence, and the log has one writer per run. Those are not portfolio decisions; they
+> are the product.
 
 This is a **flagship portfolio project**, not a startup. Every decision passes one filter:
 
