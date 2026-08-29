@@ -112,6 +112,14 @@ export type RunRequest = {
   remote?: (token: string) => string;
   loop?: RunPlan['loop'];
   /**
+   * The id this run is already known by, when something else minted it.
+   *
+   * Set by the runner daemon: the plane hands out the id with the job, and every event
+   * this run emits has to carry it or the plane will refuse them all — it authorizes an
+   * append by asking which runner that run was dispatched to.
+   */
+  runId?: string;
+  /**
    * The model that triage asks (8e), when the default is not wanted. Its credential
    * is the run's; only the model differs, because reading an issue and answering in
    * one sentence is not the job the run's model was chosen for.
@@ -149,7 +157,12 @@ export type RunResult = {
  */
 export async function runFromIssue(request: RunRequest): Promise<RunResult> {
   const { intake, app } = request;
-  const runId = crypto.randomUUID();
+  // The caller's id when it has one, and that is the hosted path (9d): the control
+  // plane mints the run id at dispatch, before any runner sees the work, because
+  // "appending to this run" is only an authorizable claim if somebody other than the
+  // writer decided the run exists (ADR-0019). Locally there is no such somebody and
+  // this stays what it always was.
+  const runId = request.runId ?? crypto.randomUUID();
   const events: RunEvent[] = [];
   const emit = async (event: RunEvent) => {
     events.push(event);
