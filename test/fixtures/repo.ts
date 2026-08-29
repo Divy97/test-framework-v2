@@ -579,6 +579,31 @@ export const committedTest = () =>
     { 'src.txt': 'right\n' },
   );
 
+/**
+ * A test that is IN THE TREE and in nobody's commit — the shape a restored
+ * dependency has.
+ *
+ * `deps/` is gitignored, so `git status --porcelain --untracked-files=all` stays
+ * clean and `verify` runs happily; the file is there in both phases and identical
+ * in both, so it anchors perfectly well. What it is not is the repository's work,
+ * and a provenance claim that cannot tell the difference is a provenance claim
+ * about `node_modules`.
+ */
+export const ignoredTest = () => {
+  const fixture = makeRepo(
+    { 'src.txt': 'wrong\n', '.gitignore': 'deps/\n' },
+    { 'src.txt': 'right\n' },
+  );
+  mkdirSync(join(fixture.repo, 'deps'), { recursive: true });
+  writeFileSync(join(fixture.repo, 'deps', 'existing.sh'), 'cat src.txt\ngrep -q right src.txt\n');
+  return fixture;
+};
+
+export const IGNORED_PINNED_REPRO: ReproSpec = {
+  command: 'sh deps/existing.sh',
+  pinned: ['deps/existing.sh'],
+};
+
 /** The fix rewrites the committed test it is judged by. Detectable, not preventable. */
 export const pinnedTampering = () =>
   makeRepo(

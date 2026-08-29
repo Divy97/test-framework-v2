@@ -516,10 +516,13 @@ async function observe(
   // Resolve the fix ref up front: a branch name could move between this check
   // and the checkout that eventually uses it.
   const fixSha = (await git(['rev-parse', fixRef], repoPath, gitEnv)).trim();
-  const tracked = new Set([
-    ...(await trackedPaths(baseSha, repoPath, gitEnv)),
-    ...(await trackedPaths(fixSha, repoPath, gitEnv)),
-  ]);
+  // Kept apart, because they answer different questions. The union refuses an
+  // APPLIED path that would overwrite committed code in either commit. The base
+  // half alone is what says a PINNED path was in the repository before this run —
+  // the observation 8d's provenance rests on, and one the fold cannot re-derive
+  // because a log carries no tree.
+  const baseTracked = await trackedPaths(baseSha, repoPath, gitEnv);
+  const tracked = new Set([...baseTracked, ...(await trackedPaths(fixSha, repoPath, gitEnv))]);
   for (const path of appliedFiles.keys()) {
     if (tracked.has(path.toLowerCase())) {
       throw new ObservationFailed(
@@ -617,6 +620,13 @@ async function observe(
         command: reproCommand,
         files: await hashRepro(),
         applied: [...appliedFiles.keys()].sort(),
+        // OBSERVED, not assumed. `applied`'s comment has always said "the remainder
+        // were already committed" and nothing had ever checked it: a pinned path can
+        // be untracked and still be in the tree — a restored `node_modules/` entry is
+        // exactly that, identical in both phases and authored by nobody. Which of the
+        // registered paths git had at the BASE commit is a fact about the repository,
+        // and it is the fact 8d's provenance is built out of.
+        committed: reproPaths.filter((path) => baseTracked.has(path.toLowerCase())).sort(),
       },
     });
   }

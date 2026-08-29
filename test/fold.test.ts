@@ -47,6 +47,7 @@ describe('fold', () => {
         command: 'npm test -- checkout-discount',
         files: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
         applied: ['tests/checkout-discount.test.ts'],
+        committed: [],
       },
       registrations: [
         {
@@ -54,6 +55,10 @@ describe('fold', () => {
           command: 'npm test -- checkout-discount',
           files: { 'tests/checkout-discount.test.ts': 'sha256:2f4d6e8a0c1b3d5f7a9c0e2b4d6f8a1c3e5b7d9f0a2c4e6b8d0f2a4c6e8b0d2f' },
           applied: ['tests/checkout-discount.test.ts'],
+          // The agent wrote it, so git had nothing at base — and this stream predates
+          // the field entirely, which reads as "not observed" and denies the
+          // provenance claim rather than granting it (8d).
+          committed: [],
         },
       ],
       reproduced: true,

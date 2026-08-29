@@ -57,6 +57,42 @@ Commit a file at exactly `.engine/repro.json`:
   already tracked in the project is refused, because writing over it would
   overwrite the code under test.
 
+## The reproduction you did not have to write
+
+Before you write a test, look at what the project's own suite already does on this
+commit. If a test that **already exists in this repository** fails for the reported
+reason, that test is the reproduction — and it is stronger evidence than anything
+you can write, for a reason that has nothing to do with quality: someone wrote it
+before this run existed, so nothing about it was shaped by the report, or by you.
+
+Register it instead of writing your own:
+
+```json
+{
+  "command": "<the project's own test command> path/to/their/test",
+  "pinned": ["path/to/their/test"]
+}
+```
+
+- `pinned` names paths the engine **reads** out of this repository and hashes. It
+  never writes them, and every one must already be tracked here — that is the whole
+  point of them. Anything *you* wrote goes in `files`, which the engine applies over
+  both commits. A path cannot be in both lists.
+- The `command` must be the project's own test command, optionally narrowed to the
+  pinned paths and nothing else. Not because a wrapper would be wrong, but because
+  the engine can only tell a reproduction is the repository's if every part of it is
+  — a command carrying anything of yours is a command you wrote.
+- **The symptom rule still applies**, and it is what usually decides this. The
+  output of that existing test still has to contain the reported string above,
+  character for character. If it fails for the right reason but says it in its own
+  words, the engine cannot tie it to this report: write your own test, which is the
+  ordinary case and is not a worse outcome.
+- If the existing test fails for a *different* reason than the report — an unrelated
+  regression, a broken build — it is not the reproduction. Do not register it.
+
+You may list both `files` and `pinned`. The run is then scored as yours, because
+part of it is.
+
 ## Rules that are not negotiable
 
 1. **Only committed files exist.** Your working tree, your temp files, your
