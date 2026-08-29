@@ -4,8 +4,10 @@ status: built
 
 # Milestone 8 — the things milestone 7 named and did not do
 
-Milestone 7 ended with a list rather than a conclusion: six items it had analysed,
-priced, and left. This milestone is that list, and nothing else. No new capability
+Milestone 7 ended with a list rather than a conclusion: seven items it had analysed,
+priced, and left — five under "what this milestone did not touch, and should", one
+defect it recorded as "still open", and one limitation it predicted and then
+observed. This milestone is that list, and nothing else. No new capability
 is invented here — every phase below already exists as a paragraph in
 [milestone-7.md](milestone-7.md), written by the session that found it and had no
 budget left to fix it.
