@@ -311,11 +311,18 @@ export async function serve(options: ServeOptions): Promise<Service> {
    * must never look like an approval that did not take.
    */
   const proveForRepo = async (repo: string): Promise<void> => {
-    const installation = await loadInstallation(client, repo);
-    const recipe = await loadRecipe(client, repo);
-    if (!installation || !recipe) return;
-    const workspace = await mkdtemp(join(tmpdir(), 'engine-prove-clone-'));
+    // EVERYTHING inside the try, including the two lookups and the temp directory.
+    // This is fired and not awaited, so a rejection escaping it is an unhandled
+    // rejection — which on current Node ends the process. A database hiccup one
+    // second after somebody approved a recipe would have taken the receiver down
+    // with it, and the surface that reported the approval would already have said
+    // it worked.
+    let workspace: string | undefined;
     try {
+      const installation = await loadInstallation(client, repo);
+      const recipe = await loadRecipe(client, repo);
+      if (!installation || !recipe) return;
+      workspace = await mkdtemp(join(tmpdir(), 'engine-prove-clone-'));
       const source = join(workspace, 'source');
       await cloneForDraft(repo, installation.installationId, source);
       const proof = await prove({
@@ -329,7 +336,7 @@ export async function serve(options: ServeOptions): Promise<Service> {
     } catch (error) {
       log(`${repo}: could not be proved — ${String(error)}`);
     } finally {
-      await rm(workspace, { recursive: true, force: true }).catch(() => {});
+      if (workspace) await rm(workspace, { recursive: true, force: true }).catch(() => {});
     }
   };
 

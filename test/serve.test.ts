@@ -14,7 +14,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type pg from 'pg';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { Intake } from '../src/github.js';
 import type { RunRequest, RunResult } from '../src/run.js';
 import { readConfig, serve, type Config, type Service } from '../src/serve.js';
@@ -210,6 +210,90 @@ describe('the service refuses to start rather than start uselessly', () => {
       OPENROUTER_API_KEY: 'sk-or-x',
     } as NodeJS.ProcessEnv;
     expect(() => readConfig(env)).toThrow(/unreadable/);
+  });
+});
+
+describe('approving a recipe proves the repository (8f)', () => {
+  const PROOF = {
+    state: 'ready_with_caveats' as const,
+    commit: 'a'.repeat(40),
+    environment: { built: true as const },
+    caveats: ['the test command `npm test` already fails at this commit (exit 1)'],
+    unproved: [],
+    provedAt: 'T',
+  };
+
+  const approve = (port: number) =>
+    fetch(`http://127.0.0.1:${port}/repos/o/r/onboard`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        recipe: JSON.stringify({ install: 'npm ci', services: [], test: 'npm test' }),
+      }).toString(),
+      redirect: 'manual',
+    });
+
+  it('starts the proving run on the recipe now in force, and stores what it found', async () => {
+    // The trigger milestone 7 asked for. Before this, the first time anyone knew
+    // whether an approved recipe works was in the middle of a real run.
+    const proved: unknown[] = [];
+    const client = onboarded();
+    const service = await serve({
+      config: config(),
+      client,
+      log: () => {},
+      run: async () => ok('r'),
+      // Neither of these may touch a network or a container for a test about wiring.
+      cloneForDraft: async () => {},
+      prove: async (plan) => {
+        proved.push(plan.recipe);
+        return PROOF;
+      },
+    });
+    services.push(service);
+
+    expect((await approve(service.eventsPort)).status).toBe(303);
+
+    // Fired, not awaited — the human who pressed approve gets their page back
+    // immediately, and this lands afterwards.
+    await vi.waitFor(() => expect(proved).toHaveLength(1));
+    expect(proved[0]).toMatchObject({ install: 'npm ci', test: 'npm test' });
+
+    // And it was WRITTEN. A proving run whose result is not stored is a container
+    // spent on a page that still says "not proved yet".
+    const queries = () =>
+      (client.query as unknown as Mock<(sql: string) => unknown>).mock.calls
+        .map((call) => String(call[0]))
+        .join('\n');
+    await vi.waitFor(() => expect(queries()).toContain('update recipes set proof'));
+  });
+
+  it('a proving run that throws does not take the service down with it', async () => {
+    // It is fired and not awaited, so a rejection escaping it is an unhandled
+    // rejection — which on current Node ends the process. A database hiccup one second
+    // after somebody approved a recipe would have killed the webhook receiver, and the
+    // page that reported the approval would already have said it worked.
+    const logs: string[] = [];
+    const service = await serve({
+      config: config(),
+      client: onboarded(),
+      log: (line) => logs.push(line),
+      run: async () => ok('r'),
+      cloneForDraft: async () => {},
+      prove: async () => {
+        throw new Error('the daemon went away');
+      },
+    });
+    services.push(service);
+
+    expect((await approve(service.eventsPort)).status).toBe(303);
+    await vi.waitFor(() => expect(logs.join('\n')).toContain('could not be proved'));
+    expect(logs.join('\n')).toContain('the daemon went away');
+
+    // Still serving. The assertion that would have failed on an unhandled rejection is
+    // the test runner surviving at all, and this one says it in the file.
+    const alive = await fetch(`http://127.0.0.1:${service.eventsPort}/repos`);
+    expect(alive.status).toBe(200);
   });
 });
 
