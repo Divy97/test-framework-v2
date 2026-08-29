@@ -20,6 +20,7 @@ import { loadProof, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
 import { readRun } from './store.js';
 import type { Route } from './sse.js';
 import type { Session } from './auth.js';
+import { forgetRun, tombstoneFor } from './forget.js';
 import { listRunners, pairRunner, revokeRunner } from './plane.js';
 import {
   escapeHtml,
@@ -102,6 +103,11 @@ export function dashboardRoutes(options: {
    * two containers have finished.
    */
   onApproved?: (repo: string) => void;
+  /**
+   * Where artifacts live, when this surface is the one holding them (9e). Absent, the
+   * forget route answers 501 rather than pretending to delete something.
+   */
+  blobRoot?: string;
   /**
    * Who is asking, and what they may act on (9c). Absent, this is the LOCAL surface:
    * one operator, bound to 127.0.0.1, and the origin check is the whole control — which
@@ -211,8 +217,44 @@ export function dashboardRoutes(options: {
       const events = await readRun(client, runId);
       const state = fold(events);
       return html(
-        evidencePage({ row, state, score: confidence(state), usage: await readUsage(client, runId) }),
+        evidencePage({
+          row,
+          state,
+          score: confidence(state),
+          usage: await readUsage(client, runId),
+          forgotten: await tombstoneFor(client, runId),
+        }),
       );
+    }
+
+    // FORGETTING (9e). A POST, behind the same origin check every write here gets, and
+    // behind the same authorization the run's own page gets — deleting somebody's
+    // evidence is not a lesser thing to be allowed to do than reading it.
+    const forgetting = /^\/runs\/([^/]+)\/forget$/.exec(path);
+    if (method === 'POST' && forgetting) {
+      const runId = decodeURIComponent(forgetting[1]!);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      const row = await readRunRow(client, runId);
+      if (!row || (who !== null && !who.repos.has(row.repo))) {
+        return html(`<!doctype html><title>not found</title><p>No such run.</p>`, 404);
+      }
+      if (!options.blobRoot) {
+        return html(`<!doctype html><title>not here</title><p>This surface stores no artifacts.</p>`, 501);
+      }
+      await forgetRun(client, {
+        runId,
+        // Named, because "who asked" is the only part of a deletion anybody can audit
+        // afterwards — the bytes are gone by definition.
+        requestedBy: who === null ? 'the local operator' : who.session.login,
+        blobRoot: options.blobRoot,
+      });
+      return {
+        status: 303,
+        type: 'text/plain',
+        body: 'forgotten\n',
+        headers: { location: `/runs/${encodeURIComponent(runId)}` },
+      };
     }
 
     const api = /^\/api\/runs\/([^/]+)$/.exec(path);

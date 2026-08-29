@@ -1,5 +1,5 @@
 ---
-status: in progress
+status: built
 ---
 
 # Milestone 9 — the thing people can actually use
@@ -19,7 +19,7 @@ are different requirements, and this milestone is the seam between them.
 | **9b** blobs cross the boundary | built |
 | **9c** GitHub OAuth, and the human surface | built |
 | **9d** the runner daemon | built |
-| **9e** deletion, as a tombstone rather than a hole | |
+| **9e** deletion, as a tombstone rather than a hole | built |
 
 The decision behind all of them is
 [ADR-0019](adr/0019-who-writes-when-the-runner-is-not-ours.md), and the one sentence
@@ -258,7 +258,46 @@ nobody runs. Every case is something that will happen to a process on a laptop:
 - an unreachable plane is waited out, not exited on;
 - an empty poll loops rather than treating 204 as a failure.
 
-**9e** is deletion. Central blobs make "delete this run" a real request, and dropping
-bytes leaves events citing refs that resolve to nothing. `forgotten` is a fold state to
-design; a run whose evidence was destroyed on request must not render like one whose
-evidence was lost.
+## 9e · forgetting, without editing history
+
+Central blobs made "delete this run" a request somebody will actually make, and it
+collides head-on with the property this project is proudest of. Deleting from an
+append-only log would make every other claim about that log worth less.
+
+So nothing is deleted from it. **The bytes go; the events stay exactly as they were.**
+The answer to *"did you edit my history"* is a flat no — we destroyed bytes we were
+holding, and a row in `forgotten` is why the hashes still in those events no longer
+resolve.
+
+`forgotten` is not an event, and that is the design rather than a shortcut. The log has
+one writer per run and it is the runner (ADR-0009, ADR-0019); a row appended by the plane
+would make it a second producer of facts about somebody's bug. Forgetting is not a fact
+about the bug at all — it is an administrative act on our storage, the same class as
+`jobs`, `installations` and `recipes`.
+
+### The subtlety worth the extra query
+
+Blobs are content-addressed, so **two runs that produced identical bytes share one
+file** — the same stdout, the same empty diff. Deleting everything a forgotten run cites
+would silently break a run nobody asked about, and it would surface much later as an
+evidence page whose hashes do not resolve: precisely the state this feature exists to
+make legible.
+
+So a ref is only removed when no *other, not-yet-forgotten* run cites it. The other half
+of that rule is tested too: a blob shared only with an already-forgotten run does go, or
+the last citation would preserve bytes nobody can see forever.
+
+### The page says which
+
+Destroyed-on-request and gone-missing look identical from the outside. One is a promise
+kept and the other is a bug, so the tombstone renders **above the verdict**, before a
+reader meets a hash that points at nothing — and the dead references are still shown,
+because hiding them would be the edit that was just refused, one layer up.
+
+### What is asserted
+
+`forget.test.ts` (5, real database and a real blob directory): the artifacts go and
+**every event row is byte-identical afterwards**; a blob another run cites is kept; a
+blob shared only with a forgotten run goes; forgetting twice does not rewrite who asked
+or when. `web.test.ts` covers the tombstone and its absence, and `authz.test.ts` covers
+the one that matters — deleting the evidence of a run you cannot see deletes nothing.

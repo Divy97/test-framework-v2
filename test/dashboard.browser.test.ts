@@ -130,6 +130,13 @@ const fixtureClient = (): pg.Client => {
     if (sql.includes('from events where run_id = $1')) {
       return params[0] === DEMO_RUN_ID ? demoRunEvents : [];
     }
+    if (sql.includes('from forgotten where run_id = $1')) {
+      // Nothing here was ever forgotten (9e). Answered rather than thrown because the
+      // run page asks on every render, and "no tombstone" is the ordinary case — but
+      // answered EXPLICITLY, because the whole point of this fake is that a query
+      // nobody wrote must not quietly render as "nothing yet".
+      return [];
+    }
     if (sql.includes('from run_usage where run_id = $1')) {
       return params[0] === DEMO_RUN_ID ? USAGE : [];
     }

@@ -131,6 +131,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
       }),
       dashboardRoutes({
         client,
+        blobRoot: config.blobRoot,
         auth: {
           session: (headers) => readSession(client, cookieValue(headers['cookie'], 'tf_session')),
           installations: (session) => installationsFor(session),

@@ -143,6 +143,22 @@ describe('being signed in is not being allowed', () => {
     expect(rows.map((row) => row.repo)).toEqual(['mine/repo']);
   });
 
+  it('deleting the evidence of a run you cannot see deletes nothing', async () => {
+    // 9e's write. Destroying somebody's evidence is not a lesser thing to be allowed to
+    // do than reading it, so it goes through the same gate as the run's own page.
+    const writes: string[] = [];
+    const route = dashboardRoutes({
+      client: fakeClient(writes),
+      installUrl: 'https://example.invalid',
+      blobRoot: '/tmp/never-used-because-this-is-refused',
+      auth: { session: async () => SESSION, installations: async () => [1] },
+    });
+    const response = await call(route, 'POST', '/runs/r-theirs/forget');
+
+    expect(response?.status).toBe(404);
+    expect(writes.some((sql) => sql.includes('insert into forgotten'))).toBe(false);
+  });
+
   it('a GitHub that will not answer denies rather than admits', async () => {
     // `installationsFor` returns an empty list when GitHub is unreachable, and this is
     // what that means at the surface: an outage must not become an authorization.

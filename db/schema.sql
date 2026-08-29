@@ -222,3 +222,24 @@ create table if not exists sessions (
 );
 
 create index if not exists sessions_github on sessions (github_id);
+
+-- A run whose artifacts were destroyed on request (9e).
+--
+-- NOT an event, and the reason is the whole design. The log has one writer per run and
+-- it is the runner (ADR-0009, ADR-0019); a row appended here by the plane would make it
+-- a second producer of facts about somebody\'s bug. Forgetting is not a fact about the
+-- bug at all — it is an administrative act on OUR storage, which is the same class as
+-- `jobs`, `installations` and `recipes`.
+--
+-- So the log is untouched, and that is the strongest available answer to "did you edit
+-- my history": no. We deleted bytes we were holding, the events still say exactly what
+-- they always said, and this row is why the hashes in them no longer resolve.
+create table if not exists forgotten (
+  run_id       uuid        primary key,
+  requested_by text        not null,
+  forgotten_at timestamptz not null default now(),
+  -- What was actually removed, which is not the same as what the run cited: a blob
+  -- another run also cites is kept, because content addressing means those are the same
+  -- bytes and deleting them would break a run nobody asked to forget.
+  removed      integer     not null default 0
+);
