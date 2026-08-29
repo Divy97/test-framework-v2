@@ -39,7 +39,7 @@ import {
   type GitHubApp,
   type IssueIntake,
 } from './github.js';
-import { orchestrate, type RunPlan } from './orchestrate.js';
+import { orchestrate, type RunPlan, type SealedWorld } from './orchestrate.js';
 import { describeEnvironment, renderPrompt } from './prompts.js';
 import type { Recipe } from './recipe.js';
 import { issueComment, pullRequestBody, pullRequestTitle } from './report.js';
@@ -134,14 +134,20 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       payload: intake.event,
     });
 
-    const environment = describeEnvironment({
-      ...(request.recipe ? { services: request.recipe.services } : {}),
-      ...(request.recipe?.test ? { testCommand: request.recipe.test } : {}),
-      browser: request.agentImage !== undefined,
-      // A recipe is what gives the agent sandbox a network and what the phases'
-      // snapshot is taken of, so it is the condition the asymmetry paragraph turns on.
-      booted: request.recipe !== null,
-    });
+    // A FUNCTION of what the engine observed in the judging container, because the
+    // paragraph about that container is the one an agent acts on and it was written
+    // before anyone had looked. `orchestrate` runs the probe after the plan is built,
+    // so the string cannot exist yet — only a way to make it can.
+    const environmentWith = (sealed?: SealedWorld) =>
+      describeEnvironment({
+        ...(request.recipe ? { services: request.recipe.services } : {}),
+        ...(request.recipe?.test ? { testCommand: request.recipe.test } : {}),
+        ...(sealed ? { sealed } : {}),
+        browser: request.agentImage !== undefined,
+        // A recipe is what gives the agent sandbox a network and what the phases'
+        // snapshot is taken of, so it is the condition the asymmetry paragraph turns on.
+        booted: request.recipe !== null,
+      });
     const issue = intake.event.raw_text;
 
     // The fix prompt cannot be rendered yet: it names the registered command, and
@@ -167,7 +173,8 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       blobRoot: request.blobRoot,
       image: request.image,
       baseRef,
-      reproPrompt: await renderPrompt('repro', { issue, environment, symptom: symptomPattern }),
+      reproPrompt: (sealed) =>
+        renderPrompt('repro', { issue, environment: environmentWith(sealed), symptom: symptomPattern }),
       // A function, so it is rendered AFTER the reproduction is registered and can name
       // the command that will actually judge the fix. It used to be rendered here with
       // prose in place of both variables, which made the prompt contradict itself — it
@@ -176,7 +183,7 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       agentPrompt: (context) =>
         renderPrompt('fix', {
           issue,
-          environment,
+          environment: environmentWith(context.sealed),
           command: context.repro.command,
           // What the base container watched the reproduction print. Every placeholder
           // must be filled — `renderPrompt` refuses a template with one left — so the

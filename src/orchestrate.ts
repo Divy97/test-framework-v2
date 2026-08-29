@@ -34,7 +34,7 @@ import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
 import { runAgentLoop, type AgentTranscript, type LoopUsage } from './loop.js';
 import type { Recipe, ReplayOutcome } from './recipe.js';
-import { isWorkerReply, type Job, type WorkerRequest } from './runner.js';
+import { isWorkerReply, type Job, type SuiteProbe, type WorkerRequest } from './runner.js';
 import { get, put } from './blobs.js';
 import { redact } from './redact.js';
 import type { ReproSpec } from './verify.js';
@@ -68,6 +68,17 @@ export type FixContext = {
    * measured against. Absent when the recipe declares no test command.
    */
   suite?: { command: string; exitCode: number };
+  /**
+   * What the recipe's own test command did in the sealed world, observed before
+   * either agent ran. Absent when the recipe declares no test command.
+   *
+   * The fix agent already gets `suite` — the base container's real SUITE_RUN — so
+   * this looks redundant and is not: `suite` says how the project's tests fared on
+   * a commit, and this says whether that command is RUNNABLE where the judging
+   * happens at all. A repository whose test command resolves from a registry has
+   * no suite result to report and every reason to be told why.
+   */
+  sealed?: SealedWorld;
 };
 
 /** Tail of base's output handed to the fix agent. The failure is at the end. */
@@ -137,8 +148,12 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * repro is registered by the base container, and the FIX agent does not start
    * until after that, so `REPRO_REGISTERED` provably precedes the fix agent's
    * first message by seq. Nobody has to trust that it did.
+   *
+   * A FUNCTION when the caller wants to say something about the world this agent
+   * will be judged in: the sealed-world probe runs after the plan is built and
+   * before the agent starts, so a string here was written before anyone looked.
    */
-  reproPrompt?: string;
+  reproPrompt?: string | ((sealed?: SealedWorld) => string | Promise<string>);
   /**
    * The commit the fix is judged at. Omitted when an agent is writing it: the
    * orchestrator then uses whatever the agent committed, which is the only
@@ -253,7 +268,13 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   draftingEnvironment?: boolean;
 } & (
   | { repro: Job['repro']; reproPrompt?: never }
-  | { reproPrompt: string; repro?: never }
+  /**
+   * A FUNCTION when the caller wants to say something about the world the agent is
+   * being judged in — the same reason `agentPrompt` is one. The probe runs after
+   * the plan is built and before this agent starts, so a string here is a prompt
+   * written before anyone looked.
+   */
+  | { reproPrompt: string | ((sealed?: SealedWorld) => string | Promise<string>); repro?: never }
 );
 
 /** What one container reported, and how it exited. */
@@ -283,6 +304,11 @@ export type PhaseResult = {
    * is the wrong thing to ship.
    */
   stderr: string;
+  /**
+   * What the sealed-world probe observed, when this was a probe container (8b).
+   * Absent for every other kind, which is every container that judges anything.
+   */
+  suiteReport?: SuiteProbe;
   /**
    * What a tool-serving container reported about bundling its commits: null when
    * it worked, prose when it did not, absent when this was not that kind of
@@ -499,6 +525,18 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // sandbox never runs from an image built out of a recipe replay it is about to
   // perform itself.
   const judging: RunPlan = snapshotImage === null ? plan : { ...plan, image: snapshotImage };
+
+  // Before the agent, because the agent is who it is for — and skipped entirely when
+  // there is no agent to tell. A caller who supplies the reproduction has already
+  // decided what runs, and spending a container on prose nobody will read is the
+  // kind of cost that gets a good check deleted later.
+  //
+  // A run whose environment failed to build never gets here either: `snapshot.failed`
+  // ends it inside the attempt loop below, so this only probes a world that exists.
+  const sealed =
+    (snapshot && 'failed' in snapshot) || !(plan.reproPrompt || plan.agentPrompt)
+      ? undefined
+      : await probeSealedWorld(judging, source, base);
 
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
@@ -723,8 +761,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // fold stricter rather than wrong.
     // The repro agent, when there is one, runs before everything: base cannot be
     // judged against a reproduction that does not exist yet.
-    if (plan.reproPrompt) {
-      steps.push({ phase: 'agent', job: {}, source: agentSource, kind: 'repro', prompt: plan.reproPrompt });
+    // Read out of the plan once. Narrowing `plan.reproPrompt` in place narrows the
+    // whole plan union with it, and the string branch then has no member left.
+    const authored = plan.reproPrompt;
+    if (authored) {
+      const prompt = typeof authored === 'function' ? await authored(sealed) : authored;
+      steps.push({ phase: 'agent', job: {}, source: agentSource, kind: 'repro', prompt });
     }
     // The FIX agent. With a repro agent present it is DEFERRED to after the base
     // container has registered the reproduction, so ADR-0008's ordering invariant
@@ -754,7 +796,10 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         // watched it fail yet.
         prompt:
           typeof plan.agentPrompt === 'function'
-            ? await plan.agentPrompt({ repro: plan.repro! })
+            ? await plan.agentPrompt({
+                repro: plan.repro!,
+                ...(sealed === undefined ? {} : { sealed }),
+              })
             : plan.agentPrompt,
       });
     }
@@ -925,6 +970,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
             typeof plan.agentPrompt === 'function'
               ? await plan.agentPrompt({
                   repro: resolvedRepro!,
+                  ...(sealed === undefined ? {} : { sealed }),
                   ...(await observedOnBase(plan.blobRoot, events, n)),
                 })
               : plan.agentPrompt;
@@ -1435,6 +1481,73 @@ async function buildEnvSnapshot(
 }
 
 /**
+ * What the project's own test command does in the world that judges — observed
+ * there, not believed about it.
+ *
+ * Two sentences in `describeEnvironment` used to be assertions. 7a deleted one of
+ * them ("The project's own test command is `X`. It passes on this commit.") for
+ * the honest reason that nothing had ever executed it, and left the other
+ * standing: that the judging container has nothing installed. 7e made that one
+ * false too — the phases run from a snapshot with the repository's dependencies
+ * in it — and nothing noticed, because a prompt is the one thing this suite
+ * cannot check (see the scripted-agent limitation in ADR-0015's amendment).
+ *
+ * So the engine runs it. `test` is a command a human approved for THIS repository
+ * and it is the template the agent imitates: milestone 7's third defect was a
+ * recipe whose test command resolved from the registry, in a container that has no
+ * network, which taught the agent to write a reproduction that needed one. That
+ * cost three model runs to diagnose and one sealed container to have prevented.
+ */
+export type SealedWorld = { command: string } & (
+  | { exitCode: number; output: string }
+  | { failed: string }
+);
+
+/**
+ * Run the recipe's test command exactly where a reproduction will be judged.
+ *
+ * It IS a base phase — same container, same image, same `--network none`, same
+ * clone, same restored dependencies, same uid — with the project's test command in
+ * the place of a reproduction. Nothing cheaper is honest: milestone 7's first
+ * defect was `corepack enable` succeeding as root in the environment build and
+ * failing as uid 1000 in the agent sandbox, so an approximation of the phase
+ * container is exactly the thing that does not answer this question.
+ *
+ * Its events are DISCARDED, and that is deliberate rather than wasteful. They
+ * describe our environment, not the user's bug, and a `TEST_RUN` here would be a
+ * second base-phase observation for the fold to pair against the real one. The
+ * ReplayOutcome precedent already covers this: what the engine learns about its own
+ * world travels on the reply channel, never on the log (ADR-0006).
+ */
+async function probeSealedWorld(
+  judging: RunPlan,
+  source: string,
+  base: string,
+): Promise<SealedWorld | undefined> {
+  const command = judging.recipe?.test;
+  if (command === undefined) return undefined;
+  const result = await runContainer(judging, source, 0, 'base', {
+    only: 'suite',
+    baseRef: base,
+    fixRef: base,
+    // Never read on this path — the Runner returns before `verify()` — and passed
+    // as the base commit rather than left to a default so nothing here names
+    // something that does not exist.
+    repro: { command: '' },
+    suiteCommand: command,
+  });
+  const observed = result.suiteReport;
+  if (observed === undefined) {
+    // The container said nothing at all: it could not stand up, or it was stopped.
+    // Prose, because an unrun command must never read as a passing one.
+    return { command, failed: result.stderr.trim().split('\n').at(-1) || 'the engine could not run it there' };
+  }
+  return 'failed' in observed
+    ? { command, failed: observed.failed }
+    : { command, exitCode: observed.exit_code, output: observed.output };
+}
+
+/**
  * Drives a tool-serving container from out here.
  *
  * The whole of ADR-0011 in one function type: something on the host is handed a
@@ -1591,6 +1704,7 @@ async function runContainer(
   const readied = new Promise<void>((resolve) => (ready = resolve));
   let handoverReport: string | null | undefined;
   let envReport: ReplayOutcome | undefined;
+  let suiteReport: SuiteProbe | undefined;
   let stdout = '';
   // Counted separately, because `stdout` is now DRAINED per line. Measuring the
   // ceiling against it would measure the current partial line, and the guard would
@@ -1614,6 +1728,7 @@ async function runContainer(
     }
     if ('ready' in parsed) ready();
     else if ('env' in parsed) envReport = parsed.env;
+    else if ('suite' in parsed) suiteReport = parsed.suite;
     else if ('finished' in parsed) handoverReport = parsed.finished.handover;
     else {
       const settle = pending.get(parsed.result.id);
@@ -1776,6 +1891,7 @@ async function runContainer(
     ...(handover ? { handover } : {}),
     ...(handoverReport === undefined ? {} : { handoverReport }),
     ...(envReport === undefined ? {} : { envReport }),
+    ...(suiteReport === undefined ? {} : { suiteReport }),
   };
 }
 

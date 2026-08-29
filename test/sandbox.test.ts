@@ -17,7 +17,7 @@ import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { confidence } from '../src/confidence.js';
 import { fold } from '../src/fold.js';
-import { draftRecipe, orchestrate } from '../src/orchestrate.js';
+import { draftRecipe, orchestrate, type SealedWorld } from '../src/orchestrate.js';
 import { SHARED_WRITABLE } from '../src/runner.js';
 import {
   APPLIED_REPRO,
@@ -2889,6 +2889,93 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // The gate holds, correctly, on a bug that is real. That is the false Tier 3
     // this milestone is about.
     expect(outcome.phases.map((p) => p.phase)).toEqual(['base']);
+  }, 900_000);
+
+  // ── 8b: the recipe's test command is judged where the agent will be ─────────
+  //
+  // Milestone 7's third defect, and the one it left open: a recipe whose test
+  // command resolves from a registry cannot run in a container with no network,
+  // and that command is the template the agent imitates — so a recipe that needs
+  // the network teaches the agent to write a reproduction that needs one. It cost
+  // three model runs to find. The engine now runs that command in the judging
+  // container before either agent starts, and tells the agent what happened.
+
+  test("the recipe's test command is run where the reproduction will be judged", async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+    let sealed: SealedWorld | undefined;
+
+    await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: hostBlobs(),
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      flakeRuns: 0,
+      baseRuns: 0,
+      symptomPattern: 'wrong',
+      // The probe is what is under test, and it runs before this is called. The
+      // agent container behind it has no `claude` in it and the run ends there —
+      // which is fine and is why nothing below asserts on the outcome.
+      reproPrompt: (world) => {
+        sealed = world;
+        return 'write a reproduction';
+      },
+      // The test command lives in a GITIGNORED path, so it exists only in what
+      // `install` wrote. A probe that ran anywhere but the judging container —
+      // the build container, a bare clone, the agent's sandbox — gets a different
+      // answer, which is the point: milestone 7's first defect was a recipe step
+      // that worked as root and failed as uid 1000.
+      recipe: {
+        install: 'mkdir -p node_modules/dep && printf "exit 0\n" > node_modules/dep/suite.sh',
+        services: [],
+        test: 'sh node_modules/dep/suite.sh',
+      },
+    });
+
+    expect(sealed).toBeDefined();
+    expect(sealed!.command).toBe('sh node_modules/dep/suite.sh');
+    expect(sealed).toMatchObject({ exitCode: 0 });
+  }, 900_000);
+
+  test('and a test command that needs the network is caught before a model is spent', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+    let sealed: SealedWorld | undefined;
+
+    await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: hostBlobs(),
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      flakeRuns: 0,
+      baseRuns: 0,
+      symptomPattern: 'wrong',
+      reproPrompt: (world) => {
+        sealed = world;
+        return 'write a reproduction';
+      },
+      // The same shape as the real one — `npx --yes pnpm@… vitest`, which resolves
+      // from the registry every time it runs — with the registry hit made explicit
+      // and instant. In the agent's sandbox this succeeds; there is a network
+      // there. In the container that judges, there is not, and before this nothing
+      // anywhere compared the two.
+      recipe: {
+        install: 'mkdir -p node_modules/dep && touch node_modules/dep/marker',
+        services: [],
+        test: 'wget -q -O- http://registry.npmjs.org/',
+      },
+    });
+
+    expect(sealed).toBeDefined();
+    // It RAN and it failed, for the reason that matters. Asserting only "not zero"
+    // would have passed while the probe was never reaching the container at all —
+    // which is exactly what this test did until the pair above disagreed with it.
+    expect(sealed).toMatchObject({ exitCode: 1 });
+    expect('output' in sealed! ? sealed.output : '').toMatch(/bad address|not found|resolve/i);
   }, 900_000);
 
   // ── 6b: the drafting agent gets a network with nothing to replay ────────────

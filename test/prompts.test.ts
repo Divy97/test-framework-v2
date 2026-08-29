@@ -183,23 +183,28 @@ describe('the environment paragraph describes what was observed', () => {
     expect(text).toMatch(/not running in the container that judges you/);
   });
 
-  test('a booted sandbox is told the judge has nothing installed', () => {
-    // The single most consequential fact for writing a runnable reproduction, and the
-    // one that was never stated. The phase containers replay no recipe, hold no recipe,
-    // and run `--network none`: they clone the commit and run the command against a bare
-    // checkout. That is how a reproduction which works in the sandbox dies as `sh:
-    // vitest: not found` in the container that judges it — a false Tier 3 about
-    // someone's bug, caused entirely by us.
+  test('a booted sandbox is told what the judge HAS, which is no longer nothing', () => {
+    // This test used to assert `nothing is installed in it`, and it was right when it
+    // was written: the phase containers cloned the commit and ran against a bare
+    // checkout. 7e changed the world and not the sentence — the phases now run from an
+    // image carrying this repository's installed dependencies — so the prompt went on
+    // telling the agent to write a reproduction out of the standard library alone, in a
+    // container that had the project's own test runner sitting in it.
     //
-    // It describes the world as it IS. An earlier draft of this paragraph described the
-    // pre-warmed snapshot that WOULD fix the asymmetry, which is not built — replacing a
-    // false claim about the environment with a different false claim about it. Hence the
-    // last assertion, which is the one that would have caught it.
+    // A prompt is the one thing the suite cannot check by running it (the scripted agent
+    // emits whatever the test author wrote), so the only defence is asserting the words.
+    // These assertions are that defence, and the negative one is the whole point.
     const text = describeEnvironment({ booted: true });
-    expect(text).toMatch(/has \*\*none of that\*\*/);
-    expect(text).toMatch(/nothing is installed in it/);
-    expect(text).toMatch(/language runtime and standard library, and nothing else/);
-    expect(text).not.toMatch(/snapshot/);
+    expect(text).toMatch(/no\n?network/i);
+    expect(text).toMatch(/nothing is running/);
+    expect(text).toMatch(/the same installed dependencies/);
+    expect(text).toMatch(/dependencies the recipe’s `install` step puts in the tree/);
+    // The two ways a correct reproduction still dies there, named.
+    expect(text).toMatch(/npx --yes/);
+    expect(text).toMatch(/node_modules\/\.bin/);
+    // The claim that stopped being true. If it ever comes back, it comes back here.
+    expect(text).not.toMatch(/nothing is installed in it/);
+    expect(text).not.toMatch(/standard library, and nothing else/);
   });
 
   test('an unbooted sandbox is told both worlds are sealed', () => {
@@ -217,6 +222,45 @@ describe('the environment paragraph describes what was observed', () => {
     expect(text).toMatch(/`node --test`/);
     expect(text).not.toMatch(/It passes on this commit/);
     expect(text).toMatch(/has\s+not been checked here/);
+  });
+
+  test('the sealed world is described from what was run in it, not from belief', () => {
+    // 8b. The disclaimer above is the honest thing to say when nothing has run the
+    // command; it is the wrong thing to say once something has. The engine runs the
+    // recipe's own test command in the judging container before either agent starts,
+    // and this is where that observation becomes a sentence.
+    const green = describeEnvironment({
+      booted: true,
+      testCommand: 'node --test',
+      sealed: { command: 'node --test', exitCode: 0, output: 'ok 12' },
+    });
+    expect(green).toMatch(/container that will judge you/);
+    expect(green).toMatch(/exited 0 there/);
+    expect(green).toMatch(/ok 12/);
+    // The disclaimer must be GONE — leaving both would tell the agent in one
+    // paragraph that we checked and in the next that we did not.
+    expect(green).not.toMatch(/has\s+not been checked here/);
+
+    // Red is a fact about the repository, not an accusation about the agent. 7d's
+    // `already_red` is the same rule one layer down.
+    const red = describeEnvironment({
+      booted: true,
+      sealed: { command: 'node --test', exitCode: 1, output: 'not ok 3 - totals' },
+    });
+    expect(red).toMatch(/exited 1 there/);
+    expect(red).toMatch(/not something/);
+    expect(red).toMatch(/not ok 3 - totals/);
+
+    // And the case this phase exists for: a test command that cannot run where the
+    // judging happens. The agent is told not to imitate it, because imitating it is
+    // exactly what a real model did — the reproduction copied the recipe's command
+    // style and needed a registry that was not there.
+    const broken = describeEnvironment({
+      booted: true,
+      sealed: { command: 'npx --yes pnpm@10 vitest', failed: 'exceeded 120000ms' },
+    });
+    expect(broken).toMatch(/could not be run there: exceeded 120000ms/);
+    expect(broken).toMatch(/do not imitate its style/);
   });
 
   test('with services it names each one and its healthcheck', () => {

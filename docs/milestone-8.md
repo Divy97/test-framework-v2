@@ -17,7 +17,7 @@ wedged suite.
 | | | |
 |---|---|---|
 | **8a** a container that will not finish is stopped | M7: "`runContainer` has no timeout" | built |
-| **8b** the recipe's own test command is judged where the agent will be judged | M7 defect 3, "still open" | |
+| **8b** the recipe's own test command is judged where the agent will be judged | M7 defect 3, "still open" | built |
 | **8c** the info request says what was actually missing | M7: "the info-request is a template" | |
 | **8d** a suite that is already red on the reported behaviour | M7: "an existing failing test is a free Tier 1" | |
 | **8e** triage, before a container starts | M7: "the cheapest available reduction in false Tier 3s" | |
@@ -56,3 +56,64 @@ returns — fired and forgotten, "the container is gone" is merely false for a
 shorter time. `a container that will not finish is stopped by the host` asserts
 both halves: the stderr line that is the *entire* diagnosis (the Runner emits its
 events when `verify` returns, and it never did), and `docker ps -a` afterwards.
+
+## 8b · the judge's world is described by running in it
+
+Milestone 7's third defect, left open: a recipe whose test command resolves from a
+registry — `npx --yes pnpm@10 vitest`, the standard idiom — cannot run in a
+container with no network. It cost three model runs to diagnose, and the reason it
+was expensive is that the command is **the template the agent imitates**: the agent
+copied the recipe's command style into its reproduction, so a recipe that needs the
+network teaches the agent to write a reproduction that needs one.
+
+The engine now runs that command where the reproduction will be judged, before
+either agent starts. Not a static check for `npx --yes` — a heuristic blocklist is
+the vibes this project refuses — and not an approximation of the phase container
+either: milestone 7's *first* defect was `corepack enable` succeeding as root in the
+environment build and failing as uid 1000 in the agent sandbox, so anything short of
+the real thing answers a different question.
+
+**So the probe IS a base phase**, with the project's test command in the place of a
+reproduction: same image, same `--network none`, same clone, same restored
+dependencies, same uid. Its events are discarded, and that is the point rather than
+waste — they describe our environment, not the user's bug, and a `TEST_RUN` here
+would be a second base-phase observation for the fold to pair against the real one.
+What the engine learns about its own world travels on the reply channel, the way
+`ReplayOutcome` already does (ADR-0006).
+
+### The lie it found on the way
+
+`describeEnvironment` told a booted agent that the judging container "has **none of
+that** … nothing is installed in it", and that a reproduction may use "the language
+runtime and standard library, and nothing else".
+
+That was true when it was written and 7e made it false three commits later: the
+phases run from an image carrying this repository's installed dependencies. Nothing
+noticed, because 7e never opened `prompts.ts` — and a prompt is the one thing this
+suite structurally cannot check, which is [ADR-0015's
+amendment](adr/0015-the-model-is-behind-an-adapter.md) and the reason 7a exists at
+all. The engine spent a milestone building the judge a `node_modules` and then told
+the agent it was not there.
+
+So the paragraph now says what the judge has (the dependencies, no network, nothing
+running), what does not cross (anything the agent installs after that point), and
+names the trap in the agent's own idiom: invoke `./node_modules/.bin/…`, not `npx
+--yes …`. And the sentence 7a deleted for asserting an unmeasured result — *"The
+project's own test command is `X`. It passes on this commit."* — comes back as the
+observation it always should have been: what the command did, in the container that
+will judge, with its output. When the probe did not run, the disclaimer stands.
+
+**`already_red` is a first-class value here too.** A test command that exits
+non-zero in the sealed world is the repository's own baseline, and the agent is told
+so in those words — 7d's rule, one layer up. Only a command that could not *run*
+there is described as something not to imitate.
+
+### What is asserted
+
+- `prompts.test.ts` — the words, because nothing else can check them. Including
+  `not.toMatch(/nothing is installed in it/)`: the claim that stopped being true
+  comes back here if it comes back at all.
+- `sandbox.test.ts` — a recipe whose `test` lives in a **gitignored** path, so it
+  exists only in what `install` wrote: it exits 0 in the probe, which no bare clone
+  and no build container could report. And its pair, a test command that reaches for
+  a registry, which does not.
