@@ -95,6 +95,16 @@ So there is no configuration under which the party being judged can reach a cred
 
 OpenRouter is the **default**, because it is the only path with a real run behind it — no Anthropic credential has ever been present here, so defaulting to Anthropic made the default the path nobody had executed. `ENGINE_PROVIDER=anthropic` is one line, and its tool runner is still the better engine for a run that deserves it. A cheaper model is generally a worse one — but it cannot make the engine *lie*, only report a lower tier, because the gate is executed evidence rather than testimony. What it *could* do is fail silently: a model that writes its tool call as prose completes the turn with nothing executed, and the transcript then reads like an agent that chose to do nothing. `probeToolCalling` refuses such a model by name, in one turn, before the run — **and that covers the model that never could, not the one that stops.** `kimi-k2-thinking` passes the probe and then degrades at turn eight; the run-time check that catches that is `stopped: 'malformed_tool_call'`, set when a turn ends inside the model's reasoning with no content and no call.
 
+## Before a container starts
+
+Two things happen at the front of a run, and both exist because the expensive parts are at the back.
+
+**Triage.** A cheap model reads the report against the repository's file listing and answers one question: could an engineer who has never seen this project begin? If not, it names the single most useful missing fact and the issue gets that question **immediately** — while the person who filed it is still at their keyboard, rather than twenty minutes later when the four-item checklist that used to arrive was a template nobody answered. It never gates. Whatever it says, the run proceeds: a cheap model's opinion of somebody's bug report is the last thing that should be able to stop one.
+
+**The sealed-world probe.** The recipe's own test command is run in the container that will judge the fix — same image, same `--network none`, same restored dependencies, same uid — before either agent starts. The result is what the agent is *told* about the world it is being judged in, which is the sentence this project had wrong twice: once asserting a result nothing had executed, and once describing a container that had stopped being empty three commits earlier.
+
+The same two containers run once more at **onboarding**, the moment a human approves a recipe, so that whether those commands work is known then rather than in the middle of a stranger's issue. What comes out is `ready`, `ready-with-caveats` or `blocked`, with each caveat priced — most importantly the project suite's colour at HEAD, which decides whether every future regression arm on that repository can say anything at all.
+
 ## Testimony vs evidence
 
 The agent's transcript is **testimony** — displayed, never trusted. Facts are **evidence** — observed and executed by the engine at its own process boundary: exit codes of commands it ran, hashes of outputs it read, diffs it computed. The agent has zero ability to append events. "Solved" is a verdict only the engine's executed checks can issue.
@@ -114,7 +124,7 @@ We never claim "deterministic replay" of an LLM execution. Replay reconstructs h
 
 ## Verification: reproduce first, or don't fix
 
-- **Tier 1** — reproduced by a failing test whose independence is established: fails on base with symptom-matching output, passes on the fix, executed by the engine. Available to a caller-supplied reproduction.
+- **Tier 1** — reproduced by a failing test whose independence is established: fails on base with symptom-matching output, passes on the fix, executed by the engine. Available to a caller-supplied reproduction — and to one the **repository already contained**, which is the same claim reached a different way ([ADR-0018](docs/adr/0018-a-reproduction-the-repository-already-had.md)): nothing applied, every path tracked at the base commit, and the project's own test command over those paths, so the agent chose which existing test to point at and authored none of it.
 - **Tier 2** — reproduced, but the reproduction's independence is unverified. **This is where an agent-authored reproduction lands**, including a browser-driven one, because an agent that knows base's tree can write an oracle over the commit instead of over the bug.
 - **Tier 3** — not reproduced: **no fix is attempted.** The deliverable is a structured info-request. This gate never bends.
 
