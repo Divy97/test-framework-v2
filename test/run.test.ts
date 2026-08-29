@@ -378,6 +378,8 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
     turns: Parameters<typeof fakeModel>[0];
     /** What TRIAGE answers (8e). `ENOUGH` by default, which posts nothing. */
     triage?: string;
+    /** An id minted elsewhere (9d), as the control plane does. */
+    runId?: string;
   }) => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = demoRepo();
@@ -404,6 +406,11 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
       recipe: null,
       image: IMAGE,
       blobRoot: blobs,
+      // 9d: the caller's id, because hosted it is the PLANE that mints one — before any
+      // runner sees the work, which is what makes "may you append to this run" a
+      // question anyone can answer. An engine that quietly generated its own would have
+      // every event of every hosted run refused.
+      ...(options.runId === undefined ? {} : { runId: options.runId }),
       append: async (event) => void events.push(event),
       remote: () => bareRemote(fixture.repo),
       flakeRuns: 0,
@@ -466,10 +473,12 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
     // It never gates. This run still goes all the way to its Tier 3, and the comment
     // count is what proves both halves: the question at the start, the verdict at
     // the end, and the run in between unaffected by either.
-    const { result, calls } = await runIssue({
+    const MINTED = 'c0ffee00-1111-4222-8333-444455556666';
+    const { result, calls, events } = await runIssue({
       title: 'Export does nothing',
       body: 'I click export and nothing happens.',
       triage: 'Which account was signed in when you clicked export?',
+      runId: MINTED,
       turns: [
         {
           content: [
@@ -496,6 +505,13 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
     // And the run was not waiting on it.
     expect(result.state.status).toBe('unresolved');
     expect(result.state.pr).toBeNull();
+
+    // 9d: every event carries the id the CALLER minted. Hosted, that id comes from the
+    // plane with the job, and the plane authorizes appends by it — an engine that
+    // generated its own would have every event of every hosted run refused, and the
+    // failure would look like an authorization bug rather than a plumbing one.
+    expect(result.runId).toBe(MINTED);
+    expect(events.every((e) => e.run_id === MINTED)).toBe(true);
   }, 900_000);
 
   test('total-rounding: a reproduction that passes on base shuts the gate, and no fix agent is spawned', async () => {

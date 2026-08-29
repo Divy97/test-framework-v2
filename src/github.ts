@@ -239,13 +239,21 @@ export const readJwt = (token: string): { header: unknown; claims: unknown } => 
 
 export type Fetcher = typeof fetch;
 
-export type GitHubApp = {
-  appId: string;
-  privateKeyPem: string;
-  /** Injected so the token path is testable against a recorded API without a network. */
-  fetch?: Fetcher;
-  api?: string;
-};
+/**
+ * How this process gets a GitHub token: it holds the App key, or it knows someone who
+ * does.
+ *
+ * A union rather than optional fields, because the two are mutually exclusive by design
+ * (ADR-0019). The control plane holds the App private key and mints. A runner on
+ * somebody's laptop holds NOTHING — it asks the plane, per run, when it needs one, which
+ * is why `mint` is a function and not a token: the comment on `installationToken` below
+ * says a value held in a variable cannot refresh itself, and that is exactly as true
+ * when the value came over a wire.
+ */
+export type GitHubApp = { fetch?: Fetcher; api?: string } & (
+  | { appId: string; privateKeyPem: string; mint?: never }
+  | { mint: (installationId: number) => Promise<string>; appId?: never; privateKeyPem?: never }
+);
 
 /**
  * Mint a one-hour installation token, scoped to that installation's repositories.
@@ -254,6 +262,11 @@ export type GitHubApp = {
  * a refresh mid-flight, and a value held in a variable cannot refresh itself.
  */
 export async function installationToken(app: GitHubApp, installationId: number): Promise<string> {
+  // Somebody else holds the key. The caller is a runner, and the whole point of
+  // ADR-0019's split is that it cannot mint for itself — so it asks, every time, and
+  // the refresh semantics below are preserved rather than traded away for a token
+  // handed over once at dispatch.
+  if (app.mint) return await app.mint(installationId);
   const api = app.api ?? 'https://api.github.com';
   const call = app.fetch ?? fetch;
   const response = await call(`${api}/app/installations/${installationId}/access_tokens`, {

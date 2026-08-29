@@ -18,7 +18,7 @@ are different requirements, and this milestone is the seam between them.
 | **9a** the runner dials out — pairing, dispatch, authorized append | built |
 | **9b** blobs cross the boundary | built |
 | **9c** GitHub OAuth, and the human surface | |
-| **9d** the runner daemon | |
+| **9d** the runner daemon | built |
 | **9e** deletion, as a tombstone rather than a hole | |
 
 The decision behind all of them is
@@ -147,9 +147,54 @@ put/get … no event schema changes when it does."*
 pairing UI lives: **Add a runner** mints the token from 9a while the human is
 authenticated, and the token is shown once.
 
-**9d** is the daemon: long-poll, run the existing engine unchanged, post events, upload
-blobs, exit. The engine underneath it does not change at all, which is the point of
-doing the boundary first.
+## 9d · the daemon
+
+The half that lives on somebody's laptop. It dials out and never listens, which is the
+entire reason this milestone exists.
+
+The engine underneath it did not change, which was the point of doing the boundary
+first — `runFromIssue` already took an injected `append`. Three things had to be added,
+and each one is a credential decision rather than a plumbing one:
+
+- **`GitHubApp` is a union now.** Either you hold the App key, or you hold a `mint`
+  function and somebody else does. The plane mints; the runner asks. Only one function
+  in the codebase ever read `appId`, so the union costs one narrowing.
+- **Tokens are asked for per call, not handed over at dispatch.**
+  `installationToken`'s own comment says *"called when needed, never captured at run
+  start: a run that exceeds an hour needs a refresh mid-flight, and a value held in a
+  variable cannot refresh itself"* — and that is exactly as true when the value came
+  over a wire. `POST /runner/runs/:id/token`, authorized the same way an append is.
+- **`runFromIssue` accepts a run id.** The plane mints it at dispatch, before any runner
+  sees the work, because "may you append to this run" is only answerable if somebody
+  other than the writer decided the run exists. An engine generating its own would have
+  had every event of every hosted run refused — and the failure would have looked like
+  an authorization bug rather than a plumbing one, which is why `run.test.ts` now
+  asserts that every event carries the caller's id.
+
+The recipe travels **with the dispatch**, read fresh from `recipes` at claim time rather
+than stored on the job: it is current configuration (ADR-0013), and a human may have
+corrected it since the delivery was queued.
+
+### What is asserted
+
+Nine tests in `test/daemon.test.ts` against a fake plane — the loop is what is under
+test, and a test of a retry policy that needs Docker and a model credential is a test
+nobody runs. Every case is something that will happen to a process on a laptop:
+
+- claims a job, ships events in order, marks it finished;
+- uploads the artifacts the events name, by ref, because that is how the engine cites
+  bytes — no separate manifest to drift;
+- asks for a token per call and never holds one;
+- **a plane that fails and recovers costs a retry, not the stream** — the far end is
+  idempotent, so a retry costs a request;
+- **a refusal is not retried, because a 4xx is an answer.** The first draft failed this:
+  the `throw` for the refusal case sat inside the try that implements the retry, so its
+  own catch swallowed it and a 403 was hammered four times;
+- a run that throws does not end the daemon, and the job is still marked finished — a
+  job left dispatched is one no other runner will take;
+- a blob that will not upload costs the artifact, never the run;
+- an unreachable plane is waited out, not exited on;
+- an empty poll loops rather than treating 204 as a failure.
 
 **9e** is deletion. Central blobs make "delete this run" a real request, and dropping
 bytes leaves events citing refs that resolve to nothing. `forgotten` is a fold state to

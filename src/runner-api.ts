@@ -12,6 +12,7 @@
 
 import type pg from 'pg';
 import { digest, put } from './blobs.js';
+import { loadRecipe } from './recipe.js';
 import type { ArtifactRef, RunEvent } from './events.js';
 import {
   appendFromRunner,
@@ -79,7 +80,19 @@ const asEvents = (value: unknown): RunEvent[] | null => {
  * `null` for anything else, so this composes with the dashboard's routes and neither
  * has to know about the other.
  */
-export function runnerRoutes(options: { client: pg.Client; blobRoot: string }): Route {
+export function runnerRoutes(options: {
+  client: pg.Client;
+  blobRoot: string;
+  /**
+   * Mint a GitHub installation token, for a runner that holds no App key (ADR-0019).
+   *
+   * Injected rather than built here: this module knows about authorization and nothing
+   * about credentials, and a test of the boundary should not need an App private key.
+   * Absent, the token route answers 501 — a plane that cannot mint should say so rather
+   * than hand back something that fails later inside a git clone.
+   */
+  mintToken?: (installationId: number) => Promise<string>;
+}): Route {
   const { client, blobRoot } = options;
 
   return async ({ method, path, query, headers, body, raw }) => {
@@ -99,7 +112,13 @@ export function runnerRoutes(options: { client: pg.Client; blobRoot: string }): 
       const asked = Number(query.get('wait') ?? '0') * 1000;
       const waitMs = Number.isFinite(asked) ? Math.min(Math.max(asked, 0), MAX_WAIT_MS) : 0;
       const job = await claimJob(client, runner, { waitMs });
-      return job ? json(job) : { status: 204, type: 'application/json', body: '' };
+      if (!job) return { status: 204, type: 'application/json', body: '' };
+      // The recipe travels with the dispatch, read FRESH rather than stored on the job.
+      // It is current configuration (ADR-0013) — a human may have corrected it since
+      // this delivery was queued, and the run that is about to start should replay what
+      // is approved now, not what was approved when the issue was filed.
+      const recipe = await loadRecipe(client, job.repo);
+      return json({ ...job, recipe });
     }
 
     const events = /^\/runner\/runs\/([^/]+)\/events$/.exec(path);
@@ -156,6 +175,26 @@ export function runnerRoutes(options: { client: pg.Client; blobRoot: string }): 
       }
       const stored = await put(blobRoot, bytes);
       return json({ ref: stored, bytes: bytes.length }, 201);
+    }
+
+    // A GitHub token for this run, minted on demand and never stored.
+    //
+    // Per request rather than handed over once at dispatch, because `installationToken`
+    // is documented as "called when needed, never captured at run start: a run that
+    // exceeds an hour needs a refresh mid-flight, and a value held in a variable cannot
+    // refresh itself." Shipping one at dispatch would have traded that away silently.
+    const minting = /^\/runner\/runs\/([^/]+)\/token$/.exec(path);
+    if (method === 'POST' && minting) {
+      const runId = decodeURIComponent(minting[1]!);
+      const authorized = await appendFromRunner(client, runner, runId, []);
+      if ('refused' in authorized) {
+        return json({ error: authorized.refused }, authorized.refused.includes('no such run') ? 404 : 403);
+      }
+      if (!options.mintToken) return json({ error: 'this plane cannot mint installation tokens' }, 501);
+      // The runner's OWN installation, never one it names. A run it is authorized for
+      // belongs to its installation by construction, so there is nothing to pass in.
+      const token = await options.mintToken(runner.installationId);
+      return json({ token });
     }
 
     const finished = /^\/runner\/runs\/([^/]+)\/finished$/.exec(path);
