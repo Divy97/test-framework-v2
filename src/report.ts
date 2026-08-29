@@ -26,6 +26,37 @@ export type ReportContext = {
   threadRef: string;
   /** Where a reader can fetch a blob by ref, when there is somewhere. */
   artifactBase?: string;
+  /**
+   * The last thing the agent said, in its own words, read out of the transcript by
+   * the caller. Attacker-influenced like the issue is — quoted, never parsed.
+   *
+   * TESTIMONY, and admissible here for a reason worth stating precisely: ADR-0006
+   * forbids testimony becoming a FACT, not testimony being shown as a question. An
+   * info request is not a verdict. The agent that spent twenty turns is the only
+   * thing in the system that knows which single fact it was missing, and until now
+   * that knowledge died with the run while the reporter got a four-item checklist
+   * identical to everyone else's.
+   */
+  lastWord?: string;
+};
+
+/**
+ * How a supervision ceiling reads to the person who filed the issue.
+ *
+ * `stopped` is an evidence-class fact — the Runner watched the process — and every
+ * value but `exit` means the agent was cut off rather than finished. A run that
+ * ended that way concluded NOTHING about the bug, and asking its reporter for more
+ * steps would be billing them for our own ceiling. Milestone 7 shipped exactly that
+ * accusation: two runs ended inside a model's own reasoning and the comment implied
+ * the agent had been idle.
+ */
+const CUT_OFF: Record<string, string> = {
+  timeout: 'it ran out of time',
+  turn_cap: 'it reached the limit on how many turns we allow',
+  line_cap: 'it produced more output than we accept',
+  byte_cap: 'it produced more output than we accept',
+  malformed_tool_call: 'it ended a turn inside its own reasoning, without making the call it had planned',
+  spawn_failed: 'the agent never started',
 };
 
 const TIER_MEANING: Record<number, string> = {
@@ -194,19 +225,56 @@ export function issueComment(state: RunState, context: ReportContext): string {
     );
   }
 
+  // A run the agent never finished. Ours, not the reporter's — and it is put first
+  // because everything below it asks them for something, which would be the wrong
+  // question. Nothing about the report has been tested.
+  const cutOff = state.agent && state.agent.stopped !== 'exit' ? CUT_OFF[state.agent.stopped] : undefined;
+  if (cutOff) {
+    return (
+      `We could not reproduce this, and the reason is on our side: the agent did not finish — ` +
+      `${cutOff}.\n\n` +
+      `**No fix was attempted, and nothing here is a finding about your report.** It was not ` +
+      `tested to a conclusion. The evidence trail for what did happen is kept, including ` +
+      `${state.transcript.length} transcript messages.\n\n` +
+      `Label this issue again to start a new run. If it stops here twice, the report is probably ` +
+      `fine and the bug is ours.`
+    );
+  }
+
   // Tier 3, which the gate never bends on and which is a deliverable rather than a
   // failure. The info-request is structured because "we could not reproduce it" on
   // its own puts the work back on the reporter with no direction.
-  return (
-    `We could not reproduce this, so **no fix was attempted**. That is deliberate: a fix for a bug ` +
-    `that was never reproduced is a guess with a diff attached.\n\n` +
+  const tried =
     `What was tried:\n\n` +
     (state.registeredRepro
       ? `- a reproduction was written and registered: \`${state.registeredRepro.command}\`\n` +
         `- it did **not** fail on the base commit, or it failed for a reason that did not match the ` +
         `reported symptom\n`
       : `- no reproduction could be written from the report as it stands\n`) +
-    (state.transcript.length > 0 ? `- ${state.transcript.length} transcript messages are stored\n` : '') +
+    (state.transcript.length > 0 ? `- ${state.transcript.length} transcript messages are stored\n` : '');
+
+  const opening =
+    `We could not reproduce this, so **no fix was attempted**. That is deliberate: a fix for a bug ` +
+    `that was never reproduced is a guess with a diff attached.\n\n` +
+    tried;
+
+  // The specific ask, when there is one. The generic list is what everybody gets
+  // when there is not — and the whole point of this branch is that it should not be
+  // what everybody gets.
+  if (context.lastWord) {
+    return (
+      opening +
+      `\nThe agent that looked said this, in its own words:\n\n` +
+      `${quote(context.lastWord)}\n\n` +
+      `That is the agent's account, not a finding: nothing here checked it. It is quoted because ` +
+      `the run that just spent twenty turns on your issue is the only thing that knows which fact ` +
+      `it was missing.\n\n` +
+      `Add what it asked for to this issue and label it again to start a new run.`
+    );
+  }
+
+  return (
+    opening +
     `\nWhat would most help, in order:\n\n` +
     `1. The exact steps, including anything you did before the ones that fail.\n` +
     `2. What you saw and what you expected instead — a screenshot or the literal text is ideal.\n` +
