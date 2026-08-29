@@ -80,6 +80,26 @@ const MAX_STREAM_BYTES = 32 * 1024 * 1024;
 /** Tail of a container's diagnostics. The reason is at the end, not the start. */
 const MAX_STDERR_CHARS = 8 * 1024;
 
+/**
+ * The wall clock ONE container gets from the host before it is stopped.
+ *
+ * Every timeout this engine had lived below this line: `verify` bounds each
+ * command, the loop bounds the agent, `replayRecipe` bounds a step. All of them
+ * are inside a container, so all of them are moot when the container itself never
+ * starts — a missing image plus a registry the daemon cannot reach wedges
+ * `docker run` before PID 1 exists, and a run in that state waits forever with
+ * nothing to show for it. Observed while running milestone 7's own suite.
+ *
+ * Generous on purpose: an hour is longer than anything legitimate this project
+ * runs (the agent loop's own ceiling is 30 minutes and the recipe's steps are 10),
+ * because this is the guard against a wedge, not a scheduling policy. A caller who
+ * wants a tighter one passes `containerTimeoutMs`.
+ */
+const CONTAINER_TIMEOUT_MS = 3_600_000;
+
+/** Unique per container within a process, so a timed-out one can be named and removed. */
+let containers = 0;
+
 export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 'repro' | 'agentPrompt'> & {
   /**
    * The fix agent's prompt — as a FUNCTION of the reproduction that was registered,
@@ -136,6 +156,15 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * image ships no agent yet, and a hostile fake is how the supervision boundary
    * is exercised without one.
    */
+  /**
+   * The wall clock each container gets, from the host. `CONTAINER_TIMEOUT_MS` by
+   * default; a test that wants to observe the ceiling passes a small one.
+   *
+   * Distinct from `timeoutMs`, which bounds a COMMAND inside a container that is
+   * running, and from `loop.timeoutMs`, which bounds the agent. This one is the
+   * only bound that survives a container which never got as far as running.
+   */
+  containerTimeoutMs?: number;
   /** How many attempts before the run gives up. One, unless a caller asks for more. */
   maxAttempts?: number;
   agentImageMount?: string;
@@ -1321,7 +1350,10 @@ async function buildEnvSnapshot(
 
   const child = spawn(
     'docker',
-    ['run', '--name', container, '-i', '-v', `${source}:/src:ro`, plan.image],
+    // `--pull never` for the same reason the phases have it: this image is one we
+    // built, and a pull here would block on a registry with the run already
+    // committed to waiting.
+    ['run', '--pull', 'never', '--name', container, '-i', '-v', `${source}:/src:ro`, plan.image],
     { stdio: ['pipe', 'pipe', 'pipe'] },
   );
   child.stdin.end(`${JSON.stringify(job)}\n`);
@@ -1340,10 +1372,29 @@ async function buildEnvSnapshot(
   child.stderr.on('data', (chunk: string) => {
     stderr = (stderr + chunk).slice(-MAX_STDERR_CHARS);
   });
+  // The same ceiling the phases get, and the container this one needs it most:
+  // it is the only one with a network, so it is the only one whose `install` can
+  // wait on a registry that never answers. The `finally` below removes the
+  // container itself; this only stops the host waiting on it.
+  let timedOut = false;
+  let stopping: Promise<unknown> | undefined;
+  const ceiling = plan.containerTimeoutMs ?? CONTAINER_TIMEOUT_MS;
+  const bell = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGKILL');
+    // Here rather than in the `finally` below, which this path returns before
+    // reaching — and a container still running is exactly what a wedge is.
+    stopping = execFile('docker', ['rm', '--force', container]).catch(() => {});
+  }, ceiling);
   const exitCode = await new Promise<number>((resolve) => {
     child.on('close', (code) => resolve(code ?? 1));
     child.on('error', () => resolve(1));
   });
+  clearTimeout(bell);
+  if (timedOut) {
+    await stopping;
+    return { failed: `the environment build was stopped after ${ceiling}ms` };
+  }
 
   let env: ReplayOutcome | undefined;
   for (const line of stdout.split('\n')) {
@@ -1442,8 +1493,20 @@ async function runContainer(
   // output mount could write one, and a phase is supposed to observe, not author.
   const handover = phase === 'agent' ? await mkdtemp(join(tmpdir(), 'engine-handover-')) : undefined;
 
+  // Named so the host can still reach it after the client is gone: killing
+  // `docker run` does not stop the container the daemon is running, so a wedge
+  // would survive the ceiling that is supposed to end it.
+  const name = `engine-${phase}-${plan.runId.replace(/[^A-Za-z0-9_-]/g, '')}-${process.pid}-${++containers}`;
+
   const args = [
-    'run', '--rm', '-i',
+    // Never from a registry. Every image this engine runs is one it built —
+    // `plan.image`, `plan.agentImage`, the environment snapshot — so a pull is
+    // always a mistake, and it is the mistake that hangs: `docker run` on a
+    // missing image blocks on a registry the daemon may never reach, before PID 1
+    // exists and before any timeout inside the container could apply. Refusing it
+    // turns an indefinite wedge into `Unable to find image ... locally`, which is
+    // the diagnosis the caller wanted anyway.
+    'run', '--rm', '-i', '--pull', 'never', '--name', name,
     // NO NETWORK for the phases. The agent needs the model API; the containers
     // that judge a commit need nothing at all, and a reproduction that can reach
     // the network is a reproduction that can be TOLD what to answer — the same
@@ -1594,6 +1657,21 @@ async function runContainer(
     child.on('error', () => resolve(1));
   });
 
+  // The ceiling. Killing the client unblocks the host; removing the container
+  // stops the work, because with the client gone the daemon keeps running it and
+  // `--rm` only fires on an exit that may never come.
+  let timedOut = false;
+  // Awaited before this function returns. Fired and forgotten, the container is
+  // still being removed when the caller reads `docker ps` — which is the same
+  // "it is gone" claim being false for a shorter time.
+  let stopping: Promise<unknown> | undefined;
+  const ceiling = plan.containerTimeoutMs ?? CONTAINER_TIMEOUT_MS;
+  const bell = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGKILL');
+    stopping = execFile('docker', ['rm', '--force', name]).catch(() => {});
+  }, ceiling);
+
   if (driver) {
     let calls = 0;
     const invoke = async (tool: string, input: Record<string, unknown>) => {
@@ -1628,6 +1706,14 @@ async function runContainer(
   }
 
   const exitCode = await closed;
+  clearTimeout(bell);
+  if (stopping) await stopping;
+  // On `stderr`, where every other operational failure of this container is
+  // already reported and where `EXIT.silent` tells a reader to look. The events
+  // it did emit are kept: a phase cut off partway is still evidence of what ran.
+  if (timedOut) {
+    stderr = `${stderr}\nthe ${phase} container was stopped after ${ceiling}ms`.slice(-MAX_STDERR_CHARS);
+  }
 
   // Collect the artifacts into the real store, from the host, once the container
   // is gone. Whatever a participant planted in its own store comes along, but it
