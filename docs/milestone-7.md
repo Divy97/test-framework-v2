@@ -249,24 +249,31 @@ sealed container at approval time would have caught it before a model was spent.
 And the limitation predicted when the snapshot was built was observed exactly: the
 sham-fix control's `git clean -xdff` takes the restored environment with it, so its
 second draw exits 127 on a dependency repository — conservative, never a false
-accusation, but blind.
+accusation, but blind. **Done in [8g](milestone-8.md).**
 
 ## What this milestone did not touch, and should
 
 Named here so the next session starts from the analysis rather than redoing it.
+**Every item below is built now — [milestone 8](milestone-8.md) is this list and
+nothing else.** The paragraphs are left exactly as they were written, because the
+analysis is what made the work cheap and rewriting it into the past tense would
+delete the only record of what was understood before anything was built.
 
 **Triage, before a container starts.** The reporter is at the keyboard at t=0 — the only
 moment a question is cheap. A cheap model reading the issue against the file tree can
 answer "is there enough here to attempt a reproduction" for a fraction of a cent, and ask
 for the specific missing thing immediately instead of answering twenty minutes later with
 a template. This is the cheapest available reduction in false Tier 3s and it does not
-exist.
+exist. **Done in [8e](milestone-8.md).**
 
 **The info-request is a template.** Every Tier 3 gets the identical four-item checklist
 while the agent that just spent twenty turns knows exactly which one fact it lacked. That
 knowledge is in the transcript and is discarded; the comment ships the transcript's
 *length*. An info request is not a verdict, so testimony is admissible here —
 ADR-0006 forbids testimony becoming *facts*, not testimony being displayed as a question.
+**Done in [8c](milestone-8.md)**, which also found the half this paragraph missed: an
+agent stopped by one of our own ceilings must not become a question for the reporter at
+all.
 
 **Onboarding proves a recipe, not a repository.** 6b's drafting run has a trigger now —
 installation — and a human still has to approve what it proposes. What it does not do is
@@ -275,11 +282,15 @@ could not be proved*: boot it, snapshot it, run the suite and **record its colou
 HEAD** (which decides whether every future regression arm is interpretable), discover the
 single-test invocation by executing it, screenshot the booted app as a UI baseline. Then
 one of three states — ready, ready-with-caveats, or blocked with each missing item priced.
+**Done in [8f](milestone-8.md)**, except the single-test invocation and the screenshot,
+which are printed on the page as unchecked rather than quietly missing.
 
 **An existing failing test is a free Tier 1.** A repository whose suite is already red on
 the reported behaviour contains the reproduction, authored by a maintainer — the
 strongest provenance the design recognises, and unreachable today because nothing looks.
 The suite run added in 7d is the mechanism; nothing consumes it that way yet.
+**Done in [8d](milestone-8.md) and [ADR-0018](adr/0018-a-reproduction-the-repository-already-had.md)** —
+the manifest gained `pinned`, and the tier gained four checkable clauses.
 
 **`runContainer` has no timeout.** A missing image plus a stalled registry wedges a run
 indefinitely — observed while running this milestone's suite. **Done in
