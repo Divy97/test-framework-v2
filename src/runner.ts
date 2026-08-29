@@ -18,7 +18,15 @@ import { superviseAgent } from './agent.js';
 import { resolveInside as confine } from './paths.js';
 import { replayRecipe, type Recipe, type ReplayOutcome } from './recipe.js';
 import { ToolHost } from './tools.js';
-import { MAX_REASON_CHARS, ObservationFailed, verify, type ReproSpec } from './verify.js';
+import {
+  MAX_OUTPUT_BYTES,
+  MAX_REASON_CHARS,
+  ObservationFailed,
+  run as observeCommand,
+  verify,
+  type Env,
+  type ReproSpec,
+} from './verify.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -83,8 +91,17 @@ export type Job = {
    * `env` is not a phase at all: it observes nothing, judges nothing and emits no
    * event. It installs this repository's dependencies so the host can commit the
    * result into the image the phases then run from — see `buildEnvironment`.
+   *
+   * `suite` is not a phase either, and deliberately not a reproduction: it runs
+   * `suiteCommand` in a phase's world — same clone, same restored dependencies,
+   * same uid, same seal — and reports what happened on the reply channel. It
+   * emits no event, because what the engine learns about ITS OWN world is not a
+   * fact about the user's bug (ADR-0006), and it is not routed through `verify()`
+   * because a reproduction anchored to nothing is refused there, correctly: the
+   * anchor rule exists to stop a fix commit owning its own reproduction, and
+   * there is no fix commit here to own anything.
    */
-  only?: 'base' | 'fix' | 'agent' | 'env';
+  only?: 'base' | 'fix' | 'agent' | 'env' | 'suite';
   flakeRuns?: number;
   baseRuns?: number;
   /**
@@ -608,12 +625,25 @@ export type WorkerReply =
    * not; the HOST turns that into a VERIFICATION_ABORTED, because in this mode the
    * host is the only writer there is.
    */
-  | { finished: { handover: string | null } };
+  | { finished: { handover: string | null } }
+  /**
+   * What the project's own test command did in a phase's world (8b). A report,
+   * never an event, for the same reason `env` is one.
+   */
+  | { suite: SuiteProbe };
+
+/**
+ * The probe's answer. `failed` when the command could not be OBSERVED at all —
+ * it never started, it overflowed, it exceeded the ceiling — which must never be
+ * collapsed into an exit code, because "we could not watch it" and "it exited 1"
+ * are the two things this project works hardest to keep apart.
+ */
+export type SuiteProbe = { exit_code: number; output: string } | { failed: string };
 
 export const isWorkerReply = (line: unknown): line is WorkerReply =>
   typeof line === 'object' &&
   line !== null &&
-  ('ready' in line || 'result' in line || 'finished' in line || 'env' in line);
+  ('ready' in line || 'result' in line || 'finished' in line || 'env' in line || 'suite' in line);
 
 /** One JSON object per line, and a trailing fragment at EOF is a whole line. */
 async function* readLines(stream: AsyncIterable<Buffer | string>): AsyncGenerator<string> {
@@ -631,6 +661,56 @@ async function* readLines(stream: AsyncIterable<Buffer | string>): AsyncGenerato
   // The Job has historically arrived with no trailing newline — `stdin.end(json)`
   // — and still may. At EOF the remainder is a complete line by definition.
   if (buffer.trim() !== '') yield buffer;
+}
+
+/** The tail the host is handed. The failure is at the end, and a suite can be enormous. */
+const PROBE_OUTPUT_CHARS = 8 * 1024;
+
+/**
+ * Run the project's own test command in a phase's world and say what happened.
+ *
+ * The executor is `verify`'s own — imported rather than reimplemented, because the
+ * probe's whole value is that it is not an approximation. Milestone 7's first
+ * defect was a recipe step that succeeded as root in the environment build and
+ * failed as uid 1000 in the agent sandbox: a probe that ran anywhere but here, as
+ * anyone but this uid, would answer a different question and read as though it had
+ * answered this one.
+ *
+ * Never throws. A command that could not be observed is reported as prose — the
+ * caller turns it into "do not imitate this", which is the true thing to say, and
+ * an exception here would end a run over a question that was only ever advisory.
+ */
+async function probeSuite(
+  job: Job,
+  world: { tree: string; gitDir: string; env: Env },
+  runAs: { uid: number; gid: number },
+): Promise<SuiteProbe> {
+  const command = job.suiteCommand;
+  if (command === undefined) return { failed: 'no test command was given to run' };
+  try {
+    // AT THE BASE COMMIT. `world()` leaves the clone on the mirror's default HEAD,
+    // which on any repository under judgement is the commit the fix is on — so
+    // without this the probe would answer for the wrong tree, and answer
+    // confidently. GIT_DIR is passed for the same reason `verify` passes it: git's
+    // state is outside the worktree here.
+    await execFileAsync('git', ['checkout', '--quiet', '--force', job.baseRef], {
+      env: { ...process.env, GIT_DIR: world.gitDir, GIT_WORK_TREE: world.tree },
+    });
+    const observed = await observeCommand(
+      command,
+      world.tree,
+      job.timeoutMs ?? 120_000,
+      MAX_OUTPUT_BYTES,
+      runAs,
+      world.env,
+    );
+    return {
+      exit_code: observed.exitCode,
+      output: observed.output.slice(-PROBE_OUTPUT_CHARS),
+    };
+  } catch (error) {
+    return { failed: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 export async function runJob(
@@ -955,6 +1035,19 @@ export async function runJob(
   if (job.only === 'agent') {
     await flush();
     for (const event of transcript) emit(`${JSON.stringify(event)}\n`);
+    return EXIT.complete;
+  }
+
+  // The sealed-world probe (8b). It runs in the world `world('verify')` just built
+  // — the phases' clone, their restored dependencies, their uid, their seal — which
+  // is the entire content of its claim: not "this command works somewhere", but
+  // "this command works where your reproduction will be judged".
+  //
+  // It ends the container. Nothing is folded, nothing is emitted, and the only
+  // thing that leaves is one reply line.
+  if (job.only === 'suite') {
+    emit(`${JSON.stringify({ suite: await probeSuite(job, phases, runAs) } satisfies WorkerReply)}\n`);
+    await flush();
     return EXIT.complete;
   }
 

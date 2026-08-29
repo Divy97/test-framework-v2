@@ -34,7 +34,7 @@ import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
 import { runAgentLoop, type AgentTranscript, type LoopUsage } from './loop.js';
 import type { Recipe, ReplayOutcome } from './recipe.js';
-import { isWorkerReply, type Job, type WorkerRequest } from './runner.js';
+import { isWorkerReply, type Job, type SuiteProbe, type WorkerRequest } from './runner.js';
 import { get, put } from './blobs.js';
 import { redact } from './redact.js';
 import type { ReproSpec } from './verify.js';
@@ -304,6 +304,11 @@ export type PhaseResult = {
    * is the wrong thing to ship.
    */
   stderr: string;
+  /**
+   * What the sealed-world probe observed, when this was a probe container (8b).
+   * Absent for every other kind, which is every container that judges anything.
+   */
+  suiteReport?: SuiteProbe;
   /**
    * What a tool-serving container reported about bundling its commits: null when
    * it worked, prose when it did not, absent when this was not that kind of
@@ -1522,36 +1527,24 @@ async function probeSealedWorld(
   const command = judging.recipe?.test;
   if (command === undefined) return undefined;
   const result = await runContainer(judging, source, 0, 'base', {
-    only: 'base',
+    only: 'suite',
     baseRef: base,
     fixRef: base,
-    // No files: the command is the whole reproduction here, and an empty manifest
-    // is what keeps this from writing anything into the tree it is measuring.
-    repro: { command },
-    // Once. The question is "does this run at all here", and the answer does not
-    // get truer on a second draw — that is what base's own repeat is for (7c).
-    baseRuns: 1,
-    flakeRuns: 0,
-    // Off. `runContainer` fills this from `recipe.test`, which is the command we
-    // are already running as the reproduction — the suite arm would run it a
-    // second time, in the same container, for nothing.
-    suiteCommand: undefined,
+    // Never read on this path — the Runner returns before `verify()` — and passed
+    // as the base commit rather than left to a default so nothing here names
+    // something that does not exist.
+    repro: { command: '' },
+    suiteCommand: command,
   });
-  const observed = result.events.find((event) => event.type === 'TEST_RUN');
-  if (observed === undefined || observed.type !== 'TEST_RUN') {
-    // No observation at all: the container could not stand up, or the command
-    // never returned. Reported as prose, because an unrun command must not read
-    // as a passing one.
-    return { command, failed: result.stderr.trim() || 'the engine could not run it there' };
+  const observed = result.suiteReport;
+  if (observed === undefined) {
+    // The container said nothing at all: it could not stand up, or it was stopped.
+    // Prose, because an unrun command must never read as a passing one.
+    return { command, failed: result.stderr.trim().split('\n').at(-1) || 'the engine could not run it there' };
   }
-  const output = await get(judging.blobRoot, observed.payload.stdout_hash)
-    .then((bytes) => bytes.toString('utf8'))
-    .catch(() => '');
-  return {
-    command,
-    exitCode: observed.payload.exit_code,
-    output: output.length > MAX_OBSERVED_CHARS ? output.slice(-MAX_OBSERVED_CHARS) : output,
-  };
+  return 'failed' in observed
+    ? { command, failed: observed.failed }
+    : { command, exitCode: observed.exit_code, output: observed.output };
 }
 
 /**
@@ -1711,6 +1704,7 @@ async function runContainer(
   const readied = new Promise<void>((resolve) => (ready = resolve));
   let handoverReport: string | null | undefined;
   let envReport: ReplayOutcome | undefined;
+  let suiteReport: SuiteProbe | undefined;
   let stdout = '';
   // Counted separately, because `stdout` is now DRAINED per line. Measuring the
   // ceiling against it would measure the current partial line, and the guard would
@@ -1734,6 +1728,7 @@ async function runContainer(
     }
     if ('ready' in parsed) ready();
     else if ('env' in parsed) envReport = parsed.env;
+    else if ('suite' in parsed) suiteReport = parsed.suite;
     else if ('finished' in parsed) handoverReport = parsed.finished.handover;
     else {
       const settle = pending.get(parsed.result.id);
@@ -1896,6 +1891,7 @@ async function runContainer(
     ...(handover ? { handover } : {}),
     ...(handoverReport === undefined ? {} : { handoverReport }),
     ...(envReport === undefined ? {} : { envReport }),
+    ...(suiteReport === undefined ? {} : { suiteReport }),
   };
 }
 

@@ -26,10 +26,10 @@ import { redact } from './redact.js';
 
 const execFileAsync = promisify(execFile);
 
-type Env = Record<string, string>;
+export type Env = Record<string, string>;
 
 /** Output capture ceiling. Beyond this the engine refuses to record rather than truncate. */
-const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+export const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 /**
  * Redirect the shell's own stderr, then run the command verbatim on its own line.
@@ -215,10 +215,15 @@ export type VerifyOptions = {
   controlRun?: boolean;
 };
 
-type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
+export type Execution = { exitCode: number; signal?: string; output: string; durationMs: number };
 
 /**
  * Run a command, capturing merged output and the real exit status.
+ *
+ * Exported for the sealed-world probe (8b), which needs THIS executor and not a
+ * copy of it: the probe's whole claim is that it ran the command the way a phase
+ * runs one — same uid, same env, same timeout, same overflow refusal. A second
+ * implementation would be a second thing to drift.
  *
  * A non-zero exit is the expected base-phase result, so it returns rather than
  * throws. Everything else execFile can reject with — spawn failure, missing cwd,
@@ -226,7 +231,7 @@ type Execution = { exitCode: number; signal?: string; output: string; durationMs
  * because recording it would put a plausible-looking exit code on an execution
  * that never produced one.
  */
-async function run(
+export async function run(
   command: string,
   cwd: string,
   timeoutMs: number,

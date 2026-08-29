@@ -2971,10 +2971,11 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     });
 
     expect(sealed).toBeDefined();
-    // Either shape is a pass and both say the same thing: it did not work there.
-    // A command that cannot resolve is usually an exit code, and a command that
-    // hangs trying is an unobserved one — the honest report of which is prose.
-    expect('failed' in sealed! || sealed!.exitCode !== 0).toBe(true);
+    // It RAN and it failed, for the reason that matters. Asserting only "not zero"
+    // would have passed while the probe was never reaching the container at all —
+    // which is exactly what this test did until the pair above disagreed with it.
+    expect(sealed).toMatchObject({ exitCode: 1 });
+    expect('output' in sealed! ? sealed.output : '').toMatch(/bad address|not found|resolve/i);
   }, 900_000);
 
   // ── 6b: the drafting agent gets a network with nothing to replay ────────────
