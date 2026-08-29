@@ -179,3 +179,16 @@ asserted as SURVIVING — red base, green fix that repaired nothing, control
 silent. Asserting a defeated defence as passing is this ADR's own convention, and
 an assertion that the control "refuses" would have been the comfortable claim
 rather than the true one.
+
+## Amended by ADR-0018 — the one case the cap does not describe
+
+The cap above is about a reproduction the agent **wrote**. A repository whose own
+suite already fails on the reported behaviour contains one it did not:
+[ADR-0018](0018-a-reproduction-the-repository-already-had.md) makes Tier 1 available
+when nothing was applied, every registered path was tracked at the base commit, and
+the command is the project's own test command over those paths — four observations,
+no claims. What is left to the agent is which existing test to point at, and the
+anchor above is what stops the fix commit rewriting it.
+
+That does not soften this decision anywhere else: an agent-authored reproduction is
+still Tier 2, still for the reason given here, and still until diff-coverage exists.

@@ -36,9 +36,9 @@ import { cloneRepository, commentOnIssue, installationToken, repoUrl, startWebho
 import { MODEL, effortLevel, providerName } from './loop.js';
 import { DEFAULT_OPENROUTER_MODEL } from './openrouter.js';
 import { loadInstallation, recordInstallation, removeInstallation } from './installations.js';
-import { draftRecipe } from './orchestrate.js';
+import { draftRecipe, proveRepository } from './orchestrate.js';
 import { projectOne, saveUsage } from './readmodel.js';
-import { loadRecipe } from './recipe.js';
+import { loadRecipe, saveProof } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runFromIssue } from './run.js';
 import { startStatusServer } from './sse.js';
@@ -191,6 +191,11 @@ export type ServeOptions = {
    * spending a container or a model credential.
    */
   draft?: typeof draftRecipe;
+  /**
+   * The proving run (8f), injected for the same reason: it is two real containers and
+   * several minutes, and a test about what onboarding STORES should need neither.
+   */
+  prove?: typeof proveRepository;
 };
 
 /**
@@ -228,6 +233,7 @@ export async function serve(options: ServeOptions): Promise<Service> {
       await cloneRepository(repoUrl(repo), into, await installationToken(app, installationId));
     });
   const draft = options.draft ?? draftRecipe;
+  const prove = options.prove ?? proveRepository;
   await ensureBlobRoot(config.blobRoot);
 
   // A queue of one — see the header. A resource policy, not a port constraint.
@@ -288,6 +294,49 @@ export async function serve(options: ServeOptions): Promise<Service> {
       log(`${repo}: drafted a recipe for a human to review at /repos/${repo}/onboard`);
     } finally {
       await rm(workspace, { recursive: true, force: true }).catch(() => {});
+    }
+  };
+
+  /**
+   * Prove that a just-approved repository actually runs (8f).
+   *
+   * Milestone 7: *"Onboarding proves a recipe, not a repository."* Until now the last
+   * step of onboarding was a human pressing approve, and the first time anyone found
+   * out whether those commands work was in the middle of a real run — twenty minutes
+   * after a stranger filed an issue, presented as a finding about their bug.
+   *
+   * The same two containers a run would use, so the answer is the one a run will get.
+   * Failing quietly for the same reason `draftForRepo` does: the recipe is stored
+   * either way, the human approved it either way, and a proving run that cannot start
+   * must never look like an approval that did not take.
+   */
+  const proveForRepo = async (repo: string): Promise<void> => {
+    // EVERYTHING inside the try, including the two lookups and the temp directory.
+    // This is fired and not awaited, so a rejection escaping it is an unhandled
+    // rejection — which on current Node ends the process. A database hiccup one
+    // second after somebody approved a recipe would have taken the receiver down
+    // with it, and the surface that reported the approval would already have said
+    // it worked.
+    let workspace: string | undefined;
+    try {
+      const installation = await loadInstallation(client, repo);
+      const recipe = await loadRecipe(client, repo);
+      if (!installation || !recipe) return;
+      workspace = await mkdtemp(join(tmpdir(), 'engine-prove-clone-'));
+      const source = join(workspace, 'source');
+      await cloneForDraft(repo, installation.installationId, source);
+      const proof = await prove({
+        runId: crypto.randomUUID(),
+        repoPath: source,
+        image: config.image,
+        recipe,
+      });
+      await saveProof(client, repo, proof);
+      log(`${repo}: proved ${proof.state}${proof.caveats.length ? ` — ${proof.caveats.length} caveat(s)` : ''}`);
+    } catch (error) {
+      log(`${repo}: could not be proved — ${String(error)}`);
+    } finally {
+      if (workspace) await rm(workspace, { recursive: true, force: true }).catch(() => {});
     }
   };
 
@@ -445,7 +494,13 @@ export async function serve(options: ServeOptions): Promise<Service> {
     read: (runId, afterSeq) => readRunAfter(client, runId, afterSeq),
     // The dashboard shares the tail's port rather than binding a third (M6f). One
     // surface, one thing to expose, and the live tail a run page needs is already here.
-    routes: dashboardRoutes({ client }),
+    routes: dashboardRoutes({
+      client,
+      // Not awaited: proving is two containers and several minutes, and the human who
+      // just pressed approve is owed a page now. The result lands in the row and the
+      // next render of this page shows it.
+      onApproved: (repo) => void proveForRepo(repo),
+    }),
   });
 
   return {

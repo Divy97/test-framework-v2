@@ -531,6 +531,77 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     expect(parseRecipe(JSON.parse(raw))).toEqual({ services: [] });
   });
 
+  test('a recipe in force with no proof yet says so, rather than saying nothing', () => {
+    // 8f. The gap this fills: between pressing approve and the proving run finishing,
+    // the page used to look identical to a repository nobody had ever checked. Silence
+    // there reads as "fine".
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, null);
+    expect(html).toContain('Not proved yet');
+    expect(html).toContain('sealed container');
+    // And a repository with no recipe has nothing to prove, so it gets no block at all.
+    expect(onboardPage('acme/widgets', null)).not.toContain('Not proved yet');
+    expectWellFormed(html);
+  });
+
+  test('a proof renders as what a run here will and will not be able to say', () => {
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, {
+      state: 'ready_with_caveats',
+      commit: 'a'.repeat(40),
+      environment: { built: true },
+      suite: { command: 'npm test', exitCode: 1, output: 'not ok 3' },
+      caveats: ['the test command `npm test` already fails at this commit (exit 1)'],
+      unproved: ['the single-test invocation: nothing here has executed one'],
+      provedAt: '2026-08-29T10:00:00.000Z',
+    });
+    expect(html).toContain('Ready, with caveats');
+    expect(html).toContain('exit 1');
+    expect(html).toContain('already fails at this commit');
+    // The engine's own gaps are kept APART from the repository's. Collapsing them
+    // would tell someone their project is missing something that is ours.
+    expect(html).toContain('Not checked by this engine at all');
+    expect(html).toContain('the single-test invocation');
+    expectWellFormed(html);
+  });
+
+  test('a blocked repository says nothing else could be checked', () => {
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, {
+      state: 'blocked',
+      commit: 'b'.repeat(40),
+      environment: { built: false, failed: 'recipe step install failed: exit 127' },
+      caveats: ['nothing else could be checked'],
+      unproved: [],
+      provedAt: '2026-08-29T10:00:00.000Z',
+    });
+    expect(html).toContain('Blocked.');
+    expect(html).toContain('exit 127');
+    expectWellFormed(html);
+  });
+
+  test('a proof from an older engine renders rather than throwing', () => {
+    // Stored as opaque JSON and read back the same way, deliberately: a proof written
+    // before a field existed is still the best thing anyone has about that repository,
+    // and throwing on it would take the whole onboarding page down with it.
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, { state: 'ready' });
+    expect(html).toContain('Ready.');
+    expectWellFormed(html);
+  });
+
+  test('a caveat cannot smuggle markup out of a container into the page', () => {
+    // Caveats quote the recipe's own commands and a container's OUTPUT, which is
+    // whatever the repository under onboarding printed. Same rule as every other
+    // string on this surface.
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, {
+      state: 'ready_with_caveats',
+      environment: { built: true },
+      caveats: ['<img src=x onerror="alert(1)">'],
+      unproved: [],
+      provedAt: 'T',
+    });
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img src=x');
+    expectWellFormed(html);
+  });
+
   test('a refusal reads as the recipe being wrong, never the project', () => {
     // `parseRecipe`'s message arriving bare would read as this system finding something wrong
     // with someone's repository — the one presentation ADR-0007's amendment forbids, and here

@@ -1,11 +1,13 @@
 ---
-status: in progress
+status: built
 ---
 
 # Milestone 8 — the things milestone 7 named and did not do
 
-Milestone 7 ended with a list rather than a conclusion: six items it had analysed,
-priced, and left. This milestone is that list, and nothing else. No new capability
+Milestone 7 ended with a list rather than a conclusion: seven items it had analysed,
+priced, and left — five under "what this milestone did not touch, and should", one
+defect it recorded as "still open", and one limitation it predicted and then
+observed. This milestone is that list, and nothing else. No new capability
 is invented here — every phase below already exists as a paragraph in
 [milestone-7.md](milestone-7.md), written by the session that found it and had no
 budget left to fix it.
@@ -21,8 +23,8 @@ wedged suite.
 | **8c** the info request says what was actually missing | M7: "the info-request is a template" | built |
 | **8d** a suite that is already red on the reported behaviour | M7: "an existing failing test is a free Tier 1" | built |
 | **8e** triage, before a container starts | M7: "the cheapest available reduction in false Tier 3s" | built |
-| **8f** onboarding proves the repository, not just the recipe | M7: "onboarding proves a recipe" | |
-| **8g** the sham-fix control survives a repository with dependencies | M7's predicted limitation, observed | |
+| **8f** onboarding proves the repository, not just the recipe | M7: "onboarding proves a recipe" | built |
+| **8g** the sham-fix control survives a repository with dependencies | M7's predicted limitation, observed | built |
 
 ## 8a · a container that will not finish is stopped
 
@@ -252,3 +254,149 @@ through the OpenRouter branch as `null`. Every assertion expecting `null` passed
 It is written down because it is the same shape the project has hit repeatedly — a
 test passing for a reason unrelated to the code — and because the thing that caught
 it was having the positive case at all.
+
+## 8f · onboarding proves the repository, not just the recipe
+
+6b gave the drafting run a trigger and a human an approve button. What neither gave
+anyone was an answer: the first time it was known whether those commands actually
+work was in the middle of a real run, twenty minutes after a stranger filed an
+issue — where it arrives dressed as a finding about their bug.
+
+Approving a recipe now starts a **proving run**: it builds the environment from that
+recipe and runs the project's own test command in the sealed container that judges a
+fix. Three states come out — `ready`, `ready_with_caveats`, `blocked` — and the state
+is derived from those two observations rather than asserted beside them.
+
+**The same two containers a real run uses**, and not a cheaper approximation. The
+whole value is that the answer is the one a run will get: an onboarding check that
+passes where runs fail is worse than no check, because it certifies a repository into
+a false Tier 3.
+
+**At approval, not at drafting.** A draft is a proposal, and there is nothing to
+prove about commands nobody has agreed to. The moment they become the commands this
+engine will execute verbatim is the moment they are worth executing once, while a
+human is still looking at the page.
+
+### The caveat that was the point
+
+*"Run the suite and record its colour at HEAD — which decides whether every future
+regression arm is interpretable."* A repository whose suite is already red at HEAD
+gets `already_red` from 7d's second arm forever, and 7d's own rule is that such a
+repository must never be told its own state is a fix's fault. Now the human is told
+at connect time, in those words: what it costs, and that nothing here is a claim
+their project is wrong.
+
+The other two caveats are the same shape: a recipe that installs nothing (correct for
+a project with no dependencies, a false "could not reproduce" for one that has them),
+and a test command that cannot run sealed (8b's finding, surfaced at the moment
+somebody can still fix it).
+
+### What is stored, and what is not built
+
+The proof lives in the `recipes` row, not a table of its own — a proof is an
+observation about a specific set of commands, so approving a new recipe has to
+invalidate it, and here that is a fact about where the bytes live rather than an
+invariant to remember. It is read back as opaque JSON and rendered defensively: a
+proof written before a field existed is still the best thing anyone has about that
+repository.
+
+Milestone 7's list had two more items, and they are **named rather than silently
+absent** — the page prints them under "not checked by this engine at all", apart from
+the repository's own caveats, because collapsing the two would tell someone their
+project is missing something that is ours:
+
+- **the single-test invocation**, which nothing has executed;
+- **a screenshot of the booted app** as a UI baseline.
+
+Both need an agent session with a network and a browser — a drafting-shaped run —
+which is a different thing from the two sealed containers this is.
+
+## 8g · the control survives a repository with dependencies
+
+Milestone 7 predicted this the moment the environment snapshot was built, and then
+observed it exactly: *"the sham-fix control's `git clean -xdff` takes the restored
+environment with it, so its second draw exits 127 on a dependency repository —
+conservative, never a false accusation, but blind."*
+
+Conservative is right — 127 is never green, and the control only accuses when both
+draws go green, so nobody was ever falsely convicted. Blind is the problem: on
+exactly the repositories 7e existed to support, the strongest anti-gaming check in
+the engine ran once and then stopped running, and nothing said so.
+
+**The fix is one flag.** The control's own scrub drops `-x`, so the ignored paths
+survive it. What `-x` was protecting against there is already handled: the sham is a
+tracked-file edit plus a commit, and the `reset --hard` on the line above undoes
+both. And a reproduction that plants an ignored flag between draws is the
+order-dependence that repeated draws exist to *expose* — this file's own reasoning
+about the base repeats says the shared tree is deliberate, *"because isolating them
+would hide the order-dependent flake they exist to catch"*.
+
+The phase boundary keeps its `-x`, unchanged. That scrub is about what the base phase
+could leave for the fix phase to read, and in production those are different
+containers anyway, each restoring its own environment.
+
+**The test was checked against its own absence.** With `-xdff` restored it fails on
+the assertion that names the defect — `exit_code` 127 on the second draw — and with
+the flag removed it passes. A control test that passes either way would have been
+this project's most familiar bug: an assertion satisfied by the check never running.
+
+## A real model ran against all of it
+
+The suite proves the engine accepts a well-formed answer; it can never prove the
+prompt asks for one ([ADR-0015](adr/0015-the-model-is-behind-an-adapter.md)). This
+milestone changed three prompt surfaces — `describeEnvironment`'s two-worlds
+paragraph, `prompts/repro.md`'s section on a reproduction the repository already had,
+and `prompts/triage.md`, which did not exist — so the suite being green said nothing
+about any of them.
+
+**The full run held.** `scripts/real-run.mts` against the demo repository, a real
+model, no scripted turns: base red **twice** with the reported symptom matched, fix
+green **three** times with the symptom gone, the project's own suite green on both
+commits, **Tier 2, 98/103**, and a pull request body that renders the Tier-1 cap
+paragraph correctly — which is the line 8d moved off `reproAuthoredByAgent` and onto
+the tier, and the run is where that would have shown up as a document contradicting
+its own headline. The agent read the rewritten environment paragraph and wrote a
+reproduction that survived the boundary.
+
+**Triage did not hold, and one call found it.** Given a precise, reproducible report —
+an endpoint and the wrong value it returns — the first version of `prompts/triage.md`
+asked *"what steps did you take to set up and run the application, and what data did
+you use"*. Both halves are answerable by reading the repository, which that prompt
+forbids asking for, and two asks joined by "and" is two questions, which it also
+forbids. **The prompt stated both rules and neither held.**
+
+Rewritten around the bar instead of the rules — *most reports are enough*, the test
+is "could a competent engineer make a first attempt", and the two prohibitions carry
+a worked rewrite rather than an assertion. Measured after:
+
+| report | answer |
+|---|---|
+| an endpoint and the wrong value it returns | `ENOUGH` |
+| a heading with a visible typo | *"What did you expect the heading to say instead of 'Ordres'?"* |
+| "export is broken again, please fix" | *"What does the export do that it should not — an error message, a wrong file, nothing at all, or something else?"* |
+| "some users see an empty dashboard, others do not" | *"Does the empty dashboard appear for specific user accounts, roles, or data states, or is it random?"* |
+
+Single questions, all of them, and every one asks for something only the reporter
+knows. **The second row moved the wrong way** — it answered `ENOUGH` before the
+rewrite — and it is recorded rather than tuned away, because iterating further would
+be fitting four samples. Triage never gates, so an unnecessary question costs one
+comment line and a missing one costs a run.
+
+## Honest status
+
+`npm run typecheck` is green. Worth saying, because it was red on `main` through
+milestone 6 — a `RunPlan` missing `symptomPattern` in `sandbox.test.ts` — so a red
+typecheck now belongs to whoever made it red.
+
+- **Without Docker: 496 passed, 1 skipped**, across 26 files.
+- **The containment suite: 58 passed, 1 skipped, 0 failed.**
+
+Milestone 7 ended at 412/417 with three named failures, and two of them are gone here
+rather than rounded off: `a container that could not run says why` hung for the whole
+of that milestone and finishes in 1.9 seconds now (8a), and `the phases share no
+tree…` was repaired at the end of 7 and holds. The third was a 300ms timing test under
+full parallelism, and it passed every run of this milestone.
+
+**What is still not covered.** No prompt is checked by any of the above. The four
+triage measurements and one real run are what stands behind this milestone's prompt
+changes, and they are four samples and one run.

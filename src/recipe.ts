@@ -112,9 +112,12 @@ export function parseRecipe(input: unknown): Recipe {
 
 /** Keyed by repository, on our side. `full_name` — the same string GitHub uses. */
 export async function saveRecipe(client: pg.Client, repo: string, recipe: Recipe): Promise<void> {
+  // `proof = null` on the update path, and it is not tidiness: a proof is about a
+  // set of commands, and leaving the old one beside new commands would show a human
+  // a green "ready" for an environment nobody has built (8f).
   await client.query(
     `insert into recipes (repo, recipe, approved_at) values ($1, $2, now())
-       on conflict (repo) do update set recipe = $2, approved_at = now()`,
+       on conflict (repo) do update set recipe = $2, approved_at = now(), proof = null`,
     [repo, JSON.stringify(recipe)],
   );
 }
@@ -122,6 +125,28 @@ export async function saveRecipe(client: pg.Client, repo: string, recipe: Recipe
 export async function loadRecipe(client: pg.Client, repo: string): Promise<Recipe | null> {
   const { rows } = await client.query('select recipe from recipes where repo = $1', [repo]);
   return rows.length === 0 ? null : parseRecipe(rows[0].recipe);
+}
+
+/**
+ * What proving this repository found (8f), stored beside the recipe it is about.
+ *
+ * The same row on purpose. A proof is an observation about a specific set of
+ * commands, so `saveRecipe` overwriting them has to invalidate it — and putting the
+ * proof in its own table would make that an invariant somebody has to remember
+ * instead of a fact about where the bytes live.
+ */
+export async function saveProof(client: pg.Client, repo: string, proof: unknown): Promise<void> {
+  await client.query('update recipes set proof = $2 where repo = $1', [repo, JSON.stringify(proof)]);
+}
+
+/**
+ * Read it back, or null. Never parsed into a shape: this is display-only, and a
+ * proof written by an older engine must render as what it is rather than throw on
+ * a field that did not exist yet.
+ */
+export async function loadProof(client: pg.Client, repo: string): Promise<unknown> {
+  const { rows } = await client.query('select proof from recipes where repo = $1', [repo]);
+  return rows.length === 0 ? null : (rows[0].proof ?? null);
 }
 
 /** What the Runner observed while standing the environment up. Facts, per service. */

@@ -16,7 +16,7 @@ import { clearDraft, loadDraft } from './drafts.js';
 import { fold } from './fold.js';
 import { listInstallations, loadInstallation } from './installations.js';
 import { listRuns, readRunRow, readUsage } from './readmodel.js';
-import { loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
+import { loadProof, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
 import { readRun } from './store.js';
 import type { Route } from './sse.js';
 import { escapeHtml, evidencePage, landingPage, onboardPage, repositoriesPage, runsPage } from './web.js';
@@ -82,6 +82,16 @@ export function dashboardRoutes(options: {
   client: pg.Client;
   /** Injected so a test can drive the surface without a GitHub App registered. */
   installUrl?: string;
+  /**
+   * Called after a recipe is stored, to prove the repository actually runs (8f).
+   *
+   * A callback rather than the work itself, for the same reason `draftForRepo` lives
+   * in `serve.ts`: proving needs a clone, a token and the images, and none of those
+   * belong to the surface that renders HTML. Fired and not awaited — it takes
+   * minutes and the human who just pressed approve is owed a response now, not when
+   * two containers have finished.
+   */
+  onApproved?: (repo: string) => void;
 }): Route {
   const { client } = options;
   const install = options.installUrl ?? installUrl();
@@ -161,8 +171,12 @@ export function dashboardRoutes(options: {
         // `loadDraft` even when a recipe already exists: `onboardPage` is the one that
         // decides `current` wins, and computing that here would be a second copy of a
         // rule that already lives in one place.
-        const [recipe, draft] = await Promise.all([loadRecipe(client, repo), loadDraft(client, repo)]);
-        return html(onboardPage(repo, recipe, draft?.draft));
+        const [recipe, draft, proof] = await Promise.all([
+          loadRecipe(client, repo),
+          loadDraft(client, repo),
+          loadProof(client, repo),
+        ]);
+        return html(onboardPage(repo, recipe, draft?.draft, undefined, proof));
       }
 
       // THE ONE WRITE. A human is approving commands the engine will execute verbatim in
@@ -179,6 +193,9 @@ export function dashboardRoutes(options: {
         // response. Cleared rather than left behind because a stale draft shown beside the
         // recipe now actually in force reads as a second, live proposal.
         await clearDraft(client, repo).catch(() => {});
+        // AFTER the write, never before: proving is about the commands now in force,
+        // and a proof of something that failed to store would be a proof of nothing.
+        options.onApproved?.(repo);
         // 303 with a Location, so a refresh re-renders the recipe rather than re-posting
         // it. Without the header this was a status code pretending to be a redirect.
         return {

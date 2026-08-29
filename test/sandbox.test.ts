@@ -17,7 +17,7 @@ import { get } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { confidence } from '../src/confidence.js';
 import { fold } from '../src/fold.js';
-import { draftRecipe, orchestrate, type SealedWorld } from '../src/orchestrate.js';
+import { draftRecipe, orchestrate, proveRepository, type SealedWorld } from '../src/orchestrate.js';
 import { SHARED_WRITABLE } from '../src/runner.js';
 import {
   APPLIED_REPRO,
@@ -2976,6 +2976,94 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     // which is exactly what this test did until the pair above disagreed with it.
     expect(sealed).toMatchObject({ exitCode: 1 });
     expect('output' in sealed! ? sealed.output : '').toMatch(/bad address|not found|resolve/i);
+  }, 900_000);
+
+  // ── 8f: onboarding proves the repository, not just the recipe ───────────────
+  //
+  // Milestone 7: "6b's drafting run has a trigger now — installation — and a human
+  // still has to approve what it proposes. What it does not do is the fuller
+  // connect-time job: prove the repo runs and record what could not be proved."
+  //
+  // The same two containers a real run uses, deliberately. An onboarding check that
+  // passes where runs fail is worse than none: it certifies a repository into a false
+  // Tier 3 twenty minutes after a stranger files an issue.
+
+  test('a repository that runs is proved ready, with nothing left to say about it', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+
+    const proof = await proveRepository({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      image: IMAGE,
+      recipe: {
+        install: 'mkdir -p node_modules/dep && printf "exit 0\n" > node_modules/dep/suite.sh',
+        services: [],
+        test: 'sh node_modules/dep/suite.sh',
+      },
+    });
+
+    expect(proof.state).toBe('ready');
+    expect(proof.environment).toEqual({ built: true });
+    // Green IN THE SEALED CONTAINER, on a script that exists only in what `install`
+    // wrote — so this is the answer a run would get, not an approximation of it.
+    expect(proof.suite).toMatchObject({ exitCode: 0 });
+    expect(proof.caveats).toEqual([]);
+    // And what this engine does not check for anyone is still said, apart from the
+    // repository's own caveats.
+    expect(proof.unproved.length).toBeGreaterThan(0);
+
+    // The image does not outlive the check. Onboarding runs on somebody else's
+    // schedule rather than a run's, so a leak here is unbounded disk growth.
+    expect(
+      execFileSync('docker', ['images', '-q', `engine-env:${RUN_ID}`], { encoding: 'utf8' }).trim(),
+    ).toBe('');
+  }, 900_000);
+
+  test('a suite that is already red at HEAD is a caveat, never an accusation', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+
+    const proof = await proveRepository({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      image: IMAGE,
+      recipe: {
+        install: 'mkdir -p node_modules/dep && printf "exit 1\n" > node_modules/dep/suite.sh',
+        services: [],
+        test: 'sh node_modules/dep/suite.sh',
+      },
+    });
+
+    // This is the fact milestone 7 wanted recorded at connect time, because it decides
+    // whether every future regression arm on this repository is interpretable: a red
+    // suite at HEAD means `already_red` forever, and 7d's rule is that a repository
+    // which arrived broken must never be told its own state is a fix's fault.
+    expect(proof.state).toBe('ready_with_caveats');
+    expect(proof.environment).toEqual({ built: true });
+    expect(proof.caveats.join('\n')).toMatch(/already fails at this commit/);
+    expect(proof.caveats.join('\n')).toMatch(/normal state/);
+  }, 900_000);
+
+  test('an environment that will not build is blocked, and says why in the recipe\'s own words', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+
+    const proof = await proveRepository({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      image: IMAGE,
+      recipe: { install: 'echo the registry is unreachable >&2; exit 3', services: [], test: 'true' },
+    });
+
+    expect(proof.state).toBe('blocked');
+    expect(proof.environment).toMatchObject({ built: false });
+    // The failure the human has to act on, not a paraphrase of it — this project has
+    // shipped "an operational failure with no diagnosis" twice and named it both times.
+    expect('failed' in proof.environment ? proof.environment.failed : '').toMatch(/registry is unreachable|exit 3|install/);
+    // Nothing else was checked, and it says so rather than reporting a green suite it
+    // never ran.
+    expect(proof.suite).toBeUndefined();
   }, 900_000);
 
   // ── 6b: the drafting agent gets a network with nothing to replay ────────────

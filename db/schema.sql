@@ -44,6 +44,16 @@ create table if not exists recipes (
   approved_at timestamptz not null default now()
 );
 
+-- What proving this repository found (8f): the environment built, the project's own
+-- test command run in a sealed container, and everything that could not be proved.
+--
+-- In THIS row rather than a table of its own, because a proof is an observation about
+-- a specific set of commands: approving a new recipe has to invalidate it, and here
+-- that is a fact about where the bytes live rather than an invariant to remember.
+-- Nullable, because a recipe approved before its proving run finished — or before this
+-- column existed — has no proof, and "not proved yet" is a state the page renders.
+alter table recipes add column if not exists proof jsonb;
+
 -- Which repositories we are installed on, and under which installation (M6a).
 --
 -- Current configuration, like `recipes`, not a fact about a run — so it is mutable and

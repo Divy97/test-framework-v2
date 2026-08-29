@@ -1104,6 +1104,162 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
 }
 
 /**
+ * What onboarding proved about a repository, and what it could not (8f).
+ *
+ * Milestone 7: *"Onboarding proves a recipe, not a repository."* 6b's drafting run
+ * ends with a human approving text in a box, and until now that was the whole of it
+ * — the first time anyone found out whether those commands actually work was in the
+ * middle of a real run, twenty minutes after a stranger filed an issue.
+ *
+ * The state is derived from the observations beneath it and never asserted on its
+ * own: `blocked` means the environment did not build, which is a repository nobody
+ * can run anything against; `ready_with_caveats` means it built and something the
+ * engine needs is missing or already broken; `ready` means neither.
+ */
+export type RepoProof = {
+  state: 'ready' | 'ready_with_caveats' | 'blocked';
+  /** The commit it was proved at. A proof is about a tree, not about a repository. */
+  commit: string;
+  /** Whether the recipe's install/migrate/seed replayed into an image at all. */
+  environment: { built: true } | { built: false; failed: string };
+  /** What the project's own test command did in a sealed container (8b's probe). */
+  suite?: SealedWorld;
+  /** What is wrong with THIS repository, each item priced in the words a human needs. */
+  caveats: string[];
+  /**
+   * What this engine does not check for anyone — kept apart from `caveats`, which
+   * are about the repository. Collapsing the two would read as "your project is
+   * missing something" when the missing thing is ours.
+   */
+  unproved: string[];
+  provedAt: string;
+};
+
+/**
+ * Prove that this repository runs, and record what could not be proved.
+ *
+ * Deliberately the same two containers a real run would use — `buildEnvSnapshot`
+ * and the sealed suite probe — rather than a cheaper approximation. The entire
+ * value here is that the answer is the one a run will get, and an onboarding check
+ * that passes where runs fail is worse than no check: it certifies a repository
+ * into a false Tier 3 twenty minutes later.
+ *
+ * Runs at APPROVAL, not at drafting. A draft is a proposal and there is nothing to
+ * prove about commands nobody has agreed to; the moment they become the commands
+ * this engine will execute verbatim is the moment they are worth executing once,
+ * while a human is still looking.
+ *
+ * What it does not do is named in `caveats` rather than left for someone to notice.
+ */
+export async function proveRepository(plan: {
+  runId: string;
+  repoPath: string;
+  image: string;
+  recipe: Recipe;
+}): Promise<RepoProof> {
+  const provedAt = new Date().toISOString();
+  const workspace = await mkdtemp(join(tmpdir(), 'engine-prove-'));
+  const store = await mkdtemp(join(tmpdir(), 'engine-prove-blobs-'));
+  await writeFile(join(store, '.evidence-store'), '');
+  let snapshotImage: string | null = null;
+
+  try {
+    const source = join(workspace, 'source');
+    // `--mirror`, for the reason `orchestrate` uses one: a plain clone hides every
+    // branch but the default under `refs/remotes`, and the container's own clone
+    // transfers `refs/heads/*` only.
+    await execFile('git', ['clone', '--quiet', '--no-local', '--mirror', '--', plan.repoPath, source]);
+    const { stdout } = await execFile('git', ['-C', source, 'rev-parse', 'HEAD']);
+    const commit = stdout.trim();
+
+    const proving: RunPlan = {
+      runId: plan.runId,
+      repoPath: plan.repoPath,
+      blobRoot: store,
+      image: plan.image,
+      baseRef: commit,
+      // Never matched against anything here: no reproduction runs, and the probe
+      // discards the events that would have carried it.
+      symptomPattern: 'x',
+      repro: { command: '' },
+      recipe: plan.recipe,
+    };
+
+    const snapshot =
+      plan.recipe.install === undefined
+        ? null
+        : await buildEnvSnapshot(proving, source, commit, plan.recipe);
+    if (snapshot && 'failed' in snapshot) {
+      return {
+        state: 'blocked',
+        commit,
+        environment: { built: false, failed: redact(snapshot.failed) },
+        caveats: [
+          'nothing else could be checked: with no environment there is no container to check it in',
+        ],
+        unproved: [],
+        provedAt,
+      };
+    }
+    if (snapshot) snapshotImage = snapshot.image;
+    const judging: RunPlan = snapshotImage === null ? proving : { ...proving, image: snapshotImage };
+
+    const suite = await probeSealedWorld(judging, source, commit);
+    const caveats: string[] = [];
+    if (plan.recipe.install === undefined) {
+      caveats.push(
+        'this recipe installs nothing, so the containers that judge a fix get a bare checkout — ' +
+          'correct for a project with no dependencies, and a false "could not reproduce" for one that has them',
+      );
+    }
+    if (suite === undefined) {
+      caveats.push(
+        'no test command is set, so no run here will ever carry a regression check: a fix that ' +
+          'breaks the rest of this project will look exactly like one that does not',
+      );
+    } else if ('failed' in suite) {
+      caveats.push(
+        `the test command \`${suite.command}\` could not be run in the sealed container: ${suite.failed}. ` +
+          'A command that needs a network or a running service cannot be the one that judges a fix, ' +
+          'and it is also the example the agent copies when it writes a reproduction',
+      );
+    } else if (suite.exitCode !== 0) {
+      caveats.push(
+        `the test command \`${suite.command}\` already fails at this commit (exit ${suite.exitCode}), ` +
+          'so every regression check on this repository will read "already red" and say nothing about ' +
+          'what a fix broke. Nothing here is a claim that the repository is wrong — a red suite at HEAD ' +
+          'is a normal state and this is only what it costs',
+      );
+    }
+
+    return {
+      state: caveats.length === 0 ? 'ready' : 'ready_with_caveats',
+      commit,
+      environment: { built: true },
+      ...(suite === undefined ? {} : { suite }),
+      caveats,
+      // Named rather than silently absent. Both are milestone 7's own list, and both
+      // need an agent session with a network and a browser — a drafting-shaped run,
+      // which is a different thing from the two sealed containers this function is.
+      unproved: [
+        'the single-test invocation: nothing here has executed one, so an agent still works it out per run',
+        'a screenshot of the booted app, which would be the UI baseline a visual reproduction is compared against',
+      ],
+      provedAt,
+    };
+  } finally {
+    await rm(workspace, { recursive: true, force: true }).catch(() => {});
+    await rm(store, { recursive: true, force: true }).catch(() => {});
+    // The image is the largest thing this leaves on the host, and onboarding runs
+    // on somebody else's schedule rather than a run's — so it is removed here for
+    // the same reason `orchestrate` removes its own in a `finally`.
+    if (snapshotImage) {
+      await execFile('docker', ['image', 'rm', '--force', snapshotImage]).catch(() => {});
+    }
+  }
+}
+
+/**
  * What one drafting session needs. Not a `RunPlan`: there is no reproduction, no
  * fix, no attempt loop, no gate — a draft is one agent turn, and the deliverable
  * is text in its transcript, not a judged commit.
