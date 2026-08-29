@@ -11,7 +11,12 @@ import type { ArtifactRef } from './events.js';
 
 const PREFIX = 'sha256:';
 
-const digest = (bytes: string | Buffer): ArtifactRef =>
+/**
+ * The ref these bytes are known by. Exported so a caller can ask what a body IS before
+ * deciding to store it — the plane refuses an upload whose claimed name is wrong, and
+ * refusing after writing would be a check that only reports.
+ */
+export const digest = (bytes: string | Buffer): ArtifactRef =>
   `${PREFIX}${createHash('sha256').update(bytes).digest('hex')}`;
 
 export function blobPath(root: string, ref: ArtifactRef): string {

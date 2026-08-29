@@ -136,7 +136,19 @@ export type Route = (request: {
    * carry anything. The one POST is a human approving commands we will execute.
    */
   body: () => Promise<string>;
-}) => Promise<{ status: number; type: string; body: string; headers?: Record<string, string> } | null>;
+  /**
+   * The body as BYTES, with a ceiling this caller chooses (9b).
+   *
+   * `body()` above decodes to a string, which is right for a form post and wrong for a
+   * blob: a screenshot round-tripped through UTF-8 is not that screenshot. And it
+   * truncates silently at the ceiling, so an oversized upload would have arrived as a
+   * digest mismatch — an operational failure wearing a tamper signal's clothes.
+   *
+   * `null` means the body exceeded `limit`. Explicitly null rather than truncated,
+   * because the caller has to be able to say "too large" instead of guessing.
+   */
+  raw: (limit?: number) => Promise<Buffer | null>;
+}) => Promise<{ status: number; type: string; body: string | Buffer; headers?: Record<string, string> } | null>;
 
 /** Ceiling on a request body. The only write takes a recipe, and a recipe is small. */
 const MAX_BODY_BYTES = 256 * 1024;
@@ -159,6 +171,31 @@ export function startStatusServer(options: {
     const path = (request.url ?? '').split('?')[0] ?? '';
     const match = /^\/runs\/([^/]+)\/events$/.exec(path);
     if (request.method !== 'GET' || !match) {
+      /**
+       * Buffer the body once, to a ceiling the caller picks.
+       *
+       * Over the ceiling it keeps DRAINING and answers `null`. Destroying the request
+       * mid-body gives the client a connection reset rather than the refusal we mean to
+       * send — the same reasoning the webhook receiver already applies — and truncating
+       * instead would hand a blob route bytes that hash to nothing.
+       */
+      const read = (limit: number): Promise<Buffer | null> =>
+        new Promise<Buffer | null>((resolve, reject) => {
+          const chunks: Buffer[] = [];
+          let bytes = 0;
+          let over = false;
+          request.on('data', (chunk: Buffer) => {
+            bytes += chunk.length;
+            if (bytes > limit) {
+              over = true;
+              return;
+            }
+            chunks.push(chunk);
+          });
+          request.on('error', reject);
+          request.on('end', () => resolve(over ? null : Buffer.concat(chunks)));
+        });
+
       const handler = options.routes;
       if (!handler) {
         response.writeHead(404, { 'content-type': 'text/plain' });
@@ -174,20 +211,8 @@ export function startStatusServer(options: {
         path,
         query: new URL(request.url ?? '/', 'http://127.0.0.1').searchParams,
         headers: request.headers,
-        body: () =>
-          new Promise<string>((resolve, reject) => {
-            const chunks: Buffer[] = [];
-            let bytes = 0;
-            request.on('data', (chunk: Buffer) => {
-              bytes += chunk.length;
-              // Stop BUFFERING past the ceiling but keep draining, exactly as the webhook
-              // receiver does: destroying the request mid-body gives the client a reset
-              // rather than the refusal we mean to send.
-              if (bytes <= MAX_BODY_BYTES) chunks.push(chunk);
-            });
-            request.on('error', reject);
-            request.on('end', () => resolve(Buffer.concat(chunks).toString()));
-          }),
+        body: async () => (await read(MAX_BODY_BYTES))?.toString() ?? '',
+        raw: (limit = MAX_BODY_BYTES) => read(limit),
       })
         .then((answer) => {
           if (!answer) {
