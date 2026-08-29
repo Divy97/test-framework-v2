@@ -234,6 +234,17 @@ export const ASK_MODEL = 'claude-haiku-4-5';
 export const ASK_MODEL_OPENROUTER = 'anthropic/claude-haiku-4-5';
 
 /**
+ * How long a one-shot question may take before the caller stops waiting.
+ *
+ * Bounded because its callers are on a path that has somewhere to be: triage runs
+ * before the first container of a real run, and the SDK's own default is ten
+ * minutes. An unbounded wait in front of a run is the exact failure 8a spent a
+ * milestone item removing from the layer below, and a cheap model answering one
+ * sentence has no business taking thirty seconds.
+ */
+const ASK_TIMEOUT_MS = 30_000;
+
+/**
  * One prompt, one answer, no tools, no loop.
  *
  * `runAgentLoop` cannot serve this: it sends `thinking: adaptive` and
@@ -254,13 +265,17 @@ export async function askOnce(options: {
   baseURL?: string;
   model?: string;
   maxTokens?: number;
+  /** The ceiling, injectable for the same reason every other one here is: to test it. */
+  timeoutMs?: number;
 }): Promise<string | null> {
   const maxTokens = options.maxTokens ?? 512;
+  const timeout = options.timeoutMs ?? ASK_TIMEOUT_MS;
   try {
     if (providerName(options.provider) === 'openrouter') {
       const key = options.apiKey ?? options.authToken ?? process.env.OPENROUTER_API_KEY;
       const response = await fetch(`${options.baseURL ?? OPENROUTER_BASE}/chat/completions`, {
         method: 'POST',
+        signal: AbortSignal.timeout(timeout),
         headers: { authorization: `Bearer ${key ?? ''}`, 'content-type': 'application/json' },
         body: JSON.stringify({
           model: options.model ?? ASK_MODEL_OPENROUTER,
@@ -275,6 +290,10 @@ export async function askOnce(options: {
       return body.choices?.[0]?.message?.content?.trim() || null;
     }
     const client = new Anthropic({
+      // Milliseconds in this SDK, and one retry rather than the default two: a
+      // question nobody is waiting on the answer to is not worth three attempts.
+      timeout,
+      maxRetries: 1,
       ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
       ...(options.authToken === undefined ? {} : { authToken: options.authToken }),
       ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),

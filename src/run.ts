@@ -198,7 +198,16 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
 
     // TRIAGE, before a container starts (8e). The reporter is at the keyboard now and
     // nowhere near it in twenty minutes, so this is the only moment a question is
-    // cheap. It never gates: the run continues either way, and the two race.
+    // cheap.
+    //
+    // It never gates. Whatever comes back, the run proceeds — the question and the
+    // run are not alternatives, and a cheap model's opinion of somebody's bug report
+    // is the last thing that should be able to stop one (7c's precedent).
+    //
+    // Awaited rather than fired, because it is one bounded call before the first
+    // container and ordering it ahead of the sandbox is the entire point. `askOnce`
+    // carries its own 30s ceiling for exactly this reason: an unbounded wait in front
+    // of a run is what 8a removed from the layer below.
     //
     // Wrapped, because everything in it is optional to the run and none of it is
     // allowed to cost one — a model that is down, a repository that will not list, a

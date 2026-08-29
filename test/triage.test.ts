@@ -6,6 +6,9 @@
 // arrives, and every one of them has to end somewhere honest.
 
 import { afterEach, describe, expect, test } from 'vitest';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { askOnce } from '../src/loop.js';
 import { triage } from '../src/triage.js';
 import { fakeModel, type FakeModel } from './fixtures/model.js';
 
@@ -96,6 +99,34 @@ describe('triage asks one question, or none', () => {
   test('the report reaches the model, because a question about nothing is worthless', async () => {
     const { model } = await ask('Which page were you on?');
     expect(JSON.stringify(model.requests.at(-1))).toContain('the export button does nothing');
+  });
+
+  test('a model that never answers is given up on, not waited for', async () => {
+    // The failure this closes is 8a's, one layer up: triage runs BEFORE the first
+    // container of a real run, and the SDK's own default ceiling is ten minutes. An
+    // unbounded wait in front of a run is the thing 8a spent an item removing from
+    // the layer below, and it would have been reintroduced here by a model that
+    // accepts a connection and then says nothing.
+    const stalled = createServer(() => {
+      // Deliberately no response. The socket is open and nothing is coming.
+    });
+    await new Promise<void>((ready) => stalled.listen(0, '127.0.0.1', ready));
+    const port = (stalled.address() as AddressInfo).port;
+    try {
+      const started = Date.now();
+      const said = await askOnce({
+        prompt: 'anything',
+        provider: 'anthropic',
+        apiKey: 'test',
+        baseURL: `http://127.0.0.1:${port}`,
+        timeoutMs: 250,
+      });
+      expect(said).toBeNull();
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally {
+      stalled.closeAllConnections?.();
+      await new Promise<void>((done) => stalled.close(() => done()));
+    }
   });
 
   test('triage carries no tools, which is what makes it cheap', async () => {
