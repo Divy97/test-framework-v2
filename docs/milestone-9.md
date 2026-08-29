@@ -17,7 +17,7 @@ are different requirements, and this milestone is the seam between them.
 |---|---|---|
 | **9a** the runner dials out — pairing, dispatch, authorized append | built |
 | **9b** blobs cross the boundary | built |
-| **9c** GitHub OAuth, and the human surface | |
+| **9c** GitHub OAuth, and the human surface | built |
 | **9d** the runner daemon | built |
 | **9e** deletion, as a tombstone rather than a hole | |
 
@@ -142,10 +142,72 @@ put/get … no event schema changes when it does."*
 
 ## 9c–9e
 
-**9c** is GitHub OAuth — one human login, sessions, and authorization answered by
-`GET /user/installations` rather than by a roles table of our own. It is also where the
-pairing UI lives: **Add a runner** mints the token from 9a while the human is
-authenticated, and the token is shown once.
+## 9c · one login, and the approval behind it
+
+The dashboard had no authentication. Not weak — none. That was correct while it bound to
+127.0.0.1 and had one operator, and it is the single most dangerous line in the codebase
+to host, because the one write on that surface stores shell commands the engine later
+executes verbatim in a sandbox with a package registry reachable (ADR-0013).
+Unauthenticated on a public address, that POST is remote code execution on somebody
+else's runner.
+
+**One human authentication: GitHub OAuth.** People arriving already have a GitHub
+account and the App is installed by one; asking for anything else would be asking them
+to remember a credential this product has no business owning.
+
+**Authorization is GitHub's answer, asked every time.** `GET /user/installations`, on
+each decision, and deliberately not cached into a roles table of our own — a permission
+model here would be a second definition of who owns a repository, free to disagree with
+GitHub's, and it would disagree on the day somebody was removed from an org. A GitHub we
+cannot reach returns an empty list, which denies; an outage must never become an
+authorization.
+
+### The distinctions that carry the weight
+
+- **`state` is the login-CSRF defence, not decoration.** Without it an attacker completes
+  their own OAuth flow and redirects the victim's browser to our callback carrying the
+  attacker's code — the victim is logged into the attacker's account, and anything they
+  approve there belongs to somebody else. Compared in constant time.
+- **`SameSite=Lax`, not `Strict`.** The OAuth callback *is* a cross-site navigation back
+  from github.com, and Strict drops the cookie on precisely the request that establishes
+  the session. Lax still refuses it on cross-site POSTs, which is the case that matters.
+- **Sessions expire in the read**, so a process that never runs a cleanup job cannot
+  leave a year-old cookie working.
+- **The session holds a user-to-server token**, which is narrower than a PAT by
+  construction — it can only reach repositories this App is installed on. That is
+  ADR-0012's reasoning about personal access tokens, applied to the human half.
+- **"Not yours" and "no such thing" are the same answer.** Run ids are uuids and
+  repository names are guessable; a stranger probing either learns nothing.
+
+### The local surface did not change
+
+`serve.ts` passes no `auth`, and with none configured nothing is gated — one operator,
+127.0.0.1, origin check. A test asserts exactly that, because 9c quietly requiring a
+GitHub login to use your own laptop would have been a regression nobody asked for.
+
+### Pairing
+
+`/repos/<repo>/runners` mints the 9a token **because a human is authenticated**: one
+login for a person, one credential for a machine, and the second is a consequence of the
+first rather than a second thing to remember. The token is rendered once — the row stores
+a hash, so "show it again" is not a feature declined but a thing that cannot be done, and
+the page says so rather than implying a lookup exists.
+
+### The plane, as a program
+
+`src/plane-server.ts`: one address GitHub can always reach, the App key, the log, and the
+queue. No Docker, no model credential, and **no path by which a delivery causes this
+process to run a command from a recipe** — the thing holding the credentials is not the
+thing that executes.
+
+### What is asserted
+
+`auth.test.ts` (16) covers the exchange, the state, the cookie attributes, expiry, and
+that an unreachable GitHub denies. `authz.test.ts` (14) is the gate, and every case is a
+person who *is* signed in reaching for a repository that is not theirs — including the
+one that matters: **approving for a repository you cannot see stores nothing**, paired
+with its control, because a test like that passes just as well on a surface that refuses
+everything.
 
 ## 9d · the daemon
 

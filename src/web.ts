@@ -472,6 +472,69 @@ const REGRESSION_LABEL: Record<RunState['regression'], string> = {
   unmeasured: 'suite unmeasured',
 };
 
+/**
+ * The machines paired to a repository, and the one screen that shows a secret (9c).
+ *
+ * `minted` is present exactly once, on the response to the form that created it. There
+ * is nowhere to look it up afterwards and the page says so — the row stores a hash, so
+ * "show it again" is not a feature we declined to build, it is a thing that cannot be
+ * done. A page that implied otherwise would teach people not to copy it.
+ */
+export function runnersPage(
+  repo: string,
+  runners: { id: string; name: string; pairedAt: string; lastSeen: string | null; revokedAt: string | null }[],
+  minted?: { token: string; name: string },
+): string {
+  const when = (value: string | null) => (value === null ? '—' : escapeHtml(value.replace('T', ' ').slice(0, 19)));
+  const body =
+    `<h1>Runners for ${escapeHtml(repo)}</h1>
+<p class="hero">A runner is a machine of yours that takes work from here and runs it. It needs Docker
+and a model key; it never receives an inbound connection, so there is no tunnel to keep alive and
+nothing to expose. It holds no GitHub credential — it asks for a token per run, and this service
+mints one.</p>` +
+    (minted
+      ? `<div class="panel">
+<h2>Pair <code>${escapeHtml(minted.name)}</code> — this token is shown once</h2>
+<p>Run this on the machine that will do the work:</p>
+<pre class="scroll"><code>ENGINE_PLANE_URL=&lt;this service&gt; \
+ENGINE_RUNNER_TOKEN=${escapeHtml(minted.token)} \
+npx tf-runner</code></pre>
+<p class="muted small">We store a hash of it, not the token, so it cannot be shown again — pair a new
+runner if you lose it, and revoke the old one below.</p>
+</div>`
+      : '') +
+    `<h2>Paired machines</h2>` +
+    (runners.length === 0
+      ? `<p class="muted">None yet. Nothing will run until one is paired.</p>`
+      : `<div class="scroll"><table>
+<tr><th>name</th><th>paired</th><th>last seen</th><th></th></tr>
+${runners
+  .map(
+    (runner) => `<tr>
+<td>${escapeHtml(runner.name)}${runner.revokedAt ? ' <b class="fail">revoked</b>' : ''}</td>
+<td>${when(runner.pairedAt)}</td>
+<td>${runner.lastSeen === null ? '<span class="muted">never</span>' : when(runner.lastSeen)}</td>
+<td>${
+      runner.revokedAt
+        ? ''
+        : `<form method="post" action="/repos/${urlPath(repo)}/runners/${escapeHtml(runner.id)}/revoke">
+<button type="submit">Revoke</button></form>`
+    }</td>
+</tr>`,
+  )
+  .join('\n')}
+</table></div>`) +
+    `<h2>Pair another</h2>
+<form method="post" action="/repos/${urlPath(repo)}/runners">
+<p><input name="name" placeholder="the laptop under the desk" required></p>
+<p><button type="submit">Create a runner token</button></p>
+</form>
+<p class="muted small">Revoking is immediate and keeps the row: whatever that machine already wrote
+stays in the log, and a reader asking who wrote it still gets an answer.</p>`;
+
+  return layout(`Runners · ${repo}`, body);
+}
+
 export function runsPage(runs: RunRow[], repo?: string): string {
   const heading = repo ? `Runs · ${escapeHtml(repo)}` : 'Runs';
   const body =
