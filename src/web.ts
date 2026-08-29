@@ -588,6 +588,14 @@ export function evidencePage(input: {
   state: RunState;
   score: Confidence;
   usage: { phase: string; turns: number; input_tokens: number; output_tokens: number }[];
+  /**
+   * Present when this run's artifacts were destroyed on request (9e).
+   *
+   * Rendered FIRST, above the verdict, because every hash below it is about to be a
+   * reference that resolves to nothing — and a reader who meets those without being
+   * told will read a kept promise as a broken system.
+   */
+  forgotten?: { requestedBy: string; forgottenAt: string; removed: number } | null;
 }): string {
   const { row, state, score, usage } = input;
   const refused = score.tier === 3;
@@ -598,6 +606,24 @@ export function evidencePage(input: {
     state.registrations.filter((r) => r.attempt === attempt).at(-1) ?? state.registeredRepro;
 
   const sections: string[] = [];
+
+  if (input.forgotten) {
+    // The distinction this page exists to preserve: destroyed on request is not the
+    // same as missing. One is a promise kept and the other is a bug, and they look
+    // identical from the outside unless somebody says which.
+    sections.push(
+      `<div class="warning">
+<h2>The evidence for this run was deleted, on request.</h2>
+<p>${escapeHtml(input.forgotten.removed.toString())} artifact(s) were destroyed at
+${escapeHtml(input.forgotten.forgottenAt.replace('T', ' ').slice(0, 19))}, asked for by
+<code>${escapeHtml(input.forgotten.requestedBy)}</code>.</p>
+<p><b>The log was not edited.</b> Every event below says exactly what it said before, including
+the <code>sha256:</code> references — those now point at bytes that no longer exist, which is what
+deleting them means. Artifacts still cited by another run were kept: content addressing makes
+identical bytes one file, and removing them would have broken a run nobody asked to forget.</p>
+</div>`,
+    );
+  }
 
   sections.push(
     `<h1>${escapeHtml(row.repo)}#${row.issue_number}</h1>

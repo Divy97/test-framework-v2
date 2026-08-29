@@ -212,9 +212,19 @@ const rowFor = (state: RunState, repo = 'acme/widgets', issue = 41): RunRow => {
   };
 };
 
-const page = (state: RunState, repo?: string) => {
-  const row = rowFor(state, repo);
-  return evidencePage({ row, state, score: confidence(state), usage: [] });
+const page = (
+  state: RunState,
+  options: { repo?: string; forgotten?: { requestedBy: string; forgottenAt: string; removed: number } } = {},
+) => {
+  const { forgotten } = options;
+  const row = rowFor(state, options.repo);
+  return evidencePage({
+    row,
+    state,
+    score: confidence(state),
+    usage: [],
+    ...(forgotten === undefined ? {} : { forgotten }),
+  });
 };
 
 const installation = (repo: string): Installation => ({
@@ -232,7 +242,7 @@ describe('escaping is the whole defence, so it is applied at every interpolation
     for (const html of [
       runsPage([rowFor(TIER_2, XSS)]),
       repositoriesPage([{ installation: installation(XSS), hasRecipe: true, runs: 3 }]),
-      page(TIER_2, XSS),
+      page(TIER_2, { repo: XSS }),
     ]) {
       expect(html).not.toContain('<script>');
       expect(html).not.toContain('</script>');
@@ -720,6 +730,27 @@ describe('every page is a document a browser can render', () => {
       // The header is the only navigation this product has.
       expect(html).toContain('href="/runs"');
     }
+  });
+
+  test('a forgotten run says so first, and does not hide the dead references', () => {
+    // 9e. Destroyed on request and gone missing look identical from the outside — one is
+    // a promise kept and the other is a bug — so the page has to say which, above the
+    // verdict, before a reader meets a hash that resolves to nothing.
+    const html = page(TIER_2, {
+      forgotten: { requestedBy: 'divy97', forgottenAt: '2026-08-30T10:00:00.000Z', removed: 3 },
+    });
+    expect(html).toContain('deleted, on request');
+    expect(html).toContain('divy97');
+    expect(html).toContain('3 artifact(s)');
+    expect(html).toContain('The log was not edited');
+    // The refs are still on the page. Hiding them would be the edit we just refused to
+    // make, one layer up.
+    expect(html).toContain('sha256:');
+    expectWellFormed(html);
+  });
+
+  test('and a run nobody forgot carries no tombstone at all', () => {
+    expect(page(TIER_2)).not.toContain('deleted, on request');
   });
 
   test('the landing page offers exactly one install button, pointed at GitHub', () => {
