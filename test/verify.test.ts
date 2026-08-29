@@ -27,6 +27,8 @@ import {
   cleanupFixtures,
   clean,
   committedTest,
+  needsIgnoredHelper,
+  REPRO_VIA_IGNORED_HELPER,
   ignoredTest,
   IGNORED_PINNED_REPRO,
   divergentHistory,
@@ -1130,6 +1132,39 @@ describe('the sham-fix control', () => {
     // Recorded as a green sham for a human to read. The engine no longer draws a
     // verdict from it — see the advisory note below.
     expect(testRuns(events).some((r) => r.phase === 'control' && r.exit_code === 0)).toBe(true);
+  });
+
+  test('still measures something on a repository that has dependencies', async () => {
+    // 8g, and the limitation milestone 7 predicted the moment the environment
+    // snapshot was built: the control's own scrub used `-xdff`, which takes the
+    // hardlinked dependency tree with it, so the SECOND draw ran a reproduction
+    // whose helper no longer existed. Exit 127 is never green, so nobody was ever
+    // falsely accused — the check simply stopped happening, on exactly the
+    // repositories 7e existed to support.
+    //
+    // The helper here is gitignored and in nobody's commit, which is the shape a
+    // restored `node_modules` has.
+    const fixture = needsIgnoredHelper();
+    const events = await observe(fixture, {
+      controlRun: true,
+      repro: REPRO_VIA_IGNORED_HELPER,
+      flakeRuns: 0,
+    });
+    const controls = testRuns(events).filter((r) => r.phase === 'control');
+
+    expect(controls).toHaveLength(2);
+    // 127 is "the command could not run", which is what a missing helper produces
+    // and what this whole phase is about. Both draws have to have actually run the
+    // reproduction.
+    expect(controls.map((r) => r.exit_code)).not.toContain(127);
+    expect(controls.map((r) => r.exit_code)).not.toContain(-1);
+
+    // And they ran the REPRODUCTION, not something that merely exited: its first
+    // line prints the source under test, so the output proves the helper resolved.
+    const outputs = await Promise.all(
+      controls.map(async (r) => (await get(fixture.blobRoot, r.stdout_hash)).toString('utf8')),
+    );
+    for (const output of outputs) expect(output).toContain('wrong');
   });
 
   test('never accuses an honest reproduction, whatever the sham does to it', async () => {

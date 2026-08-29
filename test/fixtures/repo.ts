@@ -599,6 +599,31 @@ export const ignoredTest = () => {
   return fixture;
 };
 
+/**
+ * A repository whose reproduction needs a file that only `install` puts there.
+ *
+ * `deps/` is gitignored, so the helper is in the tree and in nobody's commit —
+ * exactly the shape of the dependency tree the environment snapshot hardlinks into
+ * every phase clone since 7e. Used to prove the sham-fix control still measures
+ * something on a repository with dependencies (8g): before that, its own scrub
+ * deleted the helper and the second draw exited 127.
+ */
+export const needsIgnoredHelper = () => {
+  const fixture = makeRepo(
+    { 'src.txt': 'wrong\n', '.gitignore': 'deps/\n' },
+    { 'src.txt': 'right\n', '.gitignore': 'deps/\n' },
+  );
+  mkdirSync(join(fixture.repo, 'deps'), { recursive: true });
+  writeFileSync(join(fixture.repo, 'deps', 'helper.sh'), 'grep -q right src.txt\n');
+  return fixture;
+};
+
+/** Reads the source, then defers the verdict to a helper only `install` provides. */
+export const REPRO_VIA_IGNORED_HELPER: ReproSpec = {
+  command: 'sh repro.sh',
+  files: { 'repro.sh': 'cat src.txt\nsh deps/helper.sh\n' },
+};
+
 export const IGNORED_PINNED_REPRO: ReproSpec = {
   command: 'sh deps/existing.sh',
   pinned: ['deps/existing.sh'],

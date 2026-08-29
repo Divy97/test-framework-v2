@@ -1,5 +1,5 @@
 ---
-status: in progress
+status: built
 ---
 
 # Milestone 8 — the things milestone 7 named and did not do
@@ -22,7 +22,7 @@ wedged suite.
 | **8d** a suite that is already red on the reported behaviour | M7: "an existing failing test is a free Tier 1" | built |
 | **8e** triage, before a container starts | M7: "the cheapest available reduction in false Tier 3s" | built |
 | **8f** onboarding proves the repository, not just the recipe | M7: "onboarding proves a recipe" | built |
-| **8g** the sham-fix control survives a repository with dependencies | M7's predicted limitation, observed | |
+| **8g** the sham-fix control survives a repository with dependencies | M7's predicted limitation, observed | built |
 
 ## 8a · a container that will not finish is stopped
 
@@ -308,3 +308,32 @@ project is missing something that is ours:
 
 Both need an agent session with a network and a browser — a drafting-shaped run —
 which is a different thing from the two sealed containers this is.
+
+## 8g · the control survives a repository with dependencies
+
+Milestone 7 predicted this the moment the environment snapshot was built, and then
+observed it exactly: *"the sham-fix control's `git clean -xdff` takes the restored
+environment with it, so its second draw exits 127 on a dependency repository —
+conservative, never a false accusation, but blind."*
+
+Conservative is right — 127 is never green, and the control only accuses when both
+draws go green, so nobody was ever falsely convicted. Blind is the problem: on
+exactly the repositories 7e existed to support, the strongest anti-gaming check in
+the engine ran once and then stopped running, and nothing said so.
+
+**The fix is one flag.** The control's own scrub drops `-x`, so the ignored paths
+survive it. What `-x` was protecting against there is already handled: the sham is a
+tracked-file edit plus a commit, and the `reset --hard` on the line above undoes
+both. And a reproduction that plants an ignored flag between draws is the
+order-dependence that repeated draws exist to *expose* — this file's own reasoning
+about the base repeats says the shared tree is deliberate, *"because isolating them
+would hide the order-dependent flake they exist to catch"*.
+
+The phase boundary keeps its `-x`, unchanged. That scrub is about what the base phase
+could leave for the fix phase to read, and in production those are different
+containers anyway, each restoring its own environment.
+
+**The test was checked against its own absence.** With `-xdff` restored it fails on
+the assertion that names the defect — `exit_code` 127 on the second draw — and with
+the flag removed it passes. A control test that passes either way would have been
+this project's most familiar bug: an assertion satisfied by the check never running.
