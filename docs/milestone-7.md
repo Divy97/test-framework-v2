@@ -282,7 +282,8 @@ strongest provenance the design recognises, and unreachable today because nothin
 The suite run added in 7d is the mechanism; nothing consumes it that way yet.
 
 **`runContainer` has no timeout.** A missing image plus a stalled registry wedges a run
-indefinitely — observed while running this milestone's suite.
+indefinitely — observed while running this milestone's suite. **Done in
+[8a](milestone-8.md).**
 
 ## Honest status
 

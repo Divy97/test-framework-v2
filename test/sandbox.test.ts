@@ -23,6 +23,7 @@ import {
   APPLIED_REPRO,
   cleanupFixtures,
   clean,
+  HANGS_ON_BASE,
   HANGS_ON_FIX,
   irreproducible,
   needsInstalledDependency,
@@ -1212,7 +1213,53 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect(outcome.complete).toBe(false);
     expect(outcome.phases[0]!.events).toEqual([]);
     expect(outcome.phases[0]!.stderr).toMatch(/does-not-exist/);
-  }, 600_000);
+    // The 60s is the assertion, not the budget. `docker run` on a missing image
+    // pulls by default, and on a machine whose daemon cannot reach a registry that
+    // pull never returns — this test hung for milestone 7's whole suite. `--pull
+    // never` makes a missing image answer immediately, which is the only reason a
+    // deadline this short is safe.
+  }, 60_000);
+
+  test('a container that will not finish is stopped by the host', async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = clean();
+
+    // Every other timeout in this engine lives INSIDE a container: `verify` bounds
+    // each command, the loop bounds the agent. None of them can end a container
+    // that is wedged before its work begins, or one whose PID 1 is stuck. The
+    // in-container command bound is set far above the host's here so that it
+    // cannot be what ends this — only the ceiling can.
+    const started = Date.now();
+    const outcome = await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: hostBlobs(),
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      repro: HANGS_ON_BASE,
+      symptomPattern: 'wrong',
+      flakeRuns: 0,
+      timeoutMs: 300_000,
+      containerTimeoutMs: 5_000,
+    });
+
+    expect(Date.now() - started).toBeLessThan(120_000);
+    expect(outcome.complete).toBe(false);
+    // Nothing observed, because the Runner emits its events when `verify` returns
+    // and it never did. So the stderr line is the ENTIRE diagnosis — the same
+    // reason `EXIT.silent` says to read it, and the reason a bare kill would have
+    // been worse than the hang it replaced.
+    expect(outcome.phases[0]!.events).toEqual([]);
+    expect(outcome.phases[0]!.stderr).toMatch(/stopped after 5000ms/);
+
+    // And the container went with the client. Killing `docker run` leaves the
+    // daemon running the container it started, so without the removal the wedge
+    // outlives the run that gave up on it — `--rm` only fires on an exit that,
+    // here, is never coming.
+    const survivors = execFileSync('docker', ['ps', '-a', '--format', '{{.Names}}']).toString();
+    expect(survivors).not.toMatch(new RegExp(`engine-base-${RUN_ID}`));
+  }, 300_000);
 
   test('a store that would not outlive the run is refused before anything runs', async () => {
     // The sentinel check moved layers with the store. Each container now gets a
