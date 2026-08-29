@@ -90,3 +90,15 @@ tool surface is a temptation to constrain the agent's output — typed tools, fo
 schemas, validated arguments. Constrain the tools because we execute them; do not
 constrain the agent's *reasoning or reporting* to make its self-report easier to
 trust. We still do not trust it, so we still do not need it structured.
+
+## Amended by ADR-0019 — whose process boundary
+
+Everything above holds for a run on a machine we control, which is every run this engine
+has executed. [ADR-0019](0019-who-writes-when-the-runner-is-not-ours.md) covers the
+hosted path, where the Runner is a binary on hardware the user owns.
+
+The split between testimony and evidence is unchanged there — the agent still cannot
+write facts, and the Runner still observes at a process boundary. What changes is who
+that boundary belongs to. The honest hosted form is *"this installation's runner
+observed"*, evidence is never shown outside the installation that produced it, and the
+day a public evidence link is proposed this amendment expires along with it.
