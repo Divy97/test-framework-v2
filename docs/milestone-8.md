@@ -339,3 +339,64 @@ containers anyway, each restoring its own environment.
 the assertion that names the defect — `exit_code` 127 on the second draw — and with
 the flag removed it passes. A control test that passes either way would have been
 this project's most familiar bug: an assertion satisfied by the check never running.
+
+## A real model ran against all of it
+
+The suite proves the engine accepts a well-formed answer; it can never prove the
+prompt asks for one ([ADR-0015](adr/0015-the-model-is-behind-an-adapter.md)). This
+milestone changed three prompt surfaces — `describeEnvironment`'s two-worlds
+paragraph, `prompts/repro.md`'s section on a reproduction the repository already had,
+and `prompts/triage.md`, which did not exist — so the suite being green said nothing
+about any of them.
+
+**The full run held.** `scripts/real-run.mts` against the demo repository, a real
+model, no scripted turns: base red **twice** with the reported symptom matched, fix
+green **three** times with the symptom gone, the project's own suite green on both
+commits, **Tier 2, 98/103**, and a pull request body that renders the Tier-1 cap
+paragraph correctly — which is the line 8d moved off `reproAuthoredByAgent` and onto
+the tier, and the run is where that would have shown up as a document contradicting
+its own headline. The agent read the rewritten environment paragraph and wrote a
+reproduction that survived the boundary.
+
+**Triage did not hold, and one call found it.** Given a precise, reproducible report —
+an endpoint and the wrong value it returns — the first version of `prompts/triage.md`
+asked *"what steps did you take to set up and run the application, and what data did
+you use"*. Both halves are answerable by reading the repository, which that prompt
+forbids asking for, and two asks joined by "and" is two questions, which it also
+forbids. **The prompt stated both rules and neither held.**
+
+Rewritten around the bar instead of the rules — *most reports are enough*, the test
+is "could a competent engineer make a first attempt", and the two prohibitions carry
+a worked rewrite rather than an assertion. Measured after:
+
+| report | answer |
+|---|---|
+| an endpoint and the wrong value it returns | `ENOUGH` |
+| a heading with a visible typo | *"What did you expect the heading to say instead of 'Ordres'?"* |
+| "export is broken again, please fix" | *"What does the export do that it should not — an error message, a wrong file, nothing at all, or something else?"* |
+| "some users see an empty dashboard, others do not" | *"Does the empty dashboard appear for specific user accounts, roles, or data states, or is it random?"* |
+
+Single questions, all of them, and every one asks for something only the reporter
+knows. **The second row moved the wrong way** — it answered `ENOUGH` before the
+rewrite — and it is recorded rather than tuned away, because iterating further would
+be fitting four samples. Triage never gates, so an unnecessary question costs one
+comment line and a missing one costs a run.
+
+## Honest status
+
+`npm run typecheck` is green. Worth saying, because it was red on `main` through
+milestone 6 — a `RunPlan` missing `symptomPattern` in `sandbox.test.ts` — so a red
+typecheck now belongs to whoever made it red.
+
+- **Without Docker: 496 passed, 1 skipped**, across 26 files.
+- **The containment suite: 58 passed, 1 skipped, 0 failed.**
+
+Milestone 7 ended at 412/417 with three named failures, and two of them are gone here
+rather than rounded off: `a container that could not run says why` hung for the whole
+of that milestone and finishes in 1.9 seconds now (8a), and `the phases share no
+tree…` was repaired at the end of 7 and holds. The third was a 300ms timing test under
+full parallelism, and it passed every run of this milestone.
+
+**What is still not covered.** No prompt is checked by any of the above. The four
+triage measurements and one real run are what stands behind this milestone's prompt
+changes, and they are four samples and one run.
