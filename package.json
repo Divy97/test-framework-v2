@@ -10,7 +10,9 @@
     "replay": "tsx --env-file=.env src/cli.ts replay",
     "status": "tsx --env-file=.env src/status.ts",
     "serve": "tsx src/serve.ts",
-    "rebuild": "tsx --env-file=.env src/cli.ts rebuild"
+    "rebuild": "tsx --env-file=.env src/cli.ts rebuild",
+    "plane": "tsx src/plane-server.ts",
+    "runner": "tsx src/runner-main.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.116.0",
