@@ -288,6 +288,23 @@ export function issueComment(state: RunState, context: ReportContext): string {
   );
 }
 
+/**
+ * The comment posted at t=0, when triage found something worth asking (8e).
+ *
+ * It says a run has started as well as asking, because those two facts belong in the
+ * same message: a question with no context reads as a bot demanding homework, and the
+ * engine currently says nothing at all until it is finished. And it says where the
+ * question came from — a model, reading their report — because a question the
+ * reporter can see the provenance of is one they can also dismiss.
+ */
+export const triageComment = (question: string): string =>
+  `A run has started on this. A sandbox is coming up, the reported behaviour is being reproduced, ` +
+  `and you will get either a pull request carrying the evidence or an explanation of why not.\n\n` +
+  `One thing would help while that happens:\n\n` +
+  `${quote(question)}\n\n` +
+  `That question came from a model reading your report against this repository, so it may be wrong ` +
+  `or already answered above — the run does not wait for it either way.`;
+
 /** Quote attacker-influenced text so it cannot restructure the document around it. */
 const quote = (text: string): string =>
   text

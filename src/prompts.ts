@@ -23,7 +23,7 @@ import type { SealedWorld } from './orchestrate.js';
 /** Where the prompts live. Resolved from this module, not from the process cwd. */
 export const PROMPT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'prompts');
 
-export type PromptName = 'repro' | 'fix' | 'recipe';
+export type PromptName = 'repro' | 'fix' | 'recipe' | 'triage';
 
 /**
  * Pull the recipe out of a drafting session's last message.

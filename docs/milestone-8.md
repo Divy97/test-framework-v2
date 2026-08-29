@@ -20,7 +20,7 @@ wedged suite.
 | **8b** the recipe's own test command is judged where the agent will be judged | M7 defect 3, "still open" | built |
 | **8c** the info request says what was actually missing | M7: "the info-request is a template" | built |
 | **8d** a suite that is already red on the reported behaviour | M7: "an existing failing test is a free Tier 1" | built |
-| **8e** triage, before a container starts | M7: "the cheapest available reduction in false Tier 3s" | |
+| **8e** triage, before a container starts | M7: "the cheapest available reduction in false Tier 3s" | built |
 | **8f** onboarding proves the repository, not just the recipe | M7: "onboarding proves a recipe" | |
 | **8g** the sham-fix control survives a repository with dependencies | M7's predicted limitation, observed | |
 
@@ -201,3 +201,54 @@ satisfies every other clause and is still refused.
   the right reason in its own words is not credited, and `prompts/repro.md` says so
   rather than inviting the agent to contort someone else's test into printing our
   string. The ordinary run stays Tier 2, and that is the honest expectation.
+
+## 8e · triage, before a container starts
+
+Milestone 7: *"The reporter is at the keyboard at t=0 — the only moment a question
+is cheap."* Twenty minutes later they are somewhere else, and the four-item
+checklist that arrives then is a template nobody answers.
+
+So a cheap model now reads the report against the repository's file listing before
+any container starts, and answers one question: could an engineer who has never seen
+this project begin? If not, it names the single most useful missing fact, and the
+engine asks it immediately.
+
+**It never gates, and that is the design rather than timidity.** This project's own
+precedent is 7c's: *a check that convicts honest work does not get to end runs* —
+and the thing convicting here would be a cheap model's opinion of somebody's bug
+report. So the question is asked and the run proceeds; the two race. If the run
+wins, the reporter gets a pull request and the question cost a cent. If the gate
+holds, the answer is already on its way.
+
+The comment says three things, and each one is there for a reason: that a run has
+started (the engine used to say nothing at all until it was finished), the question,
+and **where the question came from** — a model reading their report — because a
+question whose provenance is visible is one the reporter can also dismiss.
+
+### The parts that needed building
+
+- **`askOnce`.** `runAgentLoop` could not serve this: it sends `thinking: adaptive`
+  and `output_config.effort`, which the cheap models this exists for reject
+  outright, and it offers a tool surface to a caller with nothing to execute. One
+  prompt, one answer, no tools — and both providers, because
+  [ADR-0015](adr/0015-the-model-is-behind-an-adapter.md) made the model an adapter
+  and a capability that worked on one provider would quietly undo that.
+- **A cheap model by name.** `claude-haiku-4-5`, and `anthropic/claude-haiku-4-5` on
+  the OpenRouter path — which is this project's *default* provider, so without the
+  second name the cheap path would have asked its one-sentence question of a
+  thinking model.
+- **A parser that refuses to invent.** The first non-empty line, only if it contains
+  a `?`. A model that ignores the instruction and diagnoses the bug instead gets
+  nothing posted — the engine asserting an unmeasured cause is the one thing it
+  never does.
+
+### The bug in the first draft of the test
+
+Three of the eight triage tests passed on a version where **triage never worked at
+all**: the fixture speaks the Messages API, the test did not name a provider, this
+project's default provider is OpenRouter, and the Anthropic-shaped answer came back
+through the OpenRouter branch as `null`. Every assertion expecting `null` passed.
+
+It is written down because it is the same shape the project has hit repeatedly — a
+test passing for a reason unrelated to the code — and because the thing that caught
+it was having the positive case at all.

@@ -24,7 +24,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { BetaRunnableTool } from '@anthropic-ai/sdk/lib/tools/BetaRunnableTool';
 import type { AgentFinishedV1 } from './events.js';
-import { DEFAULT_OPENROUTER_MODEL, runOpenRouterLoop } from './openrouter.js';
+import { DEFAULT_OPENROUTER_MODEL, OPENROUTER_BASE, runOpenRouterLoop } from './openrouter.js';
 import { TOOL_SCHEMAS } from './tools.js';
 
 /** The model v1.5 runs on, and the thinking configuration ADR-0011's milestone names. */
@@ -215,6 +215,85 @@ export type LoopOptions = {
  * failure to observe. `stopped` says which it was, so a transcript that was cut
  * off can never read as one that finished.
  */
+/**
+ * The model this project asks a QUESTION of, as opposed to hands a job to.
+ *
+ * Named separately from `MODEL` because the two decisions are unrelated: the agent
+ * model is chosen for whether it can write a reproduction, and this one is chosen
+ * for costing almost nothing, since it reads an issue and answers in one sentence.
+ * Milestone 7 priced the work it does at "a fraction of a cent", and that price is
+ * the reason it can run on every intake.
+ */
+export const ASK_MODEL = 'claude-haiku-4-5';
+
+/**
+ * The same model, named the way OpenRouter names it — which is this project's
+ * DEFAULT provider (see `providerName`), so without this line the cheap path would
+ * have asked a one-sentence question of a thinking model at ten times the price.
+ */
+export const ASK_MODEL_OPENROUTER = 'anthropic/claude-haiku-4-5';
+
+/**
+ * One prompt, one answer, no tools, no loop.
+ *
+ * `runAgentLoop` cannot serve this: it sends `thinking: adaptive` and
+ * `output_config.effort`, which the cheap models this exists for reject outright —
+ * and it offers a tool surface to a caller with nothing to execute. Two providers
+ * here rather than one, because ADR-0015 made the model an adapter and a capability
+ * that works on one provider only would quietly undo that.
+ *
+ * Never throws, and answers `null` for every failure. Its callers use it to make a
+ * run BETTER, never to decide whether a run happens — so a model that is down, out
+ * of credit or slow must cost nothing but the answer it would have given.
+ */
+export async function askOnce(options: {
+  prompt: string;
+  provider?: string;
+  apiKey?: string;
+  authToken?: string;
+  baseURL?: string;
+  model?: string;
+  maxTokens?: number;
+}): Promise<string | null> {
+  const maxTokens = options.maxTokens ?? 512;
+  try {
+    if (providerName(options.provider) === 'openrouter') {
+      const key = options.apiKey ?? options.authToken ?? process.env.OPENROUTER_API_KEY;
+      const response = await fetch(`${options.baseURL ?? OPENROUTER_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${key ?? ''}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: options.model ?? ASK_MODEL_OPENROUTER,
+          max_tokens: maxTokens,
+          messages: [{ role: 'user', content: options.prompt }],
+        }),
+      });
+      if (!response.ok) return null;
+      const body = (await response.json()) as {
+        choices?: { message?: { content?: string } }[];
+      };
+      return body.choices?.[0]?.message?.content?.trim() || null;
+    }
+    const client = new Anthropic({
+      ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+      ...(options.authToken === undefined ? {} : { authToken: options.authToken }),
+      ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
+    });
+    const message = await client.messages.create({
+      model: options.model ?? ASK_MODEL,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: options.prompt }],
+    });
+    const text = message.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n')
+      .trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
 export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscript> {
   if (providerName(options.provider) === 'openrouter') {
     const apiKey = options.apiKey ?? options.authToken ?? process.env.OPENROUTER_API_KEY;

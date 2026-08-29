@@ -376,6 +376,8 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
     title: string;
     body: string;
     turns: Parameters<typeof fakeModel>[0];
+    /** What TRIAGE answers (8e). `ENOUGH` by default, which posts nothing. */
+    triage?: string;
   }) => {
     execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
     const fixture = demoRepo();
@@ -389,7 +391,10 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
       }
       return new Response('{}', { status: 201 });
     }) as typeof fetch;
-    const model = await fakeModel(options.turns);
+    const model = await fakeModel(
+      options.turns,
+      options.triage === undefined ? {} : { answer: options.triage },
+    );
     models.push(model);
     const events: RunEvent[] = [];
     const mapped = issueIntake({ ...delivery(options.body), issue: { ...delivery(options.body).issue, title: options.title } });
@@ -451,6 +456,46 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
     expect(comment.body).toContain('> There is no Export control anywhere in this project');
     expect(comment.body).toMatch(/not a finding: nothing here checked it/);
     expect(comment.body).not.toMatch(/1\. The exact steps/);
+  }, 900_000);
+
+  test('a missing fact is asked about at t=0, while the run is still going', async () => {
+    // 8e, end to end. The reporter is at the keyboard the moment they file, and
+    // nowhere near it twenty minutes later — so the question that would rescue this
+    // run has to be asked BEFORE the sandbox, not after the verdict.
+    //
+    // It never gates. This run still goes all the way to its Tier 3, and the comment
+    // count is what proves both halves: the question at the start, the verdict at
+    // the end, and the run in between unaffected by either.
+    const { result, calls } = await runIssue({
+      title: 'Export does nothing',
+      body: 'I click export and nothing happens.',
+      triage: 'Which account was signed in when you clicked export?',
+      turns: [
+        {
+          content: [
+            {
+              type: 'text',
+              text: 'There is no Export control anywhere in this project. I cannot reproduce this and am committing nothing.',
+            },
+          ],
+          stop_reason: 'end_turn',
+        },
+      ],
+    });
+
+    const comments = calls.filter((c) => c.url.includes('/comments'));
+    expect(comments).toHaveLength(2);
+
+    const asked = comments[0]!.body as { body: string };
+    expect(asked.body).toContain('A run has started on this');
+    expect(asked.body).toContain('> Which account was signed in when you clicked export?');
+    // Where it came from, so the reporter can weigh it. A question with no
+    // provenance reads as a bot demanding homework.
+    expect(asked.body).toContain('came from a model reading your report');
+
+    // And the run was not waiting on it.
+    expect(result.state.status).toBe('unresolved');
+    expect(result.state.pr).toBeNull();
   }, 900_000);
 
   test('total-rounding: a reproduction that passes on base shuts the gate, and no fix agent is spawned', async () => {
