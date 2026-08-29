@@ -203,8 +203,17 @@ export function readPlaneConfig(env: NodeJS.ProcessEnv = process.env): PlaneConf
 
 if (process.argv[1]?.endsWith('plane-server.ts') || process.argv[1]?.endsWith('plane-server.js')) {
   process.loadEnvFile?.('.env');
-  startPlane(readPlaneConfig()).catch((error: unknown) => {
-    console.error(String((error as Error)?.message ?? error));
-    process.exitCode = 1;
-  });
+  // Inside the async function, not as its argument. `readPlaneConfig()` throws
+  // SYNCHRONOUSLY when the environment is incomplete, and evaluating it as an argument
+  // put that throw outside the `catch` below — so an operator missing one variable got
+  // a stack trace instead of the list naming what each missing thing costs. The
+  // message was always right; nobody was ever shown it.
+  void (async () => {
+    try {
+      await startPlane(readPlaneConfig());
+    } catch (error) {
+      console.error(String((error as Error)?.message ?? error));
+      process.exitCode = 1;
+    }
+  })();
 }
