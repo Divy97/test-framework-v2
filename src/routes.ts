@@ -19,7 +19,17 @@ import { listRuns, readRunRow, readUsage } from './readmodel.js';
 import { loadProof, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
 import { readRun } from './store.js';
 import type { Route } from './sse.js';
-import { escapeHtml, evidencePage, landingPage, onboardPage, repositoriesPage, runsPage } from './web.js';
+import type { Session } from './auth.js';
+import { listRunners, pairRunner, revokeRunner } from './plane.js';
+import {
+  escapeHtml,
+  evidencePage,
+  landingPage,
+  onboardPage,
+  repositoriesPage,
+  runnersPage,
+  runsPage,
+} from './web.js';
 
 /**
  * Is this state-changing request coming from our own page?
@@ -92,9 +102,51 @@ export function dashboardRoutes(options: {
    * two containers have finished.
    */
   onApproved?: (repo: string) => void;
+  /**
+   * Who is asking, and what they may act on (9c). Absent, this is the LOCAL surface:
+   * one operator, bound to 127.0.0.1, and the origin check is the whole control — which
+   * is what ADR-0013 has always described and what `serve.ts` still runs.
+   *
+   * Present, this is the hosted plane, and the difference is not cosmetic. The one write
+   * here stores shell commands the engine executes verbatim; unauthenticated on a public
+   * address, it is remote code execution on somebody's runner. So every page is scoped
+   * to the installations GitHub says this person may see, and the write is refused
+   * outright for anything else.
+   */
+  auth?: {
+    session: (headers: Record<string, string | string[] | undefined>) => Promise<Session | null>;
+    installations: (session: Session) => Promise<number[]>;
+  };
 }): Route {
   const { client } = options;
   const install = options.installUrl ?? installUrl();
+
+  /**
+   * The repositories this request may see, or `null` for "everything" in local mode.
+   *
+   * Derived from GitHub's answer each time rather than cached: an installation list held
+   * anywhere of ours is correct until somebody is removed from an org and confidently
+   * wrong afterwards.
+   */
+  const visible = async (
+    headers: Record<string, string | string[] | undefined>,
+  ): Promise<{ session: Session; repos: Set<string> } | null | 'anonymous'> => {
+    if (!options.auth) return null;
+    const session = await options.auth.session(headers);
+    if (!session) return 'anonymous';
+    const allowed = new Set(await options.auth.installations(session));
+    const installations = await listInstallations(client);
+    return {
+      session,
+      repos: new Set(installations.filter((i) => allowed.has(i.installationId)).map((i) => i.repo)),
+    };
+  };
+
+  /** Send a browser to log in; tell an API client plainly. */
+  const anonymous = (path: string) =>
+    path.startsWith('/api/')
+      ? json({ error: 'not signed in' }, 401)
+      : { status: 302, type: 'text/plain', body: 'sign in\n', headers: { location: '/auth/github' } };
 
   return async ({ method, path, query, body, headers }) => {
     if (method !== 'GET' && method !== 'POST') return null;
@@ -114,7 +166,11 @@ export function dashboardRoutes(options: {
     if (method === 'GET' && (path === '/' || path === '')) return html(landingPage(install));
 
     if (method === 'GET' && path === '/repos') {
-      const installations = await listInstallations(client);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      const installations = (await listInstallations(client)).filter(
+        (installation) => who === null || who.repos.has(installation.repo),
+      );
       const runs = await listRuns(client);
       const rows = await Promise.all(
         installations.map(async (installation) => ({
@@ -126,20 +182,29 @@ export function dashboardRoutes(options: {
       return html(repositoriesPage(rows));
     }
 
-    if (method === 'GET' && path === '/runs') {
+    if (method === 'GET' && (path === '/runs' || path === '/api/runs')) {
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
       const repo = query.get('repo') ?? undefined;
-      return html(runsPage(await listRuns(client, repo), repo));
-    }
-
-    if (method === 'GET' && path === '/api/runs') {
-      return json(await listRuns(client, query.get('repo') ?? undefined));
+      // Scoped by REPOSITORY rather than by a query the caller controls: a `?repo=`
+      // naming somebody else's project must return nothing, not their run list.
+      const runs = (await listRuns(client, repo)).filter(
+        (run) => who === null || who.repos.has(run.repo),
+      );
+      return path === '/api/runs' ? json(runs) : html(runsPage(runs, repo));
     }
 
     const run = /^\/runs\/([^/]+)$/.exec(path);
     if (method === 'GET' && run) {
       const runId = decodeURIComponent(run[1]!);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, runId);
-      if (!row) return html(`<!doctype html><title>not found</title><p>No such run.</p>`, 404);
+      // The same answer for "no such run" and "not yours". A run id is a uuid, so this
+      // costs a legitimate user nothing and tells a stranger nothing about what exists.
+      if (!row || (who !== null && !who.repos.has(row.repo))) {
+        return html(`<!doctype html><title>not found</title><p>No such run.</p>`, 404);
+      }
       // The page is rendered from the LOG, not from the row. The row is a cache and says
       // so; an evidence view built from a cache would be evidence at one remove, which is
       // the one thing this screen cannot be.
@@ -152,14 +217,72 @@ export function dashboardRoutes(options: {
 
     const api = /^\/api\/runs\/([^/]+)$/.exec(path);
     if (method === 'GET' && api) {
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, decodeURIComponent(api[1]!));
-      return row ? json(row) : json({ error: 'no such run' }, 404);
+      return row && (who === null || who.repos.has(row.repo))
+        ? json(row)
+        : json({ error: 'no such run' }, 404);
+    }
+
+    // RUNNERS (9c). The pairing token is minted here, and it is minted *because* a human
+    // is authenticated: one login for a person, one credential for a machine, and the
+    // second is a consequence of the first rather than a second thing to remember.
+    const runners = /^\/repos\/(.+)\/runners$/.exec(path);
+    const revoking = /^\/repos\/(.+)\/runners\/([^/]+)\/revoke$/.exec(path);
+    if (runners || revoking) {
+      const repo = decodeURIComponent((revoking ?? runners)![1]!);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      if (who !== null && !who.repos.has(repo)) {
+        return html(`<!doctype html><title>not connected</title><p>${escapeHtml(repo)} is not connected.</p>`, 404);
+      }
+      const installation = await loadInstallation(client, repo);
+      if (!installation) {
+        return html(`<!doctype html><title>not connected</title><p>${escapeHtml(repo)} is not connected.</p>`, 404);
+      }
+
+      if (method === 'POST' && revoking) {
+        await revokeRunner(client, decodeURIComponent(revoking[2]!));
+        return {
+          status: 303,
+          type: 'text/plain',
+          body: 'revoked\n',
+          headers: { location: `/repos/${encodeURIComponent(repo)}/runners` },
+        };
+      }
+
+      if (method === 'POST' && runners) {
+        const name = new URLSearchParams(await body()).get('name')?.trim();
+        if (!name) return html(runnersPage(repo, await listRunners(client, installation.installationId)), 400);
+        const { token } = await pairRunner(client, { installationId: installation.installationId, name });
+        // Rendered rather than redirected, because the token exists in exactly one
+        // response and a 303 would throw it away on the way to the page that cannot
+        // show it again.
+        return html(
+          runnersPage(repo, await listRunners(client, installation.installationId), { token, name }),
+        );
+      }
+
+      if (method === 'GET' && runners) {
+        return html(runnersPage(repo, await listRunners(client, installation.installationId)));
+      }
     }
 
     // ONBOARDING. `owner/repo` has a slash in it, so the repo is the rest of the path.
     const onboard = /^\/repos\/(.+)\/onboard$/.exec(path);
     if (onboard) {
       const repo = decodeURIComponent(onboard[1]!);
+      // BEFORE the installation lookup, and before the body is read. This is the write
+      // that stores commands the engine executes verbatim, so the question "may you"
+      // comes first and is answered by GitHub, not by us (ADR-0013, ADR-0019).
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      if (who !== null && !who.repos.has(repo)) {
+        // 404 rather than 403: a stranger probing repository names learns nothing about
+        // which ones this service knows.
+        return html(`<!doctype html><title>not connected</title><p>${escapeHtml(repo)} is not connected.</p>`, 404);
+      }
       const installation = await loadInstallation(client, repo);
       if (!installation) {
         // ESCAPED. `repo` is a path segment, so this string is whatever a stranger put

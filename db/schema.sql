@@ -199,3 +199,26 @@ create table if not exists jobs (
 
 -- Partial, because the queue is only ever read for jobs nobody has taken.
 create index if not exists jobs_queued on jobs (installation_id, queued_at) where runner_id is null;
+
+-- Who is logged in (9c). GitHub OAuth is the only human authentication there is.
+--
+-- The row holds a user-to-server token, and that is a real secret worth naming: it is
+-- what answers "which installations may this person see", asked of GitHub at the moment
+-- of every authorization decision rather than cached into a permission model of our own.
+-- It is narrower than a personal access token by construction — a user-to-server token
+-- can only reach repositories this App is installed on — which is the same reasoning
+-- ADR-0012 uses to reject PATs, applied to the human half.
+--
+-- Deleted on logout and expired by `created_at`, so the window is bounded in both
+-- directions. No refresh: a session that has aged out is a login, not a renewal.
+create table if not exists sessions (
+  id         text        primary key,   -- 32 random bytes, base64url; never a JWT
+  github_id  bigint      not null,
+  login      text        not null,
+  avatar_url text        not null default '',
+  token      text        not null,
+  created_at timestamptz not null default now(),
+  seen_at    timestamptz not null default now()
+);
+
+create index if not exists sessions_github on sessions (github_id);

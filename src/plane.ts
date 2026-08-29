@@ -86,6 +86,27 @@ export async function verifyRunner(client: pg.Client, token: string | undefined)
   return { id: row.id, installationId: Number(row.installation_id), name: row.name };
 }
 
+/** Every machine paired to an installation, revoked ones included — the row is the record. */
+export async function listRunners(
+  client: pg.Client,
+  installationId: number,
+): Promise<(Runner & { pairedAt: string; lastSeen: string | null; revokedAt: string | null })[]> {
+  const { rows } = await client.query(
+    `select id, installation_id, name, paired_at, last_seen, revoked_at
+       from runners where installation_id = $1 order by paired_at desc`,
+    [installationId],
+  );
+  const iso = (value: Date | null) => (value === null ? null : new Date(value).toISOString());
+  return rows.map((row) => ({
+    id: row.id,
+    installationId: Number(row.installation_id),
+    name: row.name,
+    pairedAt: new Date(row.paired_at).toISOString(),
+    lastSeen: iso(row.last_seen),
+    revokedAt: iso(row.revoked_at),
+  }));
+}
+
 /** Stop a machine writing, without losing who wrote what. */
 export async function revokeRunner(client: pg.Client, runnerId: string): Promise<void> {
   await client.query('update runners set revoked_at = now() where id = $1 and revoked_at is null', [runnerId]);
