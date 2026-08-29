@@ -144,3 +144,58 @@ create table if not exists recipe_drafts (
   draft      jsonb       not null,
   drafted_at timestamptz not null default now()
 );
+
+-- ── The control plane (milestone 9) ───────────────────────────────────────────
+--
+-- Both tables are CONFIGURATION AND DISPATCH, not the log — the same class as
+-- `installations` and `recipes`, and for the same reason: they describe the current
+-- state of an arrangement between a person and this service, not a fact about a run.
+-- What a run did stays in `events`, where nothing can edit it.
+--
+-- The split matters for one specific invariant. ADR-0009 says the orchestrator is the
+-- trusted writer and there is exactly one of it; hosted, that orchestrator is a runner
+-- on somebody's laptop. Keeping dispatch OUT of the log is what lets the plane decide
+-- who may write without becoming a second writer itself: it mints the `run_id` here,
+-- and every event under that id still comes from one runner.
+
+-- A machine that has been paired to an installation, and may write its events.
+--
+-- `token_hash`, never the token: it is shown once at pairing and is not recoverable
+-- afterwards. A stolen database therefore yields no runner credential — the same
+-- reasoning ADR-0012 applies to the App key, one layer down.
+create table if not exists runners (
+  id              uuid        primary key,
+  installation_id bigint      not null,
+  name            text        not null,
+  token_hash      text        not null unique,
+  paired_at       timestamptz not null default now(),
+  -- Presence. A long-poll that returns empty still stamps this, so "no runner is
+  -- online" and "no runner was ever paired" are different answers to a queued job.
+  last_seen       timestamptz,
+  -- Revocation is a timestamp rather than a delete, because a revoked runner\'s
+  -- events are still in the log and a reader asking "who wrote this" deserves a row.
+  revoked_at      timestamptz
+);
+
+create index if not exists runners_installation on runners (installation_id);
+
+-- One unit of work: a delivery the plane accepted and a runner has to execute.
+--
+-- The `run_id` is minted HERE, before any runner sees it, and that is what makes
+-- authorization possible at all: appending to a run means proving this job was
+-- dispatched to you. A runner that invents a `run_id` matches no row and is refused.
+create table if not exists jobs (
+  run_id          uuid        primary key,
+  installation_id bigint      not null,
+  repo            text        not null,
+  -- The delivery as it arrived, so a re-dispatch replays the same input rather than
+  -- a reconstruction of it.
+  intake          jsonb       not null,
+  queued_at       timestamptz not null default now(),
+  runner_id       uuid        references runners (id),
+  dispatched_at   timestamptz,
+  finished_at     timestamptz
+);
+
+-- Partial, because the queue is only ever read for jobs nobody has taken.
+create index if not exists jobs_queued on jobs (installation_id, queued_at) where runner_id is null;
