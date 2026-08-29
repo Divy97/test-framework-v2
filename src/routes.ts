@@ -285,7 +285,22 @@ export function dashboardRoutes(options: {
       }
 
       if (method === 'POST' && revoking) {
-        await revokeRunner(client, decodeURIComponent(revoking[2]!));
+        // The installation, not just the repository in the path. Authorizing the repo
+        // and then trusting the runner id from the URL let anyone with access to ANY
+        // repository revoke somebody else's runner — the id was never checked against
+        // the installation being viewed. `revokeRunner` now requires the installation
+        // and updates nothing on a mismatch.
+        const revoked = await revokeRunner(
+          client,
+          decodeURIComponent(revoking[2]!),
+          installation.installationId,
+        );
+        if (!revoked) {
+          // The same answer a runner that does not exist gets. A revoke that quietly
+          // reported success for somebody else's machine would be the bug wearing a
+          // redirect.
+          return html(`<!doctype html><title>not found</title><p>No such runner.</p>`, 404);
+        }
         return {
           status: 303,
           type: 'text/plain',

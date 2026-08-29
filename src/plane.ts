@@ -107,9 +107,33 @@ export async function listRunners(
   }));
 }
 
-/** Stop a machine writing, without losing who wrote what. */
-export async function revokeRunner(client: pg.Client, runnerId: string): Promise<void> {
-  await client.query('update runners set revoked_at = now() where id = $1 and revoked_at is null', [runnerId]);
+/**
+ * Stop a machine writing, without losing who wrote what.
+ *
+ * Scoped to an installation, and REQUIRED to be — not because the caller cannot be
+ * trusted to check, but because one of them did not. The route authorized the
+ * repository in its path and then passed the runner id from the URL straight through,
+ * so anyone with access to any repository could revoke somebody else's runner by id: a
+ * cross-tenant denial of service, found by review after it shipped.
+ *
+ * The check belongs here rather than at the call site for exactly that reason. A future
+ * route that accepts a runner id from a URL cannot forget an argument it has to supply,
+ * and a mismatch updates nothing rather than the wrong row.
+ *
+ * Returns whether it revoked anything, so a caller can tell "not yours" from "already
+ * revoked" instead of reporting success either way.
+ */
+export async function revokeRunner(
+  client: pg.Client,
+  runnerId: string,
+  installationId: number,
+): Promise<boolean> {
+  const { rowCount } = await client.query(
+    `update runners set revoked_at = now()
+       where id = $1 and installation_id = $2 and revoked_at is null`,
+    [runnerId, installationId],
+  );
+  return (rowCount ?? 0) > 0;
 }
 
 /** Note that a runner is alive. Called on every poll, so presence is never stale by more than one. */

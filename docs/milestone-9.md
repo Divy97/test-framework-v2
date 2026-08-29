@@ -193,6 +193,23 @@ first rather than a second thing to remember. The token is rendered once — the
 a hash, so "show it again" is not a feature declined but a thing that cannot be done, and
 the page says so rather than implying a lookup exists.
 
+### The IDOR review found after it shipped
+
+The pairing routes authorized the **repository** in the path and then passed the runner
+id from the URL straight through to `revokeRunner`. So a valid session on *any*
+repository could revoke *any* machine whose id it knew — a cross-tenant denial of
+service, and the same shape as the run-id checks done correctly two routes away.
+
+The fix is at the data layer rather than the route: `revokeRunner` requires an
+installation id and filters on it, so a future caller cannot forget an argument it has
+to supply, and a mismatch updates nothing instead of the wrong row. It returns whether
+it revoked anything, so the route can answer 404 rather than reporting success for
+somebody else's machine.
+
+An audit of every id taken from a URL — nine of them — found no others: the four runner
+routes go through `appendFromRunner`'s job-ownership check, the three run pages check
+the row's repository, and onboarding checks the repository itself.
+
 ### The plane, as a program
 
 `src/plane-server.ts`: one address GitHub can always reach, the App key, the log, and the
