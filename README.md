@@ -66,10 +66,16 @@ and on a Tier 3 it shows the gate **refusing to attempt a fix**, with no diff at
 Every other product in this category has a run list; the screen that is rare is the one
 where a refusal is as legible as a success.
 
-It has exactly **one write** — a human approving a recipe — and that asymmetry is the
-design: everything else on it is a projection that can be rebuilt, so a dashboard that
-could start runs or edit evidence would be a second producer, and ADR-0009 has one. The
-write is refused unless it comes from the dashboard's own page. Binding to `127.0.0.1` is
+It has almost **no writes**, and that asymmetry is the design: everything else on it is a
+projection that can be rebuilt, so a dashboard that could start runs or edit evidence would be
+a second producer, and ADR-0009 has one. The writes it does have are a human approving a
+recipe, pairing or revoking a runner, and asking for a run's artifacts to be destroyed — every
+one of them a decision a person makes, none of them a fact about anybody's bug.
+
+Each is refused unless it comes from the dashboard's own page, and hosted, unless GitHub says
+you may act on that repository. That second check is not decoration: approving a recipe stores
+commands the engine executes verbatim, so an unauthenticated POST on a public address is remote
+code execution on somebody else's runner. Binding to `127.0.0.1` is
 not a defence there and it is worth saying why, because the intuition is exactly what
 makes the bug easy to ship: the same-origin policy stops another page *reading* our
 response, never stops it *sending* the request. Approving a recipe stores commands the
@@ -80,6 +86,46 @@ which is precisely the control ADR-0013 says onboarding rests on.
 drops `run_projection` and replays `events` into byte-identical rows. That is the property
 that makes "there is no runs table" still true with a runs table in the schema: the table
 holds no truth, and a test drops it, replays, and compares the bytes.
+
+## Two halves, because a laptop cannot receive a webhook
+
+A dead ngrok URL is what started milestone 9. The App had been installed for three weeks,
+GitHub had **never delivered anything**, and the empty repository list on the dashboard was
+entirely correct — a process behind a home router cannot receive an inbound webhook, and every
+tunnel that stands in for one dies overnight.
+
+The engine needs Docker and a machine. A product needs an address GitHub can always reach.
+Those are different requirements, so they are different processes:
+
+```
+ ┌─ CONTROL PLANE ─ one address, forever ──────────┐        ┌─ RUNNER ─ your machine ─────┐
+ │  the GitHub App key · the event log · the UI    │        │  Docker · the model key     │
+ │  GitHub OAuth · a queue of jobs                 │◄───────┤  dials OUT, never listens   │
+ │  mints run ids · authorizes every append        │  poll  │  writes every event         │
+ │  NO Docker · NO model key · executes nothing    │  ship  │  holds NO GitHub key        │
+ └─────────────────────────────────────────────────┘        └─────────────────────────────┘
+```
+
+The rule that survives the split is the one this whole system rests on: **the plane mints the
+run id and writes no events.** It decides that a run exists and who may write it; the runner
+still authors every event from seq 1, so ADR-0009's single producer is intact
+([ADR-0019](docs/adr/0019-who-writes-when-the-runner-is-not-ours.md)).
+
+What hosting **cost** is written down rather than glossed. The runner is a binary on hardware
+the user owns, so "the engine executed this" becomes "this installation's runner observed it".
+Evidence is scoped to the installation that produced it, there are no public run pages and no
+shareable evidence links, and the day one is proposed that decision expires and attestation is
+required. ADR-0006 carries the amendment.
+
+One login: GitHub OAuth, and authorization asked of GitHub on every decision rather than kept
+in a roles table of our own — which would be a second definition of who owns a repository, free
+to disagree on the day somebody leaves an org. The runner's credential is a pairing token,
+minted *because* a human was authenticated, so a person signs in once and a machine gets a
+credential as a consequence.
+
+And deleting a run deletes **bytes, never rows**. The log is untouched, the hashes in it stay
+exactly where they were now pointing at nothing, and the page says so — because destroyed on
+request and gone missing are different things, and only one of them is a bug.
 
 ## Two credentials, and where they are not
 
@@ -161,6 +207,7 @@ The reported symptom is also observed on **both** sides now. Present on base is 
 16. [The second arm: the project's own suite, on both commits](docs/adr/0016-the-second-arm.md)
 17. [Environment secrets, and the network route that has to close first](docs/adr/0017-environment-secrets-and-the-network-that-has-to-close.md)
 18. [A reproduction the repository already had](docs/adr/0018-a-reproduction-the-repository-already-had.md)
+19. [Who writes, when the runner is not ours](docs/adr/0019-who-writes-when-the-runner-is-not-ours.md)
 
 The full decision record from the founding design session: [SHARED-UNDERSTANDING.md](SHARED-UNDERSTANDING.md).
 
@@ -200,6 +247,13 @@ The engine works; the product does not exist yet.
 **[Milestone 7](docs/milestone-7.md) has now been driven by a real model, and every change fired.** `anthropic/claude-sonnet-5` through OpenRouter took the same `shipped-filter` issue to a credited **Tier 2** in 95 seconds for **$0.064**: base red **twice** for the reported symptom, the symptom **gone** from all three fix runs, the project's own suite green on both commits, **98/103** under `scoring: 2` — where the old scale's best was 80/85. The agent put the symptom on the failing path prompted by nothing but the rewritten `prompts/repro.md`, which is the ground that could not previously be scored.
 
 Two earlier attempts found a **model** rather than a prompt, and are worth recording because the engine's own diagnosis was the part that was wrong. `moonshotai/kimi-k2-thinking` failed 2/2 by ending turns *inside its own reasoning* — once leaking its next call as text, once stopping mid-sentence while planning the commit, having already explored the repository, driven the browser, seen the bug and written the reproduction. The gate held correctly both times and no false pull request was opened; but the run reported *"the agent handed over a commit the repository already had"*, an accusation of idleness against a model that had done nearly everything. `stopped: 'malformed_tool_call'` now names it. `probeToolCalling` cannot: it is one turn, and that model makes structured calls perfectly well for seven of them first ([ADR-0015](docs/adr/0015-the-model-is-behind-an-adapter.md)).
+
+**[Milestone 9](docs/milestone-9.md) makes it a thing other people can run.** A control plane
+that GitHub can always reach, a runner that dials out of somebody's laptop, GitHub OAuth in
+front of the one write that stores executable commands, and deletion that destroys bytes without
+editing a log. The optimization target changed with it, and `SHARED-UNDERSTANDING.md` says so
+rather than absorbing it quietly: the filter is now *usable by someone who did not write it,
+without weakening a claim it makes* — and ADR-0019 is the first test of the second clause.
 
 **[Milestone 8](docs/milestone-8.md) is milestone 7's own list, and nothing else.** Seven items that milestone had analysed, priced and left: a wall clock and `--pull never` for the one wait nothing bounded (8a); the recipe's test command run in the container that judges, which found a paragraph in the agent's prompt that 7e had made false three commits earlier (8b); a Tier 3 comment that quotes the fact the agent said it lacked instead of a four-item checklist, and stops asking the reporter for anything when one of our own ceilings ended the run (8c); Tier 1 for a reproduction the repository already contained (8d, [ADR-0018](docs/adr/0018-a-reproduction-the-repository-already-had.md)); triage at t=0, which never gates (8e); a proving run at approval, so whether a recipe works is known when a human presses the button rather than in the middle of a stranger's issue (8f); and the sham-fix control made able to run at all on a repository with dependencies (8g).
 
