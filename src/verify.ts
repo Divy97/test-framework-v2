@@ -828,7 +828,22 @@ async function observe(
         },
       });
       await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv);
-      await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv);
+      // `-dff`, NOT `-xdff`, and this is 8g. The ignored paths here are the
+      // repository's installed dependencies, hardlinked into this clone from the
+      // environment snapshot before anything ran (7e) — the control did not create
+      // them and removing them takes the project's test runner with them. Milestone 7
+      // predicted the consequence and then observed it exactly: draw 1 exits 127 on
+      // any repository with dependencies, which is conservative (127 is never green,
+      // so no honest reproduction is ever accused) and blind (the check that would
+      // have caught an identity oracle simply did not run).
+      //
+      // What `-x` was protecting against here is already handled differently: the
+      // sham is a tracked-file edit plus a commit, and `reset --hard` above undoes
+      // both. And a reproduction that plants an ignored flag between draws is the
+      // order-dependence that repeated draws exist to EXPOSE — this file's own
+      // reasoning about the base repeats says the tree is shared on purpose, because
+      // isolating the draws would hide it.
+      await git(['clean', '--quiet', '-dff'], repoPath, gitEnv);
       controls += 1;
       await applyRepro();
       }
@@ -862,7 +877,11 @@ async function observe(
     // must not hand the fix phase a dirty tree — the contamination the container
     // split exists to prevent.
     await git(['reset', '--hard', '--quiet', baseSha], repoPath, gitEnv).catch(() => {});
-    await git(['clean', '--quiet', '-xdff'], repoPath, gitEnv).catch(() => {});
+    // `-dff` for the same reason as inside the loop (8g). The phase boundary below
+    // still uses `-x`, deliberately and unchanged — that scrub is about what the base
+    // phase could leave for the fix phase to read, and in production those are
+    // different containers anyway, each restoring its own environment.
+    await git(['clean', '--quiet', '-dff'], repoPath, gitEnv).catch(() => {});
     // No `applyRepro()` here. It was the one line the C1 fix ADDED that could
     // still end the run — outside the catch, uncaught, and throwing while
     // `progress.phase` is still `base`, so `demonstrated()` read it as a
