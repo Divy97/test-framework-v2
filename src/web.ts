@@ -172,7 +172,7 @@ export function layout(title: string, body: string): string {
 <body>
 <header class="top">
 <a class="brand" href="/">Test Framework</a>
-<nav><a href="/">Overview</a><a href="/runs">Runs</a></nav>
+<nav><a href="/repos">Repositories</a><a href="/runs">Runs</a></nav>
 </header>
 <main>
 ${body}

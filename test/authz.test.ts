@@ -203,3 +203,70 @@ describe('the local surface is unchanged', () => {
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(true);
   });
 });
+
+/**
+ * The front door, which for a while was the one page that never asked.
+ *
+ * Every other route here calls `visible(headers)` first. `/` did not — it rendered the
+ * landing page for everyone and decided the sign-in link from `options.auth !== undefined`,
+ * which answers "is login configured on this deployment", not "is this person logged
+ * out". So a signed-in user who typed the bare hostname was shown a marketing page
+ * offering them a sign-in they had already done, with no link to their own repositories.
+ *
+ * Nothing was broken underneath: the session was valid and `/repos` worked. The page
+ * simply never looked, which is the kind of bug a test of the routes it DID gate cannot
+ * find.
+ */
+describe('the landing page asks who you are', () => {
+  it('a signed-in visitor is sent to their repositories, not offered a sign-in', async () => {
+    const response = await call(surface(), 'GET', '/');
+
+    expect(response?.status).toBe(302);
+    expect(response?.headers?.location).toBe('/repos');
+  });
+
+  it('a signed-in visitor with no installations still goes to /repos, which is where the answer is', async () => {
+    // Not a special case worth its own page: `/repos` is precisely the page that says
+    // "you have not installed this anywhere yet".
+    //
+    // This input is also what a GitHub OUTAGE looks like — `installationsFor` answers `[]`
+    // rather than throwing, deliberately, so that a failure to confirm access denies it
+    // rather than granting it. Worth knowing that the front door behaves the same either
+    // way, which it does because it never asks GitHub anything (see below).
+    const response = await call(surface({ installations: [] }), 'GET', '/');
+
+    expect(response?.status).toBe(302);
+    expect(response?.headers?.location).toBe('/repos');
+  });
+
+  it('a signed-out visitor gets the landing page WITH a way in', async () => {
+    const response = await call(surface({ session: null }), 'GET', '/');
+
+    expect(response?.status).toBe(200);
+    expect(response?.body).toContain('href="/auth/github"');
+  });
+
+  it('and locally, where there is no login, the landing page offers none', async () => {
+    // The original reason the line was written the way it was, and it still holds:
+    // one operator on 127.0.0.1, and a sign-in button would lead nowhere.
+    const local = dashboardRoutes({ client: fakeClient(), installUrl: 'https://example.invalid' });
+    const response = await call(local, 'GET', '/');
+
+    expect(response?.status).toBe(200);
+    expect(response?.body).not.toContain('href="/auth/github"');
+  });
+
+  it('asks who you are without asking what you own', async () => {
+    // The property the first version of this fix broke. Reaching for `visible()` here is
+    // the obvious move — it is what every other route does — and it buys an authorization
+    // answer this route never reads: a GitHub `GET /user/installations` and an
+    // `installations` query, on the front door, which then redirects to a page that asks
+    // both again. Two round-trips to render a page that used to do no I/O at all.
+    //
+    // So: a session lookup, and nothing else.
+    const writes: string[] = [];
+    await call(surface({ writes }), 'GET', '/');
+
+    expect(writes.some((sql) => sql.includes('from installations'))).toBe(false);
+  });
+});
