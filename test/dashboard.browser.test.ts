@@ -32,7 +32,7 @@ import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type pg from 'pg';
+import type { Db } from '../src/store.js';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 // TYPE ONLY, and that is load-bearing. `src/browser.ts` reads `ENGINE_CHROMIUM` into a
 // module-level `const` at import time, so a static import here would freeze the default
@@ -96,7 +96,7 @@ const USAGE = [
 ];
 
 /**
- * A `pg.Client` that dispatches on the SQL it is handed.
+ * A `Db` that dispatches on the SQL it is handed.
  *
  * `test/serve.test.ts`'s one-shape fake answers every query with the same rows, which is
  * enough for a service that asks one question. These routes ask seven — installations, the
@@ -105,7 +105,7 @@ const USAGE = [
  * on the query text, and an unrecognised query throws rather than returning `[]`: an empty
  * result renders as "nothing yet", which is a page that passes for a query nobody wrote.
  */
-const fixtureClient = (): pg.Client => {
+const fixtureClient = (): Db => {
   const answer = (sql: string, params: unknown[]): unknown[] => {
     if (sql.includes('from installations where repo = $1')) {
       return INSTALLATIONS.filter((row) => row.repo === params[0]);
@@ -147,7 +147,7 @@ const fixtureClient = (): pg.Client => {
       const rows = answer(sql, params);
       return { rows, rowCount: rows.length };
     },
-  } as unknown as pg.Client;
+  } as unknown as Db;
 };
 
 /**

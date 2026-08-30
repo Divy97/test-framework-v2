@@ -13,7 +13,7 @@ import { createHmac, generateKeyPairSync } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type pg from 'pg';
+import type { Db } from '../src/store.js';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { Intake } from '../src/github.js';
 import type { RunRequest, RunResult } from '../src/run.js';
@@ -51,7 +51,7 @@ const config = (over: Partial<Config> = {}): Config => ({
 });
 
 /**
- * A `pg.Client` that answers per QUERY, not one shape for everything.
+ * A `Db` that answers per QUERY, not one shape for everything.
  *
  * It used to return the same rows to every question, which stopped working the moment
  * the issue path asked two: is this repository still installed (M6a), and does it have an
@@ -74,7 +74,7 @@ const fakeClient = (options: { installed?: boolean; recipe?: unknown } = {}) => 
             : [];
       return { rows, rowCount: rows.length };
     }),
-  } as unknown as pg.Client;
+  } as unknown as Db;
 };
 
 /**
@@ -432,7 +432,7 @@ describe('drafting a recipe for a freshly-installed, un-onboarded repository (M6
   };
 
   /** Whichever `client.query` call, if any, inserted a draft — `saveDraft`'s own SQL. */
-  const draftInsert = (client: pg.Client): unknown[] | undefined =>
+  const draftInsert = (client: Db): unknown[] | undefined =>
     (client.query as ReturnType<typeof vi.fn>).mock.calls.find(
       (args: unknown[]) => typeof args[0] === 'string' && args[0].includes('insert into recipe_drafts'),
     );
@@ -702,7 +702,7 @@ describe('the event tail is served beside the receiver', () => {
     ];
     const service = await serve({
       config: config(),
-      client: { query: async () => ({ rows: events.map((e) => ({ ...e })), rowCount: 1 }) } as unknown as pg.Client,
+      client: { query: async () => ({ rows: events.map((e) => ({ ...e })), rowCount: 1 }) } as unknown as Db,
       log: () => {},
       run: async () => ok('r'),
     });

@@ -13,13 +13,12 @@
 
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import type pg from 'pg';
 import type { RunEvent } from '../src/events.js';
 import { loadRecipe, saveRecipe, type Recipe } from '../src/recipe.js';
-import { appendEvent, connect, readRunAfter } from '../src/store.js';
+import { appendEvent, connect, readRunAfter, type Db } from '../src/store.js';
 import { resumeFrom, tailRun } from '../src/sse.js';
 
-let client: pg.Client | null = null;
+let client: Db | null = null;
 let why = '';
 
 beforeAll(async () => {
@@ -29,7 +28,6 @@ beforeAll(async () => {
   }
   try {
     const candidate = connect();
-    await candidate.connect();
     // The schema, not just the connection. A database with no tables would fail
     // every test below with a confusing error instead of skipping.
     await candidate.query('select 1 from events limit 1');
@@ -142,5 +140,88 @@ describe('the tail s query, against a real database', () => {
     } finally {
       await client.query('delete from events where run_id = $1', [runId]);
     }
+  });
+});
+
+/**
+ * The property the pool exists for (ADR-0020).
+ *
+ * These do not test `pg`. They test that THIS process survives a database connection
+ * dying underneath it — which the plane did not, because a `pg.Client` that loses its
+ * connection emits `'error'` with nobody listening, and an unhandled `'error'` event in
+ * Node exits the process. The bug never appeared on a laptop because a laptop's
+ * Postgres does not go away mid-afternoon. A managed database that suspends idle
+ * compute does, every night, on a schedule.
+ *
+ * `pg_terminate_backend` is how a connection is made to die on purpose. It is the same
+ * FATAL the server sends when it decides on its own that a socket has been quiet
+ * long enough.
+ */
+describe('a database connection that dies under the process', () => {
+  test('a connection killed while IDLE in the pool does not take the process down', async () => {
+    if (!client) {
+      console.log(`SKIPPED (idle connection): ${why}`);
+      return;
+    }
+    // Serve a query so a connection exists, and note which one. It goes back into the
+    // pool idle the moment this resolves — nobody is awaiting it any more, which is
+    // precisely why its death has no promise to reject and used to reach the process.
+    const { rows } = await client.query('select pg_backend_pid() as pid');
+    const idlePid = Number(rows[0].pid);
+
+    // Killed from OUTSIDE the pool, the way the server would do it.
+    const executioner = connect();
+    try {
+      await executioner.query('select pg_terminate_backend($1)', [idlePid]);
+    } finally {
+      await executioner.end();
+    }
+
+    // WATCH THE PROCESS, not just the pool. Without the listener in `connect()` the pool
+    // still recovers — it opens another connection and every assertion below passes —
+    // so a test that only queried again would stay green while the bug it exists for
+    // was fully present. What actually differs is that the dead connection's `'error'`
+    // reaches the process as an uncaught exception, and in production that is the exit.
+    // So the uncaught exception is the thing asserted on.
+    const escaped: Error[] = [];
+    const watch = (error: Error) => escaped.push(error);
+    process.on('uncaughtException', watch);
+    try {
+      // The FATAL reaches the idle socket asynchronously.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      process.off('uncaughtException', watch);
+    }
+    expect(escaped.map((error) => error.message)).toEqual([]);
+
+    // And the pool opened another one, so the drop cost a connection, not the process.
+    const after = await client.query('select pg_backend_pid() as pid');
+    expect(Number(after.rows[0].pid)).not.toBe(idlePid);
+  });
+
+  test('the pool keeps answering after every connection it holds has been killed', async () => {
+    if (!client) {
+      console.log(`SKIPPED (pool recovery): ${why}`);
+      return;
+    }
+    // Warm several connections, then kill all of them at once — a database restart
+    // rather than one reaped socket.
+    await Promise.all([client.query('select 1'), client.query('select 1'), client.query('select 1')]);
+
+    const executioner = connect();
+    try {
+      await executioner.query(
+        `select pg_terminate_backend(pid) from pg_stat_activity
+           where datname = current_database() and pid <> pg_backend_pid()`,
+      );
+    } finally {
+      await executioner.end();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    // The point of the whole change: the next request is served, with no restart and
+    // nothing for an operator to do.
+    const recovered = await client.query('select 1 as ok');
+    expect(recovered.rows[0].ok).toBe(1);
   });
 });

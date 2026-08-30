@@ -10,7 +10,7 @@
 // human UI have to agree about who owns an installation, and two servers is how they
 // start disagreeing.
 
-import type pg from 'pg';
+import type { Db } from './store.js';
 import { digest, put } from './blobs.js';
 import { loadRecipe } from './recipe.js';
 import { projectOne } from './readmodel.js';
@@ -82,7 +82,7 @@ const asEvents = (value: unknown): RunEvent[] | null => {
  * has to know about the other.
  */
 export function runnerRoutes(options: {
-  client: pg.Client;
+  client: Db;
   blobRoot: string;
   /**
    * Mint a GitHub installation token, for a runner that holds no App key (ADR-0019).

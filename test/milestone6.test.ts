@@ -16,7 +16,6 @@ import { createHmac, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type pg from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { confidence } from '../src/confidence.js';
 import type { RunEvent } from '../src/events.js';
@@ -33,7 +32,7 @@ import { projectRun, splitThreadRef } from '../src/projection.js';
 import { readRunRow, readUsage, rebuildProjection, saveUsage } from '../src/readmodel.js';
 import type { RunRequest, RunResult } from '../src/run.js';
 import { serve, type Config, type Service } from '../src/serve.js';
-import { appendEvent, connect } from '../src/store.js';
+import { appendEvent, connect, type Db } from '../src/store.js';
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const PEM = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
@@ -66,9 +65,9 @@ const config = (over: Partial<Config> = {}): Config => ({
   ...over,
 });
 
-/** A `pg.Client` that answers only what the service actually asks it. */
+/** A `Db` that answers only what the service actually asks it. */
 /**
- * A `pg.Client` that answers per QUERY rather than one shape for everything.
+ * A `Db` that answers per QUERY rather than one shape for everything.
  *
  * The issue path asks two questions now — is this repository still installed (M6a's third
  * done-when), and does it have an approved recipe — and a single-shape fake makes them
@@ -91,7 +90,7 @@ const fakeClient = (options: { installed?: boolean; recipe?: unknown } = {}) => 
             : [];
       return { rows, rowCount: rows.length };
     }),
-  } as unknown as pg.Client;
+  } as unknown as Db;
 };
 
 const delivery = (issueNumber = 41) => ({
@@ -385,7 +384,7 @@ describe('a run row is derived from its events and authors nothing', () => {
 /** The tables milestone 6 added, plus the one they are derived from. */
 const TABLES = ['events', 'installations', 'run_usage', 'run_projection'] as const;
 
-let client: pg.Client | null = null;
+let client: Db | null = null;
 let why = '';
 
 /** Whatever the driver actually said, including the `AggregateError` it hides it in. */
@@ -400,10 +399,9 @@ beforeAll(async () => {
     why = 'DATABASE_URL is not set (copy .env.example to .env and `docker compose up -d`)';
     return;
   }
-  let candidate: pg.Client;
+  let candidate: Db;
   try {
     candidate = connect();
-    await candidate.connect();
   } catch (error) {
     // Unwrapped, because a refused TCP connection arrives as an `AggregateError` whose own
     // `message` is empty and whose `toString()` is the bare word `AggregateError`. Both

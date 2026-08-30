@@ -84,11 +84,11 @@ natural author — and it would put two producers on one aggregate, which is pre
 what ADR-0009 exists to forbid. The plane queues instead.
 
 **A transaction around the batch append.** Rolling back three written events because a
-fourth collided would delete observations that happened, to punish a client bug. And
-`pg.Client` is one connection shared by every request, so `begin` here interleaves with
-concurrent statements on the same wire — a bug that appears only under load. There is
-nothing to serialise: one runner per run means the only concurrent writer is that runner
-retrying itself.
+fourth collided would delete observations that happened, to punish a client bug. And the
+handle is a pool ([ADR-0020](0020-the-database-handle-is-a-pool.md)), so a `begin` and
+its `commit` are not promised to reach the same connection. There is nothing to
+serialise: one runner per run means the only concurrent writer is that runner retrying
+itself.
 
 ## Consequences
 

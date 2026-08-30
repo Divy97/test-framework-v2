@@ -15,19 +15,18 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import type pg from 'pg';
 import type { RunEvent } from '../src/events.js';
 import { digest, get } from '../src/blobs.js';
 import type { ArtifactRef } from '../src/events.js';
 import { enqueueJob, pairRunner, revokeRunner, type Runner } from '../src/plane.js';
 import { runnerRoutes } from '../src/runner-api.js';
-import { connect } from '../src/store.js';
+import { connect, type Db } from '../src/store.js';
 
 /** One blob root for the file, made on demand so a run with no upload makes no directory. */
 let blobs: string | null = null;
 const blobRoot = (): string => (blobs ??= mkdtempSync(join(tmpdir(), 'engine-plane-blobs-')));
 
-let client: pg.Client | null = null;
+let client: Db | null = null;
 let why = '';
 
 /** Every row this file makes, so it cleans up after itself in somebody's dev database. */
@@ -41,7 +40,6 @@ beforeAll(async () => {
   }
   try {
     const candidate = connect();
-    await candidate.connect();
     await candidate.query('select 1 from runners limit 1');
     await candidate.query('select 1 from jobs limit 1');
     client = candidate;

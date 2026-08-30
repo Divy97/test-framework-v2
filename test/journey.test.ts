@@ -14,14 +14,13 @@ import { createHmac, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { RunEvent } from '../src/events.js';
 import { loadInstallation } from '../src/installations.js';
 import { listRuns, readRunRow, rebuildProjection, readUsage } from '../src/readmodel.js';
 import { loadRecipe } from '../src/recipe.js';
 import { serve, type Config, type Service } from '../src/serve.js';
-import { appendEvent, connect } from '../src/store.js';
+import { appendEvent, connect, type Db, ready as databaseReady } from '../src/store.js';
 
 const REPO = 'journey-org/journey-repo';
 const INSTALLATION_ID = 424242;
@@ -35,7 +34,7 @@ const PEM = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
  * A journey test that fails for want of a database teaches nothing and trains people to
  * ignore a red suite, which is worse than the coverage it would have bought.
  */
-let client: pg.Client | null = null;
+let client: Db | null = null;
 let why = '';
 try {
   client = connect();
@@ -99,7 +98,7 @@ let ready = false;
 beforeAll(async () => {
   if (!client) return;
   try {
-    await client.connect();
+    await databaseReady(client);
     // Probe the tables this journey needs, so a missing migration skips with a name
     // rather than failing four steps in with a column nobody can find.
     for (const table of ['events', 'recipes', 'installations', 'run_projection', 'run_usage']) {

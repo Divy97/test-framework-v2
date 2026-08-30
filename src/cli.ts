@@ -14,7 +14,7 @@ import { apply, fold, type RunState } from './fold.js';
 import { DEMO_RUN_ID, demoRunEvents } from './fixtures/demo-run.js';
 import { rebuildProjection } from './readmodel.js';
 import { loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
-import { appendEvent, connect, readRun } from './store.js';
+import { appendEvent, connect, readRun, ready } from './store.js';
 
 const [command, arg, arg2] = process.argv.slice(2);
 
@@ -30,7 +30,7 @@ async function confirm(question: string): Promise<boolean> {
 }
 
 const client = connect();
-await client.connect();
+await ready(client);
 
 try {
   if (command === 'seed') {

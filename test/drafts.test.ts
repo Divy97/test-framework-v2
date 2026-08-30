@@ -8,11 +8,10 @@
 
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import type pg from 'pg';
 import { clearDraft, loadDraft, saveDraft } from '../src/drafts.js';
-import { connect } from '../src/store.js';
+import { connect, type Db } from '../src/store.js';
 
-let client: pg.Client | null = null;
+let client: Db | null = null;
 let why = '';
 
 beforeAll(async () => {
@@ -22,7 +21,6 @@ beforeAll(async () => {
   }
   try {
     const candidate = connect();
-    await candidate.connect();
     // The schema, not just the connection — a database with no `recipe_drafts` table
     // would fail every test below with a confusing error instead of skipping by name.
     await candidate.query('select 1 from recipe_drafts limit 1');

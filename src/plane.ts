@@ -17,7 +17,7 @@
 // scoped to the installation that produced it.
 
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import type pg from 'pg';
+import type { Db } from './store.js';
 import type { RunEvent } from './events.js';
 
 /** A paired machine. The token is not here — only its hash ever is. */
@@ -48,7 +48,7 @@ const wait = (ms: number) => new Promise((done) => setTimeout(done, ms));
  * this function must never be reachable without it.
  */
 export async function pairRunner(
-  client: pg.Client,
+  client: Db,
   options: { installationId: number; name: string },
 ): Promise<{ runner: Runner; token: string }> {
   const id = randomUUID();
@@ -69,7 +69,7 @@ export async function pairRunner(
  *
  * A revoked runner verifies as nobody, which is the point of keeping the row.
  */
-export async function verifyRunner(client: pg.Client, token: string | undefined): Promise<Runner | null> {
+export async function verifyRunner(client: Db, token: string | undefined): Promise<Runner | null> {
   if (!token || !token.startsWith(TOKEN_PREFIX)) return null;
   const wanted = digest(token);
   const { rows } = await client.query(
@@ -88,7 +88,7 @@ export async function verifyRunner(client: pg.Client, token: string | undefined)
 
 /** Every machine paired to an installation, revoked ones included — the row is the record. */
 export async function listRunners(
-  client: pg.Client,
+  client: Db,
   installationId: number,
 ): Promise<(Runner & { pairedAt: string; lastSeen: string | null; revokedAt: string | null })[]> {
   const { rows } = await client.query(
@@ -124,7 +124,7 @@ export async function listRunners(
  * revoked" instead of reporting success either way.
  */
 export async function revokeRunner(
-  client: pg.Client,
+  client: Db,
   runnerId: string,
   installationId: number,
 ): Promise<boolean> {
@@ -137,7 +137,7 @@ export async function revokeRunner(
 }
 
 /** Note that a runner is alive. Called on every poll, so presence is never stale by more than one. */
-export async function sawRunner(client: pg.Client, runnerId: string): Promise<void> {
+export async function sawRunner(client: Db, runnerId: string): Promise<void> {
   await client.query('update runners set last_seen = now() where id = $1', [runnerId]);
 }
 
@@ -150,7 +150,7 @@ export async function sawRunner(client: pg.Client, runnerId: string): Promise<vo
  * stream has one author from seq 1 (ADR-0009).
  */
 export async function enqueueJob(
-  client: pg.Client,
+  client: Db,
   options: { installationId: number; repo: string; intake: unknown },
 ): Promise<string> {
   const runId = randomUUID();
@@ -175,7 +175,7 @@ export async function enqueueJob(
  * runner needs to be told more than one thing at a time.
  */
 export async function claimJob(
-  client: pg.Client,
+  client: Db,
   runner: Runner,
   options: { waitMs?: number } = {},
 ): Promise<Job | null> {
@@ -208,7 +208,7 @@ export async function claimJob(
 }
 
 /** The job is over, however it ended. Bookkeeping only — never authorization. */
-export async function finishJob(client: pg.Client, runId: string): Promise<void> {
+export async function finishJob(client: Db, runId: string): Promise<void> {
   await client.query('update jobs set finished_at = now() where run_id = $1', [runId]);
 }
 
@@ -238,7 +238,7 @@ export type Refusal = { refused: string; appended?: number };
  *    by the one participant with a legitimate reason to write to it.
  */
 export async function appendFromRunner(
-  client: pg.Client,
+  client: Db,
   runner: Runner,
   runId: string,
   events: RunEvent[],
@@ -257,10 +257,12 @@ export async function appendFromRunner(
   // written are observations that happened, and rolling three of them back because the
   // fourth collided would delete facts to punish a client bug.
   //
-  // The mechanical one: `pg.Client` is ONE connection, shared by every request this
-  // process serves. A `begin` here interleaves with a concurrent request's statements on
-  // the same wire — the classic single-connection transaction bug, and it would appear
-  // only under load, as events landing inside somebody else's rollback.
+  // The mechanical one: `Db` is a POOL. Each `query()` is answered by whichever
+  // connection is free, so a `begin` issued here and a `commit` issued three statements
+  // later are not promised to reach the same one — the transaction would open on one
+  // connection and be committed on another, or never. A real transaction needs a client
+  // checked out of the pool and released in a `finally`, which is worth writing when
+  // something actually needs to be atomic. This does not.
   //
   // What makes that safe is that there is nothing to serialise: authorization admits
   // exactly one runner per run, so the only concurrent writer of a given run is that

@@ -2,7 +2,7 @@
 //
 // A `Route` rather than a server: `sse.ts` owns the socket, this owns the answers. That
 // split is what keeps the SSE module drivable by a test with no database — the property
-// `test/sse.test.ts` depends on — while letting these routes hold a `pg.Client`.
+// `test/sse.test.ts` depends on — while letting these routes hold a `Db`.
 //
 // Everything here is READ-ONLY except one POST, and that asymmetry is the design. The
 // dashboard renders projections that can be rebuilt from the log; the single write is a
@@ -10,14 +10,13 @@
 // command we will execute". A dashboard that could start runs, edit evidence or retry
 // phases would be a second producer, and ADR-0009 has one.
 
-import type pg from 'pg';
 import { confidence } from './confidence.js';
 import { clearDraft, loadDraft } from './drafts.js';
 import { fold } from './fold.js';
 import { listInstallations, loadInstallation } from './installations.js';
 import { listRuns, readRunRow, readUsage } from './readmodel.js';
 import { loadProof, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
-import { readRun } from './store.js';
+import { readRun, type Db } from './store.js';
 import type { Route } from './sse.js';
 import type { Session } from './auth.js';
 import { forgetRun, tombstoneFor } from './forget.js';
@@ -90,7 +89,7 @@ export const installUrl = (env: NodeJS.ProcessEnv = process.env): string =>
     : 'https://github.com/settings/apps/new';
 
 export function dashboardRoutes(options: {
-  client: pg.Client;
+  client: Db;
   /** Injected so a test can drive the surface without a GitHub App registered. */
   installUrl?: string;
   /**

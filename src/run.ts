@@ -101,7 +101,7 @@ export type RunRequest = {
   agentImage?: string;
   blobRoot: string;
   /**
-   * Where the events go. Injected because the store is a `pg.Client` and the shape of
+   * Where the events go. Injected because the store is a `Db` and the shape of
    * a run has nothing to do with Postgres — and because a test needs to read them
    * without one.
    */

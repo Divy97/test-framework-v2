@@ -12,7 +12,7 @@
 // that presentation, and the gate could not catch it — the gate judges reproductions, and
 // this one is upstream of anything being reproduced.
 
-import type pg from 'pg';
+import type { Db } from './store.js';
 
 export type Installation = {
   repo: string;
@@ -36,7 +36,7 @@ const iso = (value: unknown): string =>
  * tokens that 404 with a message that does not say why.
  */
 export async function recordInstallation(
-  client: pg.Client,
+  client: Db,
   entry: { repo: string; installationId: number; account: string },
 ): Promise<void> {
   await client.query(
@@ -55,7 +55,7 @@ export async function recordInstallation(
  * different answers to a delivery arriving, and only one of them is worth a message. A
  * delete would collapse them.
  */
-export async function removeInstallation(client: pg.Client, repo: string): Promise<void> {
+export async function removeInstallation(client: Db, repo: string): Promise<void> {
   await client.query(
     'update installations set removed_at = now() where repo = $1 and removed_at is null',
     [repo],
@@ -63,7 +63,7 @@ export async function removeInstallation(client: pg.Client, repo: string): Promi
 }
 
 /** The live installation for a repository, or null. Removed rows never come back. */
-export async function loadInstallation(client: pg.Client, repo: string): Promise<Installation | null> {
+export async function loadInstallation(client: Db, repo: string): Promise<Installation | null> {
   const { rows } = await client.query(
     `select repo, installation_id, account, connected_at, removed_at
        from installations where repo = $1 and removed_at is null`,
@@ -83,7 +83,7 @@ export async function loadInstallation(client: pg.Client, repo: string): Promise
 }
 
 /** Every live installation, newest first. The repository list the dashboard renders. */
-export async function listInstallations(client: pg.Client): Promise<Installation[]> {
+export async function listInstallations(client: Db): Promise<Installation[]> {
   const { rows } = await client.query(
     `select repo, installation_id, account, connected_at, removed_at
        from installations where removed_at is null order by connected_at desc`,

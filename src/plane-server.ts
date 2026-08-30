@@ -10,7 +10,6 @@
 // command from a recipe — because the whole point of the split is that the thing with
 // the credentials is not the thing that executes.
 
-import type pg from 'pg';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -25,7 +24,7 @@ import { loadRecipe } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runnerRoutes } from './runner-api.js';
 import { startStatusServer, type Route } from './sse.js';
-import { loadEnv, connect, readRunAfter } from './store.js';
+import { loadEnv, connect, readRunAfter, type Db, ready } from './store.js';
 
 export type PlaneConfig = {
   appId: string;
@@ -55,7 +54,7 @@ export type PlaneConfig = {
  * by hand, or the change silently does nothing. That gap is unchanged; what this removes
  * is the separate step, not the discipline.
  */
-async function applySchema(client: pg.Client): Promise<void> {
+async function applySchema(client: Db): Promise<void> {
   const here = dirname(fileURLToPath(import.meta.url));
   const sql = await readFile(join(here, '..', 'db', 'schema.sql'), 'utf8');
   await client.query(sql);
@@ -83,7 +82,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
   close: () => Promise<void>;
 }> {
   const client = connect();
-  await client.connect();
+  await ready(client);
   await applySchema(client);
   await ensureBlobRoot(config.blobRoot);
 

@@ -12,14 +12,14 @@
 // into the other.
 
 import { rm } from 'node:fs/promises';
-import type pg from 'pg';
+import type { Db } from './store.js';
 import { blobPath } from './blobs.js';
 import type { ArtifactRef } from './events.js';
 
 export type Tombstone = { runId: string; requestedBy: string; forgottenAt: string; removed: number };
 
 /** Every `sha256:` ref a run's events mention, read straight out of the payloads. */
-async function refsOf(client: pg.Client, runId: string): Promise<ArtifactRef[]> {
+async function refsOf(client: Db, runId: string): Promise<ArtifactRef[]> {
   const { rows } = await client.query('select payload from events where run_id = $1', [runId]);
   const found = JSON.stringify(rows.map((row) => row.payload)).match(/sha256:[0-9a-f]{64}/g) ?? [];
   return [...new Set(found)] as ArtifactRef[];
@@ -38,7 +38,7 @@ async function refsOf(client: pg.Client, runId: string): Promise<ArtifactRef[]> 
  * tombstone, because a retried request must not rewrite who asked or when.
  */
 export async function forgetRun(
-  client: pg.Client,
+  client: Db,
   options: { runId: string; requestedBy: string; blobRoot: string },
 ): Promise<Tombstone> {
   const existing = await tombstoneFor(client, options.runId);
@@ -70,7 +70,7 @@ export async function forgetRun(
 }
 
 /** The tombstone for a run, or null. Read on every render of a run's page. */
-export async function tombstoneFor(client: pg.Client, runId: string): Promise<Tombstone | null> {
+export async function tombstoneFor(client: Db, runId: string): Promise<Tombstone | null> {
   const { rows } = await client.query(
     'select run_id, requested_by, forgotten_at, removed from forgotten where run_id = $1',
     [runId],
