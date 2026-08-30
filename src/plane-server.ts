@@ -24,7 +24,7 @@ import { loadRecipe } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runnerRoutes } from './runner-api.js';
 import { startStatusServer, type Route } from './sse.js';
-import { loadEnv, connect, readRunAfter, type Db, ready } from './store.js';
+import { loadEnv, connect, readRunAfter, type Db, ready, close } from './store.js';
 
 export type PlaneConfig = {
   appId: string;
@@ -177,7 +177,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
     close: async () => {
       await receiver.close();
       await surface.close();
-      await client.end();
+      await close(client);
     },
   };
 }

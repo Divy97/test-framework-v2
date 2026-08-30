@@ -20,6 +20,7 @@ import { loadInstallation } from '../src/installations.js';
 import { listRuns, readRunRow, rebuildProjection, readUsage } from '../src/readmodel.js';
 import { loadRecipe } from '../src/recipe.js';
 import { serve, type Config, type Service } from '../src/serve.js';
+import type pg from 'pg';
 import { appendEvent, connect, type Db, ready as databaseReady } from '../src/store.js';
 
 const REPO = 'journey-org/journey-repo';
@@ -34,7 +35,7 @@ const PEM = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
  * A journey test that fails for want of a database teaches nothing and trains people to
  * ignore a red suite, which is worse than the coverage it would have bought.
  */
-let client: Db | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 try {
   client = connect();

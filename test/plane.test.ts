@@ -20,13 +20,14 @@ import { digest, get } from '../src/blobs.js';
 import type { ArtifactRef } from '../src/events.js';
 import { enqueueJob, pairRunner, revokeRunner, type Runner } from '../src/plane.js';
 import { runnerRoutes } from '../src/runner-api.js';
-import { connect, type Db } from '../src/store.js';
+import type pg from 'pg';
+import { connect } from '../src/store.js';
 
 /** One blob root for the file, made on demand so a run with no upload makes no directory. */
 let blobs: string | null = null;
 const blobRoot = (): string => (blobs ??= mkdtempSync(join(tmpdir(), 'engine-plane-blobs-')));
 
-let client: Db | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 
 /** Every row this file makes, so it cleans up after itself in somebody's dev database. */

@@ -10,7 +10,7 @@
 // exists so a run is watchable while it happens.
 
 import { startStatusServer, type StatusServer } from './sse.js';
-import { connect, readRunAfter, ready } from './store.js';
+import { connect, readRunAfter, ready, close } from './store.js';
 
 export async function serveStatus(port?: number): Promise<StatusServer & { close: () => Promise<void> }> {
   const client = connect();
@@ -23,7 +23,7 @@ export async function serveStatus(port?: number): Promise<StatusServer & { close
     ...server,
     close: async () => {
       await server.close();
-      await client.end();
+      await close(client);
     },
   };
 }

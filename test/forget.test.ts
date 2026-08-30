@@ -15,9 +15,10 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { get, put } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { forgetRun, tombstoneFor } from '../src/forget.js';
-import { appendEvent, connect, type Db } from '../src/store.js';
+import type pg from 'pg';
+import { appendEvent, connect } from '../src/store.js';
 
-let client: Db | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 const runs: string[] = [];
 let root = '';

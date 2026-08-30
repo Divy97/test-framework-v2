@@ -41,10 +41,16 @@ export function loadEnv(path = '.env'): void {
  *
  * A pool answers each query on some live connection and opens a new one when the old
  * one is gone, so the drop costs a query rather than the process.
+ *
+ * Deliberately "something you can query" rather than the pool itself. Everything below
+ * needs exactly `query`, and saying so lets a caller that genuinely needs one connection
+ * — a transaction, which means a client checked out and released in a `finally` — hand
+ * that client in instead. `connect()` returns the concrete pool, so shutdown still has
+ * the `end()` that this type does not expose.
  */
-export type Db = pg.Pool;
+export type Db = Pick<pg.Pool, 'query'>;
 
-export const connect = (): Db => {
+export const connect = (): pg.Pool => {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
     throw new Error('DATABASE_URL is not set — copy .env.example to .env');
@@ -121,4 +127,32 @@ export async function readRunAfter(db: Db, runId: string, afterSeq: number): Pro
     payload: r.payload,
     ts: r.ts instanceof Date ? r.ts.toISOString() : r.ts,
   }));
+}
+
+/**
+ * Shut the pool down without hanging on a query that will never answer.
+ *
+ * `Client.end()` used to destroy the socket when a query was in flight — its own comment
+ * said "a hung query could block end forever". `Pool.end()` has no such escape hatch: it
+ * waits for every checked-out client to come back, with no timeout, and a query checks a
+ * client out for its whole duration. So the exact failure this pool exists to survive — a
+ * black-holed socket, a database suspending mid-statement — would leave SIGTERM waiting
+ * on a reply that is not coming, until Docker's grace period turned it into SIGKILL.
+ *
+ * Bounded here rather than at four call sites. Draining is the polite path and it is
+ * tried first; the timeout only decides how long politeness lasts.
+ */
+export async function close(pool: pg.Pool, graceMs = 5_000): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([
+    // A second `end()` rejects with "Called end on pool more than once" where the old
+    // `Client.end()` simply resolved, and a shutdown path is exactly where something
+    // gets called twice. Swallowed: the pool is closing either way.
+    pool.end().catch(() => {}),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, graceMs);
+      timer.unref();
+    }),
+  ]);
+  clearTimeout(timer);
 }

@@ -85,8 +85,10 @@ export async function readRunRow(client: Db, runId: string): Promise<RunRow | nu
  *
  * *"Delete the entire dashboard database and it rebuilds from the log"* is what milestone
  * 6 calls the most interesting thing it produces, and a claim like that is worth exactly
- * as much as the command that demonstrates it. `delete` rather than `truncate` so it runs
- * inside a transaction the caller may already hold.
+ * as much as the command that demonstrates it. `delete` rather than `truncate` so a
+ * caller CAN run it inside a transaction — which, `Db` being a pool (ADR-0020), means a
+ * caller holding one connection it checked out itself. Handed the pool, these two
+ * statements may land on different connections and no transaction contains them.
  */
 export async function rebuildProjection(client: Db): Promise<{ rebuilt: number; skipped: string[] }> {
   await client.query('delete from run_projection');

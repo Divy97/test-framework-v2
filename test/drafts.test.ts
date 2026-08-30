@@ -9,9 +9,10 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { clearDraft, loadDraft, saveDraft } from '../src/drafts.js';
-import { connect, type Db } from '../src/store.js';
+import type pg from 'pg';
+import { connect } from '../src/store.js';
 
-let client: Db | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 
 beforeAll(async () => {

@@ -32,6 +32,7 @@ import { projectRun, splitThreadRef } from '../src/projection.js';
 import { readRunRow, readUsage, rebuildProjection, saveUsage } from '../src/readmodel.js';
 import type { RunRequest, RunResult } from '../src/run.js';
 import { serve, type Config, type Service } from '../src/serve.js';
+import type pg from 'pg';
 import { appendEvent, connect, type Db } from '../src/store.js';
 
 const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -384,7 +385,7 @@ describe('a run row is derived from its events and authors nothing', () => {
 /** The tables milestone 6 added, plus the one they are derived from. */
 const TABLES = ['events', 'installations', 'run_usage', 'run_projection'] as const;
 
-let client: Db | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 
 /** Whatever the driver actually said, including the `AggregateError` it hides it in. */
@@ -399,7 +400,7 @@ beforeAll(async () => {
     why = 'DATABASE_URL is not set (copy .env.example to .env and `docker compose up -d`)';
     return;
   }
-  let candidate: Db;
+  let candidate: pg.Pool;
   try {
     candidate = connect();
   } catch (error) {
@@ -538,21 +539,30 @@ describe('the projection can be dropped and replayed', () => {
     // row by design, and a test that wiped a developer's dashboard to prove a property
     // about it would be a bad trade. `delete` rather than `truncate` is what makes this
     // possible, and this is the case it was written for.
-    await client.query('begin');
+    //
+    // ON ONE CONNECTION, checked out and released, and that is not ceremony. `Db` is a
+    // pool (ADR-0020): each query goes to whichever connection is free, so a `begin` here
+    // and a `rollback` twenty lines down are not promised to reach the same one. Split
+    // across two connections, the `delete` inside `rebuildProjection` autocommits and the
+    // `rollback` lands where no transaction is open — which Postgres answers with a
+    // WARNING that `query()` RESOLVES. The wipe this transaction exists to prevent would
+    // happen for real, to a developer's actual dashboard, and the test would pass.
+    const held = await client.connect();
     try {
-      for (const event of events) await appendEvent(client, event);
+      await held.query('begin');
+      for (const event of events) await appendEvent(held, event);
 
       // `{ rebuilt, skipped }`, not a bare count: the rebuild now survives a malformed
       // stream per-run rather than dying on the first one, and a caller has to be able
       // to see what it could not replay. A silent skip would make the property look
       // stronger than it is.
-      const outcome = await rebuildProjection(client);
+      const outcome = await rebuildProjection(held);
       expect(outcome.rebuilt).toBeGreaterThan(0);
       // Nothing skipped. The rebuild survives a malformed stream per-run now rather than
       // dying on the first one, and a silent skip would make this property look stronger
       // than it is — so the count of what could NOT be replayed is part of the assertion.
       expect(outcome.skipped).toEqual([]);
-      const first = await readRunRow(client, runId);
+      const first = await readRunRow(held, runId);
       expect(first).not.toBeNull();
       expect(first!.repo).toBe('demo-org/demo-app');
       expect(first!.issue_number).toBe(41);
@@ -563,11 +573,12 @@ describe('the projection can be dropped and replayed', () => {
       // than the shape: `toEqual` would pass on a row whose timestamps had drifted through
       // a Date round-trip, and drifted timestamps are exactly how a "disposable cache"
       // quietly becomes a source of truth nobody can rebuild.
-      await rebuildProjection(client);
-      const second = await readRunRow(client, runId);
+      await rebuildProjection(held);
+      const second = await readRunRow(held, runId);
       expect(JSON.stringify(second)).toBe(JSON.stringify(first));
     } finally {
-      await client.query('rollback');
+      await held.query('rollback');
+      held.release();
     }
   });
 });

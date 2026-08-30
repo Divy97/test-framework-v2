@@ -23,9 +23,10 @@ import {
   sessionCookie,
   type OAuthConfig,
 } from '../src/auth.js';
-import { connect, type Db } from '../src/store.js';
+import type pg from 'pg';
+import { connect } from '../src/store.js';
 
-let client: Db | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 const made: string[] = [];
 
