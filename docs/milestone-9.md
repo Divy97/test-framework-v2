@@ -379,3 +379,40 @@ product. The plane projects each accepted batch now, never at the cost of the ap
 the log is the truth, the projection is a cache `npm run rebuild` reconstructs, and
 failing a runner's write because a cache would not update is the trade this codebase
 refuses everywhere else.
+
+## Containerising it found four more
+
+The rehearsal above ran the plane from source. Putting it in an image found four
+defects that source could not, and every one of them would have been a first-deploy
+failure rather than a bug report:
+
+1. **`process.loadEnvFile('.env')` throws when there is no `.env`.** The `?.` guards
+   against an old Node, not against ENOENT — and a container has no `.env` by design,
+   because its environment *is* the environment. The image died on a stack trace about a
+   file it is meant not to have, before it could print the list naming what each missing
+   variable costs. `loadEnv()` in `store.ts` now, used by all three entry points;
+   `vitest.config.ts` had been wrapping the same call since M6 for the same reason.
+2. **Nothing applied the schema.** A fresh volume is an empty database and
+   `npm run db:schema` is a dev command pointed at the dev compose. The plane applies
+   `db/schema.sql` on start, which is safe because every statement in it is idempotent —
+   and does not make it a migration system: that file's own header names the gap where a
+   new column needs a hand-written `alter`.
+3. **A non-root process cannot create `/var/lib/plane`.** Made in the image and owned by
+   `node`, which also decides the ownership a named volume inherits — so the fix is the
+   same line as the one that stops the volume arriving root-owned on the host.
+4. **Binding `127.0.0.1` inside a container is the container's own loopback.** The plane
+   printed "plane up" and answered nothing, which is the most confusing shape a failure
+   takes. The bind address is an option now, still loopback by default — a laptop's
+   dashboard has no business on the LAN — and `ENGINE_BIND=0.0.0.0` in the image, where
+   the exposure decision belongs to the container boundary rather than to a bind address.
+
+**What the image is proved to do:** serve the surface (200 public, 302 to sign in, 401
+for an unpaired runner), verify a signed delivery and refuse a forged one, mint a run id
+and queue it, dispatch it to a paired runner **with the repository's current recipe
+attached**, give a second poller 204, and accept the finish.
+
+Two ports remain, and that is a deployment decision rather than a defect:
+`startWebhookReceiver` owns its own server because its response lifecycle is unlike the
+rest — signature first, `202` before any work. One public URL wants either a proxy in
+front or the receiver folded into the route chain, and which one is right depends on the
+host.

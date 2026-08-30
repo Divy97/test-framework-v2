@@ -1,0 +1,57 @@
+# The control plane (milestone 9). One address GitHub can always reach.
+#
+# What is NOT in this image is the point of it. No Docker client, no model
+# credential, and nothing that executes a recipe — the plane holds the App key and the
+# log, and the machine that runs somebody's code is a runner on their own hardware
+# (ADR-0019). An image that could do both would put the credentials and the untrusted
+# execution in one place, which is the split this milestone exists to make.
+FROM node:22-alpine
+
+# `git` because the plane imports `github.ts`, which shells out to it. Nothing on the
+# plane's paths clones anything today — the runner does that — but the module is in the
+# graph, and a missing binary would surface at 3am as ENOENT inside a route rather than
+# as a build that never shipped.
+RUN apk add --no-cache git
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+# The full install, not `--omit=dev`: this runs TypeScript through `tsx`, exactly as
+# every other program in this repository does. A build step would be a second thing that
+# can be stale, and today's rehearsal already found what a stale artifact costs.
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+# The schema travels with the image, because the plane applies it on start. A deployment
+# that needs somebody to remember `db:schema` is a deployment that answers its first
+# request with a relation that does not exist.
+COPY db ./db
+
+# The surface (dashboard, OAuth, runner API) and the webhook receiver bind separately.
+# Two ports is a deployment fact rather than a design one: `startWebhookReceiver` owns
+# its own server because its response lifecycle is unlike the rest — signature first,
+# 202 before any work. A single public URL wants a proxy in front, or consolidating the
+# receiver into the route chain, and that decision belongs to whoever picks the host.
+EXPOSE 8788 8787
+
+# The blob root, made HERE and owned by the user that will write to it.
+#
+# Two reasons, and the second is the one that bites. `/var/lib` is root-owned, so a
+# non-root process cannot create a directory under it — the first container died on
+# `EACCES: mkdir '/var/lib/plane'` before it printed anything else. And a named volume
+# mounted over a path takes its ownership from the image at that path, so pre-creating it
+# is also what stops the volume arriving root-owned on the host that eventually runs this.
+RUN mkdir -p /var/lib/plane/blobs && chown -R node:node /var/lib/plane
+ENV ENGINE_BLOB_ROOT=/var/lib/plane/blobs
+# Loopback inside a container is the CONTAINER's loopback, so a published port never
+# reaches a server bound to it. The default stays 127.0.0.1 for a laptop; here it has to
+# be the wildcard, and the exposure decision belongs to the container boundary and the
+# host's firewall rather than to a bind address.
+ENV ENGINE_BIND=0.0.0.0
+
+# Non-root. Nothing here is untrusted, but the process holds an App private key and
+# there is no reason for it to be able to write its own image.
+USER node
+
+ENV NODE_ENV=production
+CMD ["npx", "tsx", "src/plane-server.ts"]

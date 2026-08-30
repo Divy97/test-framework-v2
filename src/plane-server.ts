@@ -10,8 +10,11 @@
 // command from a recipe — because the whole point of the split is that the thing with
 // the credentials is not the thing that executes.
 
-import type { Server } from 'node:http';
+import type pg from 'pg';
 import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ensureBlobRoot } from './blobs.js';
 import { authRoutes } from './auth-routes.js';
 import { installationsFor, readSession, cookieValue, type OAuthConfig } from './auth.js';
@@ -22,7 +25,7 @@ import { loadRecipe } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runnerRoutes } from './runner-api.js';
 import { startStatusServer, type Route } from './sse.js';
-import { connect, readRunAfter } from './store.js';
+import { loadEnv, connect, readRunAfter } from './store.js';
 
 export type PlaneConfig = {
   appId: string;
@@ -32,9 +35,31 @@ export type PlaneConfig = {
   blobRoot: string;
   webhookPort: number;
   port: number;
+  /** Which interface to bind. Loopback locally; `0.0.0.0` in a container (see `sse.ts`). */
+  host: string;
   /** False for http in development. The cookie is marked Secure either way it is told. */
   secure?: boolean;
 };
+
+/**
+ * Bring the database up to `db/schema.sql`, on every start.
+ *
+ * A deployment otherwise needs somebody to remember a step, and a plane pointed at a
+ * fresh volume answers every request with a relation that does not exist. The file is
+ * idempotent by construction — `create table if not exists`, `create index if not
+ * exists`, `alter table ... add column if not exists` — so running it against a database
+ * that is already current does nothing.
+ *
+ * It is not a migration system and does not pretend to be. `db/schema.sql`'s own header
+ * names the gap: adding a column to an existing table needs an explicit `alter`, written
+ * by hand, or the change silently does nothing. That gap is unchanged; what this removes
+ * is the separate step, not the discipline.
+ */
+async function applySchema(client: pg.Client): Promise<void> {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const sql = await readFile(join(here, '..', 'db', 'schema.sql'), 'utf8');
+  await client.query(sql);
+}
 
 /**
  * Try each route in turn; the first that answers wins.
@@ -59,6 +84,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
 }> {
   const client = connect();
   await client.connect();
+  await applySchema(client);
   await ensureBlobRoot(config.blobRoot);
 
   const app: GitHubApp = { appId: config.appId, privateKeyPem: config.privateKeyPem };
@@ -75,6 +101,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
   const receiver = await startWebhookReceiver({
     secret: config.webhookSecret,
     port: config.webhookPort,
+    host: config.host,
     onIntake: (intake: Intake) => {
       void (async () => {
         try {
@@ -118,6 +145,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
 
   const surface = await startStatusServer({
     port: config.port,
+    host: config.host,
     read: (runId, afterSeq) => readRunAfter(client, runId, afterSeq),
     routes: chain(
       authRoutes({ client, oauth, ...(config.secure === undefined ? {} : { secure: config.secure }) }),
@@ -197,12 +225,13 @@ export function readPlaneConfig(env: NodeJS.ProcessEnv = process.env): PlaneConf
     blobRoot: env.ENGINE_BLOB_ROOT!,
     webhookPort: Number(env.WEBHOOK_PORT ?? 8787),
     port: Number(env.EVENTS_PORT ?? 8788),
+    host: env.ENGINE_BIND ?? '127.0.0.1',
     ...(env.ENGINE_PLANE_INSECURE === '1' ? { secure: false } : {}),
   };
 }
 
 if (process.argv[1]?.endsWith('plane-server.ts') || process.argv[1]?.endsWith('plane-server.js')) {
-  process.loadEnvFile?.('.env');
+  loadEnv();
   // Inside the async function, not as its argument. `readPlaneConfig()` throws
   // SYNCHRONOUSLY when the environment is incomplete, and evaluating it as an argument
   // put that throw outside the `catch` below — so an operator missing one variable got
