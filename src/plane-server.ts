@@ -18,7 +18,7 @@ import { ensureBlobRoot } from './blobs.js';
 import { authRoutes } from './auth-routes.js';
 import { installationsFor, readSession, cookieValue, type OAuthConfig } from './auth.js';
 import { webhookRoute, WEBHOOK_PATH, installationToken, type GitHubApp, type Intake } from './github.js';
-import { recordInstallation, removeInstallation } from './installations.js';
+import { forgetInstallation, reconcileInstallation } from './installations.js';
 import { enqueueJob } from './plane.js';
 import { loadRecipe } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
@@ -108,20 +108,25 @@ export async function startPlane(config: PlaneConfig): Promise<{
     void (async () => {
       try {
         if (intake.kind === 'installation') {
-          // A delivery names several repositories — `installation_repositories` adds
-          // and removes in batches — so each one is its own row.
-          for (const repo of intake.repos) {
-            if (intake.action === 'added') {
-              await recordInstallation(client, {
-                repo,
-                installationId: intake.installationId,
-                account: intake.account,
-              });
-            } else {
-              await removeInstallation(client, repo);
-            }
+          // An UNINSTALL is not reconciled, because there is nothing left to ask. Minting a
+          // token for a deleted installation 404s and throws, so routing this through the
+          // reconcile meant an uninstall marked nothing removed and the rows stayed live
+          // forever — M6a's "removed means removed", quietly undone.
+          if (intake.scope === 'app' && intake.action === 'removed') {
+            const removed = await forgetInstallation(client, intake.installationId);
+            log(`installation ${intake.installationId}: uninstalled, ${removed} marked removed`);
+            return;
           }
-          log(`installation ${intake.installationId}: ${intake.action} ${intake.repos.join(', ')}`);
+          // Otherwise the DELTA is not applied. GitHub is asked what this installation
+          // actually covers and the table is made to match, because a delta is only enough
+          // if you heard every previous one — and a plane deployed today heard none.
+          const { held, removed } = await reconcileInstallation(client, intake.installationId, (id) =>
+            installationToken(app, id),
+          );
+          log(
+            `installation ${intake.installationId}: ${intake.action} ${intake.repos.length} named, ` +
+              `reconciled to ${held} held${removed > 0 ? `, ${removed} marked removed` : ''}`,
+          );
           return;
         }
         const recipe = await loadRecipe(client, intake.repo);

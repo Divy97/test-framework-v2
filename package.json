@@ -5,6 +5,7 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
     "db:schema": "docker compose exec -T postgres psql -U postgres -d events -f - < db/schema.sql",
     "seed": "tsx --env-file=.env src/cli.ts seed",
     "replay": "tsx --env-file=.env src/cli.ts replay",

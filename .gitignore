@@ -24,3 +24,4 @@ dist/
 .runner-blobs/
 *.log
 .DS_Store
+.neon

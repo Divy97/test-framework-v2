@@ -83,6 +83,18 @@ export type InstallationIntake = {
   kind: 'installation';
   /** `added` covers install and select-more; `removed` covers uninstall and deselect. */
   action: 'added' | 'removed';
+  /**
+   * WHICH removal this is, because the two need opposite handling.
+   *
+   * `app` is the `installation` event: the App itself was installed or UNINSTALLED. On an
+   * uninstall the installation no longer exists, so asking GitHub what it covers means
+   * minting a token for it, which 404s — the reconcile cannot run, and for a while an
+   * uninstall therefore marked nothing removed at all.
+   *
+   * `repositories` is `installation_repositories`: the App is still installed and its
+   * selection changed. That one is reconciled, because GitHub is there to be asked.
+   */
+  scope: 'app' | 'repositories';
   installationId: number;
   /** The owner login the App was installed on, for display. */
   account: string;
@@ -184,14 +196,17 @@ function installationIntake(event: string, payload: unknown): InstallationIntake
     // real actions that say nothing about which repositories we hold, and treating them
     // as `added` would resurrect a removed row.
     if (body.action !== 'created' && body.action !== 'deleted') return null;
+    // A delivery naming no repository USED to be dropped here, because the repository
+    // list was built by applying these deltas and a delta of nothing changes nothing.
+    // It is not built that way any more: the plane asks GitHub for the whole list and
+    // makes the table match (`reconcileInstallation`). Under that rule an empty delta is
+    // still a fact — it says this installation changed, go and look — and dropping it
+    // silences the event in exactly the case that motivated reconciling.
     const repos = names(body.repositories);
-    // Symmetric with `installation_repositories` below: a delivery naming no repository
-    // is not a fact about any repository. It was non-null here and null there, which is
-    // the same rule stated twice and obeyed once.
-    if (repos.length === 0) return null;
     return {
       kind: 'installation',
       action: body.action === 'created' ? 'added' : 'removed',
+      scope: 'app',
       installationId,
       account,
       repos,
@@ -199,10 +214,12 @@ function installationIntake(event: string, payload: unknown): InstallationIntake
   }
 
   if (body.action !== 'added' && body.action !== 'removed') return null;
+  // Same change as above, and for the same reason. GitHub sends exactly this — an
+  // `installation_repositories` whose added list is empty — when a selection widens to
+  // "all repositories", because nothing was individually added. That delivery is how a
+  // plane finds out its list is stale, and it was the one being thrown away.
   const repos = names(body.action === 'added' ? body.repositories_added : body.repositories_removed);
-  // An add or remove naming nothing is not a fact about any repository.
-  if (repos.length === 0) return null;
-  return { kind: 'installation', action: body.action, installationId, account, repos };
+  return { kind: 'installation', action: body.action, scope: 'repositories', installationId, account, repos };
 }
 
 /**

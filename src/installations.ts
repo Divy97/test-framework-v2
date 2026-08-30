@@ -96,3 +96,127 @@ export async function listInstallations(client: Db): Promise<Installation[]> {
     removedAt: row.removed_at === null ? null : iso(row.removed_at),
   }));
 }
+
+/** GitHub's page size, and the number the loop stops on. Once, because it is one fact. */
+const PER_PAGE = 100;
+
+/**
+ * Every repository of an installation is gone, without asking GitHub whether it agrees.
+ *
+ * For `installation.deleted` only, where GitHub has already told us: the App was
+ * uninstalled. Reconciling here would mint a token for an installation that no longer
+ * exists, which 404s and throws — so the reconcile path cannot mark an uninstall removed,
+ * and for a while it did not. Marked, never deleted: a repository we no longer hold still
+ * authored runs.
+ */
+export async function forgetInstallation(client: Db, installationId: number): Promise<number> {
+  const { rowCount } = await client.query(
+    'update installations set removed_at = now() where installation_id = $1 and removed_at is null',
+    [installationId],
+  );
+  return rowCount ?? 0;
+}
+
+/**
+ * Ask GitHub what this installation actually covers, and make the table say that.
+ *
+ * `installation_repositories` reports a DELTA — the repositories just added or just
+ * removed — and a delta is only enough if you heard every previous one. A plane deployed
+ * today did not. Every repository installed before it existed is invisible to it, and no
+ * future event will mention them, because they will never be "added" again.
+ *
+ * That is not a hypothetical. Moving from a laptop to a host is exactly this: a fresh
+ * database, an App that has been installed for months, and a repository list that stays
+ * wrong forever. It cost an evening to find, and the cost was hidden — the table looked
+ * populated, with 176 of 177 rows.
+ *
+ * THE SWEEP AT THE END IS DESTRUCTIVE, which is what all the refusing is about. Marking a
+ * live repository removed makes it vanish from the dashboard and stops its runs, and no
+ * later event repairs it — the same permanence this function exists to fix. So anything
+ * short of a complete, well-formed answer from GitHub throws instead of reconciling: a
+ * partial list swept against would remove whatever it failed to mention.
+ *
+ * Scoped to ONE installation. Another installation's rows are not this one's to judge.
+ */
+export async function reconcileInstallation(
+  client: Db,
+  installationId: number,
+  mintToken: (installationId: number) => Promise<string>,
+  options: { fetch?: typeof fetch; api?: string } = {},
+): Promise<{ held: number; removed: number }> {
+  const call = options.fetch ?? fetch;
+  const api = options.api ?? 'https://api.github.com';
+  const token = await mintToken(installationId);
+
+  // Noted BEFORE the walk. Anything recorded after this moment was written by a reconcile
+  // that started later and therefore saw a fresher list, so this sweep must not judge it —
+  // see the fence in the update below.
+  const startedAt = new Date();
+
+  const held: { repo: string; account: string }[] = [];
+  let expected: number | null = null;
+  // Paginated, because "all repositories" on a real account is not one page. A truncated
+  // list here would mark the remainder removed, which is worse than not reconciling.
+  for (let page = 1; ; page += 1) {
+    const response = await call(`${api}/installation/repositories?per_page=${PER_PAGE}&page=${page}`, {
+      headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json' },
+    });
+    // EVERY non-2xx throws, 404 included. A 404 here is not documented for this endpoint
+    // and would be an unmodelled status treated as "holds nothing" — the same inversion
+    // this function refuses for a 503. When an installation is genuinely gone, GitHub says
+    // so with `installation.deleted`, and `forgetInstallation` handles that without asking.
+    if (!response.ok) {
+      throw new Error(`GitHub would not list installation ${installationId}: HTTP ${response.status}`);
+    }
+    const body = (await response.json()) as {
+      total_count?: unknown;
+      repositories?: { full_name?: unknown; owner?: { login?: unknown } }[];
+    };
+    // A 200 whose body is not the shape we expect — a gateway's JSON, an API change —
+    // would otherwise read as an empty page and sweep every row for this installation.
+    if (!Array.isArray(body.repositories)) {
+      throw new Error(`GitHub listed installation ${installationId} without a repositories array`);
+    }
+    if (typeof body.total_count === 'number') expected = body.total_count;
+    for (const entry of body.repositories) {
+      // A repository GitHub listed but did not name cannot be keyed by, and must not be
+      // quietly dropped either: dropping it means sweeping it, for a repository GitHub
+      // says is held.
+      if (typeof entry.full_name !== 'string') {
+        throw new Error(`GitHub listed a repository of installation ${installationId} with no full_name`);
+      }
+      held.push({
+        repo: entry.full_name,
+        account: typeof entry.owner?.login === 'string' ? entry.owner.login : entry.full_name.split('/')[0]!,
+      });
+    }
+    if (body.repositories.length < PER_PAGE) break;
+  }
+
+  // The walk agreed with the count GitHub gave for it. Offset pagination over a set that
+  // changes mid-walk can skip an entry, and a skipped entry is one the sweep removes.
+  if (expected !== null && held.length !== expected) {
+    throw new Error(`incomplete list for installation ${installationId}: saw ${held.length} of ${expected}`);
+  }
+
+  for (const entry of held) {
+    await recordInstallation(client, { ...entry, installationId });
+  }
+
+  // Anything this installation used to hold and GitHub no longer lists.
+  //
+  // Fenced on `connected_at < $3`, and that is not belt-and-braces. Deliveries are handled
+  // concurrently, so two reconciles for one installation overlap: an older one whose list
+  // was fetched before a repository was added would otherwise sweep the row a newer one
+  // just wrote. `recordInstallation` stamps `connected_at = now()`, so a row younger than
+  // this walk is left alone. It fails toward keeping a row live, which is the direction
+  // everything else here fails in too.
+  const { rowCount } = await client.query(
+    `update installations set removed_at = now()
+       where installation_id = $1 and removed_at is null and connected_at < $3
+         and not (repo = any($2::text[]))`,
+    [installationId, held.map((entry) => entry.repo), startedAt],
+  );
+
+  return { held: held.length, removed: rowCount ?? 0 };
+}

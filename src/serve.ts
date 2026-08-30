@@ -341,6 +341,23 @@ export async function serve(options: ServeOptions): Promise<Service> {
    * Recorded rather than run: nothing is reproduced here, and the onboarding that follows
    * needs a human to approve a recipe before any run can boot anything (ADR-0013).
    */
+  /**
+   * DELTA-BASED, deliberately, and unlike the hosted plane.
+   *
+   * `plane-server.ts` reconciles against GitHub because a plane deployed today never
+   * heard the events that installed everything already there. This does not, for a
+   * reason that is about cost rather than correctness: recording a repository here also
+   * DRAFTS a recipe for it, which is a model call and a container. Reconciling would
+   * fan that out across every repository the App has ever been installed on, at once,
+   * on somebody's laptop.
+   *
+   * The consequence is real and accepted: a repository installed before this process
+   * first ran is not in the table, and `installation_repositories` will not mention it
+   * again. On one machine with one operator that is a `draft a recipe` link away.
+   *
+   * An intake whose `repos` is empty is therefore an expected no-op here, not a bug —
+   * GitHub sends exactly that when a selection widens to "all repositories".
+   */
   const record = (intake: InstallationIntake): void => {
     tail = tail.then(async () => {
       try {
@@ -475,7 +492,13 @@ export async function serve(options: ServeOptions): Promise<Service> {
     port: config.webhookPort,
     onIntake: (intake) => {
       if (intake.kind === 'installation') {
-        log(`installation ${intake.installationId}: ${intake.action} ${intake.repos.join(', ')}`);
+        // Says what actually happened. An empty list logged as `added ` reads as though
+        // something was recorded, and nothing was.
+        log(
+          intake.repos.length === 0
+            ? `installation ${intake.installationId}: ${intake.action}, naming no repository — nothing to record`
+            : `installation ${intake.installationId}: ${intake.action} ${intake.repos.join(', ')}`,
+        );
         record(intake);
         return;
       }
