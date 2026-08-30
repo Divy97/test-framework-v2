@@ -1,10 +1,37 @@
 # The control plane (milestone 9). One address GitHub can always reach.
 #
-# What is NOT in this image is the point of it. No Docker client, no model
-# credential, and nothing that executes a recipe — the plane holds the App key and the
-# log, and the machine that runs somebody's code is a runner on their own hardware
-# (ADR-0019). An image that could do both would put the credentials and the untrusted
-# execution in one place, which is the split this milestone exists to make.
+# What is NOT in this image is the point of it. No Docker client, no model credential,
+# and nothing that executes a recipe — the plane holds the App key and the log, and the
+# machine that runs somebody's code is a runner on their own hardware (ADR-0019). An
+# image that could do both would put the credentials and the untrusted execution in one
+# place, which is the split this milestone exists to make.
+
+# ---- build ----------------------------------------------------------------
+# A COMPILE STEP, which this repository otherwise refuses, and the reason is measured
+# rather than assumed.
+#
+# Every program here runs from source through `tsx`, and the Dockerfile used to say a
+# build step is "a second thing that can be stale". That is a real hazard and it is not
+# this one: what went stale before was an IMAGE, published weeks earlier than the source
+# it claimed to be. A compile inside the image build is derived from the exact source
+# being shipped, in the same build, and cannot drift from it.
+#
+# What it buys is a cold start. A machine that stopped because nobody was looking has to
+# read `typescript` (23MB), `esbuild` and `vite` off a cold filesystem before a line of
+# ours runs, and a visitor is waiting through all of it. Measured on Fly: 1 second of
+# Firecracker, then 9 seconds of that. Shipping compiled JavaScript and production
+# dependencies only takes `node_modules` from 79MB to a fraction of it.
+#
+# `npm run plane` on a laptop is unchanged and still runs from source.
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json tsconfig.build.json ./
+COPY src ./src
+RUN npx tsc -p tsconfig.build.json
+
+# ---- runtime --------------------------------------------------------------
 FROM node:22-alpine
 
 # `git` because the plane imports `github.ts`, which shells out to it. Nothing on the
@@ -15,16 +42,17 @@ RUN apk add --no-cache git
 
 WORKDIR /app
 COPY package.json package-lock.json ./
-# The full install, not `--omit=dev`: this runs TypeScript through `tsx`, exactly as
-# every other program in this repository does. A build step would be a second thing that
-# can be stale, and today's rehearsal already found what a stale artifact costs.
-RUN npm ci
+# Production dependencies only. `typescript`, `tsx`, `vitest` and everything vitest drags
+# in are build- and test-time tools; carrying them into a running machine costs cold
+# reads on every start and buys nothing.
+RUN npm ci --omit=dev && npm cache clean --force
 
-COPY tsconfig.json ./
-COPY src ./src
+COPY --from=build /app/dist ./dist
 # The schema travels with the image, because the plane applies it on start. A deployment
 # that needs somebody to remember `db:schema` is a deployment that answers its first
 # request with a relation that does not exist.
+#
+# `../db` from the code's own directory, which is why `dist` sits where `src` did.
 COPY db ./db
 
 # ONE port, and the host is why. This used to expose two — the surface and a separate
@@ -55,4 +83,6 @@ ENV ENGINE_BIND=0.0.0.0
 USER node
 
 ENV NODE_ENV=production
-CMD ["npx", "tsx", "src/plane-server.ts"]
+# `node` directly, not `npx tsx`. `npx` alone was over a second of package resolution on
+# a cold machine, before any transpiling.
+CMD ["node", "dist/plane-server.js"]

@@ -1,0 +1,19 @@
+{
+  // Emit, for the plane's image only. `tsconfig.json` stays `noEmit` because every
+  // program here runs from source through `tsx` — that is still true on a laptop, and
+  // `npm run plane` is unchanged.
+  //
+  // What this is for is the one place source-at-runtime costs something real: a Fly
+  // machine that stopped when nobody was looking has to read `tsx`, `esbuild` and
+  // `typescript` off a cold filesystem before a line of ours runs, and the visitor is
+  // waiting through all of it.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "declaration": false,
+    "sourceMap": false
+  },
+  // `src` only. `test` is not shipped and pulls in vitest's types.
+  "include": ["src"]
+}

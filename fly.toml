@@ -1,83 +1,38 @@
-# The control plane on Fly (milestone 9, step 5).
+# fly.toml app configuration file generated for test-framework on 2026-08-30T22:15:17+05:30
 #
-# Chosen for one property: the machine stops when nobody is looking and wakes on the
-# next request in a second or two. This is a project people visit occasionally and it
-# has to answer when they do — a free tier that cold-starts in 30-60s is a dead link to
-# anyone who does not already know to wait, and an always-on box is rent for a page that
-# is idle almost all of the time.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
-# Secrets are NOT here. `fly secrets set` holds GITHUB_APP_ID, GITHUB_PRIVATE_KEY,
-# GITHUB_WEBHOOK_SECRET, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_APP_SLUG,
-# DATABASE_URL and ENGINE_PLANE_CALLBACK_URL. This file is in git; those are not, and
-# ADR-0017 is why the App key never lands in an image layer.
-app = 'CHANGE-ME'
-primary_region = 'CHANGE-ME'
+
+app = 'test-framework'
+primary_region = 'sin'
 
 [build]
   dockerfile = 'Dockerfile.plane'
 
 [env]
-  # The wildcard, because loopback inside a machine is that machine's loopback and Fly's
-  # proxy would never reach it. Same reason the image sets it; repeated here so reading
-  # this file tells you what the process is actually bound to.
   ENGINE_BIND = '0.0.0.0'
   ENGINE_BLOB_ROOT = '/var/lib/plane/blobs'
   PORT = '8788'
 
-[http_service]
-  internal_port = 8788
-  force_https = true
-
-  # THE REASON FOR FLY, and the thing to check before changing it.
-  #
-  # `min_machines_running = 0` is what makes an idle month nearly free; `auto_start` is
-  # what keeps the URL honest while it is off. A GitHub delivery wakes it the same way a
-  # visitor does, well inside GitHub's ~10s delivery timeout.
-  #
-  # Note what this means for a paired runner: the daemon holds a 25-second long poll, so
-  # while a runner is connected the machine never idles out. That is correct — a runner
-  # is connected because work is expected — but it is also the answer to "why did this
-  # cost more this month".
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
-
-  [[http_service.checks]]
-    # `/` and not a dedicated health path: it is the one route that touches neither
-    # GitHub nor a session, so a red check means the process is actually down rather
-    # than that an upstream is having a bad day.
-    path = '/'
-    interval = '30s'
-    timeout = '5s'
-    grace_period = '10s'
-
-# Evidence outlives the machine that gathered it.
-#
-# Blobs are content-addressed and referenced by events in Postgres, so losing this
-# directory turns a run page into citations that resolve to nothing — which ADR-0019
-# distinguishes from a run whose evidence was deliberately forgotten. A machine's own
-# filesystem does not survive a redeploy; this does.
 [[mounts]]
   source = 'plane_blobs'
   destination = '/var/lib/plane'
 
+[http_service]
+  internal_port = 8788
+  force_https = true
+  auto_stop_machines = 'suspend'
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    path = '/'
+
 [[vm]]
   size = 'shared-cpu-1x'
   memory = '512mb'
-
-# A LIMIT THIS DEPLOYMENT ACCEPTS, written down rather than discovered.
-#
-# `/webhook` is the only route here anyone on the internet can reach without a session,
-# and it has to buffer a body BEFORE it can verify the signature — that is inherent to a
-# MAC over the body, not a flaw in this one. Its ceiling is 2MB, eight times the 256KB
-# every other route on this port uses, because a GitHub `installation` delivery from an
-# account with many repositories is genuinely large.
-#
-# Memory is bounded: bytes past the ceiling are counted and dropped, never buffered, so a
-# single huge POST costs 2MB and not its actual size. What is NOT bounded is ingress and
-# the time spent reading it, and enough concurrent unsigned POSTs would be 2MB each
-# against this machine's 512mb while it also serves the dashboard and a runner's poll.
-#
-# Accepted because the answer is a rate limit at the edge rather than a smaller ceiling
-# that would start refusing real deliveries. If this ever gets attention it does not
-# want, that is the lever — not a code change.
+  cpus = 1
+  memory_mb = 512
