@@ -83,6 +83,18 @@ export type InstallationIntake = {
   kind: 'installation';
   /** `added` covers install and select-more; `removed` covers uninstall and deselect. */
   action: 'added' | 'removed';
+  /**
+   * WHICH removal this is, because the two need opposite handling.
+   *
+   * `app` is the `installation` event: the App itself was installed or UNINSTALLED. On an
+   * uninstall the installation no longer exists, so asking GitHub what it covers means
+   * minting a token for it, which 404s — the reconcile cannot run, and for a while an
+   * uninstall therefore marked nothing removed at all.
+   *
+   * `repositories` is `installation_repositories`: the App is still installed and its
+   * selection changed. That one is reconciled, because GitHub is there to be asked.
+   */
+  scope: 'app' | 'repositories';
   installationId: number;
   /** The owner login the App was installed on, for display. */
   account: string;
@@ -194,6 +206,7 @@ function installationIntake(event: string, payload: unknown): InstallationIntake
     return {
       kind: 'installation',
       action: body.action === 'created' ? 'added' : 'removed',
+      scope: 'app',
       installationId,
       account,
       repos,
@@ -206,7 +219,7 @@ function installationIntake(event: string, payload: unknown): InstallationIntake
   // "all repositories", because nothing was individually added. That delivery is how a
   // plane finds out its list is stale, and it was the one being thrown away.
   const repos = names(body.action === 'added' ? body.repositories_added : body.repositories_removed);
-  return { kind: 'installation', action: body.action, installationId, account, repos };
+  return { kind: 'installation', action: body.action, scope: 'repositories', installationId, account, repos };
 }
 
 /**

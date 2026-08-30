@@ -141,6 +141,11 @@ describe('intake tells an installation from an issue, and refuses the rest', () 
     expect(mapped).toEqual({
       kind: 'installation',
       action: 'added',
+      // WHICH event this was, and it decides behaviour rather than describing it: an
+      // `app`-scoped removal is an uninstall, where the installation no longer exists to
+      // be asked about, and a `repositories`-scoped one is a selection change, where it
+      // does. Routing the first through the second meant an uninstall removed nothing.
+      scope: 'app',
       installationId: 987654,
       account: 'acme',
       repos: ['acme/store', 'acme/api'],
@@ -151,8 +156,12 @@ describe('intake tells an installation from an issue, and refuses the rest', () 
     const mapped = intake('installation', { ...installed, action: 'deleted' })!;
     if (mapped.kind !== 'installation') throw new Error('an installation delivery must map to an installation');
     expect(mapped.action).toBe('removed');
+    // And scoped to the APP, not to a selection change. The hosted plane branches on
+    // this: an uninstall is swept directly, because minting a token for an installation
+    // that no longer exists 404s, and asking anyway meant nothing was ever marked removed.
+    expect(mapped.scope).toBe('app');
     // The repository list still travels: uninstalling has to name what it took away, or
-    // `removeInstallation` has nothing to mark.
+    // the local path's `removeInstallation` has nothing to mark.
     expect(mapped.repos).toEqual(['acme/store', 'acme/api']);
   });
 
@@ -192,15 +201,20 @@ describe('intake tells an installation from an issue, and refuses the rest', () 
   });
 
   it('refuses a delivery it cannot key by repository or attribute to an account', () => {
-    // An add naming nothing is not a fact about any repository, and a row with no account
-    // is a row the repositories page cannot label.
+    // A row with no account is a row the repositories page cannot label.
+    //
+    // An add naming NOTHING used to be refused here too, and M9 reversed that: the
+    // repository list is now reconciled against GitHub rather than accumulated from
+    // deltas, so a delivery with an empty list still matters — it says this installation
+    // changed, go and look. GitHub sends exactly that when a selection widens to "all
+    // repositories", and refusing it was what kept a hosted plane's list stale.
     expect(
       intake('installation_repositories', {
         action: 'added',
         installation: { id: 987654, account: { login: 'acme' } },
         repositories_added: [],
-      }),
-    ).toBeNull();
+      })?.kind,
+    ).toBe('installation');
     expect(intake('installation', { ...installed, installation: { id: 987654 } })).toBeNull();
     expect(intake('installation', { ...installed, installation: { id: 987654, account: {} } })).toBeNull();
     // And an entry with no `full_name` is dropped rather than stored under a placeholder:

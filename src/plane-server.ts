@@ -18,7 +18,7 @@ import { ensureBlobRoot } from './blobs.js';
 import { authRoutes } from './auth-routes.js';
 import { installationsFor, readSession, cookieValue, type OAuthConfig } from './auth.js';
 import { webhookRoute, WEBHOOK_PATH, installationToken, type GitHubApp, type Intake } from './github.js';
-import { reconcileInstallation } from './installations.js';
+import { forgetInstallation, reconcileInstallation } from './installations.js';
 import { enqueueJob } from './plane.js';
 import { loadRecipe } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
@@ -108,10 +108,18 @@ export async function startPlane(config: PlaneConfig): Promise<{
     void (async () => {
       try {
         if (intake.kind === 'installation') {
-          // The DELTA is not applied. GitHub is asked what this installation actually
-          // covers and the table is made to match, because a delta is only enough if you
-          // heard every previous one — and a plane deployed today heard none of them.
-          // See `reconcileInstallation`; this is the call site that found it.
+          // An UNINSTALL is not reconciled, because there is nothing left to ask. Minting a
+          // token for a deleted installation 404s and throws, so routing this through the
+          // reconcile meant an uninstall marked nothing removed and the rows stayed live
+          // forever — M6a's "removed means removed", quietly undone.
+          if (intake.scope === 'app' && intake.action === 'removed') {
+            const removed = await forgetInstallation(client, intake.installationId);
+            log(`installation ${intake.installationId}: uninstalled, ${removed} marked removed`);
+            return;
+          }
+          // Otherwise the DELTA is not applied. GitHub is asked what this installation
+          // actually covers and the table is made to match, because a delta is only enough
+          // if you heard every previous one — and a plane deployed today heard none.
           const { held, removed } = await reconcileInstallation(client, intake.installationId, (id) =>
             installationToken(app, id),
           );

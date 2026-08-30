@@ -11,7 +11,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import type { Db } from '../src/store.js';
-import { reconcileInstallation } from '../src/installations.js';
+import { forgetInstallation, reconcileInstallation } from '../src/installations.js';
 
 /** Records every statement, and answers the update with a row count. */
 const db = (writes: { sql: string; params: unknown[] }[]) =>
@@ -75,16 +75,17 @@ describe('the repository list is reconciled against GitHub, not accumulated from
     expect(recorded(writes)).toContain('me/repo-100');
   });
 
-  it('treats a gone installation as holding nothing, because 404 IS the answer', async () => {
-    // Uninstalled, or the App deleted. Distinct from an outage: here GitHub told us.
+  it('refuses a 404 too, rather than reading it as "holds nothing"', async () => {
+    // 404 is not documented for this endpoint, and an earlier version treated it as
+    // authoritative emptiness — which would sweep an installation on a spurious 404 from
+    // a proxy, or on page two after a hundred repositories had already been seen. When an
+    // installation is genuinely gone GitHub says so with `installation.deleted`, and that
+    // path does not come through here at all.
     const writes: { sql: string; params: unknown[] }[] = [];
     const fetch = vi.fn(async () => ({ ok: false, status: 404, json: async () => ({}) })) as unknown as typeof globalThis.fetch;
 
-    const result = await reconcileInstallation(db(writes), 42, async () => 'ghs_tok', { fetch });
-
-    expect(result).toEqual({ held: 0, removed: 1 });
-    expect(writes[0]!.sql).toContain('set removed_at');
-    expect(writes[0]!.params[0]).toBe(42);
+    await expect(reconcileInstallation(db(writes), 42, async () => 'ghs_tok', { fetch })).rejects.toThrow(/404/);
+    expect(writes).toEqual([]);
   });
 
   it('throws rather than reconciling against an answer GitHub did not give', async () => {
@@ -95,5 +96,69 @@ describe('the repository list is reconciled against GitHub, not accumulated from
 
     await expect(reconcileInstallation(db(writes), 42, async () => 'ghs_tok', { fetch })).rejects.toThrow(/503/);
     expect(writes).toEqual([]);
+  });
+
+  it('refuses a 200 whose body is not the shape it claims', async () => {
+    // The dangerous one, because `response.ok` is satisfied. A gateway's JSON or an API
+    // change would read as an empty page — and an empty page sweeps every row.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const fetch = vi.fn(async () => ({ ok: true, json: async () => ({ message: 'hello' }) })) as unknown as typeof globalThis.fetch;
+
+    await expect(reconcileInstallation(db(writes), 42, async () => 'ghs_tok', { fetch })).rejects.toThrow(/repositories array/);
+    expect(writes).toEqual([]);
+  });
+
+  it('refuses a walk that does not add up to the count GitHub gave for it', async () => {
+    // Offset pagination over a set that changes mid-walk can skip an entry, and a skipped
+    // entry is one the sweep removes.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ total_count: 9, repositories: [{ full_name: 'me/a', owner: { login: 'me' } }] }),
+    })) as unknown as typeof globalThis.fetch;
+
+    await expect(reconcileInstallation(db(writes), 42, async () => 'ghs_tok', { fetch })).rejects.toThrow(/1 of 9/);
+    // Nothing swept, and nothing recorded either: a partial answer is not reconciled from.
+    expect(writes.some((w) => w.sql.includes('set removed_at'))).toBe(false);
+  });
+
+  it('refuses a repository GitHub listed but did not name', async () => {
+    // Dropping it silently means sweeping it — for a repository GitHub says is held.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ total_count: 2, repositories: [{ full_name: 'me/a', owner: { login: 'me' } }, { id: 7 }] }),
+    })) as unknown as typeof globalThis.fetch;
+
+    await expect(reconcileInstallation(db(writes), 42, async () => 'ghs_tok', { fetch })).rejects.toThrow(/full_name/);
+  });
+
+  it('fences the sweep on when the walk started, so an older reconcile cannot undo a newer one', async () => {
+    // Deliveries are handled concurrently. Without this, a reconcile whose list was
+    // fetched before a repository was added sweeps the row a later one just wrote — the
+    // permanent invisibility this function exists to fix, reintroduced as a race.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const fetch = vi.fn(async () => page(['me/a'])) as unknown as typeof globalThis.fetch;
+
+    const before = new Date();
+    await reconcileInstallation(db(writes), 42, async () => 'ghs_tok', { fetch });
+
+    const sweep = writes.find((w) => w.sql.includes('set removed_at'))!;
+    expect(sweep.sql).toContain('connected_at < $3');
+    expect((sweep.params[2] as Date).getTime()).toBeGreaterThanOrEqual(before.getTime());
+  });
+});
+
+describe('an uninstall does not ask GitHub about an installation that is gone', () => {
+  it('marks every row removed without minting a token', async () => {
+    // Minting for a deleted installation 404s and throws, so routing an uninstall through
+    // the reconcile marked nothing removed at all — rows stayed live forever.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const removed = await forgetInstallation(db(writes), 42);
+
+    expect(removed).toBe(1);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.sql).toContain('set removed_at');
+    expect(writes[0]!.params[0]).toBe(42);
   });
 });
