@@ -57,12 +57,13 @@ const call = (
   method: string,
   path: string,
   body = '',
+  headers: Record<string, string> = {},
 ) =>
   route({
     method,
     path,
     query: new URLSearchParams(),
-    headers: {},
+    headers,
     body: async () => body,
     raw: async () => Buffer.from(body),
   });
@@ -268,5 +269,47 @@ describe('the landing page asks who you are', () => {
     await call(surface({ writes }), 'GET', '/');
 
     expect(writes.some((sql) => sql.includes('from installations'))).toBe(false);
+  });
+});
+
+/**
+ * The pairing command is a command people PASTE. It has to be true.
+ *
+ * It shipped saying `ENGINE_PLANE_URL=<this service>` — a literal placeholder, on a page
+ * served from the host it should have been naming — and, worse, `npx tf-runner`. There is
+ * no `tf-runner` package of ours and `bin` is empty; `tf-runner` is a real name on the npm
+ * registry owned by somebody else. So the instruction printed next to a freshly minted
+ * credential was "download a stranger's package and execute it, with this token already in
+ * your environment".
+ */
+describe('the pairing command names this service and nothing off the internet', () => {
+  const mint = (headers: Record<string, string> = {}) =>
+    call(surface(), 'POST', '/repos/mine%2Frepo/runners', 'name=laptop', headers);
+
+  it('never tells anyone to npx a package that is not ours', async () => {
+    const response = await mint();
+    // The specific hazard, pinned by name: `npx` plus a bare package name on this page
+    // is remote code execution on the operator's machine, invited by us.
+    expect(response?.body).not.toContain('npx tf-runner');
+    expect(response?.body).toContain('npm run runner');
+  });
+
+  it('prints the origin the operator is reading, not a placeholder', async () => {
+    const response = await mint({ host: 'plane.example.dev', 'x-forwarded-proto': 'https' });
+
+    expect(response?.body).toContain('ENGINE_PLANE_URL=https://plane.example.dev');
+    expect(response?.body).not.toContain('&lt;this service&gt;');
+  });
+
+  it('trusts x-forwarded-proto, because the plane speaks plain HTTP behind a terminator', async () => {
+    // Trusting the socket would print `http://` for an `https://` deployment, and a
+    // runner dialling that gets a redirect it does not follow.
+    const response = await mint({ host: 'plane.example.dev' });
+    expect(response?.body).toContain('https://plane.example.dev');
+  });
+
+  it('and stays http on a laptop, where there is no terminator and no certificate', async () => {
+    const response = await mint({ host: '127.0.0.1:8788' });
+    expect(response?.body).toContain('ENGINE_PLANE_URL=http://127.0.0.1:8788');
   });
 });

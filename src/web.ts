@@ -494,7 +494,7 @@ const REGRESSION_LABEL: Record<RunState['regression'], string> = {
 export function runnersPage(
   repo: string,
   runners: { id: string; name: string; pairedAt: string; lastSeen: string | null; revokedAt: string | null }[],
-  minted?: { token: string; name: string },
+  minted?: { token: string; name: string; planeUrl: string },
 ): string {
   const when = (value: string | null) => (value === null ? '—' : escapeHtml(value.replace('T', ' ').slice(0, 19)));
   const body =
@@ -507,11 +507,16 @@ mints one.</p>` +
       ? `<div class="panel">
 <h2>Pair <code>${escapeHtml(minted.name)}</code> — this token is shown once</h2>
 <p>Run this on the machine that will do the work:</p>
-<pre class="scroll"><code>ENGINE_PLANE_URL=&lt;this service&gt; \
+<pre class="scroll"><code>git clone https://github.com/Divy97/test-framework-v2
+cd test-framework-v2 &amp;&amp; npm ci
+ENGINE_PLANE_URL=${escapeHtml(minted.planeUrl)} \
 ENGINE_RUNNER_TOKEN=${escapeHtml(minted.token)} \
-npx tf-runner</code></pre>
+npm run runner</code></pre>
 <p class="muted small">We store a hash of it, not the token, so it cannot be shown again — pair a new
 runner if you lose it, and revoke the old one below.</p>
+<p class="muted small">The runner is this repository, run from a checkout. There is no package to
+install: an <code>npx &lt;name&gt;</code> here would fetch whatever the npm registry has under that name
+and execute it on your machine, with the token above already in its environment.</p>
 </div>`
       : '') +
     `<h2>Paired machines</h2>` +

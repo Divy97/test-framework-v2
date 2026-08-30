@@ -133,6 +133,21 @@ export function dashboardRoutes(options: {
    * anywhere of ours is correct until somebody is removed from an org and confidently
    * wrong afterwards.
    */
+  /**
+   * Where this page is being served from, for a command an operator will paste elsewhere.
+   *
+   * `x-forwarded-proto` because the plane sits behind a TLS terminator that speaks plain
+   * HTTP to it: trusting the socket would print `http://` for an `https://` deployment,
+   * and a runner dialling that gets a redirect it does not follow.
+   */
+  const origin = (headers: Record<string, string | string[] | undefined>): string => {
+    const first = (value: string | string[] | undefined) =>
+      (Array.isArray(value) ? value[0] : value)?.split(',')[0]?.trim();
+    const host = first(headers['host']) ?? '127.0.0.1';
+    const proto = first(headers['x-forwarded-proto']) ?? (host.startsWith('127.0.0.1') || host.startsWith('localhost') ? 'http' : 'https');
+    return `${proto}://${host}`;
+  };
+
   const visible = async (
     headers: Record<string, string | string[] | undefined>,
   ): Promise<{ session: Session; repos: Set<string> } | null | 'anonymous'> => {
@@ -339,7 +354,14 @@ export function dashboardRoutes(options: {
         // response and a 303 would throw it away on the way to the page that cannot
         // show it again.
         return html(
-          runnersPage(repo, await listRunners(client, installation.installationId), { token, name }),
+          runnersPage(repo, await listRunners(client, installation.installationId), {
+            token,
+            name,
+            // The URL the operator is READING this on, which is the one their runner has
+            // to dial. It used to print the literal string `<this service>`, on a page
+            // served from the host it should have been naming.
+            planeUrl: origin(headers),
+          }),
         );
       }
 
