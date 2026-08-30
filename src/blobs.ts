@@ -19,6 +19,25 @@ const PREFIX = 'sha256:';
 export const digest = (bytes: string | Buffer): ArtifactRef =>
   `${PREFIX}${createHash('sha256').update(bytes).digest('hex')}`;
 
+/**
+ * Make a directory usable as an evidence store: the directory, and the sentinel.
+ *
+ * The sentinel is not ceremony. `runJob` refuses a `/blobs` that does not carry one,
+ * because a typo'd path yields a complete, plausible event stream whose artifacts were
+ * collected into nothing — and a run whose blobs died with the container is worse than
+ * no run, since it reads as a complete record.
+ *
+ * Here rather than in `serve.ts`, where it lived, because there are three programs now.
+ * `runner-main.ts` did `mkdir` alone and every runner would have failed its first job on
+ * a check whose message is about a mount — found by running the two halves against each
+ * other before deploying either.
+ */
+export async function ensureBlobRoot(root: string): Promise<void> {
+  await mkdir(root, { recursive: true });
+  // `a`, so an existing store keeps whatever is in it and this stays idempotent.
+  await writeFile(join(root, '.evidence-store'), '', { flag: 'a' });
+}
+
 export function blobPath(root: string, ref: ArtifactRef): string {
   // The store now lives on the host, so a malformed ref is a path-traversal
   // attempt rather than a lookup miss. `put` computes its own ref and is safe;

@@ -18,5 +18,9 @@ dist/
 # and unignored after the first real run, 672K and one `git add -A` from a commit. It is
 # a run's evidence, not source, and `ENGINE_BLOB_ROOT` can point anywhere.
 .blobs/
+# The same thing, for the two programs milestone 9 added: a plane holds what runners
+# upload, and a runner holds what its containers produce before they are shipped.
+.plane-blobs/
+.runner-blobs/
 *.log
 .DS_Store

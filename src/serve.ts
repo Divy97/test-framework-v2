@@ -26,7 +26,7 @@
 //      configuration change, not a redesign.
 
 import { readFileSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type pg from 'pg';
@@ -36,6 +36,7 @@ import { cloneRepository, commentOnIssue, installationToken, repoUrl, startWebho
 import { MODEL, effortLevel, providerName } from './loop.js';
 import { DEFAULT_OPENROUTER_MODEL } from './openrouter.js';
 import { loadInstallation, recordInstallation, removeInstallation } from './installations.js';
+import { ensureBlobRoot } from './blobs.js';
 import { draftRecipe, proveRepository } from './orchestrate.js';
 import { projectOne, saveUsage } from './readmodel.js';
 import { loadRecipe, saveProof } from './recipe.js';
@@ -152,11 +153,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
 }
 
 /** The evidence store's sentinel, created once so `put` has somewhere to write. */
-async function ensureBlobRoot(root: string): Promise<void> {
-  await mkdir(root, { recursive: true });
-  await writeFile(join(root, '.evidence-store'), '', { flag: 'a' });
-}
-
 export type Service = {
   webhookPort: number;
   eventsPort: number;

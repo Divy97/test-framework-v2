@@ -12,7 +12,7 @@
 
 import type { Server } from 'node:http';
 import { readFileSync } from 'node:fs';
-import { mkdir } from 'node:fs/promises';
+import { ensureBlobRoot } from './blobs.js';
 import { authRoutes } from './auth-routes.js';
 import { installationsFor, readSession, cookieValue, type OAuthConfig } from './auth.js';
 import { startWebhookReceiver, installationToken, type GitHubApp, type Intake } from './github.js';
@@ -59,7 +59,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
 }> {
   const client = connect();
   await client.connect();
-  await mkdir(config.blobRoot, { recursive: true });
+  await ensureBlobRoot(config.blobRoot);
 
   const app: GitHubApp = { appId: config.appId, privateKeyPem: config.privateKeyPem };
   const oauth: OAuthConfig = { ...config.oauth };

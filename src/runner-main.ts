@@ -12,7 +12,7 @@
 //
 // `npx tsx src/runner-main.ts`, with ENGINE_PLANE_URL and ENGINE_RUNNER_TOKEN set.
 
-import { mkdir } from 'node:fs/promises';
+import { ensureBlobRoot } from './blobs.js';
 import { runDaemon, type DaemonIo, type DaemonJob } from './daemon.js';
 import type { IssueIntake } from './github.js';
 import { providerName } from './loop.js';
@@ -104,7 +104,11 @@ export function engineExecute(config: RunnerConfig) {
 
 export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const config = readRunnerConfig(env);
-  await mkdir(config.blobRoot, { recursive: true });
+  // The SENTINEL, not just the directory. `orchestrate` refuses a blob root without one
+  // — a typo'd path would otherwise produce a complete event stream whose artifacts went
+  // nowhere — and a bare `mkdir` here meant every runner failed its first job on a
+  // message about a mount it does not have.
+  await ensureBlobRoot(config.blobRoot);
   const log = (line: string) => console.log(line);
   log(`runner up: taking work from ${config.planeUrl}`);
   await runDaemon({

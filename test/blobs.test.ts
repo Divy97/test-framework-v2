@@ -2,11 +2,11 @@
 // hand back something other than what was stored, every hash in the event log
 // stops meaning anything.
 
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
-import { blobPath, get, put } from '../src/blobs.js';
+import { blobPath, ensureBlobRoot, get, put } from '../src/blobs.js';
 
 let root: string;
 const makeRoot = () => (root = mkdtempSync(join(tmpdir(), 'blob-test-')));
@@ -39,4 +39,21 @@ test('refuses to return bytes that are not what the ref claims', async () => {
   writeFileSync(blobPath(store, ref), 'something else entirely\n');
 
   await expect(get(store, ref)).rejects.toThrow(/not the evidence it claims/);
+});
+
+test('a store is only usable once it carries its sentinel', async () => {
+  // The bug this pins cost a run. `runner-main.ts` created its blob root with a bare
+  // `mkdir`, and `orchestrate` refuses a root with no `.evidence-store` — so every
+  // runner would have failed its FIRST job, on a message about a mount it does not
+  // have. Found by running the plane and a runner against each other before deploying
+  // either; there was no test between them because there was no test of startup.
+  const root = join(mkdtempSync(join(tmpdir(), 'engine-ensure-')), 'not', 'made', 'yet');
+  await ensureBlobRoot(root);
+  expect(existsSync(join(root, '.evidence-store'))).toBe(true);
+
+  // Idempotent, and non-destructive: a store that already holds evidence must survive
+  // the next process that opens it.
+  const ref = await put(root, 'an artifact from an earlier run\n');
+  await ensureBlobRoot(root);
+  expect((await get(root, ref)).toString()).toContain('an earlier run');
 });
