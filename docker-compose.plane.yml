@@ -40,6 +40,10 @@ services:
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:?create one on the App s settings page}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:?create one on the App s settings page}
       ENGINE_PLANE_CALLBACK_URL: ${ENGINE_PLANE_CALLBACK_URL:?}
+      # The App's slug, or the front page's only button offers to create a SECOND App
+      # rather than install this one. It reaches the container only if it is listed
+      # here — an environment variable in `.env` is not an environment a container has.
+      GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-}
       # The session cookie drops `Secure` only when told to, so http in development is a
       # deliberate setting rather than something that silently degrades.
       ENGINE_PLANE_INSECURE: ${ENGINE_PLANE_INSECURE:-}
