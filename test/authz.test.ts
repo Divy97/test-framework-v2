@@ -203,3 +203,51 @@ describe('the local surface is unchanged', () => {
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(true);
   });
 });
+
+/**
+ * The front door, which for a while was the one page that never asked.
+ *
+ * Every other route here calls `visible(headers)` first. `/` did not — it rendered the
+ * landing page for everyone and decided the sign-in link from `options.auth !== undefined`,
+ * which answers "is login configured on this deployment", not "is this person logged
+ * out". So a signed-in user who typed the bare hostname was shown a marketing page
+ * offering them a sign-in they had already done, with no link to their own repositories.
+ *
+ * Nothing was broken underneath: the session was valid and `/repos` worked. The page
+ * simply never looked, which is the kind of bug a test of the routes it DID gate cannot
+ * find.
+ */
+describe('the landing page asks who you are', () => {
+  it('a signed-in visitor is sent to their repositories, not offered a sign-in', async () => {
+    const response = await call(surface(), 'GET', '/');
+
+    expect(response?.status).toBe(302);
+    expect(response?.headers?.location).toBe('/repos');
+  });
+
+  it('a signed-in visitor with no installations still goes to /repos, which is where the answer is', async () => {
+    // Not a special case worth its own page: `/repos` is precisely the page that says
+    // "you have not installed this anywhere yet".
+    const response = await call(surface({ installations: [] }), 'GET', '/');
+
+    expect(response?.status).toBe(302);
+    expect(response?.headers?.location).toBe('/repos');
+  });
+
+  it('a signed-out visitor gets the landing page WITH a way in', async () => {
+    const response = await call(surface({ session: null }), 'GET', '/');
+
+    expect(response?.status).toBe(200);
+    expect(response?.body).toContain('href="/auth/github"');
+  });
+
+  it('and locally, where there is no login, the landing page offers none', async () => {
+    // The original reason the line was written the way it was, and it still holds:
+    // one operator on 127.0.0.1, and a sign-in button would lead nowhere.
+    const local = dashboardRoutes({ client: fakeClient(), installUrl: 'https://example.invalid' });
+    const response = await call(local, 'GET', '/');
+
+    expect(response?.status).toBe(200);
+    expect(response?.body).not.toContain('href="/auth/github"');
+  });
+});

@@ -169,9 +169,20 @@ export function dashboardRoutes(options: {
     }
 
     if (method === 'GET' && (path === '/' || path === '')) {
+      // Ask who this is, like every other page does.
+      //
+      // This line used to render the landing page for everyone, because `signIn` was
+      // answering "is login configured on this deployment" rather than "is this person
+      // logged out". The case nobody considered was the third one: hosted, AND already
+      // signed in. That visitor was shown a sign-in button they did not need, on a page
+      // with no link to their own repositories.
+      const who = await visible(headers);
+      if (who !== null && who !== 'anonymous') {
+        return { status: 302, type: 'text/plain', body: 'signed in\n', headers: { location: '/repos' } };
+      }
       // The sign-in link exists only where signing in does. Locally there is no login —
       // one operator, 127.0.0.1 — and offering one would be a button that leads nowhere.
-      return html(landingPage(install, { signIn: options.auth !== undefined }));
+      return html(landingPage(install, { signIn: who === 'anonymous' }));
     }
 
     if (method === 'GET' && path === '/repos') {
