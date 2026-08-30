@@ -234,8 +234,24 @@ the container needs no network egress at all.</p>`;
  * a warning decoration — it is the row's most important column, and it carries the link
  * that resolves it.
  */
+/**
+ * WHERE the engine runs, which changes what these pages may promise.
+ *
+ * `local` is `serve.ts`: one operator, containers on this machine, and installing a
+ * repository starts a drafting run that fills the recipe box for them.
+ *
+ * `plane` is the hosted control plane, which holds no model key and runs no containers
+ * by design (ADR-0011, ADR-0019) — work goes to a paired runner. Nothing drafts there
+ * yet, so a page that says "draft a recipe" is offering something that will not happen.
+ *
+ * Explicit rather than inferred from whether login is configured. Those are two different
+ * questions, and conflating them is exactly the bug the landing page had.
+ */
+export type Mode = 'local' | 'plane';
+
 export function repositoriesPage(
   rows: { installation: Installation; hasRecipe: boolean; runs: number }[],
+  mode: Mode = 'plane',
 ): string {
   const body =
     `<h1>Repositories</h1>` +
@@ -252,7 +268,9 @@ start.</p>`
             hasRecipe
               ? `<span class="pass">recipe approved</span>`
               : `<b class="fail">not onboarded yet</b> — ` +
-                `<a href="/repos/${urlPath(installation.repo)}/onboard">draft a recipe</a>`,
+                `<a href="/repos/${urlPath(installation.repo)}/onboard">${
+                  mode === 'local' ? 'draft a recipe' : 'write a recipe'
+                }</a>`,
           ]),
         ));
   return layout('Repositories', body);
@@ -375,6 +393,7 @@ export function onboardPage(
   draft?: unknown,
   error?: string,
   proof?: unknown,
+  mode: Mode = 'plane',
 ): string {
   const action = `/repos/${urlPath(repo)}/onboard`;
 
@@ -427,6 +446,20 @@ repository — never as a pull request against your code.</p>` +
 Treat it as a first draft, not a recommendation: check every command, every port and
 every service name against what you actually know about this project before you approve
 anything below.</p>
+</div>`
+      : '') +
+    // Says whose words are in the box. On the plane nothing drafts, so the skeleton is a
+    // skeleton and the person reading this is the author — telling them an agent wrote it
+    // would be false, and leaving them waiting for a draft that is never coming is worse.
+    (!current && !isDraft && mode === 'plane'
+      ? `<div class="panel">
+<h2>Nothing drafted this — the box is yours to fill.</h2>
+<p>Drafting reads your project and proposes a recipe, and it runs where the containers run.
+This service holds no model key and runs nothing itself (<a href="/">why</a>), so on a hosted
+plane there is no drafting yet: write the commands that install, boot and test your project,
+and approve them.</p>
+<p class="muted small">Running the engine on your own machine does draft, and this page shows
+that draft when there is one.</p>
 </div>`
       : '') +
     `<div class="warning refusal">
@@ -551,13 +584,22 @@ stays in the log, and a reader asking who wrote it still gets an answer.</p>`;
   return layout(`Runners · ${repo}`, body);
 }
 
-export function runsPage(runs: RunRow[], repo?: string): string {
+export function runsPage(runs: RunRow[], repo?: string, mode: Mode = 'plane'): string {
   const heading = repo ? `Runs · ${escapeHtml(repo)}` : 'Runs';
+  // What is ACTUALLY required, in order. This used to say only "label an issue", which
+  // is the last step of three: label one before the rest and the delivery is accepted,
+  // logged as `not onboarded — nothing queued`, and nothing appears here to say why.
+  const nothingYet =
+    mode === 'local'
+      ? `<p class="muted">No runs yet. Approve a recipe for a connected repository, then open or
+label an issue on it.</p>`
+      : `<p class="muted">No runs yet. A run needs three things: a runner paired <em>and running</em>
+on a machine of yours, an approved recipe for the repository, and an issue opened or labelled on
+it. Labelling one before the first two is accepted and then quietly does nothing.</p>`;
   const body =
     `<h1>${heading}</h1>` +
     (runs.length === 0
-      ? `<p class="muted">No runs yet. Label an issue on a connected repository to start
-one.</p>`
+      ? nothingYet
       : table(
           ['run', 'issue', 'status', 'tier', 'confidence', 'regression', 'started', 'result'],
           runs.map((run) => [

@@ -514,6 +514,10 @@ export async function serve(options: ServeOptions): Promise<Service> {
     // surface, one thing to expose, and the live tail a run page needs is already here.
     routes: dashboardRoutes({
       client,
+      // The engine runs HERE: containers on this machine, and installing a repository
+      // starts a drafting run that fills the recipe box. The hosted plane can promise
+      // neither, so the pages say different things.
+      mode: 'local',
       // Not awaited: proving is two containers and several minutes, and the human who
       // just pressed approve is owed a page now. The result lands in the row and the
       // next render of this page shows it.
