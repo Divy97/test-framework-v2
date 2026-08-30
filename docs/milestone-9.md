@@ -348,3 +348,34 @@ Worth naming as a gap rather than a war story: **nothing checks that the images 
 deployment runs are the images this repository builds.** A run against a stale image is
 an operational failure that reads, from the log, exactly like an environment that would
 not build.
+
+## The rehearsal, and the two bugs it found
+
+Milestone 9 was merged and tested and had **never been executed**. Before deploying it
+anywhere, the plane and a runner were run against each other on one machine: a signed
+delivery to the plane's receiver, a paired runner polling it, and a real job crossing
+between them.
+
+The loop works. The plane accepted the delivery, minted a run id, queued it; the runner
+claimed it in seconds, ran the engine unchanged, shipped **124 events and 109
+artifacts** back over the wire, and the run ended `PR_OPENED` on a real repository. Every
+surface answered as its tests said it would, including the two distinctions that only
+matter in production — a browser gets a redirect where an API client gets 401, and an
+unpaired runner gets 401 rather than an empty queue.
+
+Both bugs it found are the kind that only appear when the thing runs.
+
+**A blob root is a store, not a directory.** `runner-main.ts` created its root with a
+bare `mkdir`, and `orchestrate` refuses a root with no `.evidence-store` sentinel — so
+every runner would have failed its first job, on a message about a mount it does not
+have. `ensureBlobRoot` now lives in `blobs.ts` and all three programs share it; it was
+private to `serve.ts`, and the second program to need it did not know.
+
+**The plane received everything and showed nothing.** 124 events landed and
+`run_projection` was empty, because nothing on the plane's side ever called
+`projectOne` — so `/runs/<id>` reads the projection for its row and 404s on a run that
+completed perfectly. The log was flawless and invisible, on the screen that *is* the
+product. The plane projects each accepted batch now, never at the cost of the append:
+the log is the truth, the projection is a cache `npm run rebuild` reconstructs, and
+failing a runner's write because a cache would not update is the trade this codebase
+refuses everywhere else.
