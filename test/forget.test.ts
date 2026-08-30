@@ -12,13 +12,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import type pg from 'pg';
 import { get, put } from '../src/blobs.js';
 import type { ArtifactRef, RunEvent } from '../src/events.js';
 import { forgetRun, tombstoneFor } from '../src/forget.js';
+import type pg from 'pg';
 import { appendEvent, connect } from '../src/store.js';
 
-let client: pg.Client | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 const runs: string[] = [];
 let root = '';
@@ -31,7 +31,6 @@ beforeAll(async () => {
   }
   try {
     const candidate = connect();
-    await candidate.connect();
     await candidate.query('select 1 from forgotten limit 1');
     client = candidate;
   } catch (error) {

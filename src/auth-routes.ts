@@ -4,7 +4,7 @@
 // ask "may this person act on this repository" and are the product; these establish who
 // the person is at all, and nothing else on the surface needs to know how.
 
-import type pg from 'pg';
+import type { Db } from './store.js';
 import {
   authorizeUrl,
   clearedCookie,
@@ -51,7 +51,7 @@ const refused = (why: string) =>
   }) as const;
 
 export function authRoutes(options: {
-  client: pg.Client;
+  client: Db;
   oauth: OAuthConfig;
   /** False for a plane on plain http in development; the cookie says so either way. */
   secure?: boolean;

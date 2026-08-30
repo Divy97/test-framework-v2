@@ -11,9 +11,8 @@
 // the log and never inside it. That means it cannot be rebuilt by replay, and losing it
 // loses real information — which is the price of keeping the log clean, paid knowingly.
 
-import type pg from 'pg';
 import { projectRun, type RunRow } from './projection.js';
-import { readRun } from './store.js';
+import { readRun, type Db } from './store.js';
 
 const iso = (value: unknown): string => (value instanceof Date ? value.toISOString() : String(value));
 
@@ -43,7 +42,7 @@ const COLUMNS =
  * twice from the same log writes the same bytes. That is what lets the caller re-project
  * on every append without tracking whether it already had.
  */
-export async function saveRunRow(client: pg.Client, row: RunRow): Promise<void> {
+export async function saveRunRow(client: Db, row: RunRow): Promise<void> {
   await client.query(
     `insert into run_projection (${COLUMNS})
        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -60,13 +59,13 @@ export async function saveRunRow(client: pg.Client, row: RunRow): Promise<void> 
 }
 
 /** Re-derive one run's row from its events. Returns null if the run has no events. */
-export async function projectOne(client: pg.Client, runId: string): Promise<RunRow | null> {
+export async function projectOne(client: Db, runId: string): Promise<RunRow | null> {
   const row = projectRun(await readRun(client, runId));
   if (row) await saveRunRow(client, row);
   return row;
 }
 
-export async function listRuns(client: pg.Client, repo?: string): Promise<RunRow[]> {
+export async function listRuns(client: Db, repo?: string): Promise<RunRow[]> {
   const { rows } = repo
     ? await client.query(
         `select ${COLUMNS} from run_projection where repo = $1 order by started_at desc`,
@@ -76,7 +75,7 @@ export async function listRuns(client: pg.Client, repo?: string): Promise<RunRow
   return rows.map(toRow);
 }
 
-export async function readRunRow(client: pg.Client, runId: string): Promise<RunRow | null> {
+export async function readRunRow(client: Db, runId: string): Promise<RunRow | null> {
   const { rows } = await client.query(`select ${COLUMNS} from run_projection where run_id = $1`, [runId]);
   return rows[0] ? toRow(rows[0]) : null;
 }
@@ -86,10 +85,12 @@ export async function readRunRow(client: pg.Client, runId: string): Promise<RunR
  *
  * *"Delete the entire dashboard database and it rebuilds from the log"* is what milestone
  * 6 calls the most interesting thing it produces, and a claim like that is worth exactly
- * as much as the command that demonstrates it. `delete` rather than `truncate` so it runs
- * inside a transaction the caller may already hold.
+ * as much as the command that demonstrates it. `delete` rather than `truncate` so a
+ * caller CAN run it inside a transaction — which, `Db` being a pool (ADR-0020), means a
+ * caller holding one connection it checked out itself. Handed the pool, these two
+ * statements may land on different connections and no transaction contains them.
  */
-export async function rebuildProjection(client: pg.Client): Promise<{ rebuilt: number; skipped: string[] }> {
+export async function rebuildProjection(client: Db): Promise<{ rebuilt: number; skipped: string[] }> {
   await client.query('delete from run_projection');
   const { rows } = await client.query('select distinct run_id from events');
   let rebuilt = 0;
@@ -122,7 +123,7 @@ export type UsageRow = {
   model: string;
 };
 
-export async function saveUsage(client: pg.Client, row: UsageRow): Promise<void> {
+export async function saveUsage(client: Db, row: UsageRow): Promise<void> {
   await client.query(
     `insert into run_usage (run_id, phase, turns, input_tokens, output_tokens,
                             cache_read_input_tokens, cache_creation_input_tokens, provider, model)
@@ -138,7 +139,7 @@ export async function saveUsage(client: pg.Client, row: UsageRow): Promise<void>
   );
 }
 
-export async function readUsage(client: pg.Client, runId: string): Promise<UsageRow[]> {
+export async function readUsage(client: Db, runId: string): Promise<UsageRow[]> {
   const { rows } = await client.query(
     `select run_id, phase, turns, input_tokens, output_tokens,
             cache_read_input_tokens, cache_creation_input_tokens, provider, model

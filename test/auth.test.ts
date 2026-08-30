@@ -10,7 +10,6 @@
 // `fetch` and run everywhere.
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import type pg from 'pg';
 import {
   authorizeUrl,
   clearedCookie,
@@ -24,9 +23,10 @@ import {
   sessionCookie,
   type OAuthConfig,
 } from '../src/auth.js';
+import type pg from 'pg';
 import { connect } from '../src/store.js';
 
-let client: pg.Client | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 const made: string[] = [];
 
@@ -37,7 +37,6 @@ beforeAll(async () => {
   }
   try {
     const candidate = connect();
-    await candidate.connect();
     await candidate.query('select 1 from sessions limit 1');
     client = candidate;
   } catch (error) {

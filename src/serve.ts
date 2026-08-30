@@ -29,7 +29,6 @@ import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type pg from 'pg';
 import { saveDraft } from './drafts.js';
 import type { InstallationIntake, IssueIntake } from './github.js';
 import { cloneRepository, commentOnIssue, installationToken, repoUrl, startWebhookReceiver } from './github.js';
@@ -43,7 +42,7 @@ import { loadRecipe, saveProof } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runFromIssue } from './run.js';
 import { startStatusServer } from './sse.js';
-import { loadEnv, appendEvent, connect, readRunAfter } from './store.js';
+import { loadEnv, appendEvent, connect, readRunAfter, type Db, ready, close } from './store.js';
 
 export type Config = {
   /** The GitHub App's numeric id, and the PEM it signs its JWT with (ADR-0012). */
@@ -163,7 +162,7 @@ export type Service = {
 
 export type ServeOptions = {
   config: Config;
-  client: pg.Client;
+  client: Db;
   /** Injected so a test can watch a run start without spending a model or a container. */
   run?: typeof runFromIssue;
   /**
@@ -515,19 +514,27 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   loadEnv();
   const config = readConfig();
   const client = connect();
-  await client.connect();
+  await ready(client);
   const service = await serve({ config, client });
   console.log(`webhook  http://127.0.0.1:${service.webhookPort}/`);
   console.log(`events   http://127.0.0.1:${service.eventsPort}/runs/<run-id>/events`);
   console.log('one run at a time — one run is five containers, so a second would double the bill');
 
+  // One shutdown, however many signals arrive. `process.once` is per SIGNAL, so an
+  // operator's Ctrl-C followed by a supervisor's SIGTERM ran this chain twice — and the
+  // second run would reach `close(client)` while the first was still inside `drain()`,
+  // killing the run in flight and exiting 1. Harmless under `pg.Client`, whose `end()`
+  // was idempotent; not under a pool, whose second `end()` rejects.
+  let shuttingDown = false;
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.once(signal, () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
       console.log(`\n${signal}: no longer accepting deliveries; finishing the run in flight`);
       service
         .close()
         .then(() => service.drain())
-        .then(() => client.end())
+        .then(() => close(client))
         .then(() => process.exit(0))
         .catch(() => process.exit(1));
     });

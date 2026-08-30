@@ -13,13 +13,13 @@
 
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import type pg from 'pg';
 import type { RunEvent } from '../src/events.js';
 import { loadRecipe, saveRecipe, type Recipe } from '../src/recipe.js';
+import type pg from 'pg';
 import { appendEvent, connect, readRunAfter } from '../src/store.js';
 import { resumeFrom, tailRun } from '../src/sse.js';
 
-let client: pg.Client | null = null;
+let client: pg.Pool | null = null;
 let why = '';
 
 beforeAll(async () => {
@@ -29,7 +29,6 @@ beforeAll(async () => {
   }
   try {
     const candidate = connect();
-    await candidate.connect();
     // The schema, not just the connection. A database with no tables would fail
     // every test below with a confusing error instead of skipping.
     await candidate.query('select 1 from events limit 1');
@@ -142,5 +141,123 @@ describe('the tail s query, against a real database', () => {
     } finally {
       await client.query('delete from events where run_id = $1', [runId]);
     }
+  });
+});
+
+/**
+ * The property the pool exists for (ADR-0020).
+ *
+ * These do not test `pg`. They test that THIS process survives a database connection
+ * dying underneath it — which the plane did not, because a `pg.Client` that loses its
+ * connection emits `'error'` with nobody listening, and an unhandled `'error'` event in
+ * Node exits the process. The bug never appeared on a laptop because a laptop's
+ * Postgres does not go away mid-afternoon. A managed database that suspends idle
+ * compute does, every night, on a schedule.
+ *
+ * `pg_terminate_backend` is how a connection is made to die on purpose. It is the same
+ * FATAL the server sends when it decides on its own that a socket has been quiet
+ * long enough.
+ */
+describe('a database connection that dies under the process', () => {
+  test('a connection killed while IDLE in the pool does not take the process down', async () => {
+    if (!client) {
+      console.log(`SKIPPED (idle connection): ${why}`);
+      return;
+    }
+    // Serve a query so a connection exists, and note which one. It goes back into the
+    // pool idle the moment this resolves — nobody is awaiting it any more, which is
+    // precisely why its death has no promise to reject and used to reach the process.
+    const { rows } = await client.query('select pg_backend_pid() as pid');
+    const idlePid = Number(rows[0].pid);
+
+    // WATCH THE PROCESS, not just the pool. Without the listener in `connect()` the pool
+    // still recovers — it opens another connection and every other assertion here passes
+    // — so a test that only queried again would stay green while the bug it exists for
+    // was fully present. What actually differs is that the dead connection's `'error'`
+    // reaches the process as an uncaught exception, and in production that is the exit.
+    // So the uncaught exception is the thing asserted on.
+    //
+    // Armed BEFORE the kill. `pg_terminate_backend` returns when the signal is sent, so
+    // the victim's FATAL arrives a beat after the executioner's reply — measured at 0-1ms
+    // behind. Arming afterwards worked on that margin; arming first has no margin to be
+    // on the wrong side of.
+    //
+    // This depends on a real vitest behaviour worth naming, because it looks like the
+    // assertion is redundant and it is not: while a test is running and a SECOND
+    // `uncaughtException` listener exists, vitest reports nothing and defers to that
+    // listener. Inside this window `escaped` is the only judge. Delete the `expect` on
+    // the theory that vitest would have caught it anyway and the coverage disappears
+    // with no failure to tell you.
+    const escaped: Error[] = [];
+    const watch = (error: Error) => escaped.push(error);
+    process.on('uncaughtException', watch);
+    try {
+      // Killed from OUTSIDE the pool, the way the server would do it.
+      const executioner = connect();
+      try {
+        await executioner.query('select pg_terminate_backend($1)', [idlePid]);
+      } finally {
+        await executioner.end();
+      }
+      // The FATAL reaches the idle socket asynchronously.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      process.off('uncaughtException', watch);
+    }
+    expect(escaped.map((error) => error.message)).toEqual([]);
+
+    // And the pool opened another one, so the drop cost a connection, not the process.
+    const after = await client.query('select pg_backend_pid() as pid');
+    expect(Number(after.rows[0].pid)).not.toBe(idlePid);
+  });
+
+  test('every connection the pool holds can die at once and the process still does not', async () => {
+    if (!client) {
+      console.log(`SKIPPED (pool recovery): ${why}`);
+      return;
+    }
+    // The hosted failure this whole change is about: not one reaped socket, but the
+    // database going away and taking every connection with it. Concurrent queries force
+    // the pool to open more than one, and each reports the backend serving it.
+    const served = await Promise.all([
+      client.query('select pg_backend_pid() as pid'),
+      client.query('select pg_backend_pid() as pid'),
+      client.query('select pg_backend_pid() as pid'),
+    ]);
+    const mine = [...new Set(served.map((result) => Number(result.rows[0].pid)))];
+    expect(mine.length).toBeGreaterThan(1);
+
+    const escaped: Error[] = [];
+    const watch = (error: Error) => escaped.push(error);
+    process.on('uncaughtException', watch);
+    try {
+      const executioner = connect();
+      try {
+        // EXACTLY this pool's connections, by pid.
+        //
+        // The first version of this said `where datname = current_database()`, which is
+        // every backend on the database — and vitest runs test files in parallel forks
+        // against ONE database, so it reaped the connections of whatever else was
+        // running. It failed other files roughly a third of the time, from here, with
+        // an error naming them rather than this test. A test that breaks its neighbours
+        // is worse than the bug it was written for.
+        await executioner.query(
+          'select pg_terminate_backend(pid) from pg_stat_activity where pid = any($1::int[])',
+          [mine],
+        );
+      } finally {
+        await executioner.end();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } finally {
+      process.off('uncaughtException', watch);
+    }
+    // Several connections died at once, so the listener was called several times. None
+    // of them reached the process.
+    expect(escaped.map((error) => error.message)).toEqual([]);
+
+    // And the next request is served, with no restart and nothing for an operator to do.
+    const recovered = await client.query('select 1 as ok');
+    expect(recovered.rows[0].ok).toBe(1);
   });
 });

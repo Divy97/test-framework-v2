@@ -18,7 +18,7 @@
 // consequence of it, not a second thing to remember.
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import type pg from 'pg';
+import type { Db } from './store.js';
 
 export type Session = {
   id: string;
@@ -117,7 +117,7 @@ export async function identify(
   }
 }
 
-export async function createSession(client: pg.Client, who: Omit<Session, 'id'>): Promise<string> {
+export async function createSession(client: Db, who: Omit<Session, 'id'>): Promise<string> {
   const id = token();
   await client.query(
     'insert into sessions (id, github_id, login, avatar_url, token) values ($1, $2, $3, $4, $5)',
@@ -127,7 +127,7 @@ export async function createSession(client: pg.Client, who: Omit<Session, 'id'>)
 }
 
 /** Who this cookie is, or nobody. Expiry is enforced here rather than by a sweeper. */
-export async function readSession(client: pg.Client, id: string | undefined): Promise<Session | null> {
+export async function readSession(client: Db, id: string | undefined): Promise<Session | null> {
   if (!id) return null;
   const { rows } = await client.query(
     `select id, github_id, login, avatar_url, token from sessions
@@ -148,7 +148,7 @@ export async function readSession(client: pg.Client, id: string | undefined): Pr
   };
 }
 
-export async function endSession(client: pg.Client, id: string | undefined): Promise<void> {
+export async function endSession(client: Db, id: string | undefined): Promise<void> {
   if (id) await client.query('delete from sessions where id = $1', [id]);
 }
 

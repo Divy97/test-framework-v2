@@ -10,7 +10,7 @@
 // both halves are injected here: what is under test is the gate, not the API client.
 
 import { describe, expect, it, vi } from 'vitest';
-import type pg from 'pg';
+import type { Db } from '../src/store.js';
 import type { Session } from '../src/auth.js';
 import { dashboardRoutes } from '../src/routes.js';
 
@@ -39,7 +39,7 @@ const fakeClient = (writes: string[] = []) =>
             : [];
       return { rows, rowCount: rows.length };
     }),
-  }) as unknown as pg.Client;
+  }) as unknown as Db;
 
 /** A surface where this person can see installation 1 and nothing else. */
 const surface = (options: { session?: Session | null; installations?: number[]; writes?: string[] } = {}) =>

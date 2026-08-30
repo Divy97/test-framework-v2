@@ -208,6 +208,7 @@ The reported symptom is also observed on **both** sides now. Present on base is 
 17. [Environment secrets, and the network route that has to close first](docs/adr/0017-environment-secrets-and-the-network-that-has-to-close.md)
 18. [A reproduction the repository already had](docs/adr/0018-a-reproduction-the-repository-already-had.md)
 19. [Who writes, when the runner is not ours](docs/adr/0019-who-writes-when-the-runner-is-not-ours.md)
+20. [The database handle is a pool](docs/adr/0020-the-database-handle-is-a-pool.md)
 
 The full decision record from the founding design session: [SHARED-UNDERSTANDING.md](SHARED-UNDERSTANDING.md).
 

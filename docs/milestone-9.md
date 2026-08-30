@@ -52,9 +52,10 @@ given the work.
 
 **The batch append has no transaction, deliberately.** An append-only log has no
 un-append: rolling back three written observations because a fourth collided deletes
-facts to punish a client bug. And `pg.Client` is one connection shared by every request,
-so a `begin` here interleaves with concurrent statements on the same wire — a bug that
-would appear only under load, as events landing inside somebody else's rollback. Nothing
+facts to punish a client bug. And the handle is a pool
+([ADR-0020](adr/0020-the-database-handle-is-a-pool.md)), so a `begin` and its `commit`
+are not promised to reach the same connection — the transaction would open on one and be
+committed on another, or never. Nothing
 needs serialising, because one runner per run means the only concurrent writer is that
 runner retrying itself.
 

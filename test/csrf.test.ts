@@ -17,7 +17,7 @@
 // command that no human approved, so the invariant onboarding rests on was simply false.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type pg from 'pg';
+import type { Db } from '../src/store.js';
 import { dashboardRoutes } from '../src/routes.js';
 import { startStatusServer, type StatusServer } from '../src/sse.js';
 
@@ -36,7 +36,7 @@ const client = () =>
           : [];
       return { rows, rowCount: rows.length };
     }),
-  }) as unknown as pg.Client;
+  }) as unknown as Db;
 
 const serve = async () => {
   const server = await startStatusServer({

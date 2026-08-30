@@ -8,7 +8,7 @@
 // right is `sandbox.test.ts`'s question, because answering it takes two containers.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type pg from 'pg';
+import type { Db } from '../src/store.js';
 import { dashboardRoutes } from '../src/routes.js';
 import { startStatusServer, type StatusServer } from '../src/sse.js';
 
@@ -28,7 +28,7 @@ const client = (writes: string[]) =>
           : [];
       return { rows, rowCount: rows.length };
     }),
-  }) as unknown as pg.Client;
+  }) as unknown as Db;
 
 const serve = async (onApproved: (repo: string) => void, writes: string[] = []) => {
   const server = await startStatusServer({

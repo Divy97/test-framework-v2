@@ -7,7 +7,7 @@
 // Losing this table costs nothing but a re-draft: the agent can always be asked again,
 // which is why it gets no more durability than an upsert and a delete.
 
-import type pg from 'pg';
+import type { Db } from './store.js';
 
 export type Draft = {
   repo: string;
@@ -29,7 +29,7 @@ const iso = (value: unknown): string =>
  * function's job is to hold what the agent said, not to judge it — `parseRecipe` is the
  * gate, and it runs when a human is about to approve, not when this is written.
  */
-export async function saveDraft(client: pg.Client, repo: string, draft: unknown): Promise<void> {
+export async function saveDraft(client: Db, repo: string, draft: unknown): Promise<void> {
   await client.query(
     `insert into recipe_drafts (repo, draft, drafted_at) values ($1, $2, now())
        on conflict (repo) do update set draft = $2, drafted_at = now()`,
@@ -38,7 +38,7 @@ export async function saveDraft(client: pg.Client, repo: string, draft: unknown)
 }
 
 /** The live draft for a repository, or null. Unvalidated — see `saveDraft`. */
-export async function loadDraft(client: pg.Client, repo: string): Promise<Draft | null> {
+export async function loadDraft(client: Db, repo: string): Promise<Draft | null> {
   const { rows } = await client.query(
     'select repo, draft, drafted_at from recipe_drafts where repo = $1',
     [repo],
@@ -55,6 +55,6 @@ export async function loadDraft(client: pg.Client, repo: string): Promise<Draft 
  * was to give that human something to start from, and showing it again after approval
  * would read as a second, stale proposal sitting beside the one now actually in force.
  */
-export async function clearDraft(client: pg.Client, repo: string): Promise<void> {
+export async function clearDraft(client: Db, repo: string): Promise<void> {
   await client.query('delete from recipe_drafts where repo = $1', [repo]);
 }

@@ -111,7 +111,7 @@ export type StatusServer = { port: number; close: () => Promise<void> };
  * A route this server does not itself know how to answer.
  *
  * The dashboard (M6f) needs pages and JSON; this module needs to stay a thing a test can
- * drive with no database, which is why `read` is injected rather than a `pg.Client`. So
+ * drive with no database, which is why `read` is injected rather than a `Db`. So
  * the extra surface arrives the same way: as a function the caller closes over its own
  * client, returning what to send. `null` means "not mine", and the 404 stands.
  */

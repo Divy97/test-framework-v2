@@ -21,7 +21,7 @@
 // (ADR-0007's v1.5 amendment): our infrastructure being wrong about someone's
 // project is not a finding about their bug.
 
-import type pg from 'pg';
+import type { Db } from './store.js';
 import { redact } from './redact.js';
 import type { ToolHost } from './tools.js';
 
@@ -111,7 +111,7 @@ export function parseRecipe(input: unknown): Recipe {
 }
 
 /** Keyed by repository, on our side. `full_name` — the same string GitHub uses. */
-export async function saveRecipe(client: pg.Client, repo: string, recipe: Recipe): Promise<void> {
+export async function saveRecipe(client: Db, repo: string, recipe: Recipe): Promise<void> {
   // `proof = null` on the update path, and it is not tidiness: a proof is about a
   // set of commands, and leaving the old one beside new commands would show a human
   // a green "ready" for an environment nobody has built (8f).
@@ -122,7 +122,7 @@ export async function saveRecipe(client: pg.Client, repo: string, recipe: Recipe
   );
 }
 
-export async function loadRecipe(client: pg.Client, repo: string): Promise<Recipe | null> {
+export async function loadRecipe(client: Db, repo: string): Promise<Recipe | null> {
   const { rows } = await client.query('select recipe from recipes where repo = $1', [repo]);
   return rows.length === 0 ? null : parseRecipe(rows[0].recipe);
 }
@@ -135,7 +135,7 @@ export async function loadRecipe(client: pg.Client, repo: string): Promise<Recip
  * proof in its own table would make that an invariant somebody has to remember
  * instead of a fact about where the bytes live.
  */
-export async function saveProof(client: pg.Client, repo: string, proof: unknown): Promise<void> {
+export async function saveProof(client: Db, repo: string, proof: unknown): Promise<void> {
   await client.query('update recipes set proof = $2 where repo = $1', [repo, JSON.stringify(proof)]);
 }
 
@@ -144,7 +144,7 @@ export async function saveProof(client: pg.Client, repo: string, proof: unknown)
  * proof written by an older engine must render as what it is rather than throw on
  * a field that did not exist yet.
  */
-export async function loadProof(client: pg.Client, repo: string): Promise<unknown> {
+export async function loadProof(client: Db, repo: string): Promise<unknown> {
   const { rows } = await client.query('select proof from recipes where repo = $1', [repo]);
   return rows.length === 0 ? null : (rows[0].proof ?? null);
 }
