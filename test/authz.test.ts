@@ -228,6 +228,11 @@ describe('the landing page asks who you are', () => {
   it('a signed-in visitor with no installations still goes to /repos, which is where the answer is', async () => {
     // Not a special case worth its own page: `/repos` is precisely the page that says
     // "you have not installed this anywhere yet".
+    //
+    // This input is also what a GitHub OUTAGE looks like — `installationsFor` answers `[]`
+    // rather than throwing, deliberately, so that a failure to confirm access denies it
+    // rather than granting it. Worth knowing that the front door behaves the same either
+    // way, which it does because it never asks GitHub anything (see below).
     const response = await call(surface({ installations: [] }), 'GET', '/');
 
     expect(response?.status).toBe(302);
@@ -249,5 +254,19 @@ describe('the landing page asks who you are', () => {
 
     expect(response?.status).toBe(200);
     expect(response?.body).not.toContain('href="/auth/github"');
+  });
+
+  it('asks who you are without asking what you own', async () => {
+    // The property the first version of this fix broke. Reaching for `visible()` here is
+    // the obvious move — it is what every other route does — and it buys an authorization
+    // answer this route never reads: a GitHub `GET /user/installations` and an
+    // `installations` query, on the front door, which then redirects to a page that asks
+    // both again. Two round-trips to render a page that used to do no I/O at all.
+    //
+    // So: a session lookup, and nothing else.
+    const writes: string[] = [];
+    await call(surface({ writes }), 'GET', '/');
+
+    expect(writes.some((sql) => sql.includes('from installations'))).toBe(false);
   });
 });

@@ -169,20 +169,28 @@ export function dashboardRoutes(options: {
     }
 
     if (method === 'GET' && (path === '/' || path === '')) {
-      // Ask who this is, like every other page does.
+      // Whether this is SOMEBODY, not what they own — and the difference is the reason
+      // this is `auth.session()` rather than the `visible()` every other route calls.
       //
-      // This line used to render the landing page for everyone, because `signIn` was
-      // answering "is login configured on this deployment" rather than "is this person
-      // logged out". The case nobody considered was the third one: hosted, AND already
-      // signed in. That visitor was shown a sign-in button they did not need, on a page
-      // with no link to their own repositories.
-      const who = await visible(headers);
-      if (who !== null && who !== 'anonymous') {
+      // `visible()` also asks GitHub `GET /user/installations` and queries `installations`,
+      // because the routes below need to know which repositories to show. This one needs
+      // one bit. Buying the full authorization answer to read that bit would put two
+      // GitHub round-trips on the front door — one here, one on the `/repos` this
+      // redirects to — on the most-hit route in the product, which until now did no I/O
+      // at all. It would also make the landing page fail when GitHub is down: a signed-in
+      // user would be bounced to `/repos` and told they have no repositories, which is
+      // what an empty installations list renders and is not true.
+      //
+      // What was wrong before was `signIn: options.auth !== undefined`, which answers
+      // "does signing in exist on this deployment" — still the right answer for the link,
+      // and the wrong one for "is this person logged out". The session check answers that.
+      const session = options.auth ? await options.auth.session(headers) : null;
+      if (session) {
         return { status: 302, type: 'text/plain', body: 'signed in\n', headers: { location: '/repos' } };
       }
       // The sign-in link exists only where signing in does. Locally there is no login —
       // one operator, 127.0.0.1 — and offering one would be a button that leads nowhere.
-      return html(landingPage(install, { signIn: who === 'anonymous' }));
+      return html(landingPage(install, { signIn: options.auth !== undefined }));
     }
 
     if (method === 'GET' && path === '/repos') {
