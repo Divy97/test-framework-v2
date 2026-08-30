@@ -53,6 +53,7 @@ beforeAll(async () => {
 afterAll(async () => {
   if (client) {
     await client.query('delete from events where run_id = any($1)', [madeRuns]).catch(() => {});
+    await client.query('delete from run_projection where run_id = any($1)', [madeRuns]).catch(() => {});
     await client.query('delete from jobs where run_id = any($1)', [madeRuns]).catch(() => {});
     await client.query('delete from runners where id = any($1)', [madeRunners]).catch(() => {});
   }
@@ -270,6 +271,44 @@ describe('the log admits one writer per run, and it is a check now', () => {
     expect(response.status).toBe(404);
   });
 });
+
+  test('an accepted batch reaches the dashboard, not just the log', async () => {
+    // Found by running a runner against a plane: 124 events landed and `run_projection`
+    // was empty, so the completed run 404'd on the screen that IS the product. The log
+    // was perfect and invisible.
+    //
+    // Asserted on the ROW rather than on a call, because "the projection was updated" is
+    // the claim; whether it happened in the route or a job somewhere is not.
+    const id = installation();
+    const runId = await queue(id);
+    const { token } = await pair(id);
+    await call(token, 'GET', '/runner/jobs');
+
+    await call(token, 'POST', `/runner/runs/${runId}/events`, {
+      body: { events: [event(runId, 1)] },
+    });
+
+    const { rows } = await client!.query('select repo, status from run_projection where run_id = $1', [runId]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].repo).toBe('o/r');
+  });
+
+  test('a refused batch projects nothing, because nothing was recorded', async () => {
+    // The control. Projecting unconditionally would rebuild a row for a run this runner
+    // was never allowed to write, which is the authorization hole one layer down.
+    const id = installation();
+    const runId = await queue(id);
+    const mine = await pair(id, 'mine');
+    const theirs = await pair(id, 'theirs');
+    await call(mine.token, 'GET', '/runner/jobs');
+
+    await call(theirs.token, 'POST', `/runner/runs/${runId}/events`, {
+      body: { events: [event(runId, 1)] },
+    });
+
+    const { rows } = await client!.query('select 1 from run_projection where run_id = $1', [runId]);
+    expect(rows).toHaveLength(0);
+  });
 
 describe('an append is idempotent, and history is not', () => {
   test('replaying the identical batch appends nothing and succeeds', async () => {

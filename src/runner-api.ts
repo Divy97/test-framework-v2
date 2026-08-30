@@ -13,6 +13,7 @@
 import type pg from 'pg';
 import { digest, put } from './blobs.js';
 import { loadRecipe } from './recipe.js';
+import { projectOne } from './readmodel.js';
 import type { ArtifactRef, RunEvent } from './events.js';
 import {
   appendFromRunner,
@@ -134,6 +135,25 @@ export function runnerRoutes(options: {
       if (!batch) return json({ error: `expected {"events": [...]}, at most ${MAX_BATCH}` }, 400);
 
       const result = await appendFromRunner(client, runner, runId, batch);
+      if (!('refused' in result) && result.appended > 0) {
+        // The read model, rebuilt from the log this batch just extended.
+        //
+        // Without it the plane stores every event and its dashboard shows none of them:
+        // `/runs/<id>` reads the projection for the row and 404s when there is none, so
+        // a run that completed perfectly is invisible on the screen that IS the product.
+        // Found by running a runner against a plane — 124 events landed and
+        // `run_projection` had nothing.
+        //
+        // Never at the cost of the append. The log is the truth and the projection is a
+        // disposable cache that `npm run rebuild` reconstructs; failing a runner's write
+        // because a cache would not update is the evidence-loss trade this codebase
+        // refuses everywhere else.
+        //
+        // ponytail: a full fold per batch, which is O(events²) across a run because the
+        // daemon ships one event at a time. Fine at a run's scale (~130 events) and the
+        // upgrade path is to debounce or fold incrementally, not to skip it.
+        await projectOne(client, runId).catch(() => {});
+      }
       if ('refused' in result) {
         // The refusals are distinguishable on purpose. A runner operator has to be able
         // to tell a client bug from a stale process from an attack, and run ids are
