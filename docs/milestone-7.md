@@ -1,5 +1,5 @@
 ---
-status: in progress
+status: built — its open list closed by [milestone 8](milestone-8.md)
 ---
 
 # Milestone 7 — the harness around the fix
