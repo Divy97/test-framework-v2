@@ -96,3 +96,85 @@ export async function listInstallations(client: Db): Promise<Installation[]> {
     removedAt: row.removed_at === null ? null : iso(row.removed_at),
   }));
 }
+
+/**
+ * Ask GitHub what this installation actually covers, and make the table say that.
+ *
+ * `installation_repositories` reports a DELTA — the repositories just added or just
+ * removed — and a delta is only enough if you heard every previous one. A plane deployed
+ * today did not. Every repository installed before it existed is invisible to it, and no
+ * future event will mention them, because they will never be "added" again.
+ *
+ * That is not a hypothetical. Moving from a laptop to a host is exactly this: a fresh
+ * database, an App that has been installed for months, and a repository list that stays
+ * wrong forever. It cost an evening to find, and the cost was hidden — the table looked
+ * populated, with 176 of 177 rows.
+ *
+ * So the delta is not trusted. GitHub is asked for the whole list and the table is made
+ * to match it: anything present is recorded, anything absent is marked removed. Marked,
+ * never deleted — a repository we no longer hold still authored runs, and a reader asking
+ * about one deserves an answer.
+ *
+ * Scoped to ONE installation. Another installation's rows are not this one's to judge.
+ */
+export async function reconcileInstallation(
+  client: Db,
+  installationId: number,
+  mintToken: (installationId: number) => Promise<string>,
+  options: { fetch?: typeof fetch; api?: string } = {},
+): Promise<{ held: number; removed: number }> {
+  const call = options.fetch ?? fetch;
+  const api = options.api ?? 'https://api.github.com';
+  const token = await mintToken(installationId);
+
+  const held: { repo: string; account: string }[] = [];
+  // Paginated, because "all repositories" on a real account is not one page. A truncated
+  // list here would mark the remainder removed, which is worse than not reconciling.
+  for (let page = 1; ; page += 1) {
+    const response = await call(`${api}/installation/repositories?per_page=100&page=${page}`, {
+      headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json' },
+    });
+    // 404 is not a failure to answer, it IS the answer: this installation is gone —
+    // uninstalled, or its App deleted — so nothing is held any more. Reconciling to
+    // empty is correct here and only here; every other bad status is a GitHub we could
+    // not reach, and treating THAT as "holds nothing" would mark a working installation
+    // removed during an outage.
+    if (response.status === 404) {
+      const { rowCount } = await client.query(
+        'update installations set removed_at = now() where installation_id = $1 and removed_at is null',
+        [installationId],
+      );
+      return { held: 0, removed: rowCount ?? 0 };
+    }
+    if (!response.ok) {
+      throw new Error(`GitHub would not list installation ${installationId}: HTTP ${response.status}`);
+    }
+    const body = (await response.json()) as {
+      repositories?: { full_name?: unknown; owner?: { login?: unknown } }[];
+    };
+    const batch = body.repositories ?? [];
+    for (const entry of batch) {
+      if (typeof entry.full_name !== 'string') continue;
+      held.push({
+        repo: entry.full_name,
+        account: typeof entry.owner?.login === 'string' ? entry.owner.login : entry.full_name.split('/')[0]!,
+      });
+    }
+    if (batch.length < 100) break;
+  }
+
+  for (const entry of held) {
+    await recordInstallation(client, { ...entry, installationId });
+  }
+
+  // Anything this installation used to hold and GitHub no longer lists. `= any($2)` with
+  // an empty array is a valid empty set, so an installation reduced to nothing still
+  // marks its old rows removed rather than silently keeping them.
+  const { rowCount } = await client.query(
+    `update installations set removed_at = now()
+       where installation_id = $1 and removed_at is null and not (repo = any($2::text[]))`,
+    [installationId, held.map((entry) => entry.repo)],
+  );
+
+  return { held: held.length, removed: rowCount ?? 0 };
+}

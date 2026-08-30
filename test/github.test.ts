@@ -701,3 +701,43 @@ describe('the same delivery is judged the same at either door', () => {
     expect((await call(r, '', { method: 'GET' }))?.status).toBe(405);
   });
 });
+
+/**
+ * An empty delta is still an event (M9).
+ *
+ * These deliveries used to be dropped, correctly, when the repository list was BUILT by
+ * applying deltas: a delta of nothing changes nothing. The list is not built that way
+ * any more — the plane asks GitHub for the whole list and makes the table match — and
+ * under that rule the delivery matters even when its arrays are empty, because it is the
+ * signal to go and look.
+ *
+ * GitHub sends exactly this when a selection widens to "all repositories": nothing was
+ * individually added, so `repositories_added` is empty. That delivery is how a plane with
+ * a stale list finds out, and it was the one being thrown away.
+ */
+describe('an installation delivery that names no repository', () => {
+  test('is still an intake, because the list is reconciled rather than accumulated', () => {
+    const mapped = intake('installation_repositories', {
+      action: 'added',
+      installation: { id: 42, account: { login: 'me' } },
+      repositories_added: [],
+    });
+
+    expect(mapped?.kind).toBe('installation');
+    expect(mapped && 'repos' in mapped ? mapped.repos : null).toEqual([]);
+  });
+
+  test('and so is an install that arrives with no repository list', () => {
+    const mapped = intake('installation', {
+      action: 'created',
+      installation: { id: 42, account: { login: 'me' } },
+    });
+
+    expect(mapped?.kind).toBe('installation');
+  });
+
+  test('but an action that says nothing about repositories is still refused', () => {
+    // `suspend` and friends are real actions that carry no claim about what is held.
+    expect(intake('installation', { action: 'suspend', installation: { id: 42, account: { login: 'me' } } })).toBeNull();
+  });
+});
