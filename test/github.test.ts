@@ -14,6 +14,7 @@ import { describe, expect, test } from 'vitest';
 import {
   webhookRoute,
   WEBHOOK_PATH,
+  MAX_WEBHOOK_BYTES,
   type Intake,
   appJwt,
   authConfig,
@@ -665,6 +666,29 @@ describe('the same delivery is judged the same at either door', () => {
 
     expect(response?.status).toBe(413);
     expect(seen).toEqual([]);
+  });
+
+  test('it asks for the WEBHOOK ceiling, not the surface default', async () => {
+    // The ceiling is `raw`'s argument, and every other test here hands in a fake that
+    // ignores it — so dropping `MAX_WEBHOOK_BYTES` from the call would leave them all
+    // green while the limit silently became `sse.ts`'s 256KB default, eight times
+    // smaller. What that breaks is not obvious: an `installation` delivery from an
+    // account with many repositories is a big payload, and it would start coming back
+    // 413 — which GitHub retries forever and then disables the webhook over.
+    let asked: number | undefined = -1;
+    await webhookRoute({ secret: SECRET, onIntake: () => {} })({
+      method: 'POST',
+      path: WEBHOOK_PATH,
+      query: new URLSearchParams(),
+      headers: { 'x-github-event': 'issues' },
+      body: async () => '',
+      raw: async (limit?: number) => {
+        asked = limit;
+        return Buffer.from('{}');
+      },
+    });
+
+    expect(asked).toBe(MAX_WEBHOOK_BYTES);
   });
 
   test('it answers only its own path, so the rest of the chain still runs', async () => {

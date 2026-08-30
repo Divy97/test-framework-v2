@@ -185,6 +185,22 @@ export async function startPlane(config: PlaneConfig): Promise<{
   };
 }
 
+/**
+ * A port, or a legible refusal — never `NaN`.
+ *
+ * `Number('eight-thousand')` is `NaN`, which `listen` rejects with an error naming
+ * neither the variable nor the value, thrown after the `REQUIRED` check that exists to
+ * produce a readable message has already passed. This is the same idea one line earlier.
+ */
+function port(value: string | undefined): number {
+  if (value === undefined) return 8788;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+    throw new Error(`PORT is "${value}", which is not a port number`);
+  }
+  return parsed;
+}
+
 /** What is missing, and what it costs — the shape `serve.ts` and the runner both use. */
 const REQUIRED: Record<string, string> = {
   DATABASE_URL: 'there is nowhere to keep the log',
@@ -225,7 +241,7 @@ export function readPlaneConfig(env: NodeJS.ProcessEnv = process.env): PlaneConf
       callbackUrl: env.ENGINE_PLANE_CALLBACK_URL!,
     },
     blobRoot: env.ENGINE_BLOB_ROOT!,
-    port: Number(env.PORT ?? env.EVENTS_PORT ?? 8788),
+    port: port(env.PORT ?? env.EVENTS_PORT),
     host: env.ENGINE_BIND ?? '127.0.0.1',
     ...(env.ENGINE_PLANE_INSECURE === '1' ? { secure: false } : {}),
   };
@@ -233,6 +249,14 @@ export function readPlaneConfig(env: NodeJS.ProcessEnv = process.env): PlaneConf
 
 if (process.argv[1]?.endsWith('plane-server.ts') || process.argv[1]?.endsWith('plane-server.js')) {
   loadEnv();
+  // Said out loud rather than ignored. Anyone with this set configured a second server
+  // that no longer exists, and is likely to have pointed the App's webhook URL at it —
+  // which now 404s, and GitHub retries a 404 until it disables the webhook.
+  if (process.env.WEBHOOK_PORT) {
+    console.warn(
+      `WEBHOOK_PORT=${process.env.WEBHOOK_PORT} is ignored: the plane serves one port, and the webhook is a route on it at ${WEBHOOK_PATH}.`,
+    );
+  }
   // Inside the async function, not as its argument. `readPlaneConfig()` throws
   // SYNCHRONOUSLY when the environment is incomplete, and evaluating it as an argument
   // put that throw outside the `catch` below — so an operator missing one variable got

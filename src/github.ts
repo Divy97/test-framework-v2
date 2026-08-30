@@ -421,8 +421,15 @@ export function readWebhook(
   // Bounded before it is buffered. A webhook body is not evidence and an unbounded one
   // is host memory anyone can spend.
   if (body === null) return { status: 413, text: 'too large' };
-  // The RAW bytes, not a re-serialisation. Any framework that reparses and re-encodes
-  // the body changes it and breaks the MAC.
+  // The bytes AS THEY ARRIVED, never a re-serialisation. A framework that parses the body
+  // to an object and re-encodes it changes it and breaks the MAC, which is why both
+  // callers hand this function a Buffer straight off the socket.
+  //
+  // `toString()` is a UTF-8 decode, so be precise about what is verified: the MAC is
+  // computed over the decoded string, and `JSON.parse` below consumes THE SAME decode.
+  // A body that is not valid UTF-8 decodes lossily and fails the signature — closed, not
+  // open — and there is no verify-this-parse-that split, which is the failure this shape
+  // would otherwise invite.
   if (!verifyWebhook(secret, body.toString(), headers.signature)) {
     // 401 and nothing else. Not a hint about which part was wrong.
     return { status: 401, text: 'bad signature' };
@@ -456,6 +463,12 @@ export function webhookRoute(options: {
 }): Route {
   const at = options.path ?? WEBHOOK_PATH;
   return async (request) => {
+    // NOTHING here may read `request.headers['cookie']`, and nothing may log the header
+    // bag. Sharing a hostname with the dashboard means a browser now sends an operator's
+    // session cookie to this path, and this is the one route on the surface that anyone
+    // on the internet can reach. A `log(headers)` added here for debugging would write
+    // live session cookies into the plane's logs.
+    
     if (request.path !== at) return null;
     if (request.method !== 'POST') return { status: 405, type: 'text/plain', body: 'post only\n' };
     const reading = readWebhook(options.secret, await request.raw(MAX_WEBHOOK_BYTES), {

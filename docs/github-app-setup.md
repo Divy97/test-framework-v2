@@ -67,7 +67,7 @@ below — so it cannot drift the way the permission set did for a whole mileston
 | Name | anything unique |
 | Homepage URL | anything |
 | **Webhook** | ✅ Active |
-| **Webhook URL** | your tunnel URL. **The path does not matter** — `startWebhookReceiver` checks `method === 'POST'` and nothing else |
+| **Webhook URL** | **local (`serve.ts`):** your tunnel URL, and the path does not matter — `startWebhookReceiver` checks `method === 'POST'` and nothing else. **Hosted (the plane):** it must end in **`/webhook`**, because there the receiver is a route on the one public port and every other path is a 404. GitHub retries a non-2xx and eventually disables a webhook that never succeeds, so this is the difference between working and silently never working |
 | **Webhook secret** | `openssl rand -hex 32`, and keep it |
 | Request user authorization (OAuth) | **unchecked** — no user token is ever requested (ADR-0012) |
 | **Setup URL** | **blank.** GitHub owns the install screen and there is no setup flow of ours to redirect into. `installation.id` still arrives on every delivery and is still read per delivery — but since M6a it is also **recorded** in `installations` when an `installation` event arrives, because otherwise the first thing we ever learn about a repository is an issue |

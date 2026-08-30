@@ -412,8 +412,11 @@ for an unpaired runner), verify a signed delivery and refuse a forged one, mint 
 and queue it, dispatch it to a paired runner **with the repository's current recipe
 attached**, give a second poller 204, and accept the finish.
 
-Two ports remain, and that is a deployment decision rather than a defect:
-`startWebhookReceiver` owns its own server because its response lifecycle is unlike the
-rest — signature first, `202` before any work. One public URL wants either a proxy in
-front or the receiver folded into the route chain, and which one is right depends on the
-host.
+~~Two ports remain~~ — resolved when the host was chosen. The plane serves ONE port and
+the receiver is a route on it at `/webhook`; `serve.ts` keeps two, because it is the
+local product and a second port on a laptop is free. Both call the same `readWebhook`,
+so the signature-first, `202`-before-any-work lifecycle is one implementation rather than
+two that can drift.
+
+The open question this paragraph used to end on — proxy in front, or fold it into the
+chain — was answered by picking Fly, where there is nowhere to put a proxy.

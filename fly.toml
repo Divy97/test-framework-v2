@@ -64,3 +64,20 @@ primary_region = 'CHANGE-ME'
 [[vm]]
   size = 'shared-cpu-1x'
   memory = '512mb'
+
+# A LIMIT THIS DEPLOYMENT ACCEPTS, written down rather than discovered.
+#
+# `/webhook` is the only route here anyone on the internet can reach without a session,
+# and it has to buffer a body BEFORE it can verify the signature — that is inherent to a
+# MAC over the body, not a flaw in this one. Its ceiling is 2MB, eight times the 256KB
+# every other route on this port uses, because a GitHub `installation` delivery from an
+# account with many repositories is genuinely large.
+#
+# Memory is bounded: bytes past the ceiling are counted and dropped, never buffered, so a
+# single huge POST costs 2MB and not its actual size. What is NOT bounded is ingress and
+# the time spent reading it, and enough concurrent unsigned POSTs would be 2MB each
+# against this machine's 512mb while it also serves the dashboard and a runner's poll.
+#
+# Accepted because the answer is a rate limit at the edge rather than a smaller ceiling
+# that would start refusing real deliveries. If this ever gets attention it does not
+# want, that is the lever — not a code change.
