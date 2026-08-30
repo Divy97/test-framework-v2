@@ -403,6 +403,8 @@ export function startWebhookReceiver(options: {
   secret: string;
   onIntake: (intake: Intake) => void | Promise<void>;
   port?: number;
+  /** The interface to bind — see `startStatusServer`. A container must pass `0.0.0.0`. */
+  host?: string;
 }): Promise<{ port: number; close: () => Promise<void> }> {
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -458,7 +460,7 @@ export function startWebhookReceiver(options: {
 
   return new Promise((resolve, reject) => {
     server.on('error', reject);
-    server.listen(options.port ?? 0, '127.0.0.1', () => {
+    server.listen(options.port ?? 0, options.host ?? '127.0.0.1', () => {
       const address = server.address();
       if (address === null || typeof address === 'string') {
         reject(new Error('the webhook receiver did not bind a port'));

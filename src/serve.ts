@@ -43,7 +43,7 @@ import { loadRecipe, saveProof } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runFromIssue } from './run.js';
 import { startStatusServer } from './sse.js';
-import { appendEvent, connect, readRunAfter } from './store.js';
+import { loadEnv, appendEvent, connect, readRunAfter } from './store.js';
 
 export type Config = {
   /** The GitHub App's numeric id, and the PEM it signs its JWT with (ADR-0012). */
@@ -512,7 +512,7 @@ export async function serve(options: ServeOptions): Promise<Service> {
 
 /** `npx tsx src/serve.ts`. Nothing here is importable behaviour; it is the entrypoint. */
 if (import.meta.url === `file://${process.argv[1]}`) {
-  process.loadEnvFile?.('.env');
+  loadEnv();
   const config = readConfig();
   const client = connect();
   await client.connect();

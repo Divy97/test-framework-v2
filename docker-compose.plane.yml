@@ -1,0 +1,58 @@
+# The plane and its database, as they would run in production.
+#
+# Separate from `docker-compose.yml`, which is the DEV database and says so. This one is
+# prod-parity on one machine: the same image a host would run, the same environment, and
+# a named volume for the blobs so a container restart does not take a run's evidence with
+# it — which is the difference between a cache and a store.
+#
+#   docker compose -f docker-compose.plane.yml up --build
+#
+# It reads `.env`. The plane refuses to start with a list naming what each missing
+# variable costs, so a first run tells you what to add.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env — see .env.example}
+      POSTGRES_DB: events
+    volumes:
+      - planedata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d events"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.plane
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Inside the compose network, not the host's 127.0.0.1.
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@postgres:5432/events
+      GITHUB_APP_ID: ${GITHUB_APP_ID:?}
+      GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-}
+      GITHUB_PRIVATE_KEY_PATH: ${GITHUB_PRIVATE_KEY_PATH:-/run/secrets/github-app.pem}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:?create one on the App s settings page}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:?create one on the App s settings page}
+      ENGINE_PLANE_CALLBACK_URL: ${ENGINE_PLANE_CALLBACK_URL:?}
+      # The session cookie drops `Secure` only when told to, so http in development is a
+      # deliberate setting rather than something that silently degrades.
+      ENGINE_PLANE_INSECURE: ${ENGINE_PLANE_INSECURE:-}
+      ENGINE_BLOB_ROOT: /var/lib/plane/blobs
+    volumes:
+      - planeblobs:/var/lib/plane/blobs
+      # The App key, read-only, by path. A PEM in an environment variable ends up in
+      # `docker inspect` and every process listing that inherits the environment.
+      - ${GITHUB_PRIVATE_KEY_PATH:-/dev/null}:/run/secrets/github-app.pem:ro
+    ports:
+      - "127.0.0.1:8788:8788"
+      - "127.0.0.1:8787:8787"
+
+volumes:
+  planedata:
+  planeblobs:

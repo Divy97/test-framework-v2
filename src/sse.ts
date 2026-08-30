@@ -166,6 +166,18 @@ export function startStatusServer(options: {
   read: ReadEvents;
   port?: number;
   routes?: Route;
+  /**
+   * The interface to bind. `127.0.0.1` by default, and that default is deliberate: a
+   * developer's dashboard has no business on the LAN, and the one write on it stores
+   * commands this engine executes.
+   *
+   * A CONTAINER has to override it. Loopback inside a container is the container's own
+   * loopback, so a published port can never reach it — the plane's first containerised
+   * start printed "plane up" and answered nothing, which is the most confusing shape a
+   * failure can take. Set `ENGINE_BIND=0.0.0.0` there and let the container boundary and
+   * the host's firewall be the exposure decision, which is where it belongs.
+   */
+  host?: string;
 }): Promise<StatusServer> {
   const server: Server = createServer((request: IncomingMessage, response: ServerResponse) => {
     const path = (request.url ?? '').split('?')[0] ?? '';
@@ -259,7 +271,7 @@ export function startStatusServer(options: {
 
   return new Promise((resolve, reject) => {
     server.on('error', reject);
-    server.listen(options.port ?? 0, '127.0.0.1', () => {
+    server.listen(options.port ?? 0, options.host ?? '127.0.0.1', () => {
       const address = server.address();
       if (address === null || typeof address === 'string') {
         reject(new Error('the status server did not bind a port'));

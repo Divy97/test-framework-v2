@@ -17,6 +17,7 @@ import { runDaemon, type DaemonIo, type DaemonJob } from './daemon.js';
 import type { IssueIntake } from './github.js';
 import { providerName } from './loop.js';
 import { runFromIssue } from './run.js';
+import { loadEnv } from './store.js';
 
 export type RunnerConfig = {
   planeUrl: string;
@@ -121,7 +122,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
 }
 
 if (process.argv[1]?.endsWith('runner-main.ts') || process.argv[1]?.endsWith('runner-main.js')) {
-  process.loadEnvFile?.('.env');
+  loadEnv();
   main().catch((error: unknown) => {
     console.error(String((error as Error)?.message ?? error));
     process.exitCode = 1;
