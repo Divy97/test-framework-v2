@@ -753,6 +753,26 @@ describe('every page is a document a browser can render', () => {
     expect(page(TIER_2)).not.toContain('deleted, on request');
   });
 
+  test('a returning user has a way in, and only where there is one', () => {
+    // Found by clicking it. The App was already installed, so "Install on GitHub" sent
+    // the browser to the installation's own settings page — the right answer from
+    // GitHub, and a dead end for somebody who just wanted to look at their runs. The
+    // landing page had no other door.
+    const hosted = landingPage('https://github.com/apps/x/installations/new', { signIn: true });
+    expect(hosted).toContain('href="/auth/github"');
+    expect(hosted).toContain('Sign in');
+    // And it says why the other button did not work, because the person who clicked it
+    // is the person reading this.
+    expect(hosted).toContain('existing installation');
+
+    // Locally there is no login: one operator on 127.0.0.1, and a sign-in link would be
+    // a button that leads nowhere.
+    const local = landingPage('https://github.com/apps/x/installations/new');
+    expect(local).not.toContain('/auth/github');
+    expectWellFormed(hosted);
+    expectWellFormed(local);
+  });
+
   test('the landing page offers exactly one install button, pointed at GitHub', () => {
     // GitHub owns the install screen. Rebuilding it would mean asking for a token, which
     // ADR-0012 says is never requested.
