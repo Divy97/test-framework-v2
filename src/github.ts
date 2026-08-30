@@ -25,6 +25,7 @@
 // API. An SDK here would be a large surface for six requests.
 
 import { createServer } from 'node:http';
+import type { Route } from './sse.js';
 import { createHmac, createSign, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -399,6 +400,95 @@ export async function openPullRequest(
  * anything the internet posts, and the signature is the only thing standing between
  * those two facts.
  */
+/**
+ * What a delivery is, decided from its bytes — with no opinion on how it arrived.
+ *
+ * Lifted out of `startWebhookReceiver` so the same decisions can be made by a ROUTE.
+ * The plane is one hostname now (a hosted deployment gets one certificate and one
+ * public port, and path-routing between two internal servers needs a proxy in front),
+ * so the webhook lives in the plane's route chain at `POST /webhook`, while `serve.ts`
+ * keeps its own port on a laptop where two ports cost nothing.
+ *
+ * Both callers make the same four refusals for the same reasons, and the reasons are
+ * the comments at each branch below rather than in either caller.
+ */
+export function readWebhook(
+  secret: string,
+  /** The RAW bytes, or `null` for a body that exceeded the ceiling. */
+  body: Buffer | null,
+  headers: { signature: string | undefined; event: string },
+): { status: number; text: string; intake?: Intake } {
+  // Bounded before it is buffered. A webhook body is not evidence and an unbounded one
+  // is host memory anyone can spend.
+  if (body === null) return { status: 413, text: 'too large' };
+  // The bytes AS THEY ARRIVED, never a re-serialisation. A framework that parses the body
+  // to an object and re-encodes it changes it and breaks the MAC, which is why both
+  // callers hand this function a Buffer straight off the socket.
+  //
+  // `toString()` is a UTF-8 decode, so be precise about what is verified: the MAC is
+  // computed over the decoded string, and `JSON.parse` below consumes THE SAME decode.
+  // A body that is not valid UTF-8 decodes lossily and fails the signature — closed, not
+  // open — and there is no verify-this-parse-that split, which is the failure this shape
+  // would otherwise invite.
+  if (!verifyWebhook(secret, body.toString(), headers.signature)) {
+    // 401 and nothing else. Not a hint about which part was wrong.
+    return { status: 401, text: 'bad signature' };
+  }
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body.toString());
+  } catch {
+    return { status: 400, text: 'not json' };
+  }
+  const mapped = intake(headers.event, payload);
+  // Accepted and ignored, explicitly. GitHub retries a non-2xx, and retrying a `push`
+  // we will never act on forever is worse than saying so once.
+  if (!mapped) return { status: 202, text: 'not a trigger' };
+  return { status: 202, text: 'accepted', intake: mapped };
+}
+
+/**
+ * The receiver as a `Route`, for a deployment with one public hostname.
+ *
+ * Acknowledged BEFORE the run, exactly as the standalone server does it: returning the
+ * response IS the acknowledgement, and `onIntake` is started without being awaited. A
+ * run takes minutes and GitHub's delivery timeout is seconds, so holding the response
+ * open would guarantee a retry and a second run for the same issue.
+ */
+export function webhookRoute(options: {
+  secret: string;
+  onIntake: (intake: Intake) => void | Promise<void>;
+  /** Where GitHub is told to deliver. One place, so the App's setting and this agree. */
+  path?: string;
+}): Route {
+  const at = options.path ?? WEBHOOK_PATH;
+  return async (request) => {
+    // NOTHING here may read `request.headers['cookie']`, and nothing may log the header
+    // bag. Sharing a hostname with the dashboard means a browser now sends an operator's
+    // session cookie to this path, and this is the one route on the surface that anyone
+    // on the internet can reach. A `log(headers)` added here for debugging would write
+    // live session cookies into the plane's logs.
+    
+    if (request.path !== at) return null;
+    if (request.method !== 'POST') return { status: 405, type: 'text/plain', body: 'post only\n' };
+    const reading = readWebhook(options.secret, await request.raw(MAX_WEBHOOK_BYTES), {
+      signature: request.headers['x-hub-signature-256'] as string | undefined,
+      event: String(request.headers['x-github-event'] ?? ''),
+    });
+    if (reading.intake) {
+      void Promise.resolve(options.onIntake(reading.intake)).catch(() => {
+        // The caller owns its own failures. Throwing here would take the surface down
+        // and lose every later delivery.
+      });
+    }
+    return { status: reading.status, type: 'text/plain', body: `${reading.text}\n` };
+  };
+}
+
+/** The path GitHub is told to deliver to. Named once so the App setting cannot drift. */
+export const WEBHOOK_PATH = '/webhook';
+
+
 export function startWebhookReceiver(options: {
   secret: string;
   onIntake: (intake: Intake) => void | Promise<void>;
@@ -426,35 +516,22 @@ export function startWebhookReceiver(options: {
         response.end(`${text}\n`);
       };
       if (request.method !== 'POST') return reply(405, 'post only');
-      if (oversize) return reply(413, 'too large');
-      const body = Buffer.concat(chunks).toString();
-      // The RAW bytes, not a re-serialisation. Any framework that reparses and
-      // re-encodes the body changes it and breaks the MAC — which is why this reads
-      // the stream itself rather than taking a parsed object.
-      if (!verifyWebhook(options.secret, body, request.headers['x-hub-signature-256'] as string | undefined)) {
-        // 401 and nothing else. Not a hint about which part was wrong.
-        return reply(401, 'bad signature');
-      }
-      let payload: unknown;
-      try {
-        payload = JSON.parse(body);
-      } catch {
-        return reply(400, 'not json');
-      }
-      const mapped = intake(String(request.headers['x-github-event'] ?? ''), payload);
-      if (!mapped) {
-        // Accepted and ignored, explicitly. GitHub retries a non-2xx, and retrying a
-        // `push` we will never act on forever is worse than saying so once.
-        return reply(202, 'not a trigger');
-      }
+      // Every other decision is `readWebhook`'s, so this receiver and the route in the
+      // plane's chain cannot come to different conclusions about the same delivery.
+      const reading = readWebhook(options.secret, oversize ? null : Buffer.concat(chunks), {
+        signature: request.headers['x-hub-signature-256'] as string | undefined,
+        event: String(request.headers['x-github-event'] ?? ''),
+      });
       // Acknowledged BEFORE the run. A run takes minutes and GitHub's delivery
       // timeout is seconds, so holding the response open would guarantee a retry and
       // a second run for the same issue.
-      reply(202, 'accepted');
-      void Promise.resolve(options.onIntake(mapped)).catch(() => {
-        // The caller owns its own failures. Throwing here would take the receiver
-        // down and lose every later delivery.
-      });
+      reply(reading.status, reading.text);
+      if (reading.intake) {
+        void Promise.resolve(options.onIntake(reading.intake)).catch(() => {
+          // The caller owns its own failures. Throwing here would take the receiver
+          // down and lose every later delivery.
+        });
+      }
     });
   });
 

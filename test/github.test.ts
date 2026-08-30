@@ -12,6 +12,10 @@ import { generateKeyPairSync, createHmac, createVerify } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
 import {
+  webhookRoute,
+  WEBHOOK_PATH,
+  MAX_WEBHOOK_BYTES,
+  type Intake,
   appJwt,
   authConfig,
   repoUrl,
@@ -581,4 +585,119 @@ test.skip('a real issue on the demo repository produces a real pull request', ()
   // To unskip: register an App with `contents: read and write` and
   // `pull_requests: write`, install it on the demo repository, and set
   // ENGINE_GITHUB_APP_ID, ENGINE_GITHUB_PRIVATE_KEY and ENGINE_GITHUB_SECRET.
+});
+
+/**
+ * The webhook as a ROUTE, for a deployment with one hostname.
+ *
+ * A hosted plane gets one certificate and one public port, and path-routing between two
+ * internal servers needs a proxy in front of them — so the receiver moved into the
+ * plane's route chain. `serve.ts` keeps its own port, because nothing about a laptop
+ * makes a second one cost anything.
+ *
+ * What these pin is that moving it did not soften it. The refusals are the same
+ * refusals, made by the same `readWebhook`, and the delivery is acknowledged before the
+ * work starts — the property that stops GitHub retrying a run already in flight.
+ */
+describe('the same delivery is judged the same at either door', () => {
+  const call = (
+    route: ReturnType<typeof webhookRoute>,
+    body: string,
+    options: { signature?: string; event?: string; method?: string; path?: string } = {},
+  ) =>
+    route({
+      method: options.method ?? 'POST',
+      path: options.path ?? WEBHOOK_PATH,
+      query: new URLSearchParams(),
+      headers: {
+        'x-hub-signature-256': options.signature ?? sign(body),
+        'x-github-event': options.event ?? 'issues',
+      },
+      body: async () => body,
+      raw: async () => Buffer.from(body),
+    });
+
+  const route = (seen: Intake[] = []) => ({
+    seen,
+    route: webhookRoute({ secret: SECRET, onIntake: (i) => void seen.push(i) }),
+  });
+
+  test('a signed issue delivery is accepted and handed on', async () => {
+    const { seen, route: r } = route();
+    const response = await call(r, JSON.stringify(opened));
+
+    expect(response?.status).toBe(202);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.kind).toBe('issue');
+  });
+
+  test('an unsigned one is refused, and nothing is handed on', async () => {
+    const { seen, route: r } = route();
+    const response = await call(r, JSON.stringify(opened), { signature: 'sha256=nope' });
+
+    expect(response?.status).toBe(401);
+    // THE point of the route existing at all. A body that did not come from GitHub must
+    // not reach `onIntake`, which queues a job that runs commands.
+    expect(seen).toEqual([]);
+  });
+
+  test('an event we never act on is accepted and ignored, not retried forever', async () => {
+    const { seen, route: r } = route();
+    const response = await call(r, JSON.stringify({ ref: 'refs/heads/main' }), { event: 'push' });
+
+    expect(response?.status).toBe(202);
+    expect(seen).toEqual([]);
+  });
+
+  test('a body too large to buffer is refused before it is parsed', async () => {
+    const seen: Intake[] = [];
+    const r = webhookRoute({ secret: SECRET, onIntake: (i) => void seen.push(i) });
+    // `raw()` answers null past its ceiling rather than truncating — a truncated body
+    // would fail the MAC and be reported as a bad signature, which is an operational
+    // failure wearing a tamper signal's clothes.
+    const response = await r({
+      method: 'POST',
+      path: WEBHOOK_PATH,
+      query: new URLSearchParams(),
+      headers: { 'x-github-event': 'issues' },
+      body: async () => '',
+      raw: async () => null,
+    });
+
+    expect(response?.status).toBe(413);
+    expect(seen).toEqual([]);
+  });
+
+  test('it asks for the WEBHOOK ceiling, not the surface default', async () => {
+    // The ceiling is `raw`'s argument, and every other test here hands in a fake that
+    // ignores it — so dropping `MAX_WEBHOOK_BYTES` from the call would leave them all
+    // green while the limit silently became `sse.ts`'s 256KB default, eight times
+    // smaller. What that breaks is not obvious: an `installation` delivery from an
+    // account with many repositories is a big payload, and it would start coming back
+    // 413 — which GitHub retries forever and then disables the webhook over.
+    let asked: number | undefined = -1;
+    await webhookRoute({ secret: SECRET, onIntake: () => {} })({
+      method: 'POST',
+      path: WEBHOOK_PATH,
+      query: new URLSearchParams(),
+      headers: { 'x-github-event': 'issues' },
+      body: async () => '',
+      raw: async (limit?: number) => {
+        asked = limit;
+        return Buffer.from('{}');
+      },
+    });
+
+    expect(asked).toBe(MAX_WEBHOOK_BYTES);
+  });
+
+  test('it answers only its own path, so the rest of the chain still runs', async () => {
+    const { route: r } = route();
+    expect(await call(r, JSON.stringify(opened), { path: '/repos' })).toBeNull();
+  });
+
+  test('and only POST', async () => {
+    const { route: r } = route();
+    expect((await call(r, '', { method: 'GET' }))?.status).toBe(405);
+  });
 });

@@ -27,12 +27,13 @@ COPY src ./src
 # request with a relation that does not exist.
 COPY db ./db
 
-# The surface (dashboard, OAuth, runner API) and the webhook receiver bind separately.
-# Two ports is a deployment fact rather than a design one: `startWebhookReceiver` owns
-# its own server because its response lifecycle is unlike the rest — signature first,
-# 202 before any work. A single public URL wants a proxy in front, or consolidating the
-# receiver into the route chain, and that decision belongs to whoever picks the host.
-EXPOSE 8788 8787
+# ONE port, and the host is why. This used to expose two — the surface and a separate
+# webhook receiver — which costs nothing on a laptop and does not survive contact with a
+# hosted deployment: one hostname, one certificate, one public port, and path-routing
+# between two internal servers needs a proxy in front of them. So the receiver became a
+# route in the chain, at `/webhook`. `serve.ts` still runs two, because it is the local
+# product and a second port on a laptop is free.
+EXPOSE 8788
 
 # The blob root, made HERE and owned by the user that will write to it.
 #

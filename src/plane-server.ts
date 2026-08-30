@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureBlobRoot } from './blobs.js';
 import { authRoutes } from './auth-routes.js';
 import { installationsFor, readSession, cookieValue, type OAuthConfig } from './auth.js';
-import { startWebhookReceiver, installationToken, type GitHubApp, type Intake } from './github.js';
+import { webhookRoute, WEBHOOK_PATH, installationToken, type GitHubApp, type Intake } from './github.js';
 import { recordInstallation, removeInstallation } from './installations.js';
 import { enqueueJob } from './plane.js';
 import { loadRecipe } from './recipe.js';
@@ -32,7 +32,15 @@ export type PlaneConfig = {
   webhookSecret: string;
   oauth: { clientId: string; clientSecret: string; callbackUrl: string };
   blobRoot: string;
-  webhookPort: number;
+  /**
+   * The ONE port. The webhook used to have its own server on its own port, which is free
+   * on a laptop and not free on a host: a public deployment gets one hostname and one
+   * certificate, and path-routing between two internal servers needs a proxy in front of
+   * them. So the receiver is a route in the chain below, at `WEBHOOK_PATH`.
+   *
+   * `serve.ts` keeps two ports, deliberately — it is the local product and nothing about
+   * a laptop makes a second port cost anything.
+   */
   port: number;
   /** Which interface to bind. Loopback locally; `0.0.0.0` in a container (see `sse.ts`). */
   host: string;
@@ -78,7 +86,6 @@ export const chain =
 
 export async function startPlane(config: PlaneConfig): Promise<{
   port: number;
-  webhookPort: number;
   close: () => Promise<void>;
 }> {
   const client = connect();
@@ -97,56 +104,54 @@ export async function startPlane(config: PlaneConfig): Promise<{
    * repository nobody has onboarded gets an answer, not a run that reproduces nothing
    * and reports it as a finding about their bug.
    */
-  const receiver = await startWebhookReceiver({
-    secret: config.webhookSecret,
-    port: config.webhookPort,
-    host: config.host,
-    onIntake: (intake: Intake) => {
-      void (async () => {
-        try {
-          if (intake.kind === 'installation') {
-            // A delivery names several repositories — `installation_repositories` adds
-            // and removes in batches — so each one is its own row.
-            for (const repo of intake.repos) {
-              if (intake.action === 'added') {
-                await recordInstallation(client, {
-                  repo,
-                  installationId: intake.installationId,
-                  account: intake.account,
-                });
-              } else {
-                await removeInstallation(client, repo);
-              }
+  const onIntake = (intake: Intake) => {
+    void (async () => {
+      try {
+        if (intake.kind === 'installation') {
+          // A delivery names several repositories — `installation_repositories` adds
+          // and removes in batches — so each one is its own row.
+          for (const repo of intake.repos) {
+            if (intake.action === 'added') {
+              await recordInstallation(client, {
+                repo,
+                installationId: intake.installationId,
+                account: intake.account,
+              });
+            } else {
+              await removeInstallation(client, repo);
             }
-            log(`installation ${intake.installationId}: ${intake.action} ${intake.repos.join(', ')}`);
-            return;
           }
-          const recipe = await loadRecipe(client, intake.repo);
-          if (!recipe) {
-            log(`${intake.repo}#${intake.issueNumber}: not onboarded — nothing queued`);
-            return;
-          }
-          const runId = await enqueueJob(client, {
-            installationId: intake.installationId,
-            repo: intake.repo,
-            intake,
-          });
-          log(`${intake.repo}#${intake.issueNumber}: queued as ${runId}`);
-        } catch (error) {
-          // Never rethrown: this is called without being awaited, so an escape here is
-          // an unhandled rejection that ends the process — and the process is the thing
-          // GitHub is talking to.
-          log(`a delivery could not be queued: ${String(error)}`);
+          log(`installation ${intake.installationId}: ${intake.action} ${intake.repos.join(', ')}`);
+          return;
         }
-      })();
-    },
-  });
+        const recipe = await loadRecipe(client, intake.repo);
+        if (!recipe) {
+          log(`${intake.repo}#${intake.issueNumber}: not onboarded — nothing queued`);
+          return;
+        }
+        const runId = await enqueueJob(client, {
+          installationId: intake.installationId,
+          repo: intake.repo,
+          intake,
+        });
+        log(`${intake.repo}#${intake.issueNumber}: queued as ${runId}`);
+      } catch (error) {
+        // Never rethrown: this is called without being awaited, so an escape here is
+        // an unhandled rejection that ends the process — and the process is the thing
+        // GitHub is talking to.
+        log(`a delivery could not be queued: ${String(error)}`);
+      }
+    })();
+  };
 
   const surface = await startStatusServer({
     port: config.port,
     host: config.host,
     read: (runId, afterSeq) => readRunAfter(client, runId, afterSeq),
     routes: chain(
+      // First. Its path is disjoint from every other, it carries no session, and a
+      // delivery GitHub will retry should not wait behind a human's page.
+      webhookRoute({ secret: config.webhookSecret, onIntake }),
       authRoutes({ client, oauth, ...(config.secure === undefined ? {} : { secure: config.secure }) }),
       // The runner API before the dashboard: its paths are disjoint, and putting the
       // machine surface first keeps a slow human page from ever sitting in front of a
@@ -168,18 +173,32 @@ export async function startPlane(config: PlaneConfig): Promise<{
   });
 
   log(`plane up`);
-  log(`  webhook  http://127.0.0.1:${receiver.port}/`);
   log(`  surface  http://127.0.0.1:${surface.port}/`);
+  log(`  webhook  http://127.0.0.1:${surface.port}${WEBHOOK_PATH}  <- tell the App this`);
 
   return {
     port: surface.port,
-    webhookPort: receiver.port,
     close: async () => {
-      await receiver.close();
       await surface.close();
       await close(client);
     },
   };
+}
+
+/**
+ * A port, or a legible refusal — never `NaN`.
+ *
+ * `Number('eight-thousand')` is `NaN`, which `listen` rejects with an error naming
+ * neither the variable nor the value, thrown after the `REQUIRED` check that exists to
+ * produce a readable message has already passed. This is the same idea one line earlier.
+ */
+function port(value: string | undefined): number {
+  if (value === undefined) return 8788;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+    throw new Error(`PORT is "${value}", which is not a port number`);
+  }
+  return parsed;
 }
 
 /** What is missing, and what it costs — the shape `serve.ts` and the runner both use. */
@@ -222,8 +241,7 @@ export function readPlaneConfig(env: NodeJS.ProcessEnv = process.env): PlaneConf
       callbackUrl: env.ENGINE_PLANE_CALLBACK_URL!,
     },
     blobRoot: env.ENGINE_BLOB_ROOT!,
-    webhookPort: Number(env.WEBHOOK_PORT ?? 8787),
-    port: Number(env.EVENTS_PORT ?? 8788),
+    port: port(env.PORT ?? env.EVENTS_PORT),
     host: env.ENGINE_BIND ?? '127.0.0.1',
     ...(env.ENGINE_PLANE_INSECURE === '1' ? { secure: false } : {}),
   };
@@ -231,6 +249,14 @@ export function readPlaneConfig(env: NodeJS.ProcessEnv = process.env): PlaneConf
 
 if (process.argv[1]?.endsWith('plane-server.ts') || process.argv[1]?.endsWith('plane-server.js')) {
   loadEnv();
+  // Said out loud rather than ignored. Anyone with this set configured a second server
+  // that no longer exists, and is likely to have pointed the App's webhook URL at it —
+  // which now 404s, and GitHub retries a 404 until it disables the webhook.
+  if (process.env.WEBHOOK_PORT) {
+    console.warn(
+      `WEBHOOK_PORT=${process.env.WEBHOOK_PORT} is ignored: the plane serves one port, and the webhook is a route on it at ${WEBHOOK_PATH}.`,
+    );
+  }
   // Inside the async function, not as its argument. `readPlaneConfig()` throws
   // SYNCHRONOUSLY when the environment is incomplete, and evaluating it as an argument
   // put that throw outside the `catch` below — so an operator missing one variable got
