@@ -133,6 +133,8 @@ border-left-width:5px;border-radius:8px;padding:1rem 1.15rem;margin:1rem 0;color
 .points{display:inline-block;min-width:3.2rem;font-weight:700}
 .refs{margin-top:.3rem}
 .refs code{margin-right:.35rem}
+.calls{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin:1.25rem 0}
+.cta.secondary{background:transparent;color:var(--link);border:1px solid var(--line)}
 .cta{display:inline-block;margin:1.25rem 0;padding:.7rem 1.4rem;border-radius:8px;
 background:var(--fg);color:var(--bg);text-decoration:none;font-weight:600}
 .hero{font-size:1.1rem;max-width:46rem}
@@ -188,13 +190,22 @@ ${body}
  * the one thing ADR-0012 says is never requested. So the entire onboarding surface here is
  * a link, deliberately.
  */
-export function landingPage(installUrl: string): string {
+export function landingPage(installUrl: string, options: { signIn?: boolean } = {}): string {
   const body = `<h1>Open an issue. Get back a pull request that proves the bug existed.</h1>
 <p class="hero">Test Framework v2 is an event-sourced execution and verification platform.
 It is not a coding agent — the model is a replaceable component. What is not replaceable is
 the evidence: every claim it makes is a command it executed itself, in a container of its
 own, recorded in an append-only log.</p>
-<a class="cta" href="${escapeHtml(installUrl)}">Install on GitHub</a>
+<p class="calls"><a class="cta" href="${escapeHtml(installUrl)}">Install on GitHub</a>${
+    options.signIn
+      ? ' <a class="cta secondary" href="/auth/github">Sign in</a>'
+      : ''
+  }</p>${
+    options.signIn
+      ? `<p class="muted small">Already installed it? GitHub sends the install button to your
+existing installation\u2019s settings, which is the right answer and not a way in \u2014 signing in is.</p>`
+      : ''
+  }
 <h2>What actually happens</h2>
 <ul class="plain">
 <li><b>Reproduce first, or do not fix.</b> No reproduction, no fix, no partial credit. When

@@ -169,7 +169,11 @@ export function dashboardRoutes(options: {
       };
     }
 
-    if (method === 'GET' && (path === '/' || path === '')) return html(landingPage(install));
+    if (method === 'GET' && (path === '/' || path === '')) {
+      // The sign-in link exists only where signing in does. Locally there is no login —
+      // one operator, 127.0.0.1 — and offering one would be a button that leads nowhere.
+      return html(landingPage(install, { signIn: options.auth !== undefined }));
+    }
 
     if (method === 'GET' && path === '/repos') {
       const who = await visible(headers);
