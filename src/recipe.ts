@@ -144,9 +144,23 @@ export async function saveProof(client: Db, repo: string, proof: unknown): Promi
  * proof written by an older engine must render as what it is rather than throw on
  * a field that did not exist yet.
  */
-export async function loadProof(client: Db, repo: string): Promise<unknown> {
-  const { rows } = await client.query('select proof from recipes where repo = $1', [repo]);
-  return rows.length === 0 ? null : (rows[0].proof ?? null);
+export async function loadStored(
+  client: Db,
+  repo: string,
+): Promise<{ proof: unknown; approvedAt: string | null }> {
+  // `approved_at` travels with the proof because they are the same row and the page needs
+  // both. It is here at all because approving is a WRITE with no visible result: the form
+  // 303s back to a page that renders the recipe it already showed, so a click that
+  // succeeded and a click that changed nothing look identical. They are not identical, and
+  // the timestamp is the difference — the one fact on that screen that moves when the
+  // write lands.
+  const { rows } = await client.query('select proof, approved_at from recipes where repo = $1', [repo]);
+  if (rows.length === 0) return { proof: null, approvedAt: null };
+  const at = rows[0].approved_at;
+  return {
+    proof: rows[0].proof ?? null,
+    approvedAt: at instanceof Date ? at.toISOString() : (at ?? null),
+  };
 }
 
 /** What the Runner observed while standing the environment up. Facts, per service. */

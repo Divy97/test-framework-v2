@@ -15,7 +15,7 @@ import { clearDraft, loadDraft } from './drafts.js';
 import { fold } from './fold.js';
 import { listInstallations, loadInstallation } from './installations.js';
 import { listRuns, readRunRow, readUsage } from './readmodel.js';
-import { loadProof, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
+import { loadStored, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
 import { readRun, type Db } from './store.js';
 import { sameOrigin, type Route } from './sse.js';
 import type { Session } from './auth.js';
@@ -379,12 +379,12 @@ export function dashboardRoutes(options: {
         // `loadDraft` even when a recipe already exists: `onboardPage` is the one that
         // decides `current` wins, and computing that here would be a second copy of a
         // rule that already lives in one place.
-        const [recipe, draft, proof] = await Promise.all([
+        const [recipe, draft, stored] = await Promise.all([
           loadRecipe(client, repo),
           loadDraft(client, repo),
-          loadProof(client, repo),
+          loadStored(client, repo),
         ]);
-        return html(onboardPage(repo, recipe, draft?.draft, undefined, proof, chrome(who)));
+        return html(onboardPage(repo, recipe, draft?.draft, undefined, stored, chrome(who)));
       }
 
       // THE ONE WRITE. A human is approving commands the engine will execute verbatim in

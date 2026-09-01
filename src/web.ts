@@ -276,6 +276,8 @@ details[open] summary{margin-bottom:.5rem}
   margin:1.25rem 0;text-align:left;background:transparent}
 .nothing p{margin:0;max-width:40rem;color:var(--muted)}
 .nothing p + p{margin-top:.7rem}
+.in-force{font-family:var(--mono);font-size:.78rem;letter-spacing:.02em;color:var(--muted);
+  margin:1.35rem 0 0;padding:.7rem 0 0;border-top:1px solid var(--rule)}
 
 @media (max-width:40rem){
   header.top{padding:.9rem 1.15rem;gap:1rem}
@@ -744,10 +746,12 @@ export function onboardPage(
   current: Recipe | null,
   draft?: unknown,
   error?: string,
-  proof?: unknown,
+  stored?: { proof?: unknown; approvedAt?: string | null } | null,
   chrome: Chrome = {},
 ): string {
   const mode = chrome.mode ?? 'plane';
+  const proof = stored?.proof ?? undefined;
+  const approvedAt = stored?.approvedAt ?? undefined;
   const action = `/repos/${urlPath(repo)}/onboard`;
 
   // What fills the box, in priority order. An approved recipe always wins — it is the
@@ -814,6 +818,18 @@ and approve them.</p>
 <p class="muted small">Running the engine on your own machine does draft, and this page shows
 that draft when there is one.</p>
 </div>`
+      : '') +
+    // WHAT APPROVING DID, which the page could not previously say.
+    //
+    // Approving 303s back here and re-renders the recipe it already showed, so a click
+    // that stored something and a click that changed nothing look the same. That is not a
+    // cosmetic gap: the first person to use this pasted a recipe, clicked, saw an
+    // identical page, and reasonably concluded the button was broken — when in fact the
+    // paste had not landed and the empty recipe had been approved for real. The timestamp
+    // moves on every successful write, which is the difference made visible.
+    (current && approvedAt
+      ? `<p class="in-force"><span class="pass">In force</span> since ${when(approvedAt)}
+— this is what every run against ${escapeHtml(repo)} will execute.</p>`
       : '') +
     `<div class="warning refusal">
 <h2>Read this before you approve.</h2>
