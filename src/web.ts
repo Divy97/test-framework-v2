@@ -951,6 +951,9 @@ mints one.</p>` +
 <p>Run this on the machine that will do the work:</p>
 <pre class="scroll"><code>git clone https://github.com/Divy97/test-framework-v2
 cd test-framework-v2 &amp;&amp; npm ci
+npm run images   <span class="muted"># builds the two sandbox images. Several minutes, once.</span>
+
+export OPENROUTER_API_KEY=...   <span class="muted"># your own; this machine spends it, we never see it</span>
 ENGINE_PLANE_URL=${escapeHtml(minted.planeUrl)} \
 ENGINE_RUNNER_TOKEN=${escapeHtml(minted.token)} \
 npm run runner</code></pre>
@@ -959,6 +962,13 @@ runner if you lose it, and revoke the old one below.</p>
 <p class="muted small">The runner is this repository, run from a checkout. There is no package to
 install: an <code>npx &lt;name&gt;</code> here would fetch whatever the npm registry has under that name
 and execute it on your machine, with the token above already in its environment.</p>
+<p class="muted small">It needs Docker running and a model key of your own. Everything else has a
+default — the two image names are what <code>npm run images</code> builds, and evidence is written to
+<code>./.evidence-store</code> in the checkout.</p>
+<p class="muted small"><b>The token is on a command line.</b> That puts it in your shell history and,
+while the runner is running, in the output of <code>ps</code>. If that matters where you are running
+this, put it in an environment file the shell reads instead, and revoke this one if it has been
+somewhere it should not.</p>
 </div>`
       : '') +
     `<h2>Paired machines</h2>` +

@@ -28,14 +28,29 @@ export type RunnerConfig = {
   loop: { provider?: string; apiKey?: string; model?: string; effort?: string };
 };
 
-/** What is missing, and what it costs — the shape `readConfig` in `serve.ts` uses. */
+/**
+ * What is missing, and what it costs — the shape `readConfig` in `serve.ts` uses.
+ *
+ * Only what CANNOT be defaulted. This list had five entries, and three of them were
+ * asking an operator to name things this repository already decides: the two images are
+ * built by the two Dockerfiles beside this file, under the names `npm run images` gives
+ * them, and the blob root is a directory in the checkout. A new runner following the
+ * pairing page's own command hit all three at once and had nowhere to look them up —
+ * the answer lived in a document about setting up a GitHub App.
+ *
+ * The model credential stays required, because defaulting a credential is not a thing
+ * that can be done honestly.
+ */
 const REQUIRED: Record<string, string> = {
   ENGINE_PLANE_URL: 'there is nothing to take work from',
   ENGINE_RUNNER_TOKEN: 'the plane would answer 401 to every poll; pair this machine first',
-  ENGINE_IMAGE: 'the phase containers have no image to run',
-  ENGINE_AGENT_IMAGE: 'the agent sandbox has no image to run',
-  ENGINE_BLOB_ROOT: 'artifacts would be written somewhere this process does not own',
 };
+
+/** The names `npm run images` builds, and `docker-compose` uses. One place, so they agree. */
+export const DEFAULT_IMAGE = 'test-framework-v2-sandbox:latest';
+export const DEFAULT_AGENT_IMAGE = 'test-framework-v2-agent:latest';
+/** Inside the checkout, which is a directory this process certainly owns. */
+export const DEFAULT_BLOB_ROOT = './.evidence-store';
 
 export function readRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const missing = Object.keys(REQUIRED).filter((key) => !env[key]);
@@ -66,9 +81,9 @@ export function readRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
   return {
     planeUrl: env.ENGINE_PLANE_URL!,
     token: env.ENGINE_RUNNER_TOKEN!,
-    image: env.ENGINE_IMAGE!,
-    agentImage: env.ENGINE_AGENT_IMAGE!,
-    blobRoot: env.ENGINE_BLOB_ROOT!,
+    image: env.ENGINE_IMAGE ?? DEFAULT_IMAGE,
+    agentImage: env.ENGINE_AGENT_IMAGE ?? DEFAULT_AGENT_IMAGE,
+    blobRoot: env.ENGINE_BLOB_ROOT ?? DEFAULT_BLOB_ROOT,
     loop: {
       ...(env.ENGINE_PROVIDER === undefined ? {} : { provider: env.ENGINE_PROVIDER }),
       apiKey: key,
