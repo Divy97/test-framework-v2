@@ -158,6 +158,11 @@ header.top nav a{color:var(--muted);text-decoration:none;padding-bottom:.15rem;
   border-bottom:1px solid transparent}
 header.top nav a:hover{color:var(--ink);border-bottom-color:var(--rule-strong)}
 header.top nav a[aria-current=page]{color:var(--ink);border-bottom-color:var(--ink)}
+/* The way out sits at the far end, away from the way further in. */
+header.top .out{margin-left:auto;display:flex;gap:.85rem;align-items:baseline}
+header.top .who{font-family:var(--mono);font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.12em;color:var(--muted)}
+header.top .out button{margin-top:0;padding:.32rem .8rem;font-size:.66rem;letter-spacing:.12em}
 main{max-width:74rem;margin:0 auto;padding:3rem 2rem 6rem}
 
 /* ---- type ---- */
@@ -359,7 +364,11 @@ footer.foot p{margin:0;font-family:var(--mono);font-size:.72rem;color:var(--mute
  * by redefining tokens, never by defining a colour only inside the media block — a value
  * that exists in one theme is a page that renders unreadable in the other.
  */
-export function layout(title: string, body: string, current?: string, shell?: 'landing'): string {
+export function layout(
+  title: string,
+  body: string,
+  options: { current?: string; shell?: 'landing'; who?: string } = {},
+): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -381,15 +390,24 @@ export function layout(title: string, body: string, current?: string, shell?: 'l
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,300..600&family=JetBrains+Mono:wght@400;500;600&display=swap">
 <style>${STYLE}</style>
 </head>
-<body${shell === 'landing' ? ' class="landing"' : ''}>
+<body${options.shell === 'landing' ? ' class="landing"' : ''}>
 <header class="top">
 <a class="brand" href="/">Test&nbsp;Framework</a>
 <nav>${NAV.map(([href, label]) => {
     // `aria-current` rather than styling alone: a sighted reader gets the rule under the
     // word, a screen reader gets told which page this is, and both come from one fact.
-    const here = current === href;
+    const here = options.current === href;
     return `<a href="${href}"${here ? ' aria-current="page"' : ''}>${label}</a>`;
-  }).join('')}</nav>
+  }).join('')}</nav>${
+    // A signed-in surface with no way out is a surface you cannot leave on a shared
+    // machine. A POST because a link that logs you out is a link anybody's page can
+    // embed, and `/auth/logout` checks the origin for the same reason.
+    options.who
+      ? `<form class="out" method="post" action="/auth/logout">
+<span class="who">${escapeHtml(options.who)}</span><button class="quiet" type="submit">Sign out</button>
+</form>`
+      : ''
+  }
 </header>
 <main>
 ${body}
@@ -499,7 +517,7 @@ asks for a short-lived token per run.</p>
 <p>Test Framework v2 — an event-sourced execution and verification platform.</p>
 <p>Evidence over testimony. Reproduce first. Nothing merged.</p>
 </div></footer>`;
-  return layout('Test Framework v2', body, undefined, 'landing');
+  return layout('Test Framework v2', body, { shell: 'landing' });
 }
 
 /**
@@ -526,9 +544,26 @@ asks for a short-lived token per run.</p>
  */
 export type Mode = 'local' | 'plane';
 
+/**
+ * What the shell around a page needs to know, as one argument rather than four.
+ *
+ * `mode` and `who` are both about the CHROME — what this deployment can promise, and
+ * whether there is somebody to offer a way out to — not about the page's subject. Passing
+ * them positionally had `onboardPage` at six parameters before this one, which is the
+ * point at which a call site stops being readable.
+ */
+/** Spread into `layout`'s options, so an absent login stays absent rather than undefined. */
+const who = (chrome: Chrome) => (chrome.who === undefined ? {} : { who: chrome.who });
+
+export type Chrome = {
+  mode?: Mode;
+  /** The signed-in login. Absent means anonymous, or a local surface with no login at all. */
+  who?: string;
+};
+
 export function repositoriesPage(
   rows: { installation: Installation; hasRecipe: boolean; runs: number }[],
-  mode: Mode = 'plane',
+  chrome: Chrome = {},
 ): string {
   // SPLIT, not sorted. An account can have hundreds of repositories connected and one
   // onboarded, and a single list buries the only row that can do anything — which is
@@ -536,6 +571,7 @@ export function repositoriesPage(
   // as the row's most important fact, and a list that hides it is not showing it.
   const ready = rows.filter((row) => row.hasRecipe);
   const waiting = rows.filter((row) => !row.hasRecipe);
+  const mode = chrome.mode ?? 'plane';
   const verb = mode === 'local' ? 'draft a recipe' : 'write a recipe';
 
   // NO SCRIPT, and that is a decision rather than a limitation. A client-side filter was
@@ -589,7 +625,7 @@ onboarded and can take work. The rest are connected and waiting.`
 browser's find to locate it</summary>${register(waiting)}</details>`
               : register(waiting))
           : ''));
-  return layout('Repositories', body, '/repos');
+  return layout('Repositories', body, { current: '/repos', ...who(chrome) });
 }
 
 /**
@@ -709,8 +745,9 @@ export function onboardPage(
   draft?: unknown,
   error?: string,
   proof?: unknown,
-  mode: Mode = 'plane',
+  chrome: Chrome = {},
 ): string {
+  const mode = chrome.mode ?? 'plane';
   const action = `/repos/${urlPath(repo)}/onboard`;
 
   // What fills the box, in priority order. An approved recipe always wins — it is the
@@ -814,7 +851,7 @@ at once.</p>
 all, and only then is a value in that container defensible. Until that exists, recipes that
 require secrets to boot are recipes this system will report honestly that it could not
 run — which is an <code>errored</code> run, never a finding about your bug.</p>`;
-  return layout(`Onboard ${repo}`, body, '/repos');
+  return layout(`Onboard ${repo}`, body, { current: '/repos', ...who(chrome) });
 }
 
 const TIER_MEANING: Record<number, string> = {
@@ -883,6 +920,7 @@ export function runnersPage(
   repo: string,
   runners: { id: string; name: string; pairedAt: string; lastSeen: string | null; revokedAt: string | null }[],
   minted?: { token: string; name: string; planeUrl: string },
+  chrome: Chrome = {},
 ): string {
   const seen = (value: string | null) => (value === null ? '—' : when(value));
   const body =
@@ -937,10 +975,11 @@ ${runners
 <p class="muted small">Revoking is immediate and keeps the row: whatever that machine already wrote
 stays in the log, and a reader asking who wrote it still gets an answer.</p>`;
 
-  return layout(`Runners · ${repo}`, body, '/repos');
+  return layout(`Runners · ${repo}`, body, { current: '/repos', ...who(chrome) });
 }
 
-export function runsPage(runs: RunRow[], repo?: string, mode: Mode = 'plane'): string {
+export function runsPage(runs: RunRow[], repo?: string, chrome: Chrome = {}): string {
+  const mode = chrome.mode ?? 'plane';
   const heading = repo ? `Runs · ${escapeHtml(repo)}` : 'Runs';
   // What is ACTUALLY required, in order. This used to say only "label an issue", which
   // is the last step of three: label one before the rest and the delivery is accepted,
@@ -978,7 +1017,7 @@ repository. An issue opened or labelled on it.</p>
               : `<span class="muted">none</span>`,
           ]),
         ));
-  return layout(repo ? `Runs — ${repo}` : 'Runs', body, '/runs');
+  return layout(repo ? `Runs — ${repo}` : 'Runs', body, { current: '/runs', ...who(chrome) });
 }
 
 /**
@@ -1248,5 +1287,5 @@ class describing our own spending would put a fact about us into a log about you
     );
   }
 
-  return layout(`${row.repo}#${row.issue_number} — evidence`, sections.join('\n'), '/runs');
+  return layout(`${row.repo}#${row.issue_number} — evidence`, sections.join('\n'), { current: '/runs' });
 }
