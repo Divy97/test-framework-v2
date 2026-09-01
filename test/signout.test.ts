@@ -131,3 +131,90 @@ describe('the header offers the way out only where there is one', () => {
     expect(html).toContain('&lt;script&gt;');
   });
 });
+
+/**
+ * The command on the pairing page has to be the whole command.
+ *
+ * A new operator followed it exactly — clone, `npm ci`, run — and the runner refused,
+ * naming four variables it had no way to look up. The two image names and the blob root
+ * are things this repository already decides; only the model credential is genuinely the
+ * operator's. The answer to the other three lived in a document about setting up a GitHub
+ * App, which nothing in the pairing flow points at.
+ */
+describe('what the pairing page tells a stranger to run', () => {
+  it('builds the images, which a new machine does not have', async () => {
+    const { runnersPage } = await import('../src/web.js');
+    const html = runnersPage('acme/checkout', [], {
+      token: 'tfr_x',
+      name: 'laptop',
+      planeUrl: 'https://plane.test',
+    });
+
+    expect(html).toContain('npm run images');
+  });
+
+  it('names the model key, which is the one thing that cannot be defaulted', async () => {
+    const { runnersPage } = await import('../src/web.js');
+    const html = runnersPage('acme/checkout', [], {
+      token: 'tfr_x',
+      name: 'laptop',
+      planeUrl: 'https://plane.test',
+    });
+
+    expect(html).toContain('OPENROUTER_API_KEY');
+  });
+
+  it('says the token is on a command line, because that is where shell history comes from', async () => {
+    const { runnersPage } = await import('../src/web.js');
+    const html = runnersPage('acme/checkout', [], {
+      token: 'tfr_x',
+      name: 'laptop',
+      planeUrl: 'https://plane.test',
+    });
+
+    expect(html).toContain('shell history');
+  });
+});
+
+describe('a runner defaults everything this repository already decides', () => {
+  it('needs only the plane, the token and a model key', async () => {
+    const { readRunnerConfig, DEFAULT_IMAGE, DEFAULT_AGENT_IMAGE, DEFAULT_BLOB_ROOT } =
+      await import('../src/runner-main.js');
+
+    const config = readRunnerConfig({
+      ENGINE_PLANE_URL: 'https://plane.test',
+      ENGINE_RUNNER_TOKEN: 'tfr_x',
+      OPENROUTER_API_KEY: 'sk-x',
+    } as NodeJS.ProcessEnv);
+
+    expect(config.image).toBe(DEFAULT_IMAGE);
+    expect(config.agentImage).toBe(DEFAULT_AGENT_IMAGE);
+    expect(config.blobRoot).toBe(DEFAULT_BLOB_ROOT);
+  });
+
+  it('still refuses without a model key, which is nobody else s to supply', async () => {
+    const { readRunnerConfig } = await import('../src/runner-main.js');
+
+    expect(() =>
+      readRunnerConfig({
+        ENGINE_PLANE_URL: 'https://plane.test',
+        ENGINE_RUNNER_TOKEN: 'tfr_x',
+      } as NodeJS.ProcessEnv),
+    ).toThrow(/OPENROUTER_API_KEY/);
+  });
+
+  it('and an override still overrides, for a machine with its own images', async () => {
+    const { readRunnerConfig } = await import('../src/runner-main.js');
+
+    const config = readRunnerConfig({
+      ENGINE_PLANE_URL: 'https://plane.test',
+      ENGINE_RUNNER_TOKEN: 'tfr_x',
+      OPENROUTER_API_KEY: 'sk-x',
+      ENGINE_IMAGE: 'mine:1',
+      ENGINE_BLOB_ROOT: '/mnt/evidence',
+    } as NodeJS.ProcessEnv);
+
+    expect(config.image).toBe('mine:1');
+    expect(config.blobRoot).toBe('/mnt/evidence');
+  });
+});
