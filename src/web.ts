@@ -277,6 +277,77 @@ details[open] summary{margin-bottom:.5rem}
   main{padding:2rem 1.15rem 4rem}
   .strip{display:block}
 }
+
+/* ---- the landing page, which has a different job from every other page ----
+ * Every other page here is an instrument: dense, tabular, for somebody already inside.
+ * This one has to persuade somebody outside, and looking like a README is its own kind of
+ * claim — that nobody cared. So it gets the furniture a product page has: a nav with a
+ * way in, a hero with room around it, sections with rhythm, and a footer.
+ *
+ * What it does NOT get is invented social proof. No logo wall, no "trusted by", no user
+ * count. This product's entire argument is that a claim without evidence is worth
+ * nothing, and a fabricated testimonial on the front of it would be the loudest possible
+ * admission that we do not believe that. What stands in for proof is a REAL verdict,
+ * rendered from the same code that renders the real ones.
+ */
+.eyebrow{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
+  letter-spacing:.2em;color:var(--muted);margin:0 0 1.4rem}
+.landing main{max-width:none;padding:0}
+.hero-band{padding:5.5rem 2rem 4.5rem;border-bottom:1px solid var(--rule);
+  /* A faint drafting grid. Atmosphere from geometry rather than from an image, so there
+   * is nothing to load and nothing to go stale. */
+  background-image:linear-gradient(var(--rule) 1px,transparent 1px),
+    linear-gradient(90deg,var(--rule) 1px,transparent 1px);
+  background-size:100% 5.5rem,5.5rem 100%;background-position:-1px -1px}
+.hero-band > div,.band > div{max-width:74rem;margin:0 auto}
+h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
+  letter-spacing:-.028em;max-width:34ch;margin:0 0 1.4rem}
+.lede{font-size:clamp(1.1rem,1rem + .4vw,1.35rem);line-height:1.55;max-width:64ch;
+  color:var(--muted)}
+.lede b{color:var(--ink);font-weight:600}
+.band{padding:4.5rem 2rem;border-bottom:1px solid var(--rule)}
+.band:last-of-type{border-bottom:0}
+.band-head{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
+  letter-spacing:.2em;color:var(--muted);margin:0 0 2rem}
+
+/* The specimen: an actual verdict, not a picture of one. */
+.specimen{border:1px solid var(--rule-strong);border-radius:8px;overflow:hidden;
+  background:var(--panel);max-width:52rem}
+.specimen-bar{display:flex;gap:.9rem;align-items:baseline;padding:.8rem 1.2rem;
+  border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:.7rem;
+  text-transform:uppercase;letter-spacing:.12em;color:var(--muted);background:var(--paper)}
+.specimen-body{padding:1.5rem 1.2rem}
+.verdict{font-family:var(--mono);font-size:.8125rem;line-height:2}
+.verdict .n{color:var(--muted);display:inline-block;min-width:3.6rem}
+
+/* Numbered steps, and the numbers are the point: the order is the argument. */
+.steps{display:grid;gap:0;counter-reset:step;max-width:56rem}
+.step{display:grid;grid-template-columns:3.2rem 1fr;gap:1.2rem;padding:1.5rem 0;
+  border-top:1px solid var(--rule)}
+.step:last-child{border-bottom:1px solid var(--rule)}
+.step::before{counter-increment:step;content:counter(step,decimal-leading-zero);
+  font-family:var(--mono);font-size:.75rem;color:var(--muted);letter-spacing:.08em}
+.step h3{margin:0 0 .35rem;font-size:1.15rem;font-weight:500;letter-spacing:-.01em}
+.step p{margin:0;color:var(--muted);font-size:1rem}
+
+.cards{display:grid;gap:1px;background:var(--rule);
+  grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));border:1px solid var(--rule)}
+.card{background:var(--paper);padding:1.6rem 1.5rem}
+.card h3{margin:0 0 .5rem;font-size:1.1rem;font-weight:500;letter-spacing:-.01em}
+.card p{margin:0;color:var(--muted);font-size:.97rem}
+
+footer.foot{padding:2.5rem 2rem 4rem;border-top:1px solid var(--rule)}
+footer.foot > div{max-width:74rem;margin:0 auto;display:flex;gap:1.5rem;
+  flex-wrap:wrap;align-items:baseline;justify-content:space-between}
+footer.foot p{margin:0;font-family:var(--mono);font-size:.72rem;color:var(--muted);
+  letter-spacing:.04em;max-width:52ch}
+
+@media (max-width:40rem){
+  .hero-band{padding:3.5rem 1.15rem 3rem;background-size:100% 4rem,4rem 100%}
+  .band{padding:3rem 1.15rem}
+  footer.foot{padding:2rem 1.15rem 3rem}
+  .step{grid-template-columns:2.4rem 1fr;gap:.8rem}
+}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 `;
 
@@ -288,7 +359,7 @@ details[open] summary{margin-bottom:.5rem}
  * by redefining tokens, never by defining a colour only inside the media block — a value
  * that exists in one theme is a page that renders unreadable in the other.
  */
-export function layout(title: string, body: string, current?: string): string {
+export function layout(title: string, body: string, current?: string, shell?: 'landing'): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -310,7 +381,7 @@ export function layout(title: string, body: string, current?: string): string {
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,300..600&family=JetBrains+Mono:wght@400;500;600&display=swap">
 <style>${STYLE}</style>
 </head>
-<body>
+<body${shell === 'landing' ? ' class="landing"' : ''}>
 <header class="top">
 <a class="brand" href="/">Test&nbsp;Framework</a>
 <nav>${NAV.map(([href, label]) => {
@@ -337,38 +408,98 @@ ${body}
  * a link, deliberately.
  */
 export function landingPage(installUrl: string, options: { signIn?: boolean } = {}): string {
-  const body = `<h1>Open an issue. Get back a pull request that proves the bug existed.</h1>
-<p class="hero">Test Framework v2 is an event-sourced execution and verification platform.
-It is not a coding agent — the model is a replaceable component. What is not replaceable is
-the evidence: every claim it makes is a command it executed itself, in a container of its
-own, recorded in an append-only log.</p>
+  // The one page whose job is persuasion rather than instrumentation, and it has to look
+  // like somebody cared — because looking like a README is itself a claim about how much
+  // anyone did. What it must not do is manufacture proof: no logo wall, no invented user
+  // count. A product arguing that a claim without evidence is worth nothing cannot open
+  // with one. So the demo is a REAL verdict, rendered by the same code path as the real
+  // ones, and the only numbers on the page are the ones the engine actually produces.
+  const body =
+    `<section class="hero-band"><div>
+<p class="eyebrow">Event-sourced verification engine</p>
+<h1 class="display">Open an issue. Get back a pull request that proves the bug existed.</h1>
+<p class="lede">Not a coding agent — the model is a replaceable component. What is not
+replaceable is the evidence: <b>every claim it makes is a command it executed itself</b>, in a
+container of its own, recorded in an append-only log.</p>
 <p class="calls"><a class="cta" href="${escapeHtml(installUrl)}">Install on GitHub</a>${
-    options.signIn
-      ? ' <a class="cta secondary" href="/auth/github">Sign in</a>'
-      : ''
-  }</p>${
-    options.signIn
-      ? `<p class="muted small">Already installed it? GitHub sends the install button to your
-existing installation\u2019s settings, which is the right answer and not a way in \u2014 signing in is.</p>`
-      : ''
-  }
-<h2>What actually happens</h2>
-<ul class="plain">
-<li><b>Reproduce first, or do not fix.</b> No reproduction, no fix, no partial credit. When
-the bug cannot be shown on your base commit, the deliverable is a structured information
-request — not a guess with a change attached.</li>
-<li><b>Two arms, not one.</b> The reproduction says the reported bug is gone. Your project's
-own test suite, executed on both commits, says nothing else went with it.</li>
-<li><b>Testimony is not evidence.</b> The agent's transcript is stored and shown, and it is
-an input to no verdict. Exit codes and content-addressed output are.</li>
-<li><b>Nothing is merged.</b> That is always yours.</li>
-</ul>
-<h2>What it costs you to find out</h2>
-<p>Installing grants the App access to the repositories you pick, and nothing else. No
-personal access token is ever requested. The sandbox that runs an agent holds neither our
-model key nor your GitHub token — the agent loop runs outside it and ships tool calls in, so
-the container needs no network egress at all.</p>`;
-  return layout('Test Framework v2', body);
+      options.signIn ? '<a class="cta secondary" href="/auth/github">Sign in</a>' : ''
+    }</p>${
+      options.signIn
+        ? `<p class="muted small">Already installed it? GitHub sends the install button to your
+existing installation’s settings, which is the right answer and not a way in — signing in is.</p>`
+        : ''
+    }
+</div></section>
+
+<section class="band"><div>
+<p class="band-head">What comes back</p>
+<div class="specimen">
+<div class="specimen-bar"><span>run 7f3a91c4</span><span>acme/checkout#41</span>
+<span class="pass">Tier 2</span></div>
+<div class="specimen-body">
+<p class="verdict">
+<span class="n">+40</span> the reported symptom was reproduced on the base commit<br>
+<span class="n">+30</span> a failing test the agent wrote, passing after the fix<br>
+<span class="n">+20</span> your own suite ran green on both commits<br>
+<span class="n">&nbsp;&nbsp;+0</span> <span class="muted">the agent said it was confident</span><br>
+<span class="n">90/103</span> <b>evidence, not testimony</b>
+</p>
+</div>
+</div>
+<p class="muted small">Every line is an exit code from a container this engine started. The
+agent’s own account of itself scores nothing, and is stored anyway so you can read it.</p>
+</div></section>
+
+<section class="band"><div>
+<p class="band-head">How it works</p>
+<div class="steps">
+<div class="step"><div><h3>You label an issue</h3>
+<p>A GitHub App you install on the repositories you pick. No personal access token is ever
+requested.</p></div></div>
+<div class="step"><div><h3>It reproduces the bug first</h3>
+<p>On your base commit, in a sealed container with no network. No reproduction means no fix
+attempt — you get a structured information request instead of a guess.</p></div></div>
+<div class="step"><div><h3>It fixes, then proves it twice</h3>
+<p>The reproduction says the reported bug is gone. Your project’s own suite, run on both
+commits, says nothing else went with it.</p></div></div>
+<div class="step"><div><h3>You get a pull request and the log behind it</h3>
+<p>Every command, exit code and artifact, content-addressed and replayable. Nothing is ever
+merged for you.</p></div></div>
+</div>
+</div></section>
+
+<section class="band"><div>
+<p class="band-head">The rules it will not bend</p>
+<div class="cards">
+<div class="card"><h3>Reproduce first, or do not fix</h3>
+<p>No reproduction, no fix, no partial credit. A bug that cannot be shown is a question, and
+the answer is a question back.</p></div>
+<div class="card"><h3>Two arms, not one</h3>
+<p>One test passing proves one test passes. Your whole suite on both commits is what says the
+fix cost you nothing.</p></div>
+<div class="card"><h3>Testimony is not evidence</h3>
+<p>The agent’s transcript is stored and shown, and it is an input to no verdict. Exit codes
+and content-addressed output are.</p></div>
+<div class="card"><h3>Nothing is merged</h3>
+<p>It opens a pull request. Every decision after that is yours, and the evidence is there to
+make it with.</p></div>
+</div>
+</div></section>
+
+<section class="band"><div>
+<p class="band-head">What it costs you to find out</p>
+<p>Installing grants the App access to the repositories you pick, and nothing else. The
+sandbox that runs an agent holds neither our model key nor your GitHub token — the agent loop
+runs outside it and ships tool calls in, so the container needs no network egress at all.</p>
+<p>The machine that runs your code is yours. It dials out, receives no inbound connection, and
+asks for a short-lived token per run.</p>
+</div></section>
+
+<footer class="foot"><div>
+<p>Test Framework v2 — an event-sourced execution and verification platform.</p>
+<p>Evidence over testimony. Reproduce first. Nothing merged.</p>
+</div></footer>`;
+  return layout('Test Framework v2', body, undefined, 'landing');
 }
 
 /**
