@@ -557,7 +557,7 @@ describe('the onboarding screen is the only write, and its copy carries the weig
   });
 
   test('a proof renders as what a run here will and will not be able to say', () => {
-    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, {
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, { proof: {
       state: 'ready_with_caveats',
       commit: 'a'.repeat(40),
       environment: { built: true },
@@ -565,7 +565,7 @@ describe('the onboarding screen is the only write, and its copy carries the weig
       caveats: ['the test command `npm test` already fails at this commit (exit 1)'],
       unproved: ['the single-test invocation: nothing here has executed one'],
       provedAt: '2026-08-29T10:00:00.000Z',
-    });
+    } });
     expect(html).toContain('Ready, with caveats');
     expect(html).toContain('exit 1');
     expect(html).toContain('already fails at this commit');
@@ -577,14 +577,14 @@ describe('the onboarding screen is the only write, and its copy carries the weig
   });
 
   test('a blocked repository says nothing else could be checked', () => {
-    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, {
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, { proof: {
       state: 'blocked',
       commit: 'b'.repeat(40),
       environment: { built: false, failed: 'recipe step install failed: exit 127' },
       caveats: ['nothing else could be checked'],
       unproved: [],
       provedAt: '2026-08-29T10:00:00.000Z',
-    });
+    } });
     expect(html).toContain('Blocked.');
     expect(html).toContain('exit 127');
     expectWellFormed(html);
@@ -594,7 +594,7 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     // Stored as opaque JSON and read back the same way, deliberately: a proof written
     // before a field existed is still the best thing anyone has about that repository,
     // and throwing on it would take the whole onboarding page down with it.
-    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, { state: 'ready' });
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, { proof: { state: 'ready' } });
     expect(html).toContain('Ready.');
     expectWellFormed(html);
   });
@@ -603,13 +603,13 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     // Caveats quote the recipe's own commands and a container's OUTPUT, which is
     // whatever the repository under onboarding printed. Same rule as every other
     // string on this surface.
-    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, {
+    const html = onboardPage('acme/widgets', RECIPE, undefined, undefined, { proof: {
       state: 'ready_with_caveats',
       environment: { built: true },
       caveats: ['<img src=x onerror="alert(1)">'],
       unproved: [],
       provedAt: 'T',
-    });
+    } });
     expect(html).not.toContain('<img src=x');
     expect(html).toContain('&lt;img src=x');
     expectWellFormed(html);

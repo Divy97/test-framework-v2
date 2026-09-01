@@ -10,6 +10,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Db } from '../src/store.js';
 import { dashboardRoutes } from '../src/routes.js';
+import { onboardPage } from '../src/web.js';
 import { startStatusServer, type StatusServer } from '../src/sse.js';
 
 const servers: StatusServer[] = [];
@@ -92,5 +93,31 @@ describe('approving a recipe starts a proving run', () => {
     });
     expect(response.status).toBe(403);
     expect(approved).toEqual([]);
+  });
+});
+
+/**
+ * Approving is a write with no visible result, and that made a working button look broken.
+ *
+ * The form 303s back to a page that renders the recipe it already showed. A click that
+ * stored something and a click that stored the same thing again are pixel-identical — so
+ * the first person to use this pasted a recipe, clicked, saw no change, and reported that
+ * nothing happened. The click had worked. The paste had not landed, and an empty recipe
+ * was approved for real, with the page unable to say either way.
+ */
+describe('the page says what approving did', () => {
+  it('names when the recipe in force took force', () => {
+    const html = onboardPage('acme/widgets', { install: 'npm ci', services: [], test: 'npm test' }, undefined, undefined, {
+      approvedAt: '2026-09-01T18:12:33.928Z',
+    });
+
+    expect(html).toContain('In force');
+    // The moving part: a second approval writes a new timestamp, so the page changes even
+    // when the recipe does not.
+    expect(html).toContain('01 Sept');
+  });
+
+  it('says nothing of the sort when no recipe has ever been approved', () => {
+    expect(onboardPage('acme/widgets', null)).not.toContain('In force');
   });
 });
