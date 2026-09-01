@@ -16,7 +16,7 @@ import {
   sessionCookie,
   type OAuthConfig,
 } from './auth.js';
-import type { Route } from './sse.js';
+import { sameOrigin, type Route } from './sse.js';
 import { escapeHtml, layout } from './web.js';
 
 /** The state cookie lives exactly as long as a login takes. */
@@ -96,10 +96,17 @@ export function authRoutes(options: {
       };
     }
 
-    // POST, not GET. A link that logs somebody out is a link anybody's page can embed,
-    // and the same-origin check that guards the rest of this surface only runs on
-    // writes. Small stakes, one word to get right.
+    // POST, not GET. A link that logs somebody out is a link anybody's page can embed.
+    //
+    // And the same-origin check is APPLIED here, which it was not: the comment that used
+    // to sit on this line said the check guarding the rest of the surface covered writes,
+    // and it does — the rest of the surface. `sameOrigin` lived inside `dashboardRoutes`,
+    // and these routes are chained ahead of it, so a cross-site form could sign somebody
+    // out. Small stakes as attacks go, and a claim the code was not keeping.
     if (method === 'POST' && path === '/auth/logout') {
+      if (!sameOrigin(headers)) {
+        return { status: 403, type: 'text/plain', body: 'refused: this looks like a cross-site request.\n' };
+      }
       await endSession(client, cookieValue(headers['cookie'], 'tf_session'));
       return {
         status: 303,

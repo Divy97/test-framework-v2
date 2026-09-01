@@ -115,6 +115,51 @@ export type StatusServer = { port: number; close: () => Promise<void> };
  * the extra surface arrives the same way: as a function the caller closes over its own
  * client, returning what to send. `null` means "not mine", and the 404 stands.
  */
+/**
+ * Is this write coming from our own page?
+ *
+ * Lives HERE, next to `Route`, because two route modules need it and neither owns the
+ * other. It used to be private to `routes.ts`, which meant `/auth/logout` — in
+ * `auth-routes.ts`, chained BEFORE the dashboard — never saw it, while a comment beside
+ * that route said the same-origin check guarded this surface. It guarded the other one.
+ */
+/**
+ * Is this state-changing request coming from our own page?
+ *
+ * The one POST here stores a recipe — **arbitrary shell commands the engine later
+ * executes verbatim** in a sandbox with a package registry reachable. Without this check
+ * it was a textbook CSRF, and binding to `127.0.0.1` bought nothing: the same-origin
+ * policy stops another page READING our response, never stops it sending the request, and
+ * `application/x-www-form-urlencoded` is a CORS "simple" content type so no preflight
+ * ever happens. Any page the operator visited could have silently stored a recipe, and
+ * the next run on that repository would have executed it.
+ *
+ * Worse than the execution: it defeats the claim onboarding rests on. ADR-0013 says the
+ * approval "is the only control there is on a stored command we will execute" — and a
+ * forged POST is a stored command no human approved.
+ *
+ * `Sec-Fetch-Site` is the primary check because every current browser sends it and it
+ * cannot be set by script. `Origin` is the fallback for anything older. A request with
+ * NEITHER is not a browser — curl, the CLI, a test — and cannot be cross-site forged,
+ * because forging one already requires code execution on the machine.
+ */
+export const sameOrigin = (headers: Record<string, string | string[] | undefined>): boolean => {
+  const one = (name: string): string | undefined => {
+    const value = headers[name];
+    return Array.isArray(value) ? value[0] : value;
+  };
+  const site = one('sec-fetch-site');
+  if (site !== undefined) return site === 'same-origin' || site === 'none';
+  const origin = one('origin');
+  if (origin === undefined) return true;
+  const host = one('host');
+  try {
+    return host !== undefined && new URL(origin).host === host;
+  } catch {
+    return false;
+  }
+};
+
 export type Route = (request: {
   method: string;
   path: string;

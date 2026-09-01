@@ -17,7 +17,7 @@ import { listInstallations, loadInstallation } from './installations.js';
 import { listRuns, readRunRow, readUsage } from './readmodel.js';
 import { loadProof, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
 import { readRun, type Db } from './store.js';
-import type { Route } from './sse.js';
+import { sameOrigin, type Route } from './sse.js';
 import type { Session } from './auth.js';
 import { forgetRun, tombstoneFor } from './forget.js';
 import { listRunners, pairRunner, revokeRunner } from './plane.js';
@@ -32,42 +32,6 @@ import {
   type Mode,
 } from './web.js';
 
-/**
- * Is this state-changing request coming from our own page?
- *
- * The one POST here stores a recipe — **arbitrary shell commands the engine later
- * executes verbatim** in a sandbox with a package registry reachable. Without this check
- * it was a textbook CSRF, and binding to `127.0.0.1` bought nothing: the same-origin
- * policy stops another page READING our response, never stops it sending the request, and
- * `application/x-www-form-urlencoded` is a CORS "simple" content type so no preflight
- * ever happens. Any page the operator visited could have silently stored a recipe, and
- * the next run on that repository would have executed it.
- *
- * Worse than the execution: it defeats the claim onboarding rests on. ADR-0013 says the
- * approval "is the only control there is on a stored command we will execute" — and a
- * forged POST is a stored command no human approved.
- *
- * `Sec-Fetch-Site` is the primary check because every current browser sends it and it
- * cannot be set by script. `Origin` is the fallback for anything older. A request with
- * NEITHER is not a browser — curl, the CLI, a test — and cannot be cross-site forged,
- * because forging one already requires code execution on the machine.
- */
-const sameOrigin = (headers: Record<string, string | string[] | undefined>): boolean => {
-  const one = (name: string): string | undefined => {
-    const value = headers[name];
-    return Array.isArray(value) ? value[0] : value;
-  };
-  const site = one('sec-fetch-site');
-  if (site !== undefined) return site === 'same-origin' || site === 'none';
-  const origin = one('origin');
-  if (origin === undefined) return true;
-  const host = one('host');
-  try {
-    return host !== undefined && new URL(origin).host === host;
-  } catch {
-    return false;
-  }
-};
 
 const html = (body: string, status = 200) => ({ status, type: 'text/html; charset=utf-8', body });
 const json = (body: unknown, status = 200) => ({
@@ -170,6 +134,18 @@ export function dashboardRoutes(options: {
     };
   };
 
+  /**
+   * The chrome for a page: what this deployment can promise, and who is looking at it.
+   *
+   * `visible()` already asked both questions to decide whether to render at all, so the
+   * answer is here — the alternative was every page re-deriving a login it was handed.
+   */
+  const chrome = (seen: Awaited<ReturnType<typeof visible>>) => ({
+    mode: options.mode ?? ('plane' as const),
+    ...(seen !== null && seen !== 'anonymous' ? { who: seen.session.login } : {}),
+  });
+
+
   /** Send a browser to log in; tell an API client plainly. */
   const anonymous = (path: string) =>
     path.startsWith('/api/')
@@ -230,7 +206,7 @@ export function dashboardRoutes(options: {
           runs: runs.filter((run) => run.repo === installation.repo).length,
         })),
       );
-      return html(repositoriesPage(rows, options.mode ?? 'plane'));
+      return html(repositoriesPage(rows, chrome(who)));
     }
 
     if (method === 'GET' && (path === '/runs' || path === '/api/runs')) {
@@ -242,7 +218,7 @@ export function dashboardRoutes(options: {
       const runs = (await listRuns(client, repo)).filter(
         (run) => who === null || who.repos.has(run.repo),
       );
-      return path === '/api/runs' ? json(runs) : html(runsPage(runs, repo, options.mode ?? 'plane'));
+      return path === '/api/runs' ? json(runs) : html(runsPage(runs, repo, chrome(who)));
     }
 
     const run = /^\/runs\/([^/]+)$/.exec(path);
@@ -356,7 +332,7 @@ export function dashboardRoutes(options: {
 
       if (method === 'POST' && runners) {
         const name = new URLSearchParams(await body()).get('name')?.trim();
-        if (!name) return html(runnersPage(repo, await listRunners(client, installation.installationId)), 400);
+        if (!name) return html(runnersPage(repo, await listRunners(client, installation.installationId), undefined, chrome(who)), 400);
         const { token } = await pairRunner(client, { installationId: installation.installationId, name });
         // Rendered rather than redirected, because the token exists in exactly one
         // response and a 303 would throw it away on the way to the page that cannot
@@ -369,12 +345,12 @@ export function dashboardRoutes(options: {
             // to dial. It used to print the literal string `<this service>`, on a page
             // served from the host it should have been naming.
             planeUrl: origin(headers),
-          }),
+          }, chrome(who)),
         );
       }
 
       if (method === 'GET' && runners) {
-        return html(runnersPage(repo, await listRunners(client, installation.installationId)));
+        return html(runnersPage(repo, await listRunners(client, installation.installationId), undefined, chrome(who)));
       }
     }
 
@@ -408,7 +384,7 @@ export function dashboardRoutes(options: {
           loadDraft(client, repo),
           loadProof(client, repo),
         ]);
-        return html(onboardPage(repo, recipe, draft?.draft, undefined, proof, options.mode ?? 'plane'));
+        return html(onboardPage(repo, recipe, draft?.draft, undefined, proof, chrome(who)));
       }
 
       // THE ONE WRITE. A human is approving commands the engine will execute verbatim in
