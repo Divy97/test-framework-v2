@@ -29,6 +29,7 @@ import {
   repositoriesPage,
   runnersPage,
   runsPage,
+  type Mode,
 } from './web.js';
 
 /**
@@ -102,6 +103,13 @@ export function dashboardRoutes(options: {
    * two containers have finished.
    */
   onApproved?: (repo: string) => void;
+  /**
+   * Where the engine runs, which decides what these pages may promise — see `Mode`.
+   *
+   * Defaults to `plane`, the more restricted one: a deployment that forgot to say
+   * offers less than it can, rather than promising drafting that will never happen.
+   */
+  mode?: Mode;
   /**
    * Where artifacts live, when this surface is the one holding them (9e). Absent, the
    * forget route answers 501 rather than pretending to delete something.
@@ -222,7 +230,7 @@ export function dashboardRoutes(options: {
           runs: runs.filter((run) => run.repo === installation.repo).length,
         })),
       );
-      return html(repositoriesPage(rows));
+      return html(repositoriesPage(rows, options.mode ?? 'plane'));
     }
 
     if (method === 'GET' && (path === '/runs' || path === '/api/runs')) {
@@ -234,7 +242,7 @@ export function dashboardRoutes(options: {
       const runs = (await listRuns(client, repo)).filter(
         (run) => who === null || who.repos.has(run.repo),
       );
-      return path === '/api/runs' ? json(runs) : html(runsPage(runs, repo));
+      return path === '/api/runs' ? json(runs) : html(runsPage(runs, repo, options.mode ?? 'plane'));
     }
 
     const run = /^\/runs\/([^/]+)$/.exec(path);
@@ -400,7 +408,7 @@ export function dashboardRoutes(options: {
           loadDraft(client, repo),
           loadProof(client, repo),
         ]);
-        return html(onboardPage(repo, recipe, draft?.draft, undefined, proof));
+        return html(onboardPage(repo, recipe, draft?.draft, undefined, proof, options.mode ?? 'plane'));
       }
 
       // THE ONE WRITE. A human is approving commands the engine will execute verbatim in

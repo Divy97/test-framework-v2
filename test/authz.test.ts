@@ -313,3 +313,79 @@ describe('the pairing command names this service and nothing off the internet', 
     expect(response?.body).toContain('ENGINE_PLANE_URL=http://127.0.0.1:8788');
   });
 });
+
+/**
+ * What the pages PROMISE has to match what the deployment can do.
+ *
+ * The hosted plane holds no model key and runs no containers (ADR-0011, ADR-0019): work
+ * goes to a paired runner, and nothing drafts a recipe there. Yet the pages offered to
+ * "draft a recipe" and said a run starts by labelling an issue — the last of three steps.
+ * Someone following that labels an issue, the plane logs `not onboarded — nothing queued`,
+ * and the screen says nothing at all. That is the failure mode this project exists to
+ * refuse, in the UI rather than in a verdict.
+ *
+ * `mode` is explicit rather than inferred from whether login is configured, because those
+ * are two different questions — the conflation the landing page already had once.
+ */
+describe('a page promises only what its deployment can do', () => {
+  /** Installed, but nothing has run: the state every one of these pages is about. */
+  const noRunsYet = () =>
+    ({
+      query: vi.fn(async (sql: string) => {
+        const rows = sql.includes('from installations')
+          ? [{ repo: 'mine/repo', installation_id: 1, account: 'me', connected_at: new Date(), removed_at: null }]
+          : [];
+        return { rows, rowCount: rows.length };
+      }),
+    }) as unknown as Db;
+
+  const page = async (path: string, mode?: 'local' | 'plane') =>
+    (
+      await call(
+        dashboardRoutes({
+          client: noRunsYet(),
+          installUrl: 'https://example.invalid',
+          ...(mode === undefined ? {} : { mode }),
+          auth: { session: async () => SESSION, installations: async () => [1] },
+        }),
+        'GET',
+        path,
+      )
+    )?.body as string;
+
+  it('does not offer to draft a recipe where nothing drafts', async () => {
+    const body = await page('/repos', 'plane');
+    expect(body).toContain('write a recipe');
+    expect(body).not.toContain('draft a recipe');
+  });
+
+  it('still offers drafting on a laptop, where installing one starts a drafting run', async () => {
+    const body = await page('/repos', 'local');
+    expect(body).toContain('draft a recipe');
+  });
+
+  it('names all three things a hosted run needs, not just the last one', async () => {
+    const body = await page('/runs', 'plane');
+    // The runner is the one nobody guesses: pairing mints a credential, and the machine
+    // still has to be running for anything to execute.
+    expect(body).toContain('runner paired');
+    expect(body).toContain('approved recipe');
+    expect(body).not.toContain('No runs yet. Label an issue');
+  });
+
+  it('tells a hosted operator the recipe box is theirs to fill', async () => {
+    const body = await page('/repos/mine%2Frepo/onboard', 'plane');
+    expect(body).toContain('the box is yours to fill');
+  });
+
+  it('and says no such thing locally, where a draft is coming', async () => {
+    const body = await page('/repos/mine%2Frepo/onboard', 'local');
+    expect(body).not.toContain('the box is yours to fill');
+  });
+
+  it('defaults to the restricted mode, so a deployment that forgot to say promises less', async () => {
+    // Failing toward under-promising: a plane that renders as a laptop tells people to
+    // wait for a draft that is never coming.
+    expect(await page('/repos')).toContain('write a recipe');
+  });
+});
