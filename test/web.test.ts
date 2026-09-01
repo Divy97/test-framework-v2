@@ -476,7 +476,10 @@ describe('the run list', () => {
     expect(html).toContain(`${two.score}/${two.ceiling}`);
     expect(html).toContain('Tier 2');
     expect(html).toContain('Tier 3');
-    expect(html).toContain('pr_opened');
+    // Labelled for a reader, with the stored value still on the element — the property
+    // is that the run list carries its status, not that it prints a database enum.
+    expect(html).toContain('PR opened');
+    expect(html).toContain('title=\"pr_opened\"');
     expect(html).toContain('/runs/run-tier2');
     expect(html).toContain('/runs/run-tier3');
     expectWellFormed(html);

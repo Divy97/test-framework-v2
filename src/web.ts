@@ -86,64 +86,198 @@ const table = (headers: string[], rows: string[][]): string =>
 // Descendant selectors only, and no `>` or `<` anywhere in the sheet: the style block is
 // interpolated into the document as text, and a combinator there is a character the parser
 // has to be trusted to ignore. Cheaper to not write one.
+/** The only navigation this product has. One place, so a page cannot invent a third tab. */
+const NAV: [string, string][] = [
+  ['/repos', 'Repositories'],
+  ['/runs', 'Runs'],
+];
+
 const STYLE = `
-:root{color-scheme:light dark;--bg:#ffffff;--fg:#14161a;--muted:#5b6270;--line:#e2e5ea;
---panel:#f7f8fa;--code:#eef0f3;--link:#14459c;--warn-bg:#fff2f2;--warn-line:#c8332e;
---warn-fg:#8a1f1c;--ok:#1c6b3f;--bad:#a32a25;}
-@media (prefers-color-scheme:dark){:root{--bg:#0e1116;--fg:#e6e9ee;--muted:#99a2b0;
---line:#262c35;--panel:#161b22;--code:#1b212a;--link:#87b0ff;--warn-bg:#2b1616;
---warn-line:#e0605a;--warn-fg:#ffb3ae;--ok:#68d391;--bad:#ff8e88;}}
+/*
+ * A FORENSIC REGISTER, not a dashboard, and the typography carries the argument.
+ *
+ * This product's one claim is evidence over testimony (ADR-0006): a verdict is a command
+ * it executed, recorded in an append-only log, and an agent's account of itself is stored
+ * and believed about nothing. So the type splits the same way the domain does — a serif
+ * for what PEOPLE wrote (headings, prose, explanation) and a monospace for every machine
+ * fact (ids, commands, exit codes, digests, timestamps). You can tell at a glance which
+ * you are reading, which is the distinction the whole engine exists to hold.
+ *
+ * Paper and ink, warm rather than blue-black, because everything else in this category is
+ * blue-black. Colour is rationed: hairlines and neutrals carry structure, and saturation
+ * is spent only on a verdict.
+ */
+:root{
+  color-scheme:light dark;
+  --paper:#faf9f6; --ink:#17161a; --muted:#6d6b63; --rule:#e4e1d9; --rule-strong:#d3cfc4;
+  --panel:#f3f1eb; --code:#eeebe3; --link:#1f4b8f;
+  --ok:#2c6e49; --bad:#9b2c2c;
+  --warn-bg:#fdf5ed; --warn-line:#b4553a; --warn-fg:#7c3a24;
+  --serif:"Newsreader",ui-serif,Georgia,Cambria,"Times New Roman",serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --paper:#121110; --ink:#eceae3; --muted:#96918a; --rule:#292722; --rule-strong:#3a372f;
+  --panel:#1a1815; --code:#1e1c18; --link:#b3ccff;
+  --ok:#7fc79b; --bad:#e89b94;
+  --warn-bg:#231a14; --warn-line:#c4693f; --warn-fg:#f0c3a8;
+}}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em}
-code{background:var(--code);padding:.1em .35em;border-radius:4px;word-break:break-all}
-a{color:var(--link)}
-header.top{display:flex;gap:1.25rem;align-items:baseline;flex-wrap:wrap;
-padding:.9rem 1.25rem;border-bottom:1px solid var(--line);background:var(--panel)}
-header.top .brand{font-weight:700;text-decoration:none;color:var(--fg)}
-header.top nav a{margin-right:1rem}
-main{max-width:62rem;margin:0 auto;padding:1.5rem 1.25rem 4rem}
-h1{font-size:1.5rem;margin:0 0 .35rem}
-h2{font-size:1.05rem;margin:2rem 0 .5rem;padding-bottom:.3rem;border-bottom:1px solid var(--line)}
-p{margin:.5rem 0}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font:400 1.0625rem/1.62 var(--serif);
+  font-optical-sizing:auto;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+::selection{background:var(--ink);color:var(--paper)}
+
+/* Machine facts. Tabular figures so a column of numbers reads as a column. */
+code,pre,kbd,samp,th,td,input,textarea,button,nav,.mono,.chip,.points{
+  font-family:var(--mono);font-variant-numeric:tabular-nums}
+code{background:var(--code);padding:.1em .34em;border-radius:3px;font-size:.855em;
+  overflow-wrap:anywhere;border:1px solid var(--rule)}
+/* A digest or a token has no word boundaries to break on; prose does. */
+code.hash{word-break:break-all}
+/* In a table an id is already in a mono column — a second box around it is noise. */
+td a code,td code{background:none;border:0;padding:0}
+pre{margin:0;font-size:.8125rem;line-height:1.6}
+pre code{background:none;border:0;padding:0;word-break:normal}
+
+a{color:var(--link);text-decoration-thickness:1px;text-underline-offset:.18em}
+a:hover{text-decoration-thickness:2px}
+:focus-visible{outline:2px solid var(--link);outline-offset:2px;border-radius:2px}
+
+/* ---- chrome ---- */
+header.top{display:flex;gap:2rem;align-items:baseline;flex-wrap:wrap;
+  padding:1.05rem 2rem;border-bottom:1px solid var(--rule);background:var(--paper);
+  position:sticky;top:0;z-index:5;backdrop-filter:saturate(140%) blur(6px)}
+header.top .brand{font-family:var(--serif);font-size:1.15rem;font-weight:500;
+  letter-spacing:-.01em;text-decoration:none;color:var(--ink)}
+header.top nav{display:flex;gap:1.5rem;font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.14em}
+header.top nav a{color:var(--muted);text-decoration:none;padding-bottom:.15rem;
+  border-bottom:1px solid transparent}
+header.top nav a:hover{color:var(--ink);border-bottom-color:var(--rule-strong)}
+header.top nav a[aria-current=page]{color:var(--ink);border-bottom-color:var(--ink)}
+main{max-width:74rem;margin:0 auto;padding:3rem 2rem 6rem}
+
+/* ---- type ---- */
+h1{font-size:clamp(1.9rem,1.4rem + 1.6vw,2.6rem);font-weight:400;letter-spacing:-.021em;
+  line-height:1.12;margin:0 0 .6rem}
+/* Section labels, printed-register style. The HTML text is untouched — this is CSS. */
+h2{font-family:var(--mono);font-size:.7rem;font-weight:500;text-transform:uppercase;
+  letter-spacing:.15em;color:var(--muted);margin:3rem 0 .9rem;padding-bottom:.55rem;
+  border-bottom:1px solid var(--rule)}
+h2:first-child{margin-top:0}
+p{margin:.65rem 0;max-width:46rem}
+.hero{font-size:1.2rem;line-height:1.58;max-width:44rem;color:var(--ink)}
 .muted{color:var(--muted)}
-.small{font-size:.86rem}
-.scroll{overflow-x:auto;max-width:100%}
-table{border-collapse:collapse;width:100%;font-size:.9rem}
-th,td{text-align:left;padding:.4rem .6rem;border-bottom:1px solid var(--line);
-vertical-align:top;white-space:nowrap}
-th{color:var(--muted);font-weight:600}
-td.wrap{white-space:normal}
-.strip{display:flex;flex-wrap:wrap;gap:.5rem;margin:.75rem 0 0}
-.chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;
-padding:.15rem .7rem;font-size:.82rem}
-.chip b{font-weight:600}
-.pass{color:var(--ok)}
-.fail{color:var(--bad)}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;
-padding:1rem 1.15rem;margin:1rem 0}
-.warning{background:var(--warn-bg);border:1px solid var(--warn-line);
-border-left-width:5px;border-radius:8px;padding:1rem 1.15rem;margin:1rem 0;color:var(--warn-fg)}
-.warning h2{border:0;margin:0 0 .4rem;color:inherit}
-.refusal{border-left-width:5px}
-.refusal h2{border:0;margin:0 0 .4rem}
+.small{font-size:.855rem;line-height:1.55}
+p.muted.small{font-size:.9rem;line-height:1.6;max-width:44rem}
+ul.plain{padding-left:1.15rem;max-width:46rem}
+ul.plain li{margin:.4rem 0}
+
+/* ---- tables: a register, hairlines only, no stripes ---- */
+.scroll{overflow-x:auto;max-width:100%;
+  /* A fade at the edge, so a cut-off column looks cut off rather than finished. */
+  mask-image:linear-gradient(to right,#000 calc(100% - 2.5rem),transparent)}
+.scroll:hover{mask-image:none}
+table{border-collapse:collapse;width:100%;font-size:.8125rem}
+th,td{text-align:left;padding:.7rem .85rem;vertical-align:baseline;white-space:nowrap}
+th{font-size:.66rem;font-weight:500;text-transform:uppercase;letter-spacing:.12em;
+  color:var(--muted);border-bottom:1px solid var(--rule-strong);
+  position:sticky;top:0;background:var(--paper)}
+td{border-bottom:1px solid var(--rule)}
+tbody tr:hover td{background:var(--panel)}
+td:first-child,th:first-child{padding-left:0}
+td:last-child,th:last-child{padding-right:0}
+td.wrap{white-space:normal;font-family:var(--serif);font-size:.95rem;max-width:32rem}
+th.num,td.num{text-align:right}
+
+/* ---- verdict ---- */
+.pass{color:var(--ok);font-weight:500}
+.fail{color:var(--bad);font-weight:500}
+b.fail,b.pass{font-weight:600}
+
+/* ---- containers ---- */
+.panel{background:var(--panel);border:1px solid var(--rule);border-radius:6px;
+  padding:1.35rem 1.5rem;margin:1.35rem 0}
+.panel h2{margin-top:0}
+.warning{background:var(--warn-bg);border:1px solid var(--warn-line);border-left-width:3px;
+  border-radius:6px;padding:1.35rem 1.5rem;margin:1.35rem 0;color:var(--warn-fg)}
+.warning h2,.refusal h2{border:0;margin:0 0 .5rem;padding:0;color:inherit;
+  font-family:var(--serif);font-size:1.15rem;font-weight:500;text-transform:none;
+  letter-spacing:-.01em}
+.warning a{color:inherit;text-decoration-thickness:2px}
+.refusal{border-left-width:3px}
+
+/* ---- evidence list ---- */
 .grounds{list-style:none;padding:0;margin:.5rem 0}
-.grounds li{padding:.55rem 0;border-bottom:1px solid var(--line)}
-.points{display:inline-block;min-width:3.2rem;font-weight:700}
-.refs{margin-top:.3rem}
-.refs code{margin-right:.35rem}
-.calls{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin:1.25rem 0}
-.cta.secondary{background:transparent;color:var(--link);border:1px solid var(--line)}
-.cta{display:inline-block;margin:1.25rem 0;padding:.7rem 1.4rem;border-radius:8px;
-background:var(--fg);color:var(--bg);text-decoration:none;font-weight:600}
-.hero{font-size:1.1rem;max-width:46rem}
-ul.plain{padding-left:1.1rem}
-textarea{display:block;width:100%;background:var(--code);color:var(--fg);
-border:1px solid var(--line);border-radius:8px;padding:.75rem;
-font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86rem}
-button{margin-top:.9rem;padding:.6rem 1.3rem;border-radius:8px;border:0;cursor:pointer;
-background:var(--fg);color:var(--bg);font-weight:600;font-size:.95rem}
+.grounds li{padding:.85rem 0;border-bottom:1px solid var(--rule);display:flex;gap:1rem;
+  align-items:baseline;flex-wrap:wrap}
+.grounds li:last-child{border-bottom:0}
+.points{display:inline-block;min-width:3.4rem;font-weight:600;font-size:.8125rem;
+  color:var(--muted);flex:none}
+.refs{margin-top:.35rem;flex-basis:100%}
+.refs code{margin-right:.35rem;font-size:.72rem}
+
+/* ---- chips: a metadata strip, not buttons ---- */
+.strip{display:flex;flex-wrap:wrap;gap:0;margin:1rem 0 0;
+  border-top:1px solid var(--rule);border-bottom:1px solid var(--rule)}
+.chip{padding:.6rem 1.1rem .6rem 0;margin-right:1.1rem;font-size:.72rem;
+  text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}
+.chip b{font-weight:600;text-transform:none;letter-spacing:0;color:var(--ink);
+  font-size:.8125rem}
+
+/* ---- actions ---- */
+.calls{display:flex;gap:.85rem;align-items:center;flex-wrap:wrap;margin:2rem 0}
+.cta{display:inline-block;padding:.72rem 1.5rem;border-radius:4px;background:var(--ink);
+  color:var(--paper);text-decoration:none;font-family:var(--mono);font-size:.775rem;
+  font-weight:500;text-transform:uppercase;letter-spacing:.1em;
+  transition:transform .12s ease,opacity .12s ease}
+.cta:hover{opacity:.88;transform:translateY(-1px)}
+.cta.secondary{background:transparent;color:var(--ink);
+  box-shadow:inset 0 0 0 1px var(--rule-strong)}
+.calls .cta{margin:0}
+button{margin-top:1rem;padding:.68rem 1.4rem;border-radius:4px;border:0;cursor:pointer;
+  background:var(--ink);color:var(--paper);font-size:.775rem;font-weight:500;
+  text-transform:uppercase;letter-spacing:.1em}
+button:hover{opacity:.88}
+button.quiet{background:transparent;color:var(--muted);
+  box-shadow:inset 0 0 0 1px var(--rule-strong);margin-top:0}
+button.quiet:hover{color:var(--bad);box-shadow:inset 0 0 0 1px var(--bad);opacity:1}
+
+/* ---- forms ---- */
+textarea{display:block;width:100%;background:var(--code);color:var(--ink);
+  border:1px solid var(--rule-strong);border-radius:6px;padding:1rem;
+  font-size:.8125rem;line-height:1.6;resize:vertical}
+textarea:focus{border-color:var(--link)}
+input[type=text],input:not([type]){background:var(--code);color:var(--ink);
+  border:1px solid var(--rule-strong);border-radius:4px;padding:.6rem .75rem;
+  font-size:.8125rem;min-width:18rem;max-width:100%}
+
+/* ---- the fold over a long register ---- */
+details{margin:.5rem 0 0}
+summary{font-family:var(--mono);font-size:.72rem;letter-spacing:.04em;color:var(--muted);
+  cursor:pointer;padding:.7rem 0;border-bottom:1px solid var(--rule);list-style:none;
+  display:flex;gap:.6rem;align-items:baseline}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"+";font-weight:600;color:var(--ink)}
+details[open] summary::before{content:"\\2212"}
+summary:hover{color:var(--ink)}
+details[open] summary{margin-bottom:.5rem}
+
+/* ---- an empty state that looks deliberate ---- */
+.nothing{border:1px dashed var(--rule-strong);border-radius:6px;padding:2.5rem 1.75rem;
+  margin:1.25rem 0;text-align:left;background:transparent}
+.nothing p{margin:0;max-width:40rem;color:var(--muted)}
+.nothing p + p{margin-top:.7rem}
+
+@media (max-width:40rem){
+  header.top{padding:.9rem 1.15rem;gap:1rem}
+  main{padding:2rem 1.15rem 4rem}
+  .strip{display:block}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
 `;
 
 /**
@@ -154,7 +288,7 @@ background:var(--fg);color:var(--bg);font-weight:600;font-size:.95rem}
  * by redefining tokens, never by defining a colour only inside the media block — a value
  * that exists in one theme is a page that renders unreadable in the other.
  */
-export function layout(title: string, body: string): string {
+export function layout(title: string, body: string, current?: string): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -167,12 +301,24 @@ export function layout(title: string, body: string): string {
      - the only assertion that catches a page which loaded but is broken - noisy on every
      single page, and a signal that is always red is not a signal. -->
 <link rel="icon" href="data:,">
+<!-- Two families, and the split is the domain's: a serif for what people wrote, a
+     monospace for every machine fact. Preconnected because they are on the critical path
+     for first paint, and each face names a real fallback so a blocked or slow font
+     degrades to something with the same job rather than to Times at 15px. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,300..600&family=JetBrains+Mono:wght@400;500;600&display=swap">
 <style>${STYLE}</style>
 </head>
 <body>
 <header class="top">
-<a class="brand" href="/">Test Framework</a>
-<nav><a href="/repos">Repositories</a><a href="/runs">Runs</a></nav>
+<a class="brand" href="/">Test&nbsp;Framework</a>
+<nav>${NAV.map(([href, label]) => {
+    // `aria-current` rather than styling alone: a sighted reader gets the rule under the
+    // word, a screen reader gets told which page this is, and both come from one fact.
+    const here = current === href;
+    return `<a href="${href}"${here ? ' aria-current="page"' : ''}>${label}</a>`;
+  }).join('')}</nav>
 </header>
 <main>
 ${body}
@@ -253,27 +399,66 @@ export function repositoriesPage(
   rows: { installation: Installation; hasRecipe: boolean; runs: number }[],
   mode: Mode = 'plane',
 ): string {
-  const body =
-    `<h1>Repositories</h1>` +
-    (rows.length === 0
-      ? `<p class="muted">No repositories are connected yet. Install the App on one to
-start.</p>`
-      : table(
-          ['repository', 'account', 'connected', 'runs', 'onboarding'],
-          rows.map(({ installation, hasRecipe, runs }) => [
-            `<a href="/runs?repo=${urlPath(installation.repo)}">${cell(installation.repo)}</a>`,
-            cell(installation.account),
-            cell(installation.connectedAt),
-            String(runs),
+  // SPLIT, not sorted. An account can have hundreds of repositories connected and one
+  // onboarded, and a single list buries the only row that can do anything — which is
+  // exactly what happened here at 176 of 177. The onboarding column is documented above
+  // as the row's most important fact, and a list that hides it is not showing it.
+  const ready = rows.filter((row) => row.hasRecipe);
+  const waiting = rows.filter((row) => !row.hasRecipe);
+  const verb = mode === 'local' ? 'draft a recipe' : 'write a recipe';
+
+  // NO SCRIPT, and that is a decision rather than a limitation. A client-side filter was
+  // the obvious answer to a long list, and `test/web.test.ts` asserts these pages contain
+  // no `<script>` at all — the strongest injection guard in the suite, because a real
+  // injected tag cannot hide behind a legitimate one if there are none. `<details>` and
+  // the browser's own find solve the same problem with no script and no request.
+  const register = (of: typeof rows) =>
+    `<div class="scroll"><table>
+<thead><tr>${['repository', 'account', 'connected', 'runs', 'onboarding']
+      .map((head) => `<th${head === 'runs' ? ' class="num"' : ''}>${head}</th>`)
+      .join('')}</tr></thead>
+<tbody>${of
+      .map(
+        ({ installation, hasRecipe, runs }) =>
+          `<tr><td><a href="/runs?repo=${urlPath(installation.repo)}">${cell(installation.repo)}</a></td>` +
+          `<td class="muted">${cell(installation.account)}</td>` +
+          `<td class="muted">${when(installation.connectedAt)}</td>` +
+          `<td class="num">${runs === 0 ? '<span class="muted">&mdash;</span>' : String(runs)}</td>` +
+          `<td>${
             hasRecipe
               ? `<span class="pass">recipe approved</span>`
               : `<b class="fail">not onboarded yet</b> — ` +
-                `<a href="/repos/${urlPath(installation.repo)}/onboard">${
-                  mode === 'local' ? 'draft a recipe' : 'write a recipe'
-                }</a>`,
-          ]),
-        ));
-  return layout('Repositories', body);
+                `<a href="/repos/${urlPath(installation.repo)}/onboard">${verb}</a>`
+          }</td></tr>`,
+      )
+      .join('')}</tbody></table></div>`;
+
+  const body =
+    `<h1>Repositories</h1>` +
+    (rows.length === 0
+      ? `<div class="nothing"><p>No repositories are connected yet.</p>
+<p>Install the App on one to start. It grants access to the repositories you pick and
+nothing else.</p></div>`
+      : `<p class="hero">${
+          ready.length === 0
+            ? `Nothing here can run yet — a repository needs an approved recipe before an issue
+on it does anything.`
+            : `${ready.length} of ${rows.length} ${ready.length === 1 ? 'repository is' : 'repositories are'}
+onboarded and can take work. The rest are connected and waiting.`
+        }</p>` +
+        (ready.length > 0
+          ? `<h2>Onboarded</h2>${register(ready)}`
+          : '') +
+        (waiting.length > 0
+          ? `<h2>Connected, not onboarded</h2>` +
+            // Collapsed when there are enough of them to bury something. Open otherwise,
+            // because a fold over four rows is ceremony.
+            (waiting.length > 12
+              ? `<details><summary>${waiting.length} repositories &mdash; expand to onboard one, then use your
+browser's find to locate it</summary>${register(waiting)}</details>`
+              : register(waiting))
+          : ''));
+  return layout('Repositories', body, '/repos');
 }
 
 /**
@@ -467,9 +652,14 @@ that draft when there is one.</p>
 <p>Every run against this repository will execute these commands <b>verbatim</b>, in the agent
 sandbox, with a package registry reachable. Nothing sandboxes them from that sandbox —
 <b>you are the control</b>.</p>
-<p>An agent drafted this. It is testimony, not a finding: we validate its shape and nothing
-about what it does. A service answering its healthcheck is the only thing here the engine
-will ever treat as evidence.</p>
+<p>${
+      isDraft
+        ? `An agent drafted this. It is testimony, not a finding: we validate its shape and
+nothing about what it does.`
+        : `Whoever wrote this box is the only review it has had: we validate its shape and
+nothing about what it does.`
+    } A service answering its healthcheck is the only thing here the engine will ever treat as
+evidence.</p>
 </div>
 <form method="post" action="${action}">
 <p class="small muted">JSON. <code>install</code>, <code>migrate</code>, <code>seed</code> and
@@ -493,7 +683,7 @@ at once.</p>
 all, and only then is a value in that container defensible. Until that exists, recipes that
 require secrets to boot are recipes this system will report honestly that it could not
 run — which is an <code>errored</code> run, never a finding about your bug.</p>`;
-  return layout(`Onboard ${repo}`, body);
+  return layout(`Onboard ${repo}`, body, '/repos');
 }
 
 const TIER_MEANING: Record<number, string> = {
@@ -509,6 +699,40 @@ const TIER_MEANING: Record<number, string> = {
  * writes the full sentence as a scored ground. This map exists so a table cell can be four
  * words instead of forty, and it must never grow a fifth entry the fold cannot produce.
  */
+/**
+ * A timestamp a person can scan, from one a machine wrote.
+ *
+ * `2026-08-20T13:40:11.596Z` is precise and unreadable, and a column of them is a wall.
+ * The full value stays in `title`, so precision is one hover away and nothing is lost —
+ * the shortened form is for finding the row, not for citing it.
+ */
+const when = (iso: string): string => {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return cell(iso);
+  const day = at.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', timeZone: 'UTC' });
+  const time = at.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'UTC' });
+  return `<span title="${escapeHtml(iso)}">${escapeHtml(`${day} ${time}`)}</span>`;
+};
+
+/**
+ * The head of a run id, which is what people actually read and say out loud.
+ *
+ * The whole id is the link's href and its `title`; showing all 36 characters spent half
+ * the table on a value nobody compares by eye.
+ */
+const shortId = (id: string): string =>
+  `<span title="${escapeHtml(id)}">${escapeHtml(id.slice(0, 8))}</span>`;
+
+/** `pr_opened` is a value in a database, not a word. */
+const STATUS_LABEL: Record<string, string> = {
+  pr_opened: 'PR opened',
+  information_requested: 'information requested',
+  refused: 'refused',
+  running: 'running',
+  errored: 'errored',
+  forgotten: 'forgotten',
+};
+
 const REGRESSION_LABEL: Record<RunState['regression'], string> = {
   clean: 'suite clean',
   broken: 'suite BROKEN by the fix',
@@ -529,7 +753,7 @@ export function runnersPage(
   runners: { id: string; name: string; pairedAt: string; lastSeen: string | null; revokedAt: string | null }[],
   minted?: { token: string; name: string; planeUrl: string },
 ): string {
-  const when = (value: string | null) => (value === null ? '—' : escapeHtml(value.replace('T', ' ').slice(0, 19)));
+  const seen = (value: string | null) => (value === null ? '—' : when(value));
   const body =
     `<h1>Runners for ${escapeHtml(repo)}</h1>
 <p class="hero">A runner is a machine of yours that takes work from here and runs it. It needs Docker
@@ -554,20 +778,21 @@ and execute it on your machine, with the token above already in its environment.
       : '') +
     `<h2>Paired machines</h2>` +
     (runners.length === 0
-      ? `<p class="muted">None yet. Nothing will run until one is paired.</p>`
+      ? `<div class="nothing"><p>No machines paired.</p>
+<p>Nothing will run until one is.</p></div>`
       : `<div class="scroll"><table>
 <tr><th>name</th><th>paired</th><th>last seen</th><th></th></tr>
 ${runners
   .map(
     (runner) => `<tr>
 <td>${escapeHtml(runner.name)}${runner.revokedAt ? ' <b class="fail">revoked</b>' : ''}</td>
-<td>${when(runner.pairedAt)}</td>
-<td>${runner.lastSeen === null ? '<span class="muted">never</span>' : when(runner.lastSeen)}</td>
+<td>${seen(runner.pairedAt)}</td>
+<td>${runner.lastSeen === null ? '<span class="muted">never</span>' : seen(runner.lastSeen)}</td>
 <td>${
       runner.revokedAt
         ? ''
         : `<form method="post" action="/repos/${urlPath(repo)}/runners/${escapeHtml(runner.id)}/revoke">
-<button type="submit">Revoke</button></form>`
+<button class="quiet" type="submit">Revoke</button></form>`
     }</td>
 </tr>`,
   )
@@ -581,7 +806,7 @@ ${runners
 <p class="muted small">Revoking is immediate and keeps the row: whatever that machine already wrote
 stays in the log, and a reader asking who wrote it still gets an answer.</p>`;
 
-  return layout(`Runners · ${repo}`, body);
+  return layout(`Runners · ${repo}`, body, '/repos');
 }
 
 export function runsPage(runs: RunRow[], repo?: string, mode: Mode = 'plane'): string {
@@ -591,11 +816,12 @@ export function runsPage(runs: RunRow[], repo?: string, mode: Mode = 'plane'): s
   // logged as `not onboarded — nothing queued`, and nothing appears here to say why.
   const nothingYet =
     mode === 'local'
-      ? `<p class="muted">No runs yet. Approve a recipe for a connected repository, then open or
-label an issue on it.</p>`
-      : `<p class="muted">No runs yet. A run needs three things: a runner paired <em>and running</em>
-on a machine of yours, an approved recipe for the repository, and an issue opened or labelled on
-it. Labelling one before the first two is accepted and then quietly does nothing.</p>`;
+      ? `<div class="nothing"><p>No runs yet.</p>
+<p>Approve a recipe for a connected repository, then open or label an issue on it.</p></div>`
+      : `<div class="nothing"><p>No runs yet. A run needs three things:</p>
+<p>A runner paired <em>and running</em> on a machine of yours. An approved recipe for the
+repository. An issue opened or labelled on it.</p>
+<p>Labelling one before the first two is accepted, and then quietly does nothing.</p></div>`;
   const body =
     `<h1>${heading}</h1>` +
     (runs.length === 0
@@ -603,11 +829,11 @@ it. Labelling one before the first two is accepted and then quietly does nothing
       : table(
           ['run', 'issue', 'status', 'tier', 'confidence', 'regression', 'started', 'result'],
           runs.map((run) => [
-            `<a href="/runs/${encodeURIComponent(run.run_id)}"><code>${escapeHtml(
-              run.run_id,
-            )}</code></a>`,
-            cell(`${run.repo}#${run.issue_number}`),
-            cell(run.status),
+            `<a href="/runs/${encodeURIComponent(run.run_id)}">${shortId(run.run_id)}</a>`,
+            cell(repo ? `#${run.issue_number}` : `${run.repo}#${run.issue_number}`),
+            // Labelled, with the stored value still on the element: the column is read by
+            // people, and `pr_opened` is a value in a database rather than a word.
+            `<span title="${escapeHtml(run.status)}">${cell(STATUS_LABEL[run.status] ?? run.status)}</span>`,
             `Tier ${run.tier}`,
             // The denominator travels with the number. A bare `80` is unreadable once the
             // grounds change, which is the drift `ceiling` and `scoring` exist to stop.
@@ -615,13 +841,13 @@ it. Labelling one before the first two is accepted and then quietly does nothing
             run.regression === 'broken'
               ? `<b class="fail">${cell(REGRESSION_LABEL.broken)}</b>`
               : cell(REGRESSION_LABEL[run.regression]),
-            cell(run.started_at),
+            when(run.started_at),
             run.pr_url
               ? `<a href="${escapeHtml(run.pr_url)}">pull request</a>`
-              : `<span class="muted">no pull request</span>`,
+              : `<span class="muted">none</span>`,
           ]),
         ));
-  return layout(repo ? `Runs — ${repo}` : 'Runs', body);
+  return layout(repo ? `Runs — ${repo}` : 'Runs', body, '/runs');
 }
 
 /**
@@ -891,5 +1117,5 @@ class describing our own spending would put a fact about us into a log about you
     );
   }
 
-  return layout(`${row.repo}#${row.issue_number} — evidence`, sections.join('\n'));
+  return layout(`${row.repo}#${row.issue_number} — evidence`, sections.join('\n'), '/runs');
 }
