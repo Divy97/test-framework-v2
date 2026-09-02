@@ -149,9 +149,26 @@ export async function runDaemon(options: {
     return sent;
   };
 
+  /**
+   * Thrown when the plane has answered, and the answer is about this runner's credential.
+   *
+   * Distinguished from every other failure because it is not a failure to communicate —
+   * it IS communication, and waiting cannot change it.
+   */
+  class NotPaired extends Error {}
+
   const claim = async (): Promise<DaemonJob | null> => {
     const response = await call(`${base}/runner/jobs?wait=${wait}`, { headers: auth });
     if (response.status === 204) return null;
+    // 401 and 403 are the plane saying WHO you are, not that it is having a bad day. A
+    // token that is wrong, revoked, or for another installation will never start working,
+    // and re-pairing issues a new one that this process could not pick up anyway.
+    if (response.status === 401 || response.status === 403) {
+      throw new NotPaired(
+        `the plane will not take this runner's token (HTTP ${response.status}). ` +
+          'Pair this machine again and start it with the new token.',
+      );
+    }
     if (!response.ok) throw new Error(`the plane answered HTTP ${response.status} to a poll`);
     return (await response.json()) as DaemonJob;
   };
@@ -162,8 +179,18 @@ export async function runDaemon(options: {
       try {
         job = await claim();
       } catch (error) {
-        // The plane being unreachable is the ordinary state of a laptop, not an
-        // emergency. Say so once and wait — exiting would need somebody to notice and
+        // A credential the plane refuses is the one error waiting cannot fix. Said once
+        // and stopped, because the alternative is what this actually did: a wrong token
+        // printing the same line every few seconds forever, which reads as a network
+        // problem and is not one. Same lesson the append path learned in M9 — a 4xx is an
+        // ANSWER — arriving late on the poll path.
+        if (error instanceof NotPaired) {
+          log(String(error.message));
+          stopped = true;
+          break;
+        }
+        // Everything else: the plane being unreachable is the ordinary state of a laptop,
+        // not an emergency. Say so and wait — exiting would need somebody to notice and
         // restart a process whose whole job is to be there when the plane comes back.
         log(`waiting for the plane: ${String(error)}`);
         await backoff(2);

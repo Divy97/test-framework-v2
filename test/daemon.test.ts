@@ -45,6 +45,8 @@ type Seen = { method: string; path: string; body: string };
 const fakePlane = async (options: {
   job?: DaemonJob | null;
   appendStatus?: (attempt: number) => number;
+  /** What the poll answers. 401/403 is the plane refusing this runner's credential. */
+  pollStatus?: number;
 } = {}) => {
   const seen: Seen[] = [];
   let handed = false;
@@ -64,6 +66,7 @@ const fakePlane = async (options: {
       };
 
       if (path === '/runner/jobs') {
+        if (options.pollStatus !== undefined) return send(options.pollStatus, { error: 'nope' });
         if (handed || options.job === null) return send(204);
         handed = true;
         return send(200, options.job ?? JOB);
@@ -262,5 +265,61 @@ describe('the daemon survives the things that happen to laptops', () => {
 
     expect(plane.seen.filter((s) => s.path === '/runner/jobs').length).toBeGreaterThan(1);
     expect(logs.join('\n')).not.toContain('nothing should have been executed');
+  });
+});
+
+describe('a credential the plane refuses is not a network problem', () => {
+  // The daemon treated every poll failure the same, on the reasoning that an unreachable
+  // plane is the ordinary state of a laptop. True of a blip and a 5xx. Not true of a 401:
+  // that is the plane saying WHO you are, it will never become true by waiting, and
+  // re-pairing issues a new token this process could not pick up anyway. A wrong token
+  // printed the same line every few seconds forever, which reads as a network problem.
+  //
+  // Same lesson the append path learned in M9 — a 4xx is an ANSWER — arriving late here.
+  for (const status of [401, 403]) {
+    test(`stops on HTTP ${status}, saying what to do about it`, async () => {
+      const plane = await fakePlane({ pollStatus: status });
+      const logs: string[] = [];
+      const daemon = await runDaemon({
+        planeUrl: plane.url,
+        token: 'tfr_wrong',
+        blobRoot: blobRoot(),
+        waitSeconds: 0,
+        log: (line) => logs.push(line),
+        execute: async () => {
+          throw new Error('nothing should have been executed');
+        },
+      });
+      // Long enough that a retrying loop would have logged this many times over.
+      await new Promise((done) => setTimeout(done, 300));
+      await daemon.stop();
+
+      const said = logs.join('\n');
+      expect(said).toContain('will not take this runner');
+      expect(said).toContain('Pair this machine again');
+      // Said ONCE. The bug was the same line forever.
+      expect(logs.filter((line) => line.includes('will not take this runner'))).toHaveLength(1);
+      // And never as though the plane were merely unreachable.
+      expect(said).not.toContain('waiting for the plane');
+    });
+  }
+
+  test('but a 500 IS waited out, because that one can come back', async () => {
+    const plane = await fakePlane({ pollStatus: 500 });
+    const logs: string[] = [];
+    const daemon = await runDaemon({
+      planeUrl: plane.url,
+      token: 'tfr_test',
+      blobRoot: blobRoot(),
+      waitSeconds: 0,
+      log: (line) => logs.push(line),
+      execute: async () => {
+        throw new Error('nothing should have been executed');
+      },
+    });
+    await new Promise((done) => setTimeout(done, 200));
+    await daemon.stop();
+
+    expect(logs.join('\n')).toContain('waiting for the plane');
   });
 });
