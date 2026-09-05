@@ -70,6 +70,16 @@ export type EnvBuiltV1 = {
 export type SandboxSealedV1 = {
   v: 1;
   sandbox_id: string;
+  /**
+   * WHICH sandbox this is about, because the fold has to tell them apart.
+   *
+   * Every sandbox is sealed and probed, including the ones that judge — their output is
+   * the evidence, so a policy the platform accepted and did not apply there is worse than
+   * one on the agent's machine. But `sealedBeforeAgent` is a question about AGENTS, and
+   * without this field a base phase's seal, sitting in the log before an agent's first
+   * message, satisfied it for an agent that was never sealed at all.
+   */
+  phase: 'agent' | 'base' | 'fix';
   policy: 'deny-all';
   /** `true` means the probe REACHED something, which is a seal that did not take. */
   probe: { dns: boolean; route: boolean };

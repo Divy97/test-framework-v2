@@ -192,6 +192,18 @@ Two costs this adds, named rather than left to be discovered:
   spool the agent cannot. Tool calls therefore go in base64 inside a `sudo tee`, one round
   trip, the same cost the file write would have been. The spool stays root-owned 0700, so
   the agent cannot forge `{done: true}` and choose its own ending.
+- **The in-container agent is not available here, and is refused rather than degraded.**
+  `agentPrompt` runs the loop inside the sandbox — a model credential in there, and a route
+  to the model API for the whole session, which is what [ADR-0011](0011-the-agent-loop-runs-outside-the-sandbox.md)
+  moved out and what this ADR says is in no sandbox at all. It also has no `{ready}`
+  handshake, so there is no moment at which the executor could close the route: the agent
+  would run its whole life with a way out and nothing in the log would say so. Docker keeps
+  that path because the suite still drives it. This executor supports the ADR-0011 topology
+  only, and throws for the other.
+- **`SANDBOX_SEALED` names which sandbox it is about.** Once every sandbox is probed, a
+  base phase's seal sits in the log before the next agent speaks — and the fold's
+  `sealedBeforeAgent` is a question about AGENTS. Without the `phase` field it answered
+  `true` for an agent nobody had sealed.
 - **`sweep()` is scoped to one worker.** It reads this worker's ledger and a tag carrying
   this worker's identity. A tag shared across a deployment would turn one booting worker
   into an outage for every other one.

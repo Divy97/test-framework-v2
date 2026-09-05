@@ -51,6 +51,15 @@ const execFile = promisify(execFileCb);
 const MAX_STREAM_BYTES = 32 * 1024 * 1024;
 /** Tail of a phase's diagnostics. The reason is at the end, not the start. */
 const MAX_STDERR_CHARS = 8 * 1024;
+/**
+ * The most a phase may leave in its store.
+ *
+ * `/blobs` is handed to uid 1000 so the repro can write its own captures, which means the
+ * size is the agent's to choose. Generous — a transcript and a few screenshots are orders
+ * of magnitude under it — and finite, because everything under it crosses a network into
+ * this process's memory.
+ */
+const MAX_STORE_BYTES = 256 * 1024 * 1024;
 /** The wall clock one phase gets from this process. The platform enforces its own beside it. */
 const PHASE_TIMEOUT_MS = 3_600_000;
 
@@ -129,8 +138,14 @@ const runnerCommand = (entry: string) => `sudo -n ${entry} --job ${JOB} --spool 
  */
 const deliver = async (sandbox: SandboxHandle, name: string, line: string): Promise<void> => {
   const encoded = Buffer.from(line, 'utf8').toString('base64');
+  // `test -s` after the pipe, because `sh -c` reports the LAST command's status and has no
+  // `pipefail` to promise otherwise: a `base64` that failed would leave `tee` exiting 0
+  // over an empty file, `spoolRequests` would skip the empty file forever, and the host
+  // would wait for a reply to a call that was never delivered — the exact silent hang
+  // this function exists to make loud.
   const written = await sandbox.run(
-    `printf %s '${encoded}' | base64 -d | sudo -n tee ${SPOOL}/in/${name} > /dev/null`,
+    `printf %s '${encoded}' | base64 -d | sudo -n tee ${SPOOL}/in/${name} > /dev/null; ` +
+      `sudo -n test -s ${SPOOL}/in/${name}`,
   );
   if (written.exitCode !== 0) {
     // Loudly. A swallowed failure here is an agent loop waiting for a reply that will
@@ -298,12 +313,20 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
         // longest operation and the one most able to hang on somebody else's registry.
         // Without it a control plane that stalls wedges the worker indefinitely.
         const ceiling = plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS;
+        // Cleared, not merely unref'd. A long-lived worker builds an environment per run,
+        // and a timer left pending holds its closure — and the sandbox handle inside it —
+        // for the whole ceiling, which is an hour by default.
+        let bell: NodeJS.Timeout | undefined;
         const finished = await Promise.race([
           sandbox.run(runnerCommand(entry), { timeoutMs: ceiling }),
-          new Promise<Finished>((resolve) =>
-            setTimeout(() => resolve({ exitCode: -1, output: `the environment build was stopped after ${ceiling}ms` }), ceiling + 30_000).unref(),
-          ),
-        ]);
+          new Promise<Finished>((resolve) => {
+            bell = setTimeout(
+              () => resolve({ exitCode: -1, output: `the environment build was stopped after ${ceiling}ms` }),
+              ceiling + 30_000,
+            );
+            bell.unref();
+          }),
+        ]).finally(() => clearTimeout(bell));
 
         let env: ReplayOutcome | undefined;
         for (const line of finished.output.split('\n')) {
@@ -403,6 +426,8 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
 
   const staging = await mkdtemp(join(tmpdir(), 'engine-vercel-phase-'));
   const handover = phase === 'agent' ? await mkdtemp(join(tmpdir(), 'engine-handover-')) : undefined;
+  /** Whether the result this returns carries `handover`, which decides who owns it. */
+  let returned = false;
   const eventLines: string[] = [];
   const pending = new Map<string, (result: { ok: boolean; output: string }) => void>();
   let ready = () => {};
@@ -476,6 +501,34 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
     if (plan.agentImageMount !== undefined) {
       throw new Error('agentImageMount is a bind mount and this executor has none; build the binary into the image');
     }
+    // THE IN-CONTAINER AGENT IS NOT AVAILABLE HERE, and refusing is the only honest
+    // answer (ADR-0011, ADR-0021).
+    //
+    // `agentPrompt` runs the loop inside the sandbox. That needs a model credential in
+    // there and a route to the model API for the whole session — which is exactly what
+    // ADR-0011 moved outside and what ADR-0021 says is in no sandbox at all. It also has
+    // no `{ready}` handshake, so there is no moment at which this executor could seal the
+    // machine: `wantsNetwork` would be true, the pre-seal skipped, and the flip lives
+    // behind the driver. The agent would run its whole life with a full route out and the
+    // log would say nothing about it — a silence exactly where the substrate's central
+    // claim is supposed to be.
+    //
+    // Docker keeps that path because it is the M3.1 shape the suite still drives. This
+    // executor supports the ADR-0011 topology only, and says so rather than running an
+    // unsealed agent.
+    if (overrides.agentPrompt !== undefined) {
+      throw new Error(
+        'this executor cannot run the agent inside the sandbox: there is no moment at which it ' +
+          'could be sealed, and the model key belongs in the worker (ADR-0011, ADR-0021)',
+      );
+    }
+    // The two halves of the tool protocol travel together. `serveTools` with nothing
+    // driving it serves forever; a driver with no `serveTools` is a container that never
+    // reads the spool, and — because the seal is emitted mid-stream on that path — it is
+    // also the one shape in which this executor's own seq and the Runner's could collide.
+    if (Boolean(driver) !== Boolean(overrides.serveTools)) {
+      throw new Error('a driver and `serveTools` are the two halves of one protocol; pass both or neither');
+    }
     sandbox = await inner.open(from, wantsNetwork ? 'allow-all' : 'deny-all', plan);
 
     /** Set when a probe found a way out, which refuses the phase without losing it. */
@@ -533,7 +586,7 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
       pre.push(
         own(plan.runId, 0, {
           type: 'SANDBOX_SEALED',
-          payload: { v: 1, sandbox_id: at.id, policy: 'deny-all', probe: observed },
+          payload: { v: 1, sandbox_id: at.id, phase, policy: 'deny-all', probe: observed },
         }),
       );
       if (observed.dns || observed.route) {
@@ -716,12 +769,19 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
         }),
       );
     }
-    // Numbered here, in one place, so nothing has to guess a seq while it is being
-    // written. `pre` occupies the range the Job's `afterSeq` was bumped past.
+    // RENUMBERED, all of it, in one place. Not merely arranged around the Job's bumped
+    // `afterSeq`: that only holds while `pre` stops growing before the Job is written, and
+    // it does not — the agent's seal is pushed mid-stream. Trusting the arithmetic made a
+    // driver-without-`serveTools` phase emit two events at seq 1, and `fold()` threw on
+    // the gap that left. The guard above now refuses that combination, and this makes the
+    // collision impossible rather than merely unreachable.
+    //
+    // Safe because a seq is an ordering and nothing else: no payload in this log refers to
+    // another event by number, and the Runner allocates contiguously, so shifting its
+    // block preserves the order it observed things in.
     let seq = afterSeq;
-    const numbered = pre.map((event) => ({ ...event, seq: ++seq }));
-    const last = observed.at(-1)?.seq ?? seq;
-    const all = [...numbered, ...observed, ...post.map((event, index) => ({ ...event, seq: last + index + 1 }))];
+    const all = [...pre, ...observed, ...post].map((event) => ({ ...event, seq: ++seq }));
+    returned = true;
     return {
       phase,
       events: all,
@@ -738,6 +798,10 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
     // because this line cannot be relied on when the process dies.
     if (sandbox) await inner.close(sandbox, plan.runId, phase);
     await rm(staging, { recursive: true, force: true }).catch(() => {});
+    // A refused phase hands nothing over, so its directory is a host temp dir nobody will
+    // ever look in. `refusal()` returns without it, which is what makes it removable here
+    // — the success path's is the caller's, and `orchestrate` owns that one.
+    if (handover && !returned) await rm(handover, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -775,6 +839,14 @@ async function collect(sandbox: SandboxHandle, blobRoot: string, staging: string
     }
     const bytes = await sandbox.readFile(`${WORK}/blobs.tar`);
     if (!bytes) return "this sandbox's artifacts could not be read back";
+    // A CEILING, because `/blobs` is handed to uid 1000 and the agent's own commands run
+    // as that user. The event stream has had one since M4 and this did not: a phase that
+    // filled its store would have had every byte read into host memory and written into
+    // the evidence store. Reported rather than thrown, like every other collection
+    // failure — the events are the record and they are worth keeping.
+    if (bytes.length > MAX_STORE_BYTES) {
+      return `this sandbox's artifacts are ${bytes.length} bytes, more than the ${MAX_STORE_BYTES} a phase may leave`;
+    }
     const archive = join(staging, 'blobs.tar');
     await writeFile(archive, bytes);
     const into = join(staging, 'blobs');

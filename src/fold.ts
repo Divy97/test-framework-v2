@@ -891,6 +891,13 @@ function sealedBeforeEveryAgent(events: RunEvent[]): boolean {
   let broken = false;
   for (const event of events) {
     if (event.type === 'SANDBOX_SEALED') {
+      // Only the AGENT's. Every sandbox is sealed and probed, and a base phase's seal —
+      // which legitimately sits in the log before the next agent speaks — would otherwise
+      // answer this question for an agent nobody sealed. Conversely a judging sandbox
+      // whose probe reached is a serious fault, but it is not THIS fact and must not turn
+      // a correctly sealed agent run into `false`: the `ceiling`-shaped abort beside it is
+      // what records that one.
+      if (event.payload.phase !== 'agent') continue;
       anySeal = true;
       // A seal that arrives after this phase's agent has spoken says nothing about the
       // turns it already took; a probe that reached says nothing at all.

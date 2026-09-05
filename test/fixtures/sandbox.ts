@@ -36,6 +36,8 @@ export type FakeSandbox = {
   flippedAfter: number | null;
   stopped: boolean;
   tags: Record<string, string>;
+  /** The paths `PREPARE` made, so a test can assert the Runner's world exists. */
+  prepared: Set<string>;
 };
 
 /** What a scripted Runner is given: the sandbox, and a way to read the tool calls sent to it. */
@@ -106,6 +108,14 @@ export function tarOf(files: Record<string, string>): Buffer {
   return Buffer.concat(blocks);
 }
 
+/**
+ * Who `writeFiles` runs as on the managed image, and who the repro drops to.
+ *
+ * The same number, which is the fact the whole spool design turns on — see the refusal in
+ * `writeFiles` below.
+ */
+export const SANDBOX_UID = 1000;
+
 /** One JSON line, as the Runner would write it. */
 export const line = (value: unknown): string => `${JSON.stringify(value)}\n`;
 
@@ -152,8 +162,17 @@ export function fakeSandboxes(options: FakeOptions = {}): {
       id: fake.id,
       writeFiles: async (files) => {
         for (const file of files) {
+          // THE ONE PERMISSION THIS FAKE MODELS, because one uid difference is the whole
+          // of the transport's design. `writeFiles` runs as uid 1000 — the uid the repro
+          // drops to — and `PREPARE` makes the spool root-owned 0700 so that user cannot
+          // forge `{done: true}`. Which means the host cannot write it either. Without
+          // this refusal the executor could go back to writing tool calls with
+          // `writeFiles`, every call would fail EACCES on the first live agent phase, and
+          // the suite would stay green.
+          if (file.path.startsWith('/work/rpc/')) {
+            throw new Error(`EACCES: the spool is root-owned 0700 and writeFiles runs as uid ${SANDBOX_UID}`);
+          }
           fake.files.set(file.path, file.content);
-          if (file.path.includes('/rpc/in/')) notice(file.content.toString('utf8').trim());
         }
       },
       readFile: async (path) => {
@@ -173,10 +192,22 @@ export function fakeSandboxes(options: FakeOptions = {}): {
         if (command.includes("require('dgram')")) {
           return reachable(fake) ? { exitCode: 0, output: 'UDP_ANSWERED 45' } : { exitCode: 3, output: 'UDP_TIMEOUT' };
         }
+        // `PREPARE` is what makes the paths the Runner needs. Recorded rather than
+        // assumed, so a test can assert that `/out` is one of them — without it
+        // `handOverCommits` finds no directory and silently hands over nothing.
+        if (command.includes('mkdir -p')) {
+          for (const path of ['/work', '/blobs', '/out', '/opt/env']) {
+            if (command.includes(path)) fake.prepared.add(path);
+          }
+          return { exitCode: 0, output: '' };
+        }
         if (command.includes('tar -cf')) {
           return options.tarFails
             ? { exitCode: 0, output: `${options.tarFails}\nTAR 2` }
-            : { exitCode: 0, output: './\nTAR 0' };
+            // The listing mentions `TAR 0` on purpose: a substring match anywhere in a
+            // stream the guest influences is not a check, and only reading the LAST line
+            // tells a real success from a filename.
+            : { exitCode: 0, output: './\n./TAR 0-shaped-name\nTAR 0' };
         }
         // A tool call, delivered the way the executor delivers one: base64 inside a
         // command, because the spool is root-owned and `writeFiles` runs as uid 1000.
@@ -279,6 +310,7 @@ export function fakeSandboxes(options: FakeOptions = {}): {
           flippedAfter: null,
           stopped: false,
           tags: tags ?? {},
+          prepared: new Set<string>(),
         };
         sandboxes.push(fake);
         return handleFor(fake);

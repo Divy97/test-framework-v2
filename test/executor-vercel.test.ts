@@ -131,6 +131,114 @@ describe('a container that judges never has a network', () => {
   });
 });
 
+describe('the world the Runner needs, and the one thing the host may not write', () => {
+  test('PREPARE makes /out, or every agent hands over nothing and says nothing', async () => {
+    // `handOverCommits` stats `/out` and returns null when it is not a directory —
+    // legitimate on a run that only wants a transcript, and silent. The orchestrator reads
+    // that null as "the bundle was made". On Docker the bind mount creates the path; here
+    // nothing did, so every agent phase would have handed over nothing, invisibly.
+    const fake = fakeSandboxes({
+      runner: async function* ({ awaitSpool }: RunnerContext) {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+        yield line({ ready: true });
+        await awaitSpool((written) => written.includes('"done":true'));
+        yield line({ finished: { handover: null } });
+      },
+    });
+    await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan({ recipe: { install: 'npm ci', services: [] } }),
+      source: repo(),
+      afterSeq: 0,
+      phase: 'agent',
+      overrides: { serveTools: true },
+      driver: async () => {},
+    });
+    expect([...fake.sandboxes[0]!.prepared]).toEqual(expect.arrayContaining(['/work', '/blobs', '/out']));
+  });
+
+  test('a tool call goes in as root, because the host writes as the user the repro is', async () => {
+    // The uid the SDK writes files as and the uid the repro drops to are the same one, so
+    // a spool the host can write is a spool the agent can forge `{done: true}` into. The
+    // fake refuses a `writeFiles` under `/work/rpc`, which is what a real sandbox would do
+    // with a root-owned 0700 directory — so an executor that went back to writing tool
+    // calls that way fails here instead of on the first live agent phase.
+    const fake = fakeSandboxes({
+      runner: async function* ({ awaitSpool }: RunnerContext) {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+        yield line({ ready: true });
+        const call = await awaitSpool((written) => written.includes('"call"'));
+        yield line({ result: { id: (JSON.parse(call) as { call: { id: string } }).call.id, ok: true, output: 'ok' } });
+        await awaitSpool((written) => written.includes('"done":true'));
+        yield line({ finished: { handover: null } });
+      },
+    });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan({ recipe: { install: 'npm ci', services: [] } }),
+      source: repo(),
+      afterSeq: 0,
+      phase: 'agent',
+      overrides: { serveTools: true },
+      driver: async ({ invoke }) => void (await invoke('read', { path: 'README' })),
+    });
+    expect(result.exitCode).toBe(0);
+    // Delivered through `sudo`, and verified afterwards: `sh -c` reports the last
+    // command's status, so without the `test -s` a failing `base64` would leave an empty
+    // spool file, which the Runner skips forever while the host waits for a reply.
+    const delivered = fake.sandboxes[0]!.commands.filter((one) => one.includes('/rpc/in/'));
+    expect(delivered).toHaveLength(2); // the call, and `{done:true}`
+    for (const command of delivered) {
+      expect(command).toMatch(/sudo -n tee/);
+      expect(command).toMatch(/sudo -n test -s/);
+    }
+  });
+
+  test('the in-container agent is refused, because there is no moment to seal it', async () => {
+    // `agentPrompt` runs the loop inside the sandbox: a model credential in there, and a
+    // route to the model API for the whole session. There is no `{ready}` handshake on
+    // that path, so this executor has no moment at which it could close the route — the
+    // agent would run its whole life with a way out and the log would say nothing. Docker
+    // keeps the path; this substrate says so instead of running an unsealed agent.
+    const fake = fakeSandboxes();
+    await expect(
+      vercelExecutor({ client: fake.client }).runPhase({
+        plan: plan({ recipe: { install: 'npm ci', services: [] } }),
+        source: repo(),
+        afterSeq: 0,
+        phase: 'agent',
+        overrides: { agentPrompt: 'find the bug' },
+      }),
+    ).rejects.toThrow(/could be sealed/);
+    // And the two halves of the tool protocol travel together, which is also the one
+    // shape in which this executor's seq and the Runner's could have collided.
+    await expect(
+      vercelExecutor({ client: fake.client }).runPhase({
+        plan: plan({ recipe: { install: 'npm ci', services: [] } }),
+        source: repo(),
+        afterSeq: 0,
+        phase: 'agent',
+        overrides: {},
+        driver: async () => {},
+      }),
+    ).rejects.toThrow(/two halves of one protocol/);
+  });
+
+  test('a base phase’s seal does not answer the question about an agent', () => {
+    // Every sandbox is sealed and probed now, so a judging phase's `SANDBOX_SEALED` sits
+    // in the log before the next agent speaks — and without the `phase` field it satisfied
+    // `sealedBeforeAgent` for an agent nobody sealed.
+    const at = (seq: number, type: string, payload: unknown): RunEvent =>
+      ({ run_id: RUN, seq, ts: 'T', type, payload }) as RunEvent;
+    const seal = (seq: number, phase: string) =>
+      at(seq, 'SANDBOX_SEALED', { v: 1, sandbox_id: 's', phase, policy: 'deny-all', probe: { dns: false, route: false } });
+    const said = (seq: number) => at(seq, 'AGENT_MESSAGE', { v: 1, n: 0, claimed_type: 'text', bytes: 1 });
+    const done = (seq: number) => at(seq, 'AGENT_FINISHED', { v: 1, messages: 1, exit_code: 0, stopped: 'end' });
+
+    expect(fold([seal(1, 'base'), said(2), done(3)]).sealedBeforeAgent).toBe(false);
+    // THE positive control: the same shape with the agent's own seal.
+    expect(fold([seal(1, 'agent'), said(2), done(3)]).sealedBeforeAgent).toBe(true);
+  });
+});
+
 describe('the agent sandbox is sealed before it is asked anything', () => {
   /** A Runner that stands the world up, then answers one tool call, then finishes. */
   const serving = async function* ({ awaitSpool }: RunnerContext) {
@@ -263,7 +371,7 @@ describe('the agent sandbox is sealed before it is asked anything', () => {
       [
         { seq: 1, type: 'RUN_REQUESTED', payload: { v: 1, source: 'github_issue', thread_ref: 'o/r#1', raw_text: 'x' } },
         { seq: 2, type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } },
-        { seq: sealedAt, type: 'SANDBOX_SEALED', payload: { v: 1, sandbox_id: 's', policy: 'deny-all', probe: { dns: false, route: false } } },
+        { seq: sealedAt, type: 'SANDBOX_SEALED', payload: { v: 1, sandbox_id: 's', phase: 'agent', policy: 'deny-all', probe: { dns: false, route: false } } },
         { seq: messageAt, type: 'AGENT_MESSAGE', payload: { v: 1, role: 'assistant', text: 'hi' } },
       ]
         .sort((a, b) => a.seq - b.seq)
@@ -284,7 +392,7 @@ describe('the agent sandbox is sealed before it is asked anything', () => {
     const at = (seq: number, type: string, payload: unknown): RunEvent =>
       ({ run_id: RUN, seq, ts: 'T', type, payload }) as RunEvent;
     const seal = (seq: number, reached = false) =>
-      at(seq, 'SANDBOX_SEALED', { v: 1, sandbox_id: 's', policy: 'deny-all', probe: { dns: reached, route: false } });
+      at(seq, 'SANDBOX_SEALED', { v: 1, sandbox_id: 's', phase: 'agent', policy: 'deny-all', probe: { dns: reached, route: false } });
     const said = (seq: number) => at(seq, 'AGENT_MESSAGE', { v: 1, n: 0, claimed_type: 'text', bytes: 1 });
     const done = (seq: number) => at(seq, 'AGENT_FINISHED', { v: 1, messages: 1, exit_code: 0, stopped: 'end' });
 
@@ -302,7 +410,7 @@ describe('the agent sandbox is sealed before it is asked anything', () => {
   test('a seal whose probe reached the network folds to false, whenever it arrived', async () => {
     const events: RunEvent[] = [
       { seq: 1, type: 'RUN_REQUESTED', payload: { v: 1, source: 'github_issue', thread_ref: 'o/r#1', raw_text: 'x' } },
-      { seq: 2, type: 'SANDBOX_SEALED', payload: { v: 1, sandbox_id: 's', policy: 'deny-all', probe: { dns: false, route: true } } },
+      { seq: 2, type: 'SANDBOX_SEALED', payload: { v: 1, sandbox_id: 's', phase: 'agent', policy: 'deny-all', probe: { dns: false, route: true } } },
     ].map((one) => ({ ...one, run_id: RUN, ts: '2026-09-06T00:00:00.000Z' })) as RunEvent[];
     expect(fold(events).sealedBeforeAgent).toBe(false);
   });
@@ -446,6 +554,15 @@ describe('nothing is left running, and nothing is left uncollected', () => {
     expect(await executor.sweep()).toBe(0);
     // And the file is gone, so a later sweep does not re-ask the platform about the dead.
     expect(existsSync(ledger.path)).toBe(false);
+
+    // The ledger is what a crashed worker leaves, and the sweep has to READ it: a tag
+    // query alone answers about the platform, and a ledger nothing opens is a file that
+    // grows forever while the sandboxes it names bill by the second.
+    const { writeFileSync } = await import('node:fs');
+    const orphan = await fake.client.create({ from: { image: 'engine:test' }, policy: 'deny-all', timeoutMs: 1000, tags: {} });
+    writeFileSync(ledger.path, `${JSON.stringify({ sandboxId: orphan.id, runId: RUN })}\n`);
+    expect(await executor.sweep()).toBe(1);
+    expect(fake.sandboxes.find((one) => one.id === orphan.id)!.stopped).toBe(true);
 
     // The case the sweep exists for: a sandbox this worker made and did not stop.
     await fake.client.create({ from: { image: 'engine:test' }, policy: 'deny-all', timeoutMs: 1000, tags });
