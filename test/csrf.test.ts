@@ -45,7 +45,7 @@ const client = () =>
 
 /** A GitHub that knows one issue, so a permitted press has something to queue. */
 const github = {
-  token: async () => 'ghs_test',
+  token: async () => 'an-installation-token',
   api: 'http://github.invalid',
   fetch: (async (input: string | URL | Request) => {
     const path = new URL(String(input instanceof Request ? input.url : input)).pathname;

@@ -234,9 +234,12 @@ describe('starting a run is a write, and gated like one', () => {
    * covers the credential and not only the call made with it.
    */
   const github = (asked: string[] = []) => ({
+    // NOT shaped like a real credential. `ghs_…` is GitHub's prefix for an installation
+    // token, and a secret scanner reads any literal wearing it as a leak — this repository's
+    // first one failed on exactly that. A stand-in has to be unmistakably a stand-in.
     token: async () => {
       asked.push('token');
-      return 'ghs_test';
+      return 'an-installation-token';
     },
     api: 'http://github.invalid',
     fetch: (async (input: string | URL | Request) => {

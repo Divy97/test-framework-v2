@@ -33,7 +33,7 @@ describe('what the plane does with a delivery', () => {
   it('an issue delivery is acknowledged, logged, and queues nothing', async () => {
     const writes: string[] = [];
     const lines: string[] = [];
-    const mint = vi.fn(async () => 'ghs_never');
+    const mint = vi.fn(async () => 'never-minted');
 
     await planeIntake({ client: client(writes), mint, log: (line) => lines.push(line) })(ISSUE);
 
