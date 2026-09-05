@@ -76,22 +76,29 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10a** | the spike: what Vercel Sandbox must be shown to do, each with a number (below) | a Vercel login | run 2026-09-06; #68 |
 | **10b** | the `Executor` seam; Docker behind it; `orchestrate.ts` names no docker | | merged; #67 |
 | **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | merged; #69 |
-| **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | in review |
+| **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | merged; #72 |
 | **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | |
 | **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | |
 | **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | merged; #66 |
 | **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
 | **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | |
-| **10j** | recipe `env` and `required`; `blocked` | | in review; #70 |
-| **10k** | the model key and secrets: stored, listed by name, never read back | 10j | in review |
+| **10j** | recipe `env` and `required`; `blocked` | | merged; #70 |
+| **10k** | the model key and secrets: stored, listed by name, never read back | 10j | merged; #71 |
 | **10l** | secrets injected only under `deny-all`, with the guard executed | 10d, 10k | |
 | **10m** | orientation, plan, critic — off by default, proven inert, then measured | | |
 | **10n** | every line of the record that this milestone made false | all | |
 
-**10k has two deploy prerequisites, and merging without them takes the plane down.**
+Half of Track A and half of Track B are in. What is left is the half that touches a real
+machine: **10e** puts the worker on Fly and takes the first live run, which is also the
+first time any of 10d's executor runs against a sandbox rather than a fake. Until it does,
+ADR-0021's numbers are the spike's and the executor is unexercised — two review rounds
+found four defects in it that only reading caught, and a fifth would probably find more.
+
+**10k has two deploy prerequisites, and the next deploy fails without them.**
 `PLANE_SECRETS_KEY` is now in the plane's `REQUIRED` set, so a deployment that does not
-have it fails `readPlaneConfig` at boot, fails its health check, and rolls back. Set it
-and apply the schema BEFORE the merge:
+have it fails `readPlaneConfig` at boot, fails its health check, and rolls back. It is
+merged as of 2026-09-06 and **neither of these has been run** — there is no CI, so nothing
+has deployed since. Both are required before the next `fly deploy`:
 
 ```
 fly secrets set PLANE_SECRETS_KEY="$(openssl rand -base64 32)" -a test-framework
