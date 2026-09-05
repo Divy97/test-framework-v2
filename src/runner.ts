@@ -126,7 +126,7 @@ const WORK = '/work';
  */
 const BLOBS = '/blobs';
 /** Matches the `repro` user created in the Dockerfile. */
-const REPRO_UID = 1000;
+export const REPRO_UID = 1000;
 const REPRO_GID = 1000;
 
 /**
@@ -149,7 +149,7 @@ const ENV_IGNORED = `${ENV}/ignored.txt`;
  * They demand opposite things — fold the channel, or ignore it and read stderr —
  * so collapsing them would leave a caller unable to tell evidence from nothing.
  */
-const EXIT = {
+export const EXIT = {
   /** Every phase observed; the stream is complete. */
   complete: 0,
   /** An engine or Runner bug. Nothing on the channel. */
@@ -191,11 +191,34 @@ const SENTINEL = '.evidence-store';
  */
 export const SHARED_WRITABLE = ['/tmp', '/var/tmp', '/dev/shm', '/dev/mqueue', '/home/node'];
 
-async function hostStoreIsMounted(path: string): Promise<boolean> {
+/**
+ * Which way the evidence is going to outlive the machine that produced it (M10).
+ *
+ * `mounted` is Docker's: `/blobs` is a bind mount, so the bytes are already on a host
+ * that outlives the container, and a store on the same device as `/` is the silent-loss
+ * case the check exists to refuse.
+ *
+ * `collected` is a microVM's: there is no host to mount from, the store is on this
+ * machine's own filesystem, and the worker copies it out before destroying the machine
+ * (ADR-0021). The device check cannot apply — everything is the same device — so what is
+ * left is the sentinel, which still proves the caller MEANT this directory to be a store
+ * rather than a path typo the run would write into and lose.
+ */
+export type StoreMode = 'mounted' | 'collected';
+
+async function storeWillOutliveThis(path: string, mode: StoreMode): Promise<boolean> {
   try {
-    const [here, root] = await Promise.all([stat(path), stat('/')]);
-    if (here.dev === root.dev) return false;
-    await stat(`${path}/${SENTINEL}`);
+    // `lstat`, and the sentinel has to be a FILE. Under `collected` the sentinel is the
+    // only gate left — the device check cannot apply — so the shapes `guardEvidence`
+    // already anticipates (a symlink where the store should be, a directory wearing the
+    // sentinel's name) matter more here than they did, not less.
+    const here = await lstat(path);
+    if (!here.isDirectory()) return false;
+    if (mode === 'mounted') {
+      const root = await stat('/');
+      if (here.dev === root.dev) return false;
+    }
+    if (!(await lstat(`${path}/${SENTINEL}`)).isFile()) return false;
     return true;
   } catch {
     return false;
@@ -240,12 +263,18 @@ async function hostStoreIsMounted(path: string): Promise<boolean> {
  * and only then kill. The residual is a child forked in the window between two
  * signals, which the next pass stops.
  */
-async function reap(): Promise<void> {
+async function reap(only?: (pid: number) => Promise<boolean> | boolean): Promise<void> {
   const alive = async () => {
     const pids = (await readdir('/proc'))
       .map(Number)
       .filter((pid) => Number.isInteger(pid) && pid > 1);
-    return new Set(pids);
+    if (!only) return new Set(pids);
+    // Filtered when this process is not PID 1 (M10): a microVM is shared with the
+    // substrate's own agent, and sweeping everything would stop the thing holding the
+    // channel open.
+    const mine = new Set<number>();
+    for (const pid of pids) if (await only(pid)) mine.add(pid);
+    return mine;
   };
 
   const signal = (pids: Set<number>, sig: NodeJS.Signals) => {
@@ -274,6 +303,63 @@ async function reap(): Promise<void> {
 async function clearTheField(extra: string[] = [], evidence?: EvidenceStore): Promise<void> {
   if (process.pid !== 1) return;
   await reap();
+  await scrub(extra, evidence);
+}
+
+/**
+ * Every process owned by `uid`, for a machine we own but are not PID 1 of (M10).
+ *
+ * The PID-1 sweep above cannot run in a microVM: `/proc` there holds the substrate's own
+ * agent, and SIGSTOPping it stops the channel this run reports on. The uid is the same
+ * boundary one layer in — the repro and everything the agent started run as it, and the
+ * Runner does not.
+ *
+ * Self and ancestors are excluded by pid rather than by uid, because a substrate may well
+ * run OUR entrypoint as the same uid the repro drops to: on Vercel's managed images the
+ * default user is 1000. Killing the Runner mid-teardown would end the run with the
+ * evidence unflushed, which is the one outcome worse than a survivor.
+ */
+async function reapOwnedBy(uid: number): Promise<void> {
+  const ancestors = new Set<number>([process.pid]);
+  for (let pid = process.ppid; pid > 1; ) {
+    ancestors.add(pid);
+    const parent = await ownerAndParent(pid);
+    if (!parent) break;
+    pid = parent.ppid;
+  }
+  await reap(async (pid) => {
+    if (ancestors.has(pid)) return false;
+    const who = await ownerAndParent(pid);
+    return who?.uid === uid;
+  });
+}
+
+/** A process's real uid and parent, read out of `/proc`. Absent when it is already gone. */
+async function ownerAndParent(pid: number): Promise<{ uid: number; ppid: number } | null> {
+  try {
+    const status = await readFile(`/proc/${pid}/status`, 'utf8');
+    // `Uid:` is real, effective, saved, filesystem — the first is the one that says who
+    // started it, which is what the teardown is about.
+    const uid = Number(/^Uid:\s+(\d+)/m.exec(status)?.[1]);
+    const ppid = Number(/^PPid:\s+(\d+)/m.exec(status)?.[1]);
+    return Number.isInteger(uid) && Number.isInteger(ppid) ? { uid, ppid } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The same teardown, on a machine this process is not PID 1 of (M10). */
+async function clearTheFieldOwnedBy(
+  uid: number,
+  extra: string[] = [],
+  evidence?: EvidenceStore,
+): Promise<void> {
+  await reapOwnedBy(uid);
+  await scrub(extra, evidence);
+}
+
+/** Empty every directory a participant can write, and evict what it left in the store. */
+async function scrub(extra: string[] = [], evidence?: EvidenceStore): Promise<void> {
   for (const dir of [...SHARED_WRITABLE, ...extra]) {
     // Defensive, and currently against an unreachable case: every parent of
     // every path in the list is root-owned 0755, so a participant cannot swap
@@ -713,6 +799,25 @@ async function probeSuite(
   }
 }
 
+/**
+ * How this Runner is placed on the machine it is running on (M10).
+ *
+ * Absent, it is Docker's: PID 1 in a container of our own, with a bind-mounted store.
+ * Present, it is a microVM's — see `src/runner-vm.ts`, which is the only caller that
+ * sets either field.
+ */
+export type RunJobOptions =
+  /** Docker's: PID 1 in a container of our own, with a bind-mounted store. */
+  | { store?: 'mounted'; field?: never }
+  /**
+   * A microVM's. `field` is REQUIRED here, and the union is how: with a store this
+   * process does not own outright and no uid to reap, `clearTheField` returns early
+   * (not PID 1) and nothing else runs — so the agent's backgrounded processes would
+   * survive into the base phase and the run would report success anyway. That is
+   * ADR-0010's red-then-green flip, arrived at by an omission the type now refuses.
+   */
+  | { store: 'collected'; field: { uid: number } };
+
 export async function runJob(
   job: Job,
   workDir = WORK,
@@ -720,6 +825,7 @@ export async function runJob(
   emit: (line: string) => void = (line) => process.stdout.write(line),
   /** Tool calls from the host, when the loop is out there. Required by `serveTools`. */
   requests?: AsyncIterable<string>,
+  options: RunJobOptions = {},
 ): Promise<number> {
   // Git's own state lives outside every worktree. Inside one, the repro owns
   // .git and plants a post-checkout hook that `git clean` never descends into,
@@ -738,10 +844,14 @@ export async function runJob(
   // mount the run still produces a complete, plausible event stream whose
   // artifacts die with --rm — the exact failure this is here to prevent, only
   // invisible.
-  if (!(await hostStoreIsMounted(blobRoot))) {
+  const store = options.store ?? 'mounted';
+  if (!(await storeWillOutliveThis(blobRoot, store))) {
     throw new ObservationFailed(
-      `${blobRoot} is not a host store (mount it and leave a ${SENTINEL} file); ` +
-        'the evidence would not survive the container',
+      store === 'mounted'
+        ? `${blobRoot} is not a host store (mount it and leave a ${SENTINEL} file); ` +
+          'the evidence would not survive the container'
+        : `${blobRoot} is not an evidence store (create it and leave a ${SENTINEL} file); ` +
+          'there would be nothing here for the worker to collect',
     );
   }
 
@@ -989,7 +1099,12 @@ export async function runJob(
     // different commit, and that commit is what got verified. `chmod 0444`
     // cannot stop a file's own owner, and a bind mount does not carry the mode
     // to the host anyway.
-    await clearTheField([], evidence);
+    // The caller says which machine this is, and only one teardown runs. Calling both
+    // would mean a substrate that happened to start us as PID 1 got the unfiltered
+    // `/proc` sweep — which would SIGSTOP its own agent, the one thing `reapOwnedBy`
+    // exists to avoid.
+    if (options.field) await clearTheFieldOwnedBy(options.field.uid, [], evidence);
+    else await clearTheField([], evidence);
     // Recorded as an event, not written to a stream nothing folds. The size
     // ceiling and a failed bundle used to reach only `process.stderr`, which the
     // orchestrator keeps on `PhaseResult.stderr` and never persists — so the
@@ -1079,7 +1194,11 @@ export async function runJob(
       // and nothing about the fix has to change; and a process the BASE phase
       // backgrounds is the same attack again, which no amount of directory
       // scrubbing reaches.
-      onPhaseBoundary: () => clearTheField([phases.env.TMPDIR, phases.env.HOME], evidence),
+      onPhaseBoundary: async () => {
+        const extra = [phases.env.TMPDIR, phases.env.HOME];
+        if (options.field) await clearTheFieldOwnedBy(options.field.uid, extra, evidence);
+        else await clearTheField(extra, evidence);
+      },
       ...(job.only === undefined ? {} : { only: job.only }),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),
       ...(job.baseRuns === undefined ? {} : { baseRuns: job.baseRuns }),
