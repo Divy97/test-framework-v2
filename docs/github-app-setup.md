@@ -18,7 +18,7 @@ see the notes there.
 |---|---|---|
 | **Contents** — read and write | clone at base; push the fix branch | `cloneRepository`, `run.ts` |
 | **Pull requests** — read and write | `POST /repos/:repo/pulls` | `github.ts:264` |
-| **Issues** — read and write | `POST /repos/:repo/issues/:n/comments` | `github.ts:385` |
+| **Issues** — read and write | `POST /repos/:repo/issues/:n/comments`; and, since M10, `GET /repos/:repo/issues` and `GET /repos/:repo/issues/:n` — the picker, and the run it starts | `commentOnIssue`, `listOpenIssues`, `readIssue` |
 
 Nothing else. Every additional permission is one the party under judgement could
 theoretically benefit from, and the whole architecture rests on it having none.
@@ -37,7 +37,7 @@ Subscribe to exactly these three:
 
 | Event | Actions `intake()` acts on | Why |
 |---|---|---|
-| **Issues** | `opened`, `labeled` | the two triggers that start a run |
+| **Issues** | `opened`, `labeled` | mapped by `intake()` and, locally, the trigger that starts a run. **The hosted plane acknowledges and ignores it** since M10 — runs start from the dashboard, by a person |
 | **Installation** | `created`, `deleted` | how a repository first becomes known to us (M6a) |
 | **Installation repositories** | `added`, `removed` | selecting or deselecting a repository later |
 

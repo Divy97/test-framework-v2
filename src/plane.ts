@@ -151,14 +151,52 @@ export async function sawRunner(client: Db, runnerId: string): Promise<void> {
  */
 export async function enqueueJob(
   client: Db,
-  options: { installationId: number; repo: string; intake: unknown },
+  options: {
+    installationId: number;
+    repo: string;
+    intake: unknown;
+    /** The GitHub user id of whoever pressed Start (M10); absent for a webhook delivery. */
+    requestedBy?: number;
+    /** Copied out of the intake so `openJobFor` is an index lookup, not a jsonb scan. */
+    issueNumber?: number;
+  },
 ): Promise<string> {
   const runId = randomUUID();
   await client.query(
-    'insert into jobs (run_id, installation_id, repo, intake) values ($1, $2, $3, $4)',
-    [runId, options.installationId, options.repo, JSON.stringify(options.intake)],
+    `insert into jobs (run_id, installation_id, repo, intake, requested_by, issue_number)
+       values ($1, $2, $3, $4, $5, $6)`,
+    [
+      runId,
+      options.installationId,
+      options.repo,
+      JSON.stringify(options.intake),
+      options.requestedBy ?? null,
+      options.issueNumber ?? null,
+    ],
   );
   return runId;
+}
+
+/**
+ * The run already under way for this issue, if there is one (M10).
+ *
+ * Two presses of Start — or one while the first run is still going — would queue two
+ * runs that clone the same commit and race to open two pull requests. `finished_at` is
+ * stamped by the runner on every ending, so an unfinished job is one that is genuinely
+ * in flight; the two-hour ceiling is for the one whose runner died with it, which would
+ * otherwise block this issue forever.
+ */
+export async function openJobFor(client: Db, repo: string, issueNumber: number): Promise<string | null> {
+  const { rows } = await client.query(
+    `select run_id from jobs
+       where repo = $1 and issue_number = $2 and finished_at is null
+         and queued_at > now() - interval '2 hours'
+       order by queued_at desc
+       limit 1`,
+    [repo, issueNumber],
+  );
+  const row = rows[0] as { run_id: string } | undefined;
+  return row?.run_id ?? null;
 }
 
 /**

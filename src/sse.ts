@@ -212,6 +212,20 @@ export function startStatusServer(options: {
   port?: number;
   routes?: Route;
   /**
+   * May this request tail this run? (M10)
+   *
+   * Absent, anyone who knows a run id may — the LOCAL surface: one operator on loopback,
+   * for whom a run id is not a secret. The hosted plane passes one, because the tail
+   * streams every event raw and every event is somebody's evidence; a uuid being hard to
+   * guess was never the same as being allowed. The two refusals are the ones the run's
+   * own page gives — 401 for nobody, 404 for not yours — for the same reason: a stranger
+   * probing ids learns nothing about which exist.
+   */
+  authorize?: (
+    runId: string,
+    headers: Record<string, string | string[] | undefined>,
+  ) => Promise<'ok' | 'anonymous' | 'forbidden'>;
+  /**
    * The interface to bind. `127.0.0.1` by default, and that default is deliberate: a
    * developer's dashboard has no business on the LAN, and the one write on it stores
    * commands this engine executes.
@@ -287,30 +301,43 @@ export function startStatusServer(options: {
       return;
     }
     const runId = decodeURIComponent(match[1]!);
-    response.writeHead(200, {
-      'content-type': 'text/event-stream',
-      'cache-control': 'no-store',
-      connection: 'keep-alive',
-      // Chunked, and flushed per write. A buffering proxy in front of this turns a
-      // live tail into a single response at the end, which is the failure mode SSE
-      // is most often reported broken for.
-      'x-accel-buffering': 'no',
-    });
+    void (async () => {
+      const verdict = options.authorize ? await options.authorize(runId, request.headers) : 'ok';
+      if (verdict !== 'ok') {
+        response.writeHead(verdict === 'anonymous' ? 401 : 404, { 'content-type': 'application/json' });
+        response.end(`${JSON.stringify({ error: verdict === 'anonymous' ? 'not signed in' : 'no such run' })}\n`);
+        return;
+      }
+      response.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-store',
+        connection: 'keep-alive',
+        // Chunked, and flushed per write. A buffering proxy in front of this turns a
+        // live tail into a single response at the end, which is the failure mode SSE
+        // is most often reported broken for.
+        'x-accel-buffering': 'no',
+      });
 
-    let connected = true;
-    request.on('close', () => (connected = false));
-    response.on('close', () => (connected = false));
+      let connected = true;
+      request.on('close', () => (connected = false));
+      response.on('close', () => (connected = false));
 
-    void tailRun({
-      runId,
-      afterSeq: resumeFrom(request.headers['last-event-id']),
-      read: options.read,
-      write: (chunk) => {
-        if (connected) response.write(chunk);
-      },
-      connected: () => connected,
-    }).finally(() => {
-      if (connected) response.end();
+      await tailRun({
+        runId,
+        afterSeq: resumeFrom(request.headers['last-event-id']),
+        read: options.read,
+        write: (chunk) => {
+          if (connected) response.write(chunk);
+        },
+        connected: () => connected,
+      }).finally(() => {
+        if (connected) response.end();
+      });
+    })().catch((error: unknown) => {
+      // The authorizer asked a database and it did not answer. A 500 rather than a
+      // stream, and never an unhandled rejection — the same rule the route branch keeps.
+      if (!response.headersSent) response.writeHead(500, { 'content-type': 'text/plain' });
+      response.end(`${String((error as Error)?.message ?? error)}\n`);
     });
   });
 

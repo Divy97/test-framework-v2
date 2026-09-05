@@ -67,10 +67,13 @@ Every other product in this category has a run list; the screen that is rare is 
 where a refusal is as legible as a success.
 
 It has almost **no writes**, and that asymmetry is the design: everything else on it is a
-projection that can be rebuilt, so a dashboard that could start runs or edit evidence would be
-a second producer, and ADR-0009 has one. The writes it does have are a human approving a
-recipe, pairing or revoking a runner, and asking for a run's artifacts to be destroyed — every
-one of them a decision a person makes, none of them a fact about anybody's bug.
+projection that can be rebuilt, so a dashboard that could edit evidence or retry a phase would
+be a second producer, and ADR-0009 has one. The writes it does have are a human approving a
+recipe, starting a run, pairing or revoking a runner, and asking for a run's artifacts to be
+destroyed — every one of them a decision a person makes, none of them a fact about anybody's
+bug. Starting a run is a write to `jobs`, the same act a webhook delivery performed in
+milestone 9; the log's first event still comes from the worker (ADR-0019), so the plane
+dispatches and never produces. An `issues` delivery, since milestone 10, starts nothing.
 
 Each is refused unless it comes from the dashboard's own page, and hosted, unless GitHub says
 you may act on that repository. That second check is not decoration: approving a recipe stores

@@ -191,6 +191,189 @@ describe('being signed in is not being allowed', () => {
   });
 });
 
+/**
+ * Starting a run is a write, and gated like one (M10).
+ *
+ * `POST /api/runs` queues a job a worker will execute against a repository — clone,
+ * install, run the recipe's commands. It is the webhook's old job behind a button, and
+ * the button answers "may you" the way the approval does: before the installation is
+ * looked up, and before GitHub is asked anything about the issue.
+ */
+describe('starting a run is a write, and gated like one', () => {
+  const RECIPE_ROW = { recipe: { install: 'npm ci', services: [], test: 'npm test' } };
+
+  /** Answers the lookups the trigger makes, and records every write WITH its params. */
+  const triggerClient = (
+    writes: { sql: string; params: unknown[] }[],
+    options: { recipe?: boolean; open?: boolean } = {},
+  ) =>
+    ({
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        writes.push({ sql, params });
+        const rows = sql.includes('from installations')
+          ? [
+              { repo: 'mine/repo', installation_id: 1, account: 'me', connected_at: new Date(), removed_at: null },
+              { repo: 'theirs/repo', installation_id: 2, account: 'them', connected_at: new Date(), removed_at: null },
+            ].filter((row) => !sql.includes('where repo = $1') || row.repo === params[0])
+          : sql.includes('from recipes')
+            ? (options.recipe ?? true)
+              ? [RECIPE_ROW]
+              : []
+            : sql.includes('from jobs')
+              ? options.open
+                ? [{ run_id: 'already-running' }]
+                : []
+              : [];
+        return { rows, rowCount: rows.length };
+      }),
+    }) as unknown as Db;
+
+  /** GitHub as the picker and the button see it: one open issue, and one pull request. */
+  const github = (asked: string[] = []) => ({
+    token: async () => 'ghs_test',
+    api: 'http://github.invalid',
+    fetch: (async (input: string | URL | Request) => {
+      const url = String(input instanceof Request ? input.url : input);
+      asked.push(url);
+      const path = new URL(url).pathname;
+      const issue = {
+        number: 41,
+        title: 'The orders page title is misspelled',
+        body: 'It says "Ordres".',
+        html_url: 'https://github.com/mine/repo/issues/41',
+        labels: [{ name: 'bug' }],
+        updated_at: '2026-09-01T00:00:00Z',
+      };
+      // Every pull request is an issue to this endpoint, with one extra key.
+      const pull = { ...issue, number: 42, title: 'Fix the title', pull_request: { url: 'x' } };
+      if (path === '/repos/mine/repo/issues') return Response.json([issue, pull]);
+      if (path === '/repos/mine/repo/issues/41') return Response.json(issue);
+      if (path === '/repos/mine/repo/issues/42') return Response.json(pull);
+      return new Response('not found', { status: 404 });
+    }) as typeof fetch,
+  });
+
+  const trigger = (
+    writes: { sql: string; params: unknown[] }[],
+    options: { recipe?: boolean; open?: boolean; asked?: string[]; session?: Session | null; app?: boolean } = {},
+  ) =>
+    dashboardRoutes({
+      client: triggerClient(writes, options),
+      installUrl: 'https://example.invalid',
+      auth: {
+        session: async () => (options.session === undefined ? SESSION : options.session),
+        installations: async () => [1],
+      },
+      ...(options.app === false ? {} : { github: github(options.asked) }),
+    });
+
+  const start = (route: ReturnType<typeof dashboardRoutes>, repo: string, issue = 41, type = 'application/json') =>
+    call(route, 'POST', '/api/runs', JSON.stringify({ repo, issue_number: issue }), { 'content-type': type });
+
+  const queued = (writes: { sql: string; params: unknown[] }[]) => writes.filter((w) => w.sql.includes('insert into jobs'));
+
+  it('THE test: starting a run on a repository you cannot see queues nothing, and GitHub is never asked', async () => {
+    // Signed in, valid session, a body a real page would send — and installation 2 is not
+    // theirs. If this passes, a worker clones somebody else's repository and runs its
+    // recipe on the strength of a session that was never allowed to see it.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const asked: string[] = [];
+    const response = await start(trigger(writes, { asked }), 'theirs/repo');
+
+    expect(response?.status).toBe(404);
+    expect(queued(writes)).toHaveLength(0);
+    // Before the issue is fetched, not after: an unauthorized request must not spend an
+    // installation token reading a stranger's issue on its way to being refused.
+    expect(asked).toHaveLength(0);
+  });
+
+  it('and starting one on a repository you CAN see is queued, so the refusal is not blanket', async () => {
+    // The control. Without it the test above passes on a button that refuses everyone.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const response = await start(trigger(writes), 'mine/repo');
+
+    expect(response?.status).toBe(202);
+    const { run_id } = JSON.parse(String(response?.body)) as { run_id: string };
+    expect(run_id).toMatch(/^[0-9a-f-]{36}$/);
+
+    const [job] = queued(writes);
+    expect(job).toBeDefined();
+    // Who pressed the button and on what, as columns; and the same fact inside the intake
+    // the worker will write as `RUN_REQUESTED`, so the log says it too.
+    expect(job!.params[4]).toBe(SESSION.githubId);
+    expect(job!.params[5]).toBe(41);
+    const intake = JSON.parse(String(job!.params[3])) as { event: { thread_ref: string; requested_by?: string; source: string } };
+    expect(intake.event.thread_ref).toBe('mine/repo#41');
+    expect(intake.event.requested_by).toBe('divy97');
+    // Still `github_issue`: that is where the report lives. Who asked is a second fact.
+    expect(intake.event.source).toBe('github_issue');
+  });
+
+  it('an anonymous press is told plainly, and the picker likewise', async () => {
+    const writes: { sql: string; params: unknown[] }[] = [];
+    expect((await start(trigger(writes, { session: null }), 'mine/repo'))?.status).toBe(401);
+    expect((await call(trigger(writes, { session: null }), 'GET', '/api/repos/mine%2Frepo/issues'))?.status).toBe(401);
+    expect(queued(writes)).toHaveLength(0);
+  });
+
+  it('a repository with no recipe is answered, not run', async () => {
+    // The onboarding gate the webhook path had (M6a), kept: a run against a repository
+    // nobody has described would reproduce nothing and call that a finding.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const response = await start(trigger(writes, { recipe: false }), 'mine/repo');
+
+    expect(response?.status).toBe(409);
+    expect(JSON.parse(String(response?.body))).toMatchObject({ error: 'not onboarded' });
+    expect(queued(writes)).toHaveLength(0);
+  });
+
+  it('a run already under way is not queued twice', async () => {
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const response = await start(trigger(writes, { open: true }), 'mine/repo');
+
+    expect(response?.status).toBe(409);
+    expect(JSON.parse(String(response?.body))).toMatchObject({ run_id: 'already-running' });
+    expect(queued(writes)).toHaveLength(0);
+  });
+
+  it('a pull request is not an issue, however it is numbered', async () => {
+    // A run against a pull request is a run against a fix that already exists. The picker
+    // never offers one; the button must not accept one typed in by hand either.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const response = await start(trigger(writes), 'mine/repo', 42);
+
+    expect(response?.status).toBe(404);
+    expect(queued(writes)).toHaveLength(0);
+  });
+
+  it('the picker lists what you may see, and drops pull requests', async () => {
+    const asked: string[] = [];
+    const mine = await call(trigger([], { asked }), 'GET', '/api/repos/mine%2Frepo/issues');
+    expect(mine?.status).toBe(200);
+    expect((JSON.parse(String(mine?.body)) as { number: number }[]).map((issue) => issue.number)).toEqual([41]);
+
+    const theirs = await call(trigger([], { asked }), 'GET', '/api/repos/theirs%2Frepo/issues');
+    expect(theirs?.status).toBe(404);
+    // One fetch for the list that was allowed, none for the one that was not.
+    expect(asked).toHaveLength(1);
+  });
+
+  it('a form body is refused as the wrong kind, before anything is looked up', async () => {
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const response = await start(trigger(writes), 'mine/repo', 41, 'application/x-www-form-urlencoded');
+
+    expect(response?.status).toBe(415);
+    expect(writes).toHaveLength(0);
+  });
+
+  it('a surface with no App says so, rather than listing nothing', async () => {
+    const writes: { sql: string; params: unknown[] }[] = [];
+    expect((await start(trigger(writes, { app: false }), 'mine/repo'))?.status).toBe(501);
+    expect((await call(trigger(writes, { app: false }), 'GET', '/api/repos/mine%2Frepo/issues'))?.status).toBe(501);
+    expect(queued(writes)).toHaveLength(0);
+  });
+});
+
 describe('the local surface is unchanged', () => {
   it('with no auth configured, nothing is gated', async () => {
     // ADR-0013's original shape: one operator, 127.0.0.1, the origin check is the

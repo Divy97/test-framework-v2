@@ -186,3 +186,54 @@ describe('over HTTP, as a browser would', () => {
     }
   });
 });
+
+/**
+ * The tail asks who you are, when told to (M10).
+ *
+ * On the hosted plane this endpoint streamed every event of any run to anyone who knew
+ * its id. A uuid is hard to guess; that was never the same as being allowed. The test
+ * above — no `authorize` — is the local surface and stays open on purpose.
+ */
+describe('the tail is authorized like the run page', () => {
+  test('nobody gets 401, not yours gets 404, and only yours gets a stream', async () => {
+    const server = await startStatusServer({
+      read: async (_runId, afterSeq) => log(3).filter((event) => event.seq > afterSeq),
+      authorize: async (runId, headers) =>
+        headers['cookie'] === undefined ? 'anonymous' : runId === RUN_ID ? 'ok' : 'forbidden',
+    });
+    try {
+      const base = `http://127.0.0.1:${server.port}`;
+
+      const nobody = await fetch(`${base}/runs/${RUN_ID}/events`);
+      expect(nobody.status).toBe(401);
+      expect(nobody.headers.get('content-type')).toBe('application/json');
+      await nobody.text();
+
+      // The same answer a run that does not exist gets: a stranger probing ids learns
+      // nothing about which ones this service holds.
+      const theirs = await fetch(`${base}/runs/somebody-elses-run/events`, { headers: { cookie: 'tf_session=x' } });
+      expect(theirs.status).toBe(404);
+      await theirs.text();
+
+      const controller = new AbortController();
+      const mine = await fetch(`${base}/runs/${RUN_ID}/events`, {
+        headers: { cookie: 'tf_session=x' },
+        signal: controller.signal,
+      });
+      expect(mine.status).toBe(200);
+      expect(mine.headers.get('content-type')).toBe('text/event-stream');
+      let body = '';
+      const reader = mine.body!.getReader();
+      const decoder = new TextDecoder();
+      while (received(body).length < 3) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        body += decoder.decode(value, { stream: true });
+      }
+      controller.abort();
+      expect(received(body).map((frame) => frame.id)).toEqual([1, 2, 3]);
+    } finally {
+      await server.close();
+    }
+  });
+});
