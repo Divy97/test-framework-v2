@@ -142,3 +142,68 @@ is a different claim, and priced separately.)
   plane.
 - Cost is a projection like everything else: active-CPU seconds and GB-hours per sandbox
   are recorded per phase and folded into what a run cost (M6).
+
+## Amendment (10d): what the executor actually depends on
+
+The executor is written against a seven-verb interface (`src/vercel-client.ts`), not
+against `@vercel/sandbox` — which appears in exactly one function, behind a dynamic
+import, so the engine still loads on a machine that has never installed it. Three
+consequences of that shape are decisions rather than style:
+
+- **`@vercel/sandbox` is the only new runtime dependency, and it is optional at import
+  time.** A Docker-only runner never resolves it. The whole test suite for the Vercel path
+  runs with no token, no network, and no SDK.
+- **Nothing reads the SDK's `networkPolicy` or `status`.** The spike found both are the
+  value this process last sent rather than the value the platform holds — after a live
+  flip the field lagged, and after a session ended `status` still said `running`. A guard
+  written against either would be a guard against our own cache. So the interface has no
+  method to read one, and the seal is established by running two data-exchanging probes
+  inside the sandbox and recording what they found (`SANDBOX_SEALED.probe`).
+- **Every sandbox is probed, not only the agent's.** The argument above — the policy you
+  sent is not the policy the platform holds — applies hardest to the containers that
+  judge. The agent's sandbox is the one ADR-0010 says "is not contained, and it no longer
+  needs to be"; base and fix are the opposite, and their output IS the evidence. A
+  `deny-all` the platform accepted and failed to apply on a base sandbox would produce a
+  reproduction that could have been told what to answer, and nothing else in this design
+  would notice. So a judging phase is probed before it is given the source or the Job.
+- **A probe that still reaches the network refuses the phase.** Refuses by RETURNING,
+  though. Throwing unwound the whole run — `orchestrate()` accumulates events locally and
+  returns them at the end — so an exception from the fix agent's phase discarded the
+  attempt, the registration and every base observation. The design has a name for this
+  outcome (`SANDBOX_SEALED` with `probe: true`, and `cause: 'environment'`, which
+  disqualifies the attempt and ends the run `errored`), and `Executor.runPhase` must not
+  throw for an outcome the design has a name for.
+
+Two costs this adds, named rather than left to be discovered:
+
+- **The transport is not resumable.** Re-attaching to a detached command's output replays
+  a window and then closes (spike item 5), so a stream dropped mid-phase cannot be picked
+  up where it left off. `runner-vm.ts` mirrors every reply to `<spool>/out/<id>.json` for
+  that reason; the events themselves are durable in the plane once appended.
+- **A phase now has two ceilings.** Ours, enforced by the process driving it, and the
+  platform's session timeout, enforced with that process dead. `PhaseResult.ceiling`
+  reports the first; the second cannot be reported by a process that is dead, and what
+  surfaces then is a stream that ends and a sandbox the boot sweep finds.
+  `VERIFICATION_ABORTED{cause:'ceiling'}` puts ours in the log — where the fold
+  disqualifies the attempt, because a comparison cut short mid-observation is half a
+  comparison and must not be credited with a reproduction.
+- **The host cannot write the spool, and that is the point.** `writeFiles` runs as uid
+  1000 — the uid the repro drops to — so there is no ownership that lets the host write a
+  spool the agent cannot. Tool calls therefore go in base64 inside a `sudo tee`, one round
+  trip, the same cost the file write would have been. The spool stays root-owned 0700, so
+  the agent cannot forge `{done: true}` and choose its own ending.
+- **The in-container agent is not available here, and is refused rather than degraded.**
+  `agentPrompt` runs the loop inside the sandbox — a model credential in there, and a route
+  to the model API for the whole session, which is what [ADR-0011](0011-the-agent-loop-runs-outside-the-sandbox.md)
+  moved out and what this ADR says is in no sandbox at all. It also has no `{ready}`
+  handshake, so there is no moment at which the executor could close the route: the agent
+  would run its whole life with a way out and nothing in the log would say so. Docker keeps
+  that path because the suite still drives it. This executor supports the ADR-0011 topology
+  only, and throws for the other.
+- **`SANDBOX_SEALED` names which sandbox it is about.** Once every sandbox is probed, a
+  base phase's seal sits in the log before the next agent speaks — and the fold's
+  `sealedBeforeAgent` is a question about AGENTS. Without the `phase` field it answered
+  `true` for an agent nobody had sealed.
+- **`sweep()` is scoped to one worker.** It reads this worker's ledger and a tag carrying
+  this worker's identity. A tag shared across a deployment would turn one booting worker
+  into an outage for every other one.

@@ -67,6 +67,11 @@ describe('fold', () => {
       // Null, and that is the M2/M3 shape: this stream replays no recipe, so there
       // was no environment to be ready. `aborts` is what distinguishes that from a
       // recipe that failed to boot.
+      // M10: the world the phases were made from, and whether the agent sandbox was
+      // sealed before it spoke. This demo stream carries neither event, and the honest
+      // answers are "nothing was built" and "no, it was not" — Docker never seals one.
+      environment: null,
+      sealedBeforeAgent: false,
       env: null,
       fixDiff: {
         changed_files: ['src/checkout/discount.ts'],

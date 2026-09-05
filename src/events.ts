@@ -27,6 +27,64 @@ export type SandboxCreatedV1 = {
   image_ref: string;
 };
 
+/**
+ * The world the phases judge from was built, and what it is (M10, ADR-0021).
+ *
+ * NOT a field on `ENV_READY`, which is a different sandbox: that one is the agent's, it
+ * replayed the recipe for the agent's own benefit, and it is emitted per attempt. This is
+ * emitted once, before the first attempt, and names the artifact every phase container is
+ * then created from — a Docker image tag on one substrate, a snapshot id on another.
+ *
+ * Why it exists at all: after 7e the phases stopped running from `plan.image` and started
+ * running from something built during this run, and nothing in the log said so. A reader
+ * asking "what did the base phase actually execute in" had to know the milestone. The
+ * snapshot reference is also the one thing that makes an environment build reproducible
+ * enough to argue about — it is what somebody would ask us to keep.
+ */
+export type EnvBuiltV1 = {
+  v: 1;
+  /** Which substrate built it: the value `Executor.kind` carries. */
+  executor: string;
+  /** The image the build itself started from. */
+  image_ref: string;
+  /** What the phases are created from. Opaque to everything but the executor that made it. */
+  snapshot: string;
+  /** The recipe steps that ran, and what they returned. */
+  steps: { step: string; exit_code: number }[];
+};
+
+/**
+ * The agent's sandbox lost its route out, and it was checked (M10, ADR-0017, ADR-0021).
+ *
+ * The one event in this log that is about OUR infrastructure and belongs here anyway,
+ * because a later decision reads it: secrets may be injected only into a sandbox observed
+ * to be sealed before the agent's first turn, and "observed" has to mean something a
+ * reader can check afterwards. So `probe` carries what was actually run — two commands,
+ * inside the sandbox, that try to exchange data with the internet — rather than the
+ * policy we asked for.
+ *
+ * `false` in both fields is the sealed answer. It is a claim about a moment, not a
+ * guarantee about the session: what makes it worth anything is that the fold can compare
+ * this event's seq against the first `AGENT_MESSAGE` and see the order.
+ */
+export type SandboxSealedV1 = {
+  v: 1;
+  sandbox_id: string;
+  /**
+   * WHICH sandbox this is about, because the fold has to tell them apart.
+   *
+   * Every sandbox is sealed and probed, including the ones that judge — their output is
+   * the evidence, so a policy the platform accepted and did not apply there is worse than
+   * one on the agent's machine. But `sealedBeforeAgent` is a question about AGENTS, and
+   * without this field a base phase's seal, sitting in the log before an agent's first
+   * message, satisfied it for an agent that was never sealed at all.
+   */
+  phase: 'agent' | 'base' | 'fix';
+  policy: 'deny-all';
+  /** `true` means the probe REACHED something, which is a seal that did not take. */
+  probe: { dns: boolean; route: boolean };
+};
+
 export type AttemptStartedV1 = {
   v: 1;
   n: number;
@@ -370,8 +428,16 @@ export type VerificationAbortedV1 = {
    * recipe marks required had no value. Nothing booted, nothing was cloned, and the
    * run ends `blocked` rather than `errored` — a fault on nobody's side, with one
    * action attached. `missing` beside it carries the names.
+   *
+   * `ceiling` is the fifth (M10) and it is the wall clock, not a verdict: a phase that
+   * ran longer than this engine allows was stopped by us, mid-observation, and whatever
+   * it had said up to that point is still in the log. It is `environment`'s sibling
+   * rather than a finding — the run ends `errored`, because a phase we cut short cannot
+   * be reported as a reproduction that failed. Docker reported this on stderr only, where
+   * nothing folded it, and the microVM substrate adds a second ceiling of its own that
+   * fires with this process dead — a failure mode two layers can produce needs a name.
    */
-  cause?: 'handover' | 'collection' | 'environment' | 'missing_env';
+  cause?: 'handover' | 'collection' | 'environment' | 'missing_env' | 'ceiling';
   /**
    * The environment variable names a run was missing, when `cause` is `missing_env` (M10).
    *
@@ -420,6 +486,8 @@ export type EventPayload =
   | { type: 'RUN_REQUESTED'; payload: RunRequestedV1 }
   | { type: 'REPRO_REGISTERED'; payload: ReproRegisteredV1 }
   | { type: 'SANDBOX_CREATED'; payload: SandboxCreatedV1 }
+  | { type: 'ENV_BUILT'; payload: EnvBuiltV1 }
+  | { type: 'SANDBOX_SEALED'; payload: SandboxSealedV1 }
   | { type: 'ATTEMPT_STARTED'; payload: AttemptStartedV1 }
   | { type: 'ENV_READY'; payload: EnvReadyV1 }
   | { type: 'AGENT_MESSAGE'; payload: AgentMessageV1 }

@@ -494,6 +494,29 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // container's observations.
   let afterSeq = 0;
 
+  // WHAT THE PHASES WILL RUN IN, said once, before the first attempt (M10, ADR-0021).
+  //
+  // After 7e the containers that judge stopped running from `plan.image` and started
+  // running from something built during this run, and nothing in the log said so — a
+  // reader asking what the base phase executed in had to know which milestone shipped
+  // when. `steps` is what the replay returned, which is a fact about the build and not
+  // about the project: `install` exiting 0 says the command succeeded and nothing about
+  // whether it installed the right thing.
+  if (built && 'snapshot' in built) {
+    events.push(
+      own(plan.runId, ++afterSeq, {
+        type: 'ENV_BUILT',
+        payload: {
+          v: 1,
+          executor: executor.kind,
+          image_ref: plan.image,
+          snapshot: built.snapshot.ref,
+          steps: built.steps ?? [],
+        },
+      }),
+    );
+  }
+
   // The agent, if there is one, in a container that is torn down before the
   // first phase is ever cloned. This is what ADR-0010's "the agent's world is
   // discarded" becomes when the world is a container: it is not scrubbed, it
@@ -610,7 +633,16 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
           transcript = await runAgentLoop({ prompt, invoke, ...plan.loop });
         },
       });
-      let seq = at;
+      // AFTER whatever the executor itself wrote, not from `at`.
+      //
+      // Until M10 nothing but the container wrote events for this phase, and in
+      // `serveTools` mode the container writes none — so `at` was the whole answer. The
+      // Vercel executor writes one: `SANDBOX_SEALED`, which has to precede every
+      // `AGENT_MESSAGE` below or the fold's ordering question is answered wrongly for a
+      // sandbox that WAS sealed in time. Starting here instead of at `at` is what keeps
+      // the two writers from claiming the same seq, and the Runner allocates
+      // contiguously from `afterSeq`, so this is the last seq either of them used.
+      let seq = at + result.events.length;
       const written: RunEvent[] = [];
       // The environment, first, because it precedes everything the agent said.
       //

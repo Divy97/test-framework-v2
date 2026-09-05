@@ -48,6 +48,21 @@ export type PhaseResult = {
   /** Host directory the agent container left its commits in, when it had one. */
   handover?: string;
   /**
+   * The phase was stopped by this engine's wall clock rather than finishing (M10).
+   *
+   * Beside the `VERIFICATION_ABORTED{cause:'ceiling'}` the executor also emits, not
+   * instead of it: the event is what the fold reads and what disqualifies the attempt.
+   * This field is for a caller that wants the fact without re-reading the events, and
+   * nothing reads it today.
+   *
+   * `'wall'` only. The substrate's own session timeout — enforced with our process dead —
+   * is the other ceiling a microVM adds, and it is not reported here because a process
+   * that is dead reports nothing; what surfaces then is a stream that ends and a sandbox
+   * the boot sweep finds. A `'session'` value would be a name for an observation this
+   * design cannot make.
+   */
+  ceiling?: 'wall';
+  /**
    * What the container said on stderr, bounded.
    *
    * `EXIT.silent` is documented as "ignore the channel and read stderr", and
@@ -143,7 +158,18 @@ export interface Executor {
     source: string,
     base: string,
     recipe: Recipe,
-  ): Promise<{ snapshot: EnvSnapshot } | { failed: string }>;
+  ): Promise<
+    | {
+        snapshot: EnvSnapshot;
+        /**
+         * What the replay returned, for `ENV_BUILT` (M10). Optional because it is a
+         * report and not the product: an executor that cannot recover the step list
+         * still built a usable world, and a snapshot is worth more than its provenance.
+         */
+        steps?: { step: string; exit_code: number }[];
+      }
+    | { failed: string }
+  >;
   /** Forget a snapshot. Never at the cost of the run: callers `.catch` it. */
   dropSnapshot(snapshot: EnvSnapshot): Promise<void>;
 }
