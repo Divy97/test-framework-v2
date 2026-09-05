@@ -13,11 +13,13 @@ import { dockerExecutor } from '../src/executor-docker.js';
 describe('the orchestrator does not know what Docker is', () => {
   test('orchestrate.ts names no docker executable, and the Docker executor does', () => {
     // Over the CODE, not the prose: the file's comments are the record of six review
-    // rounds about containers and may say "docker" as often as they like. What must
-    // not appear is the executable, quoted, which is the only way to spawn one.
+    // rounds about containers and may say "docker" — quoted or not — as often as they
+    // like. What must not appear is a process-spawning call whose first argument is the
+    // executable, which is the only way to start one.
+    const spawnsDocker = /\b(spawn|spawnSync|execFile|execFileSync|exec|execSync)\(\s*['"`]docker['"`]/;
     const orchestrate = readFileSync(join(process.cwd(), 'src/orchestrate.ts'), 'utf8');
     const docker = readFileSync(join(process.cwd(), 'src/executor-docker.ts'), 'utf8');
-    expect(orchestrate).not.toMatch(/['"]docker['"]/);
+    expect(orchestrate).not.toMatch(spawnsDocker);
     // And the control: the thing that was removed exists where it was moved to, in
     // both of its shapes — the phase container and the committed environment.
     expect(docker).toMatch(/spawn\(\s*'docker'/);

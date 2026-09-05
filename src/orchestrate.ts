@@ -5,6 +5,11 @@
 // has a daemon. What moves with it is the thing that mattered: base and fix stop
 // sharing a machine.
 //
+// Since M10 the containers themselves are started one file over: this module decides
+// WHICH phase runs, in what order, from what world, and what its result means; an
+// `Executor` (`executor.ts`, Docker in `executor-docker.ts`) decides where. Nothing
+// here spawns anything, and `test/executor.test.ts` keeps it that way.
+//
 // Six review rounds established the shape of the problem. Every fix that scrubbed
 // a shared channel was correct and was followed by another way in, because
 // per-participant directories and a best-effort process sweep are approximations
@@ -142,6 +147,11 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   repoPath: string;
   /** Host directory holding the evidence. Must pre-exist with its sentinel. */
   blobRoot: string;
+  /**
+   * The image every judging phase runs from — and the agent, when `agentImage` is not
+   * set. Read by the executor, which decides what an image reference IS: a local Docker
+   * tag today, a registry reference on a substrate that pulls.
+   */
   image: string;
   /**
    * Where each phase runs (M10, ADR-0021). Docker on this machine unless a caller
@@ -167,6 +177,11 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   containerTimeoutMs?: number;
   /** How many attempts before the run gives up. One, unless a caller asks for more. */
   maxAttempts?: number;
+  /**
+   * Host path to a `claude` executable, mounted over the image's (see the doc two fields
+   * up). A bind mount is a Docker idea: the Docker executor honours this and any other
+   * ignores it, which is acceptable only because it exists for the hostile-fake tests.
+   */
   agentImageMount?: string;
   /**
    * The image for the AGENT container only — the one with a browser in it (5f).
@@ -329,7 +344,16 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // (something still holding the image, a daemon that went away) must not
     // replace a completed run's events with an exception about disk hygiene. That
     // is the evidence-loss shape this file has been bitten by three times.
-    if (snapshot) await executor.dropSnapshot(snapshot).catch(() => {});
+    //
+    // `try`/`catch` around the `await`, not `.catch()` on the promise: an executor that
+    // throws synchronously never returns a promise to attach a handler to.
+    if (snapshot) {
+      try {
+        await executor.dropSnapshot(snapshot);
+      } catch {
+        // Disk hygiene, never at the cost of the run.
+      }
+    }
   }
 
   async function run(): Promise<RunOutcome> {
@@ -1200,7 +1224,13 @@ export async function proveRepository(plan: {
     // The image is the largest thing this leaves on the host, and onboarding runs
     // on somebody else's schedule rather than a run's — so it is removed here for
     // the same reason `orchestrate` removes its own in a `finally`.
-    if (snapshot) await executor.dropSnapshot(snapshot).catch(() => {});
+    if (snapshot) {
+      try {
+        await executor.dropSnapshot(snapshot);
+      } catch {
+        // Never at the cost of the proof.
+      }
+    }
   }
 }
 

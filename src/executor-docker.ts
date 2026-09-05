@@ -1,6 +1,6 @@
 // The Docker executor: one container per phase, on this machine (M4 → M10).
 //
-// This is `orchestrate.ts`\'s container code, moved behind the `Executor` seam
+// This is `orchestrate.ts`'s container code, moved behind the `Executor` seam
 // unchanged in what it does. The comments travelled with it because they are the
 // record of why each line is the way it is — six review rounds, ADR-0011, ADR-0013,
 // ADR-0014, 7e, 8a — and a move that dropped them would leave the next reader
@@ -9,11 +9,11 @@
 // Two things about the shape are worth saying here rather than in the middle:
 //
 //   - There is no `docker exec`. Every container is one `docker run -i`, and the
-//     host drives it over that process\'s stdin and stdout: the Job goes in as one
+//     host drives it over that process's stdin and stdout: the Job goes in as one
 //     JSON line, events and replies come out interleaved, and for an agent phase the
 //     tool protocol (`WorkerRequest`/`WorkerReply`, runner.ts) rides the same pipe.
 //     That is why the seam above this file is a PHASE and not a primitive.
-//   - The "snapshot" is `docker commit` of a container deliberately not `--rm`\'d, so
+//   - The "snapshot" is `docker commit` of a container deliberately not `--rm`'d, so
 //     it can outlive its own exit long enough to be committed. Another substrate has
 //     a snapshot API and no such container; the `Executor` contract only asks for a
 //     reference back.
@@ -34,7 +34,6 @@ import { own, type EnvSnapshot, type Executor, type PhaseResult, type PhaseSpec 
 const execFile = promisify(execFileCb);
 
 /** Output ceiling per container. Matches what the sandbox tests already allow. */
-
 const MAX_STREAM_BYTES = 32 * 1024 * 1024;
 /** Tail of a container's diagnostics. The reason is at the end, not the start. */
 const MAX_STDERR_CHARS = 8 * 1024;
@@ -271,7 +270,7 @@ async function runPhase(spec: PhaseSpec): Promise<PhaseResult> {
     // reproduction needing a package the base commit lacked was simply unrunnable.
     // It is not the seal that changed: the dependencies arrive in the IMAGE now,
     // installed by a build container before the agent existed, so the phases still
-    // reach nothing and no longer need to (see `buildEnvSnapshot`).
+    // reach nothing and no longer need to (see `buildSnapshot`).
     // NO NETWORK, for every container including the agent's.
     //
     // The phases need none. The agent needs the model API — and the transport for

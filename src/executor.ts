@@ -1,8 +1,8 @@
 // Where a phase runs, as an interface (M10, ADR-0021).
 //
-// Every container this engine has ever started went through one function in
-// `orchestrate.ts`, and every one of them was Docker: a `docker run -i` driven over its
-// own stdin and stdout. That was the right shape for a laptop and it is the wrong
+// Every container this engine has ever started went through two functions in
+// `orchestrate.ts` — one for a phase, one for the environment build — and every one of
+// them was Docker: a `docker run -i` driven over its own stdin and stdout. That was the right shape for a laptop and it is the wrong
 // shape for a milestone that puts each phase in a microVM somebody else operates. The
 // seam is drawn at the PHASE, not at the container primitive — create, exec, mount —
 // because Docker here has no `exec`, no file transfer that is not a bind mount, and a
@@ -102,6 +102,11 @@ export type PhaseSpec = {
   source: string;
   afterSeq: number;
   phase: PhaseResult['phase'];
+  /**
+   * Fields of the `Job` the caller decides. `Job.sourcePath` is container-internal
+   * (`/src` on Docker) and is the executor's to set, not the caller's — an override of
+   * it here is a Docker assumption leaking through.
+   */
   overrides: Partial<Job>;
   /** Present only for a `serveTools` container: what to run while it serves. */
   driver?: ContainerDriver;
@@ -112,6 +117,17 @@ export type PhaseSpec = {
   from?: EnvSnapshot;
 };
 
+/**
+ * Two host-side obligations travel with this contract, and a remote implementation has
+ * to materialise both rather than assume a shared filesystem:
+ *
+ *   - every artifact a phase produced is in `plan.blobRoot` — a HOST directory, the
+ *     evidence store — by the time `runPhase` returns, re-digested on the way in;
+ *   - an `agent` phase returns `handover` as a HOST directory holding `agent.bundle`,
+ *     because `applyHandover` in `orchestrate.ts` does `lstat` and `git fetch` on it.
+ *
+ * Docker gets both for free from bind mounts. Anything else copies bytes out.
+ */
 export interface Executor {
   readonly kind: 'docker' | 'vercel';
   /** Run one phase to completion and report what it did. Never throws for an outcome the design has a name for. */
