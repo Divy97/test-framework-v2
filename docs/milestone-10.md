@@ -24,8 +24,9 @@ destroyed when the run ends.
 - **Where the sandbox runs:** Vercel Sandbox, a Firecracker microVM per phase, with egress
   denied — including DNS — by a firewall outside the VM, and the agent loop in a worker of
   ours. The comparison of eight candidates is [milestone-10-substrate.md](milestone-10-substrate.md);
-  the decision is [ADR-0021](adr/0021-the-sandbox-is-a-microvm-we-do-not-operate.md), `proposed`
-  until the spike below has numbers.
+  the decision is [ADR-0021](adr/0021-the-sandbox-is-a-microvm-we-do-not-operate.md), `accepted`
+  on the spike's numbers ([milestone-10-spike.md](milestone-10-spike.md): 32 PASS, 3 FAIL, all
+  three design inputs).
 - **Manual trigger only.** `issues` webhooks are logged and ignored; `installation*`
   deliveries stay, since they are how the plane learns repositories.
 - **Environment, split in two.** Non-secret configuration — ports, the URL of a Postgres the
@@ -72,13 +73,13 @@ Two tracks. B never waits on A until 10h and 10l.
 
 | | | depends on | status |
 |---|---|---|---|
-| **10a** | the spike: what Vercel Sandbox must be shown to do, each with a number (below) | a `VERCEL_TOKEN` | |
-| **10b** | the `Executor` seam; Docker behind it; `orchestrate.ts` names no docker | | |
+| **10a** | the spike: what Vercel Sandbox must be shown to do, each with a number (below) | a Vercel login | run 2026-09-06; #68 |
+| **10b** | the `Executor` seam; Docker behind it; `orchestrate.ts` names no docker | | in review; #67 |
 | **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | |
 | **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | |
 | **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | |
 | **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | |
-| **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | |
+| **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | in review; #66 |
 | **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
 | **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | |
 | **10j** | recipe `env` and `required`; `blocked` | | |

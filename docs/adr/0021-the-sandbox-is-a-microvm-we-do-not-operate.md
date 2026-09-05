@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # The sandbox is a microVM we do not operate
@@ -10,7 +10,37 @@ was the right split and the wrong end state: nobody installs a daemon and Docker
 bug fixed, and a runner that lives on a laptop can only be demonstrated from that laptop.
 Milestone 10 removes the laptop. This ADR says what replaces it and what that costs.
 
-The research behind it is [milestone-10-substrate.md](../milestone-10-substrate.md).
+The research behind it is [milestone-10-substrate.md](../milestone-10-substrate.md); the
+spike that made it `accepted` is [milestone-10-spike.md](../milestone-10-spike.md).
+
+## The spike, and what it corrected
+
+Thirteen things the substrate had to be shown to do were run once against a real account
+on 2026-09-06: 32 PASS, 3 FAIL, every FAIL a design input rather than a reason to fall back.
+Four of its findings correct sentences below, and are left standing in the text with these
+corrections beside them:
+
+- **`deny-all` is a terminating proxy for TCP and a drop for UDP**, not a packet filter. A
+  raw `connect()` to `1.1.1.1:53` succeeds; nothing the connection carries reaches the
+  destination, TLS is reset, a UDP query is never answered. Sealed in substance, and the
+  probes that prove it exchange data rather than stopping at `connect`. The flip on a
+  running sandbox took effect within 351–2,029 ms, with a loopback server surviving.
+- **A snapshot expires in no less than a day** — `expiration` must be 0 or ≥ 86,400,000 ms.
+  The six-hour snapshot below is a one-day snapshot deleted explicitly.
+- **The SDK's `networkPolicy` and `status` getters are stale** after a flip and after a
+  session ends. The executor records the policy it set and lets the post-flip probe be the
+  evidence; it reads neither getter.
+- **Re-attaching to a command's stream is a replay, not a resume**, and the managed image
+  runs as uid 1000 with dash and no `procps`. One `logs()` iterator is held for a phase's
+  whole life, with mirrored results as the recovery path; the Runner is started with `sudo`
+  or the paths are made writable first.
+
+And the numbers the decision rests on: a sealed phase boots from a 338 MB snapshot in
+504 ms; cold start is 0.9 s from the image and 1.2 s from a snapshot; this project's own
+alpine agent image runs under Firecracker and answers CDP; `stop()` reports plausible
+active-CPU. The one criterion that failed as measured — `runCommand` p50 of 332 ms — was
+measured from a laptop in Mumbai to `iad1`; the worker lives in `iad`, and 10e records the
+in-region number.
 
 ## Decision
 
@@ -33,7 +63,8 @@ Four properties are the reason, in the order the criteria were ranked:
    the container boundary. Base, fix and the agent now share nothing but a snapshot id.
 3. **The snapshot is 7e.** `snapshot()` on the build sandbox after `install`, `migrate`,
    `seed`; base and fix are created from that snapshot with `deny-all`. The security
-   argument is unchanged: those bytes existed before any agent did.
+   argument is unchanged: those bytes existed before any agent did. (Measured: 3.2 s to
+   snapshot 338 MB, 504 ms to boot a sealed phase from it.)
 4. **No credential shares a machine with a stranger's code.** The loop, and the model key
    it holds, run in a worker that is ours — ADR-0011's "outside" is now a machine in `iad`
    rather than the host that owns a Docker socket — and every sandbox is `deny-all`, so
