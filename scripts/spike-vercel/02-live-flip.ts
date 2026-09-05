@@ -8,8 +8,8 @@ import { create, sh, FAST_PROBES, PROBES, LOOPBACK_SERVER, LOOPBACK_PROBE, seale
 
 const sandbox = await create({ networkPolicy: 'allow-all' });
 try {
-  const before = await sh(sandbox, PROBES.dns, { timeoutMs: 30_000 });
-  verdict('2.before', before.code === 0 && before.out.startsWith('RESOLVED'), `allow-all resolves: ${before.out}`);
+  const before = await sh(sandbox, PROBES.udp, { timeoutMs: 30_000 });
+  verdict('2.before', before.code === 0 && before.out.startsWith('UDP_ANSWERED'), `allow-all reaches 1.1.1.1 over UDP: ${before.out}`);
   await sandbox.runCommand({ cmd: 'sh', args: ['-c', LOOPBACK_SERVER], detached: true });
   await new Promise((r) => setTimeout(r, 1500));
 
@@ -23,10 +23,12 @@ try {
   const deadline = flipped + 30_000;
   while (performance.now() < deadline && upper === null) {
     const start = performance.now();
-    const dns = await sh(sandbox, FAST_PROBES.dns, { timeoutMs: 10_000 });
+    // Data-exchanging probes with one-second timeouts: UDP DNS straight to 1.1.1.1, and
+    // DNS over TCP that has to be ANSWERED, not merely connected.
+    const udp = await sh(sandbox, FAST_PROBES.udp, { timeoutMs: 10_000 });
     const tcp = await sh(sandbox, FAST_PROBES.tcp, { timeoutMs: 10_000 });
-    last = `${dns.out} / ${tcp.out}`;
-    if (sealedFailure(dns) && sealedFailure(tcp)) {
+    last = `${udp.out} / ${tcp.out}`;
+    if (sealedFailure(udp) && sealedFailure(tcp)) {
       lower = start - flipped;
       upper = performance.now() - flipped;
     } else {

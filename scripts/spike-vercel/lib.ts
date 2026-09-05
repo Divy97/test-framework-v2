@@ -97,29 +97,43 @@ export const prepare = async (sandbox: Sandbox) => {
 
 /** True only when a probe failed the way a sealed sandbox fails — not because node crashed. */
 export const sealedFailure = (probe: { code: number; out: string }) =>
-  probe.code !== 0 && /^(DNS_FAIL|TCP_FAIL|TIMEOUT|HTTP_FAIL)/.test(probe.out);
+  probe.code !== 0 && /^(DNS_FAIL|UDP_TIMEOUT|UDP_FAIL|TCP_FAIL|TIMEOUT|TCP_CONNECTED_NO_DATA|TCP_CONNECTED_THEN_|HTTP_FAIL|TLS_FAIL|TLS_TIMEOUT)/.test(probe.out);
 
 /**
  * The three egress probes, in node so they work on any image with a node binary. Each
  * prints one word and exits 0 only if the network was REACHED — so "all non-zero" is
  * the sealed answer, and the word says how it failed.
  */
-/**
- * Fast-failing variants for polling a flip: a resolver with one try and a one-second
- * timeout, a TCP connect that gives up in a second. Under a policy that DROPS rather than
- * rejects, the ordinary probes wait out glibc's resolver and a four-second socket timeout,
- * and a poll that stamps after them would measure the probes, not the seal.
- */
-export const FAST_PROBES = {
-  dns: `node -e "const r=new (require('dns').promises.Resolver)({timeout:1000,tries:1});r.setServers(['1.1.1.1']);r.resolve4('registry.npmjs.org').then(a=>{console.log('RESOLVED',a[0]);process.exit(0)},e=>{console.log('DNS_FAIL',e.code);process.exit(1)})"`,
-  tcp: `node -e "const s=require('net').connect(53,'1.1.1.1');s.setTimeout(1000,()=>{console.log('TIMEOUT');process.exit(3)});s.on('connect',()=>{console.log('ROUTED');process.exit(0)});s.on('error',e=>{console.log('TCP_FAIL',e.code);process.exit(1)})"`,
-};
+// A minimal DNS query for `example.com` (A), built in place so nothing here is a hex
+// string somebody has to trust. Shared by the UDP and TCP probes.
+const DNS_QUERY = "const name=Buffer.concat([Buffer.from([7]),Buffer.from('example'),Buffer.from([3]),Buffer.from('com'),Buffer.from([0])]);const q=Buffer.concat([Buffer.from([0x12,0x34,1,0,0,1,0,0,0,0,0,0]),name,Buffer.from([0,1,0,1])]);";
 
-export const PROBES = {
+/**
+ * Probes that EXCHANGE DATA, because a connect that succeeds proves nothing: the first
+ * run of item 1 saw `connect()` to 1.1.1.1:53 complete under `deny-all` while HTTP died
+ * with a socket error — the shape of a proxy that accepts the handshake and then drops
+ * the connection. The question is whether a byte ever reaches the destination, so each
+ * probe here sends something and waits for an answer only the destination could give.
+ * Each prints one word and exits 0 only if the network was REACHED; the word says how it
+ * failed. `${ms}` is the per-probe timeout.
+ */
+export const probes = (ms = 4000) => ({
+  /** The system resolver, whatever the sandbox points it at. */
   dns: `node -e "require('dns').promises.lookup('registry.npmjs.org').then(r=>{console.log('RESOLVED',r.address);process.exit(0)},e=>{console.log('DNS_FAIL',e.code);process.exit(1)})"`,
-  tcp: `node -e "const s=require('net').connect(53,'1.1.1.1');s.setTimeout(4000,()=>{console.log('TIMEOUT');process.exit(3)});s.on('connect',()=>{console.log('ROUTED');process.exit(0)});s.on('error',e=>{console.log('TCP_FAIL',e.code);process.exit(1)})"`,
-  http: `node -e "fetch('http://1.1.1.1/',{signal:AbortSignal.timeout(4000)}).then(r=>{console.log('HTTP',r.status);process.exit(0)},e=>{console.log('HTTP_FAIL',e.cause?.code??e.name);process.exit(1)})"`,
-};
+  /** DNS over UDP straight to 1.1.1.1 — a proxy cannot terminate UDP the way it terminates TCP. */
+  udp: `node -e "${DNS_QUERY}const d=require('dgram').createSocket('udp4');setTimeout(()=>{console.log('UDP_TIMEOUT');process.exit(3)},${ms});d.on('message',m=>{console.log('UDP_ANSWERED',m.length);process.exit(0)});d.on('error',e=>{console.log('UDP_FAIL',e.code);process.exit(1)});d.send(q,53,'1.1.1.1')"`,
+  /** DNS over TCP to 1.1.1.1: connect, SEND the query, and wait for the answer. */
+  tcp: `node -e "${DNS_QUERY}const s=require('net').connect(53,'1.1.1.1');let c=false;s.setTimeout(${ms},()=>{console.log(c?'TCP_CONNECTED_NO_DATA':'TIMEOUT');process.exit(3)});s.on('connect',()=>{c=true;s.write(Buffer.concat([Buffer.from([0,q.length]),q]))});s.on('data',m=>{console.log('TCP_DATA',m.length);process.exit(0)});s.on('error',e=>{console.log(c?'TCP_CONNECTED_THEN_'+e.code:'TCP_FAIL '+e.code);process.exit(1)});s.on('close',()=>{if(c){console.log('TCP_CONNECTED_THEN_CLOSED');process.exit(2)}})"`,
+  /** A TLS handshake to 1.1.1.1:443 with SNI — completes only if the real server answers. */
+  tls: `node -e "const s=require('tls').connect({host:'1.1.1.1',port:443,servername:'one.one.one.one'});s.setTimeout(${ms},()=>{console.log('TLS_TIMEOUT');process.exit(3)});s.on('secureConnect',()=>{console.log('TLS_OK',s.getProtocol());process.exit(0)});s.on('error',e=>{console.log('TLS_FAIL',e.code||e.message);process.exit(1)})"`,
+  http: `node -e "fetch('http://1.1.1.1/',{signal:AbortSignal.timeout(${ms})}).then(r=>{console.log('HTTP',r.status);process.exit(0)},e=>{console.log('HTTP_FAIL',e.cause?.code??e.name);process.exit(1)})"`,
+  /** Connect only — kept as INFORMATION, never a verdict: it says whether a proxy is in the path. */
+  connect: `node -e "const s=require('net').connect(53,'1.1.1.1');s.setTimeout(${ms},()=>{console.log('CONNECT_TIMEOUT');process.exit(3)});s.on('connect',()=>{console.log('CONNECT_ACCEPTED');process.exit(0)});s.on('error',e=>{console.log('CONNECT_REFUSED',e.code);process.exit(1)})"`,
+});
+
+/** The ordinary set (4s) and the fast set for polling a flip (1s). */
+export const PROBES = probes(4000);
+export const FAST_PROBES = probes(1000);
 
 /** A loopback server on 8080 that answers `ok`, left running. */
 export const LOOPBACK_SERVER = `node -e "require('http').createServer((q,r)=>r.end('ok')).listen(8080,'127.0.0.1')"`;

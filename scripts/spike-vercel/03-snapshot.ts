@@ -36,7 +36,7 @@ try {
   // Same filesystem, so a hardlinked copy shares inodes: link count ≥ 2 on a file inside.
   const link = await sh(phase, 'mkdir -p /work/clone && cp -al /opt/env/repo/node_modules /work/clone/node_modules && stat -c %h /work/clone/node_modules/typescript/package.json');
   verdict('3.cp-al', link.code === 0 && Number(link.out) >= 2, `link count ${link.out} (exit ${link.code})`);
-  const sealed = await sh(phase, FAST_PROBES.dns, { timeoutMs: 10_000 });
+  const sealed = await sh(phase, FAST_PROBES.udp, { timeoutMs: 10_000 });
   verdict('3.sealed', sealedFailure(sealed), sealed.out);
 } finally {
   await stopQuietly(phase);
