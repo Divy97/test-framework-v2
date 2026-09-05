@@ -126,7 +126,7 @@ const WORK = '/work';
  */
 const BLOBS = '/blobs';
 /** Matches the `repro` user created in the Dockerfile. */
-const REPRO_UID = 1000;
+export const REPRO_UID = 1000;
 const REPRO_GID = 1000;
 
 /**
@@ -149,7 +149,7 @@ const ENV_IGNORED = `${ENV}/ignored.txt`;
  * They demand opposite things — fold the channel, or ignore it and read stderr —
  * so collapsing them would leave a caller unable to tell evidence from nothing.
  */
-const EXIT = {
+export const EXIT = {
   /** Every phase observed; the stream is complete. */
   complete: 0,
   /** An engine or Runner bug. Nothing on the channel. */
@@ -208,13 +208,17 @@ export type StoreMode = 'mounted' | 'collected';
 
 async function storeWillOutliveThis(path: string, mode: StoreMode): Promise<boolean> {
   try {
-    const here = await stat(path);
+    // `lstat`, and the sentinel has to be a FILE. Under `collected` the sentinel is the
+    // only gate left — the device check cannot apply — so the shapes `guardEvidence`
+    // already anticipates (a symlink where the store should be, a directory wearing the
+    // sentinel's name) matter more here than they did, not less.
+    const here = await lstat(path);
     if (!here.isDirectory()) return false;
     if (mode === 'mounted') {
       const root = await stat('/');
       if (here.dev === root.dev) return false;
     }
-    await stat(`${path}/${SENTINEL}`);
+    if (!(await lstat(`${path}/${SENTINEL}`)).isFile()) return false;
     return true;
   } catch {
     return false;
@@ -802,12 +806,17 @@ async function probeSuite(
  * Present, it is a microVM's — see `src/runner-vm.ts`, which is the only caller that
  * sets either field.
  */
-export type RunJobOptions = {
-  /** Whether the store is mounted from a host, or collected off this machine afterwards. */
-  store?: StoreMode;
-  /** Whose processes the teardown may reap, when this process is not PID 1. */
-  field?: { uid: number };
-};
+export type RunJobOptions =
+  /** Docker's: PID 1 in a container of our own, with a bind-mounted store. */
+  | { store?: 'mounted'; field?: never }
+  /**
+   * A microVM's. `field` is REQUIRED here, and the union is how: with a store this
+   * process does not own outright and no uid to reap, `clearTheField` returns early
+   * (not PID 1) and nothing else runs — so the agent's backgrounded processes would
+   * survive into the base phase and the run would report success anyway. That is
+   * ADR-0010's red-then-green flip, arrived at by an omission the type now refuses.
+   */
+  | { store: 'collected'; field: { uid: number } };
 
 export async function runJob(
   job: Job,
@@ -1090,11 +1099,12 @@ export async function runJob(
     // different commit, and that commit is what got verified. `chmod 0444`
     // cannot stop a file's own owner, and a bind mount does not carry the mode
     // to the host anyway.
-    await clearTheField([], evidence);
-    // And the same teardown for a machine this process is not PID 1 of, where the line
-    // above returns without doing anything. Both are called rather than one chosen,
-    // because which applies is a fact about the machine, not about the caller's intent.
+    // The caller says which machine this is, and only one teardown runs. Calling both
+    // would mean a substrate that happened to start us as PID 1 got the unfiltered
+    // `/proc` sweep — which would SIGSTOP its own agent, the one thing `reapOwnedBy`
+    // exists to avoid.
     if (options.field) await clearTheFieldOwnedBy(options.field.uid, [], evidence);
+    else await clearTheField([], evidence);
     // Recorded as an event, not written to a stream nothing folds. The size
     // ceiling and a failed bundle used to reach only `process.stderr`, which the
     // orchestrator keeps on `PhaseResult.stderr` and never persists — so the
@@ -1186,8 +1196,8 @@ export async function runJob(
       // scrubbing reaches.
       onPhaseBoundary: async () => {
         const extra = [phases.env.TMPDIR, phases.env.HOME];
-        await clearTheField(extra, evidence);
         if (options.field) await clearTheFieldOwnedBy(options.field.uid, extra, evidence);
+        else await clearTheField(extra, evidence);
       },
       ...(job.only === undefined ? {} : { only: job.only }),
       ...(job.flakeRuns === undefined ? {} : { flakeRuns: job.flakeRuns }),

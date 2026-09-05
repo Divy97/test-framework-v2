@@ -28,12 +28,11 @@
 import { closeSync, openSync, writeSync } from 'node:fs';
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { isWorkerReply, runJob, type Job } from './runner.js';
+import { EXIT, isWorkerReply, REPRO_UID, runJob, type Job } from './runner.js';
+import { ObservationFailed } from './verify.js';
 
 const WORK = '/work';
 const BLOBS = '/blobs';
-/** Matches the `repro` user in both images, and the uid the phases drop to. */
-const REPRO_UID = 1000;
 
 /** How often the spool is re-read when it is empty. */
 const POLL_MS = 50;
@@ -91,19 +90,42 @@ export const flag = (argv: string[], name: string, fallback: string): string => 
   const inline = argv.find((arg) => arg.startsWith(`--${name}=`));
   if (inline) return inline.slice(name.length + 3);
   const at = argv.indexOf(`--${name}`);
-  return at !== -1 && argv[at + 1] !== undefined ? argv[at + 1]! : fallback;
+  const next = at === -1 ? undefined : argv[at + 1];
+  // `--job --spool x` gives `job` no value. Taking `--spool` as a path would read the Job
+  // out of a file nobody wrote and fail somewhere far from the mistake.
+  return next !== undefined && !next.startsWith('--') ? next : fallback;
 };
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   const jobPath = flag(argv, 'job', `${WORK}/job.json`);
   const spool = flag(argv, 'spool', `${WORK}/rpc`);
-  const blobRoot = flag(argv, 'blobs', BLOBS);
-  const workDir = flag(argv, 'work', WORK);
 
-  // The same dead end the container entrypoint takes, and for the same reason: this
-  // process's fd 1 IS the event channel, and a participant that can write to it can forge
-  // events and truncate the one before them (ADR-0006). Being PID 1 was never what made
-  // that work — holding a private handle and leaving fd 1 pointing at nothing is.
+  // THE PRECONDITION, enforced rather than assumed (10a item 10, ADR-0006).
+  //
+  // The spike found that on the managed image uid 1000 can `readlink` a root process's
+  // `/proc/<pid>/fd/1` — which is a reminder of where the protection actually comes from.
+  // The container entrypoint's fd/1 dead end closes ONE path to the channel; what keeps
+  // the repro away from the private handle beside it is the kernel refusing one user the
+  // fds of another. If the Runner runs as the same uid the repro drops to, that refusal
+  // is gone: the agent can enumerate `/proc`, find this process, open the channel and
+  // write forged events onto it.
+  //
+  // Vercel's managed images run as uid 1000 by default — the very uid `runAs` drops to —
+  // so this is not hypothetical, and it is the sort of thing that would hold in a test
+  // and quietly not hold in production. The worker starts this with `sudo` (ADR-0021);
+  // refusing here is what makes forgetting to a loud failure rather than a silent one.
+  const me = process.getuid?.();
+  if (me === REPRO_UID) {
+    throw new ObservationFailed(
+      `the Runner is running as uid ${REPRO_UID}, the same user the repro drops to; ` +
+        'nothing would separate the agent from the event channel — start it as another user (sudo)',
+    );
+  }
+
+  // The same dead end the container entrypoint takes: this process's fd 1 IS the event
+  // channel, and a participant that can write to it can forge events and truncate the one
+  // before them (ADR-0006). Being PID 1 was never what made that work — holding a private
+  // handle, and being a different user, is.
   const channel = openSync('/proc/self/fd/1', 'w');
   closeSync(1);
   openSync('/dev/null', 'w');
@@ -125,7 +147,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       return;
     }
     if (isWorkerReply(parsed) && 'result' in parsed) {
-      void writeFile(join(out, `${parsed.result.id}.json`), line).catch(() => {
+      // The id becomes a filename, and it is whatever the host called the tool call —
+      // `ToolHost` echoes it back verbatim. Confined to one path segment rather than
+      // trusted: `../` in an id would put a reply outside the spool.
+      const id = parsed.result.id.replace(/[^A-Za-z0-9_-]/g, '') || 'reply';
+      void writeFile(join(out, `${id}.json`), line).catch(() => {
         // The channel already carried it. A mirror that cannot be written is a recovery
         // path that will not be there, never a reason to fail the phase.
       });
@@ -133,7 +159,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   };
 
   const job = JSON.parse(await readFile(jobPath, 'utf8')) as Job;
-  return await runJob(job, workDir, blobRoot, emit, spoolRequests(join(spool, 'in')), {
+  return await runJob(job, WORK, BLOBS, emit, spoolRequests(join(spool, 'in')), {
     store: 'collected',
     field: { uid: REPRO_UID },
   });
@@ -148,7 +174,13 @@ if (process.argv[1]?.endsWith('runner-vm.ts') || process.argv[1]?.endsWith('runn
       process.exitCode = code;
     })
     .catch((error: unknown) => {
-      process.stderr.write(`RunnerError: ${String(error)}\n`);
-      process.exitCode = 1;
+      // The same split the container entrypoint makes, and for the reason `EXIT`'s own
+      // comment gives: `partial` and `silent` demand opposite things of a caller — fold
+      // the channel, or ignore it and read stderr — so collapsing them leaves the
+      // executor unable to tell evidence from nothing. The store refusal above is an
+      // `ObservationFailed`, and would otherwise reach 10d as an indistinguishable 1.
+      const failed = error instanceof ObservationFailed;
+      process.stderr.write(`${failed ? 'ObservationFailed' : 'RunnerError'}: ${String(error)}\n`);
+      process.exitCode = failed ? EXIT.silent : EXIT.bug;
     });
 }
