@@ -142,3 +142,36 @@ is a different claim, and priced separately.)
   plane.
 - Cost is a projection like everything else: active-CPU seconds and GB-hours per sandbox
   are recorded per phase and folded into what a run cost (M6).
+
+## Amendment (10d): what the executor actually depends on
+
+The executor is written against a seven-verb interface (`src/vercel-client.ts`), not
+against `@vercel/sandbox` — which appears in exactly one function, behind a dynamic
+import, so the engine still loads on a machine that has never installed it. Three
+consequences of that shape are decisions rather than style:
+
+- **`@vercel/sandbox` is the only new runtime dependency, and it is optional at import
+  time.** A Docker-only runner never resolves it. The whole test suite for the Vercel path
+  runs with no token, no network, and no SDK.
+- **Nothing reads the SDK's `networkPolicy` or `status`.** The spike found both are the
+  value this process last sent rather than the value the platform holds — after a live
+  flip the field lagged, and after a session ended `status` still said `running`. A guard
+  written against either would be a guard against our own cache. So the interface has no
+  method to read one, and the seal is established by running two data-exchanging probes
+  inside the sandbox and recording what they found (`SANDBOX_SEALED.probe`).
+- **A probe that still reaches the network refuses the phase.** Not reports it: the claim
+  this substrate was chosen for is that the agent works with no route out, and running one
+  that still has a route and calling the result evidence is the same class of mistake as
+  letting the agent write its own facts (ADR-0006).
+
+Two costs this adds, named rather than left to be discovered:
+
+- **The transport is not resumable.** Re-attaching to a detached command's output replays
+  a window and then closes (spike item 5), so a stream dropped mid-phase cannot be picked
+  up where it left off. `runner-vm.ts` mirrors every reply to `<spool>/out/<id>.json` for
+  that reason; the events themselves are durable in the plane once appended.
+- **A phase now has two ceilings.** Ours, enforced by the process driving it, and the
+  platform's session timeout, enforced with that process dead. `PhaseResult.ceiling` says
+  which fired, and `VERIFICATION_ABORTED{cause:'ceiling'}` puts it in the log — where the
+  fold disqualifies the attempt, because a comparison cut short mid-observation is half a
+  comparison and must not be credited with a reproduction.

@@ -48,6 +48,19 @@ export type PhaseResult = {
   /** Host directory the agent container left its commits in, when it had one. */
   handover?: string;
   /**
+   * Which wall clock ended this phase, when one did (M10).
+   *
+   * `wall` is ours — `containerTimeoutMs`, enforced by the process driving the phase.
+   * `session` is the substrate's, enforced with that process dead, which is the failure
+   * mode a microVM adds: a worker that dies leaves a machine the platform ends on its own
+   * schedule. Absent means the phase finished on its own terms.
+   *
+   * Beside the `ceiling` abort rather than instead of it: the event is what a reader of
+   * the log sees, and this is what the orchestrator branches on without re-reading its
+   * own events.
+   */
+  ceiling?: 'wall' | 'session';
+  /**
    * What the container said on stderr, bounded.
    *
    * `EXIT.silent` is documented as "ignore the channel and read stderr", and
@@ -143,7 +156,18 @@ export interface Executor {
     source: string,
     base: string,
     recipe: Recipe,
-  ): Promise<{ snapshot: EnvSnapshot } | { failed: string }>;
+  ): Promise<
+    | {
+        snapshot: EnvSnapshot;
+        /**
+         * What the replay returned, for `ENV_BUILT` (M10). Optional because it is a
+         * report and not the product: an executor that cannot recover the step list
+         * still built a usable world, and a snapshot is worth more than its provenance.
+         */
+        steps?: { step: string; exit_code: number }[];
+      }
+    | { failed: string }
+  >;
   /** Forget a snapshot. Never at the cost of the run: callers `.catch` it. */
   dropSnapshot(snapshot: EnvSnapshot): Promise<void>;
 }

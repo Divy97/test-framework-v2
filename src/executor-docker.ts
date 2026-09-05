@@ -93,7 +93,7 @@ async function buildSnapshot(
   source: string,
   base: string,
   recipe: Recipe,
-): Promise<{ snapshot: EnvSnapshot } | { failed: string }> {
+): Promise<{ snapshot: EnvSnapshot; steps?: { step: string; exit_code: number }[] } | { failed: string }> {
   // Sanitised the same way the handover ref is: a run id reaches this as a docker
   // name and a tag, and both have a character set.
   const id = plan.runId.replace(/[^A-Za-z0-9_-]/g, '') || 'run';
@@ -195,7 +195,13 @@ async function buildSnapshot(
   try {
     if (failed !== null) return { failed };
     await execFile('docker', ['commit', container, image]);
-    return { snapshot: { ref: image } };
+    // The step list travels with the reference, so `ENV_BUILT` can say what the replay
+    // did rather than only that it worked. `output` is dropped: it is the recipe's own
+    // stdout and belongs in a blob, not in an event a projection reads.
+    return {
+      snapshot: { ref: image },
+      steps: (env?.steps ?? []).map(({ step, exit_code }) => ({ step, exit_code })),
+    };
   } catch (error) {
     return { failed: `could not commit the environment: ${String(error)}` };
   } finally {

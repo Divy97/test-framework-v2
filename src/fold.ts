@@ -139,6 +139,32 @@ export type RunState = {
    */
   shownAttempts: number[];
   /**
+   * The world the phases were created from, once one was built (M10, ADR-0021).
+   *
+   * Separate from `env`, which is the agent's sandbox replaying the recipe for its own
+   * benefit. This is the artifact every container that JUDGES was made from, and it is
+   * recorded because after 7e the phases stopped running from the image the plan names
+   * and nothing in the log said what they ran from instead.
+   */
+  // Optional rather than required, so the hand-built `RunState` fixtures two test files
+  // carry do not have to gain a field that says nothing about what they are testing. A
+  // real fold always sets it; absent and `null` mean the same thing to every reader.
+  environment?: { executor: string; imageRef: string; snapshot: string } | null;
+  /**
+   * The agent's sandbox was sealed before the agent said anything (M10, ADR-0017).
+   *
+   * An ORDERING, derived here rather than believed: the seq of `SANDBOX_SEALED` against
+   * the seq of the first `AGENT_MESSAGE`. A seal recorded after the agent's first turn
+   * proves nothing about the turn, and a seal whose probe reached the network is not a
+   * seal at all — both fold to `false`.
+   *
+   * Honestly `false` on Docker, where the agent sandbox keeps its network by design
+   * (ADR-0013's asymmetry) and emits no seal. This is what ADR-0017's injection guard
+   * reads, which is why it says "was", not "is": it is a claim about a moment in a log,
+   * and the guard that acts on it runs in the worker against a live observation.
+   */
+  sealedBeforeAgent?: boolean;
+  /**
    * The environment the run was judged in, once a healthcheck answered.
    *
    * Null means one of two very different things and the difference is in `aborts`:
@@ -245,6 +271,8 @@ const initialState = (runId: string): RunState => ({
   reproducedAttempt: null,
   shownOnBase: false,
   shownAttempts: [],
+  environment: null,
+  sealedBeforeAgent: false,
   env: null,
   fixDiff: null,
   completedAttempts: [],
@@ -371,6 +399,29 @@ export function apply(state: RunState, event: RunEvent): RunState {
     }
     case 'SANDBOX_CREATED':
       return { ...next, status: 'sandbox_ready' };
+    case 'ENV_BUILT':
+      // Recorded, nothing recomputed. It says what the phases ran in; it says nothing
+      // about what they found.
+      return {
+        ...next,
+        environment: {
+          executor: event.payload.executor,
+          imageRef: event.payload.image_ref,
+          snapshot: event.payload.snapshot,
+        },
+      };
+    case 'SANDBOX_SEALED':
+      // The ORDER is the fact, so it is decided here and not by a consumer. `transcript`
+      // holds the agent's messages and is empty until the first one — which is exactly
+      // the question: did this arrive before the agent had said anything?
+      //
+      // A probe that reached the network is not a seal, whenever it arrived. Reading the
+      // policy field instead would be reading what we asked for rather than what happened.
+      return {
+        ...next,
+        sealedBeforeAgent:
+          state.transcript.length === 0 && !event.payload.probe.dns && !event.payload.probe.route,
+      };
     case 'ATTEMPT_STARTED':
       return { ...next, status: 'attempting', currentAttempt: event.payload.n };
     case 'ENV_READY': {
@@ -657,7 +708,13 @@ function demonstrated(
   // have demonstrated anything.
   const truncated = new Set(
     aborts
-      .filter((a) => a.phase === 'base' || (a.phase === 'setup' && a.cause === 'environment'))
+      // `ceiling` beside `environment` (M10): a phase this engine cut short mid-observation
+      // is an attempt whose world stopped existing part-way, and crediting a reproduction
+      // to it would credit a comparison one half of which never finished. Same class,
+      // same disqualification, different cause because the operator's fix is different.
+      .filter(
+        (a) => a.phase === 'base' || (a.phase === 'setup' && (a.cause === 'environment' || a.cause === 'ceiling')),
+      )
       .map((a) => a.attempt),
   );
   const registered = new Map(registrations.map((r) => [r.attempt, r]));
