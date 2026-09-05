@@ -84,3 +84,52 @@ itself needs trusting, rather than removing the target.
   building one now would be scope this ADR was not asked to open.
 
 **Revisit when** the agent-sandbox snapshot extension has a milestone of its own.
+
+---
+
+## Amendment (M10, 10k): storage ships; injection is still blocked
+
+The route this ADR said had to close, closes. [ADR-0021](0021-the-sandbox-is-a-microvm-we-do-not-operate.md)
+replaces the Docker bridge with a Firecracker microVM whose egress policy is
+`deny-all` — enforced outside the guest, flipped on a running sandbox after `install`
+and before the agent's first turn, and observed by a probe from the worker rather than
+believed from the SDK. That is the "snapshot extension" this ADR was waiting for, in a
+different shape: the sandbox does not lose its network at snapshot time, it loses it at
+a moment we choose and then check.
+
+So the block moves. **Storage ships now; injection does not.**
+
+What this amendment decides:
+
+- **Values are stored encrypted, keyed to the row they belong to.** AES-256-GCM under
+  `PLANE_SECRETS_KEY`, additional data `repo\0name` for a repository secret and
+  `user\0<github id>` for a person's model key. The AAD is the part worth arguing for:
+  without it a ciphertext is portable, and anyone who can WRITE a row — a restored
+  backup, a bad migration, an injection — can move a key from a repository they own onto
+  one they do not and have the worker inject it there. Bound, that ciphertext decrypts
+  nowhere else, and the failure is an exception rather than a wrong plaintext.
+- **No route returns a value.** `GET` answers with names. There is no verb that reads one
+  back, and `src/secrets.ts` exports exactly one reader per kind, reachable only from a
+  runner route that authorizes against the `jobs` row.
+- **A runner is handed what its run is entitled to, never what it names.** The repository
+  comes from `jobs`, so a paired runner holding one run cannot ask for another's
+  credentials. The same rule the token route already follows.
+- **Injection stays behind `ENGINE_SECRETS_ENABLED`, unset everywhere.** The runner
+  `/secrets` route answers 501 while it is unset — not an empty object, because a worker
+  has to be able to tell "this repository has no secrets" from "this deployment does not
+  hand them out". The flag flips in 10l, on the strength of a test that fakes a sandbox
+  whose policy is `allow` and asserts nothing is injected and the run ends `errored`.
+- **The model key is not gated by any of this.** It is what pays for the run, it is held
+  in the worker, and it never enters a sandbox at all. Storing it is what the button
+  needs to work, and it is the reason `PLANE_SECRETS_KEY` is required at boot on every
+  plane rather than only on one that injects.
+
+What this amendment does NOT decide, and says so rather than implying otherwise:
+
+- **Rotation.** Every row records `key_id` so a second key is possible. A key accepted for
+  reads while the first is retired, a re-seal pass, an operator procedure — none of that
+  exists, and shipping half of it would be a mechanism that reads as rotation and is not.
+- **What a secret under `deny-all` is actually good for.** It satisfies startup
+  validation and a suite that reads `process.env`. It does not make a live third-party
+  call, because there is no route out — that is the point. The UI has to say so, or
+  somebody stores a real `STRIPE_SECRET_KEY` and files a bug about a timeout.

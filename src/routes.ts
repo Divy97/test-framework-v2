@@ -18,7 +18,18 @@ import { fold } from './fold.js';
 import { intake, listOpenIssues, readIssue, type Fetcher } from './github.js';
 import { listInstallations, loadInstallation } from './installations.js';
 import { listRuns, readRunRow, readUsage } from './readmodel.js';
-import { loadStored, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
+import { ENV_NAME, loadStored, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
+import { PROVIDERS } from './loop.js';
+import {
+  deleteModelKey,
+  deleteRepoSecret,
+  hasModelKey,
+  listRepoSecretNames,
+  MAX_SECRET_CHARS,
+  putModelKey,
+  putRepoSecret,
+  secretsEnabled,
+} from './secrets.js';
 import { readRun, type Db } from './store.js';
 import { sameOrigin, type Route } from './sse.js';
 import type { Session } from './auth.js';
@@ -170,24 +181,32 @@ export function dashboardRoutes(options: {
       : { status: 302, type: 'text/plain', body: 'sign in\n', headers: { location: '/auth/github' } };
 
   return async ({ method, path, query, body, headers }) => {
-    if (method !== 'GET' && method !== 'POST') return null;
+    if (!['GET', 'POST', 'PUT', 'DELETE'].includes(method)) return null;
     // Before any routing, so a route added later cannot forget it. Every GET here is a
     // projection that can be rebuilt from the log; the writes are what need a human.
-    if (method === 'POST' && !sameOrigin(headers)) {
+    if (method !== 'GET' && !sameOrigin(headers)) {
       return {
         status: 403,
         type: 'text/plain',
         body:
           'refused: this looks like a cross-site request.\n\n' +
-          'Approving a recipe stores commands this engine executes verbatim, so it is only\n' +
-          'accepted from its own page (ADR-0013: the approval is the control).\n',
+          'Approving a recipe stores commands this engine executes verbatim, and storing a\n' +
+          'secret hands this service a credential — so a write is only accepted from its own\n' +
+          'page (ADR-0013: the approval is the control).\n',
       };
     }
     // A JSON write has to say it is one. `sameOrigin` above is the control; this makes
     // sure a `/api/` route never parses a body that arrived as a form, whatever sent it —
     // the one request shape a browser can send with no preflight is exactly the one no
     // JSON client sends. 415, because the body is the wrong kind rather than forbidden.
-    if (method === 'POST' && path.startsWith('/api/') && !contentType(headers).startsWith('application/json')) {
+    //
+    // `DELETE` is absent because it carries no body. It is still covered by the check
+    // above, and a cross-site `DELETE` cannot leave a browser without a preflight at all.
+    if (
+      (method === 'POST' || method === 'PUT') &&
+      path.startsWith('/api/') &&
+      !contentType(headers).startsWith('application/json')
+    ) {
       return json({ error: 'send application/json' }, 415);
     }
 
@@ -302,6 +321,99 @@ export function dashboardRoutes(options: {
       };
     }
 
+    // ── SECRETS (M10, ADR-0017) ──────────────────────────────────────────────────
+    //
+    // Three routes and none of them returns a value. `GET` answers with names, `PUT`
+    // takes one in, `DELETE` removes one; there is no fourth verb, and `src/secrets.ts`
+    // exports no function these could call to read one back even by mistake.
+    //
+    // Storing is allowed while injection is not (`ENGINE_SECRETS_ENABLED`), and that is
+    // deliberate rather than an oversight: the injection guard is 10l's and it has to be
+    // executed against a real sealed sandbox before any credential goes near a run. What
+    // the pages must therefore say — and do — is that a value stored today is held and
+    // not used. The `enabled` flag below is what they say it from.
+    const secrets = /^\/api\/repos\/(.+?)\/secrets(?:\/([^/]+))?$/.exec(path);
+    if (secrets && (method === 'GET' || method === 'PUT' || method === 'DELETE')) {
+      const repo = decodeURIComponent(secrets[1]!);
+      const name = secrets[2] === undefined ? null : decodeURIComponent(secrets[2]);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      // The same 404 for "not yours" and "no such repository", for the same reason the
+      // issue picker gives: a stranger probing names learns nothing.
+      if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
+      if (!(await loadInstallation(client, repo))) return json({ error: 'not connected' }, 404);
+
+      if (method === 'GET') {
+        if (name !== null) return json({ error: 'a stored value is never returned' }, 405);
+        return json({ names: await listRepoSecretNames(client, repo), enabled: secretsEnabled() });
+      }
+      if (name === null) return json({ error: 'name the variable: /secrets/NAME' }, 404);
+      // The same name rule a recipe's `required` obeys, because these two lists are read
+      // against each other: a secret stored under a name no recipe can ask for is a value
+      // this service holds and can never use.
+      if (!ENV_NAME.test(name)) return json({ error: `\`${name}\` is not an environment variable name` }, 400);
+
+      if (method === 'DELETE') {
+        return (await deleteRepoSecret(client, repo, name))
+          ? json({ deleted: name })
+          : json({ error: 'no such secret' }, 404);
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await body());
+      } catch {
+        return json({ error: 'the body is not JSON' }, 400);
+      }
+      const value = (parsed as { value?: unknown } | null)?.value;
+      // An empty value is refused rather than stored. `missingRequired` treats `''` as
+      // missing, so storing one would produce a name that is listed as present and still
+      // blocks the run — the worst of both answers.
+      if (typeof value !== 'string' || value === '') {
+        return json({ error: 'send { "value": "…" } with a non-empty value' }, 400);
+      }
+      if (value.length > MAX_SECRET_CHARS) return json({ error: 'that value is too long to be a credential' }, 413);
+      await putRepoSecret(client, repo, name, value, who === null ? 'the local operator' : who.session.login);
+      // 200 with the name, never the value — an echo here is the one place a credential
+      // could slip back out through a route that was written not to return one.
+      return json({ stored: name, enabled: secretsEnabled() });
+    }
+
+    // ── THE MODEL KEY (M10) ──────────────────────────────────────────────────────
+    //
+    // One per person. A run started from the button spends the key of whoever pressed it,
+    // which is why this is on `/api/settings` and not under a repository: the key follows
+    // the human, and two people connected to the same repository pay separately.
+    if (path === '/api/settings/model-key' && (method === 'GET' || method === 'PUT' || method === 'DELETE')) {
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      // A deployment with no login has no "whoever pressed it" to bill, and `serve.ts`
+      // takes its key from the operator's own environment. Saying so is better than
+      // storing a row under a user nobody can sign in as.
+      if (who === null) return json({ error: 'this surface has no accounts; set a key in the environment' }, 501);
+      const githubId = who.session.githubId;
+
+      if (method === 'GET') return json(await hasModelKey(client, githubId));
+      if (method === 'DELETE') {
+        return (await deleteModelKey(client, githubId)) ? json({ deleted: true }) : json({ error: 'no key' }, 404);
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await body());
+      } catch {
+        return json({ error: 'the body is not JSON' }, 400);
+      }
+      const asked = (parsed ?? {}) as { provider?: unknown; key?: unknown };
+      const provider = typeof asked.provider === 'string' ? asked.provider : 'openrouter';
+      const key = asked.key;
+      if (!(PROVIDERS as string[]).includes(provider)) {
+        return json({ error: `provider must be one of ${PROVIDERS.join(', ')}` }, 400);
+      }
+      if (typeof key !== 'string' || key === '') return json({ error: 'send { "key": "…" }' }, 400);
+      if (key.length > MAX_SECRET_CHARS) return json({ error: 'that value is too long to be a key' }, 413);
+      await putModelKey(client, githubId, provider, key);
+      return json({ stored: true, provider });
+    }
+
     // THE ISSUE PICKER (M10). Authorized like every other page — may you see this
     // repository — and then GitHub is asked, on every request, what is open there.
     const issues = /^\/api\/repos\/(.+)\/issues$/.exec(path);
@@ -363,6 +475,16 @@ export function dashboardRoutes(options: {
       // a finding about the bug.
       if ((await loadRecipe(client, repo)) === null) {
         return json({ error: 'not onboarded', onboard: `/repos/${encodeURIComponent(repo)}/onboard` }, 409);
+      }
+      // WHO PAYS (M10). A run spends the key of whoever pressed Start, so a person
+      // without one gets an answer here rather than a job that a worker claims, cannot
+      // drive, and ends `errored` — a failure about our configuration wearing the shape
+      // of a finding about their bug. 412: the request is fine, a precondition is not.
+      //
+      // Only where there are accounts. The local surface has one operator and takes its
+      // key from the environment, which is what every run before the button did.
+      if (who !== null && (await hasModelKey(client, who.session.githubId)) === null) {
+        return json({ error: 'no model key', settings: '/settings' }, 412);
       }
       const open = await openJobFor(client, repo, issueNumber);
       if (open !== null) return json({ error: 'a run for this issue is already under way', run_id: open }, 409);
@@ -493,12 +615,18 @@ export function dashboardRoutes(options: {
         // `loadDraft` even when a recipe already exists: `onboardPage` is the one that
         // decides `current` wins, and computing that here would be a second copy of a
         // rule that already lives in one place.
-        const [recipe, draft, stored] = await Promise.all([
+        const [recipe, draft, stored, names] = await Promise.all([
           loadRecipe(client, repo),
           loadDraft(client, repo),
           loadStored(client, repo),
+          listRepoSecretNames(client, repo),
         ]);
-        return html(onboardPage(repo, recipe, draft?.draft, undefined, stored, chrome(who)));
+        return html(
+          onboardPage(repo, recipe, draft?.draft, undefined, stored, chrome(who), {
+            names,
+            enabled: secretsEnabled(),
+          }),
+        );
       }
 
       // THE ONE WRITE. A human is approving commands the engine will execute verbatim in

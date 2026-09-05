@@ -83,10 +83,17 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
 | **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | |
 | **10j** | recipe `env` and `required`; `blocked` | | in review; #70 |
-| **10k** | the model key and secrets: stored, listed by name, never read back | | |
+| **10k** | the model key and secrets: stored, listed by name, never read back | 10j | in review |
 | **10l** | secrets injected only under `deny-all`, with the guard executed | 10d, 10k | |
 | **10m** | orientation, plan, critic — off by default, proven inert, then measured | | |
 | **10n** | every line of the record that this milestone made false | all | |
+
+10k ships the storage, the JSON API and the runner routes, and a **read-only** list of
+stored names on the onboarding page. There is no form: a `PUT` with a JSON body is not
+something an HTML form can send, and writing the JavaScript for one into `src/web.ts` — a
+file 10i deletes — would be work done twice. The form arrives with the Next.js UI, which
+sends JSON natively. Until then a value is stored with one `curl`, and the API is the
+tested surface.
 
 Rough order: week 1 — 10a and 10g; weeks 2–3 — 10b, 10c, 10j, 10k; weeks 4–5 — 10d, 10i;
 week 6 — 10e, 10h; week 7 — 10f, 10l, 10m; week 8 — 10n and real runs on repositories the

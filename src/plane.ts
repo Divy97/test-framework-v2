@@ -251,6 +251,34 @@ export async function claimJob(
   }
 }
 
+/**
+ * What a job says about itself: its repository, and who pressed Start (M10).
+ *
+ * Read from `jobs` rather than taken from the caller, and that is the whole point of it
+ * existing. The two routes that hand values to a worker — the repository's secrets and
+ * the requester's model key — must scope them to THIS run, not to a repository or a user
+ * the runner names. A runner authorized for a run gets exactly what that run's row says.
+ *
+ * `requestedBy` is null for a job that arrived by webhook, which no longer starts runs on
+ * the plane. Absence is "before the button existed", not "unknown".
+ */
+export async function jobFacts(
+  client: Db,
+  runId: string,
+): Promise<{ repo: string; installationId: number; requestedBy: number | null } | null> {
+  const { rows } = await client.query(
+    'select repo, installation_id, requested_by from jobs where run_id = $1',
+    [runId],
+  );
+  const row = rows[0] as { repo: string; installation_id: string; requested_by: string | null } | undefined;
+  if (!row) return null;
+  return {
+    repo: row.repo,
+    installationId: Number(row.installation_id),
+    requestedBy: row.requested_by === null ? null : Number(row.requested_by),
+  };
+}
+
 /** The job is over, however it ended. Bookkeeping only — never authorization. */
 export async function finishJob(client: Db, runId: string): Promise<void> {
   await client.query('update jobs set finished_at = now() where run_id = $1', [runId]);

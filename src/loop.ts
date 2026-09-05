@@ -32,7 +32,7 @@ export const MODEL = 'claude-opus-5';
 
 /** The two wire shapes this engine can drive an agent over. */
 export type Provider = 'anthropic' | 'openrouter';
-const PROVIDERS: Provider[] = ['anthropic', 'openrouter'];
+export const PROVIDERS: Provider[] = ['anthropic', 'openrouter'];
 
 /**
  * Which API to talk to: the caller's, then `ENGINE_PROVIDER`, then OpenRouter.

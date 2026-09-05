@@ -19,10 +19,12 @@ import {
   appendFromRunner,
   claimJob,
   finishJob,
+  jobFacts,
   sawRunner,
   verifyRunner,
   type Runner,
 } from './plane.js';
+import { modelKey, repoSecrets, secretsEnabled } from './secrets.js';
 import type { Route } from './sse.js';
 
 /** The longest a runner may hold a poll open. Long enough to be cheap, short enough to notice a deploy. */
@@ -215,6 +217,60 @@ export function runnerRoutes(options: {
       // belongs to its installation by construction, so there is nothing to pass in.
       const token = await options.mintToken(runner.installationId);
       return json({ token });
+    }
+
+    // ── WHAT A RUN IS PAID FOR AND BOOTED WITH (M10, ADR-0017) ──────────────────
+    //
+    // Two routes, authorized through the same door as an append — a runner gets what the
+    // run it holds is entitled to, and nothing it can name. That is not a formality: a
+    // route that took a `repo` parameter would let any paired runner ask for any
+    // repository's credentials, and every runner on this plane belongs to somebody else.
+    //
+    // Values leave here. That is the only place in this service where they do, and both
+    // ends of it are constrained: the caller has to hold a run, and the plane refuses
+    // `/secrets` outright until this deployment has enabled injection, because 10l is
+    // what proves the sandbox they land in has no route out.
+    const wants = /^\/runner\/runs\/([^/]+)\/(secrets|model-key)$/.exec(path);
+    if (method === 'POST' && wants) {
+      const runId = decodeURIComponent(wants[1]!);
+      const authorized = await appendFromRunner(client, runner, runId, []);
+      if ('refused' in authorized) {
+        return json({ error: authorized.refused }, authorized.refused.includes('no such run') ? 404 : 403);
+      }
+      const facts = await jobFacts(client, runId);
+      if (!facts) return json({ error: 'no such run' }, 404);
+
+      if (wants[2] === 'secrets') {
+        // 501 rather than an empty object, and the difference matters to the worker: it
+        // has to be able to tell "this repository has no secrets" from "this deployment
+        // does not hand them out yet". An empty object would read as the first and start
+        // a run that quietly lacks what its recipe requires.
+        if (!secretsEnabled()) {
+          return json({ error: 'this deployment does not inject stored secrets yet (ADR-0017)' }, 501);
+        }
+        try {
+          return json({ secrets: await repoSecrets(client, facts.repo) });
+        } catch (error) {
+          // A row that will not open is a row that was moved, corrupted, or sealed under
+          // a key this deployment no longer has. It is ours, not the runner's, and it
+          // must not arrive as a bare cipher error: the worker's only useful response is
+          // to stop, and the operator's is to look at `key_id`.
+          return json(
+            {
+              error:
+                'a stored secret for this repository could not be decrypted; ' +
+                'PLANE_SECRETS_KEY may have changed, or the row was written elsewhere',
+              detail: String((error as Error).message ?? error),
+            },
+            500,
+          );
+        }
+      }
+      // The key of whoever pressed Start. A webhook-era job has nobody to bill, so it
+      // gets a null and the worker falls back to its own configuration — which is what
+      // every run did before the button existed.
+      if (facts.requestedBy === null) return json(null);
+      return json(await modelKey(client, facts.requestedBy));
     }
 
     const finished = /^\/runner\/runs\/([^/]+)\/finished$/.exec(path);

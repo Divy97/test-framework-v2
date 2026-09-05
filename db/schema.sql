@@ -253,3 +253,40 @@ create table if not exists forgotten (
   -- bytes and deleting them would break a run nobody asked to forget.
   removed      integer     not null default 0
 );
+
+-- Values a run needs and nobody may read back (M10, ADR-0017).
+--
+-- `bytea`, not `text`, and encrypted before it gets here: `src/secrets.ts` seals with
+-- AES-256-GCM under `PLANE_SECRETS_KEY` and binds each ciphertext to the row it belongs
+-- to, so a value moved between rows fails to open rather than opening somewhere it was
+-- never meant to be. The database therefore holds nothing a `select *` can read, which
+-- is the property a backup, a restored snapshot and a support session all depend on.
+--
+-- `key_id` records which key sealed each row. There is one today, named `k1`. Rotation
+-- is not implemented and this column is what makes implementing it possible without a
+-- migration that has to guess.
+--
+-- No `value` column anywhere, and no route that returns one. What comes back from this
+-- table is names.
+create table if not exists repo_secrets (
+  repo       text        not null,
+  name       text        not null,
+  ciphertext bytea       not null,
+  key_id     text        not null,
+  created_by text        not null,
+  updated_at timestamptz not null default now(),
+  primary key (repo, name)
+);
+
+-- What pays for a person's runs (M10).
+--
+-- One per human, not per repository: the key is the person's, the cost is the person's,
+-- and a run started from the button spends the key of whoever pressed it. Same sealing,
+-- bound to the GitHub user id instead of a repository.
+create table if not exists user_model_keys (
+  github_id  bigint      primary key,
+  provider   text        not null,
+  ciphertext bytea       not null,
+  key_id     text        not null,
+  updated_at timestamptz not null default now()
+);

@@ -76,7 +76,7 @@ const MAX_SERVICES = 8;
 const MAX_ENV_NAMES = 64;
 
 /** The shape an environment variable name has, everywhere this engine reads one. */
-const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+export const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 
 /**
  * Names the engine sets for its own reasons, which a recipe may not take over.
