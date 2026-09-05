@@ -25,16 +25,18 @@
 // gets its own empty store and the host collects from it afterwards. Blobs are
 // content-addressed, so collecting is a copy that cannot collide meaningfully.
 
-import { execFile as execFileCb, spawn } from 'node:child_process';
+import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-import { cp, lstat, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
 import { runAgentLoop, type AgentTranscript, type LoopUsage } from './loop.js';
-import type { Recipe, ReplayOutcome } from './recipe.js';
-import { isWorkerReply, type Job, type SuiteProbe, type WorkerRequest } from './runner.js';
+import type { Recipe } from './recipe.js';
+import type { Job } from './runner.js';
+import { dockerExecutor } from './executor-docker.js';
+import { own, type EnvSnapshot, type Executor, type PhaseResult } from './executor.js';
 import { get, put } from './blobs.js';
 import { redact } from './redact.js';
 import type { ReproSpec } from './verify.js';
@@ -84,32 +86,7 @@ export type FixContext = {
 /** Tail of base's output handed to the fix agent. The failure is at the end. */
 const MAX_OBSERVED_CHARS = 8 * 1024;
 
-/** Output ceiling per container. Matches what the sandbox tests already allow. */
 const execFile = promisify(execFileCb);
-
-const MAX_STREAM_BYTES = 32 * 1024 * 1024;
-/** Tail of a container's diagnostics. The reason is at the end, not the start. */
-const MAX_STDERR_CHARS = 8 * 1024;
-
-/**
- * The wall clock ONE container gets from the host before it is stopped.
- *
- * Every timeout this engine had lived below this line: `verify` bounds each
- * command, the loop bounds the agent, `replayRecipe` bounds a step. All of them
- * are inside a container, so all of them are moot when the container itself never
- * starts — a missing image plus a registry the daemon cannot reach wedges
- * `docker run` before PID 1 exists, and a run in that state waits forever with
- * nothing to show for it. Observed while running milestone 7's own suite.
- *
- * Generous on purpose: an hour is longer than anything legitimate this project
- * runs (the agent loop's own ceiling is 30 minutes and the recipe's steps are 10),
- * because this is the guard against a wedge, not a scheduling policy. A caller who
- * wants a tighter one passes `containerTimeoutMs`.
- */
-const CONTAINER_TIMEOUT_MS = 3_600_000;
-
-/** Unique per container within a process, so a timed-out one can be named and removed. */
-let containers = 0;
 
 export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 'repro' | 'agentPrompt'> & {
   /**
@@ -167,6 +144,14 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   blobRoot: string;
   image: string;
   /**
+   * Where each phase runs (M10, ADR-0021). Docker on this machine unless a caller
+   * brings another — the worker brings Vercel's. Everything above this field is the
+   * same either way, which is the whole point of it being a field: the order of
+   * phases, the gate, the seq counter and the fold are the product; where a phase
+   * executes is a substrate.
+   */
+  executor?: Executor;
+  /**
    * Host path to a `claude` executable, mounted over the image's. For tests: the
    * image ships no agent yet, and a hostile fake is how the supervision boundary
    * is exercised without one.
@@ -223,7 +208,7 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * before the agent gets the tools (ADR-0013).
    *
    * Its presence is also what gives the agent sandbox a network — see the docker
-   * args in `runContainer`. Omitted, nothing boots and every container stays
+   * args in `executor-docker.ts`. Omitted, nothing boots and every container stays
    * sealed, which is what the adversarial fixtures want and what 5a asserts.
    */
   recipe?: Recipe;
@@ -247,7 +232,7 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
    * drafting run).
    *
    * The rule this widens: "the agent sandbox gets a network when, and only when,
-   * there is a recipe to replay" (see the docker args in `runContainer`) — written
+   * there is a recipe to replay" (see the docker args in `executor-docker.ts`) — written
    * when the only agent that could exist was one replaying a recipe a human had
    * already approved. A drafting agent is the one PROPOSING that recipe, and
    * `prompts/recipe.md` tells it to install what it proposes, boot what it
@@ -277,58 +262,6 @@ export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 
   | { reproPrompt: string | ((sealed?: SealedWorld) => string | Promise<string>); repro?: never }
 );
 
-/** What one container reported, and how it exited. */
-export type PhaseResult = {
-  phase: 'agent' | 'base' | 'fix';
-  events: RunEvent[];
-  exitCode: number;
-  /**
-   * What the agent loop spent, when this phase ran one.
-   *
-   * The loop totalled this and then it was dropped here, which made "what did that run
-   * cost" unanswerable from outside `src/loop.ts` — the exact gap the totalling was
-   * added to close, reintroduced one layer up. Deliberately NOT an event: inventing an
-   * event class to describe our own spending would put a fact about us in a log about
-   * the user's bug (ADR-0006), so it rides on the result instead.
-   */
-  usage?: LoopUsage;
-  /** Host directory the agent container left its commits in, when it had one. */
-  handover?: string;
-  /**
-   * What the container said on stderr, bounded.
-   *
-   * `EXIT.silent` is documented as "ignore the channel and read stderr", and
-   * discarding it made that exit code unreadable: a store missing its sentinel
-   * looked exactly like a missing image, an OOM kill, or a spawn failure. For a
-   * project whose subject is evidence, an operational failure with no diagnosis
-   * is the wrong thing to ship.
-   */
-  stderr: string;
-  /**
-   * What the sealed-world probe observed, when this was a probe container (8b).
-   * Absent for every other kind, which is every container that judges anything.
-   */
-  suiteReport?: SuiteProbe;
-  /**
-   * What a tool-serving container reported about bundling its commits: null when
-   * it worked, prose when it did not, absent when this was not that kind of
-   * container.
-   *
-   * It arrives as a REPORT rather than an event because in that mode the host is
-   * the only writer (ADR-0006's amendment), and the host turns it into the
-   * VERIFICATION_ABORTED with a seq only the host can allocate.
-   */
-  handoverReport?: string | null;
-  /**
-   * What the container observed while replaying the recipe, when it replayed one.
-   *
-   * Present and `ready` → the host emits `ENV_READY`. Present and not `ready` → the
-   * host emits a `setup` abort with `cause: 'environment'` and the run ends
-   * `errored`, because our infrastructure being wrong about someone's project is
-   * not a finding about their bug (ADR-0007's v1.5 amendment).
-   */
-  envReport?: ReplayOutcome;
-};
 
 export type RunOutcome = {
   events: RunEvent[];
@@ -344,13 +277,6 @@ export type RunOutcome = {
   refused: boolean;
 };
 
-/**
- * The orchestrator's own events. It is a trusted writer — ADR-0006's constraint
- * is that the AGENT cannot write facts, and ADR-0009 makes the orchestrator the
- * one producer allowed to state why a run stopped.
- */
-const own = (runId: string, seq: number, event: Omit<RunEvent, 'run_id' | 'seq' | 'ts'>): RunEvent =>
-  ({ ...event, run_id: runId, seq, ts: new Date().toISOString() }) as RunEvent;
 
 /**
  * Run one attempt as a sequence of containers.
@@ -380,10 +306,12 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // the only place a commit crosses between containers, and it crosses as a
   // bundle: objects and refs, no working tree, nothing else.
   const workspace = await mkdtemp(join(tmpdir(), 'engine-workspace-'));
+  // Where the phases run (M10). Docker unless the caller brought another executor.
+  const executor = plan.executor ?? dockerExecutor();
   // The environment snapshot, when one was built. Declared out here because it is
-  // an IMAGE — the largest thing a run leaves on the host — and it has to be
+  // the largest thing a run leaves behind — an image, on Docker — and it has to be
   // removable from the `finally` below rather than from the end of a happy path.
-  let snapshotImage: string | null = null;
+  let snapshot: EnvSnapshot | null = null;
   // `finally`, because the throws between here and the end of the run are what
   // leak. This file already carried the invariant as a COMMENT — "every throw
   // between the clone and the cleanup at the end leaves a full clone of the
@@ -401,9 +329,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // (something still holding the image, a daemon that went away) must not
     // replace a completed run's events with an exception about disk hygiene. That
     // is the evidence-loss shape this file has been bitten by three times.
-    if (snapshotImage) {
-      await execFile('docker', ['image', 'rm', '--force', snapshotImage]).catch(() => {});
-    }
+    if (snapshot) await executor.dropSnapshot(snapshot).catch(() => {});
   }
 
   async function run(): Promise<RunOutcome> {
@@ -515,16 +441,15 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   //
   // Only with an `install` step to replay. Without one there is nothing a phase
   // could be missing, and everything behaves exactly as it did.
-  const snapshot =
+  const built =
     plan.recipe?.install === undefined
       ? null
-      : await buildEnvSnapshot(plan, source, base, plan.recipe);
-  if (snapshot && 'image' in snapshot) snapshotImage = snapshot.image;
-  // The two containers that JUDGE run from the snapshot; everything else is
-  // untouched by it. `plan.image` stays what the agent falls back to, so the agent
-  // sandbox never runs from an image built out of a recipe replay it is about to
-  // perform itself.
-  const judging: RunPlan = snapshotImage === null ? plan : { ...plan, image: snapshotImage };
+      : await executor.buildSnapshot(plan, source, base, plan.recipe);
+  if (built && 'snapshot' in built) snapshot = built.snapshot;
+  // The two containers that JUDGE run from the snapshot — `from`, on every
+  // `runPhase` below that is not the agent's; everything else is untouched by it.
+  // The agent sandbox never runs from a world built out of a recipe replay it is
+  // about to perform itself.
 
   // Before the agent, because the agent is who it is for — and skipped entirely when
   // there is no agent to tell. A caller who supplies the reproduction has already
@@ -534,9 +459,9 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
   // A run whose environment failed to build never gets here either: `snapshot.failed`
   // ends it inside the attempt loop below, so this only probes a world that exists.
   const sealed =
-    (snapshot && 'failed' in snapshot) || !(plan.reproPrompt || plan.agentPrompt)
+    (built && 'failed' in built) || !(plan.reproPrompt || plan.agentPrompt)
       ? undefined
-      : await probeSealedWorld(judging, source, base);
+      : await probeSealedWorld(executor, plan, source, base, snapshot ?? undefined);
 
   // Starts at zero because this function owns the whole run: it emits the first
   // event. A caller-supplied starting seq was a public field that could not work
@@ -596,7 +521,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
     // bug (ADR-0007's v1.5 amendment). After ATTEMPT_STARTED because every event
     // belongs to an attempt, and retrying is pointless: the next attempt would
     // install from the same source with the same recipe.
-    if (snapshot && 'failed' in snapshot) {
+    if (built && 'failed' in built) {
       events.push(
         own(plan.runId, ++afterSeq, {
           type: 'VERIFICATION_ABORTED',
@@ -604,7 +529,7 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
             v: 1,
             phase: 'setup',
             cause: 'environment',
-            reason: redact(snapshot.failed).slice(0, MAX_REASON_CHARS),
+            reason: redact(built.failed).slice(0, MAX_REASON_CHARS),
           },
         }),
       );
@@ -637,7 +562,13 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         ...extra,
       };
       if (!plan.loop) {
-        return await runContainer(plan, agentSource, at, 'agent', { agentPrompt: prompt, ...shared });
+        return await executor.runPhase({
+          plan,
+          source: agentSource,
+          afterSeq: at,
+          phase: 'agent',
+          overrides: { agentPrompt: prompt, ...shared },
+        });
       }
       let transcript: AgentTranscript = {
         lines: [],
@@ -645,16 +576,16 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         exitCode: -1,
         usage: { turns: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
       };
-      const result = await runContainer(
+      const result = await executor.runPhase({
         plan,
-        agentSource,
-        at,
-        'agent',
-        { serveTools: true, ...shared },
-        async ({ invoke }) => {
+        source: agentSource,
+        afterSeq: at,
+        phase: 'agent',
+        overrides: { serveTools: true, ...shared },
+        driver: async ({ invoke }) => {
           transcript = await runAgentLoop({ prompt, invoke, ...plan.loop });
         },
-      );
+      });
       let seq = at;
       const written: RunEvent[] = [];
       // The environment, first, because it precedes everything the agent said.
@@ -905,7 +836,14 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
       const result =
         step.phase === 'agent'
           ? await agentContainer(step.prompt!, afterSeq, overrides)
-          : await runContainer(judging, step.source, afterSeq, step.phase, overrides);
+          : await executor.runPhase({
+              plan,
+              source: step.source,
+              afterSeq,
+              phase: step.phase,
+              overrides,
+              ...(snapshot ? { from: snapshot } : {}),
+            });
       // Record what the container reported BEFORE judging any of it. Checking
       // first and breaking discarded the transcript and the container's own
       // stream — the same mistake the abort path made: a run that could not be
@@ -1000,10 +938,17 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
         // ran anchored to nothing and aborted AFTER a perfectly good base phase —
         // the ordering was right and the spec never reached the container judging
         // the fix.
-        const fix = await runContainer(judging, source, afterSeq, 'fix', {
-          only: 'fix',
-          fixRef,
-          ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+        const fix = await executor.runPhase({
+          plan,
+          source,
+          afterSeq,
+          phase: 'fix',
+          overrides: {
+            only: 'fix',
+            fixRef,
+            ...(resolvedRepro ? { repro: resolvedRepro } : {}),
+          },
+          ...(snapshot ? { from: snapshot } : {}),
         });
         phases.push(fix);
         events.push(...fix.events);
@@ -1138,7 +1083,7 @@ export type RepoProof = {
 /**
  * Prove that this repository runs, and record what could not be proved.
  *
- * Deliberately the same two containers a real run would use — `buildEnvSnapshot`
+ * Deliberately the same two containers a real run would use — `buildSnapshot`
  * and the sealed suite probe — rather than a cheaper approximation. The entire
  * value here is that the answer is the one a run will get, and an onboarding check
  * that passes where runs fail is worse than no check: it certifies a repository
@@ -1156,12 +1101,15 @@ export async function proveRepository(plan: {
   repoPath: string;
   image: string;
   recipe: Recipe;
+  /** Where the two containers run. Docker unless the caller brings another (M10). */
+  executor?: Executor;
 }): Promise<RepoProof> {
   const provedAt = new Date().toISOString();
   const workspace = await mkdtemp(join(tmpdir(), 'engine-prove-'));
   const store = await mkdtemp(join(tmpdir(), 'engine-prove-blobs-'));
   await writeFile(join(store, '.evidence-store'), '');
-  let snapshotImage: string | null = null;
+  const executor = plan.executor ?? dockerExecutor();
+  let snapshot: EnvSnapshot | null = null;
 
   try {
     const source = join(workspace, 'source');
@@ -1185,15 +1133,15 @@ export async function proveRepository(plan: {
       recipe: plan.recipe,
     };
 
-    const snapshot =
+    const built =
       plan.recipe.install === undefined
         ? null
-        : await buildEnvSnapshot(proving, source, commit, plan.recipe);
-    if (snapshot && 'failed' in snapshot) {
+        : await executor.buildSnapshot(proving, source, commit, plan.recipe);
+    if (built && 'failed' in built) {
       return {
         state: 'blocked',
         commit,
-        environment: { built: false, failed: redact(snapshot.failed) },
+        environment: { built: false, failed: redact(built.failed) },
         caveats: [
           'nothing else could be checked: with no environment there is no container to check it in',
         ],
@@ -1201,10 +1149,9 @@ export async function proveRepository(plan: {
         provedAt,
       };
     }
-    if (snapshot) snapshotImage = snapshot.image;
-    const judging: RunPlan = snapshotImage === null ? proving : { ...proving, image: snapshotImage };
+    if (built) snapshot = built.snapshot;
 
-    const suite = await probeSealedWorld(judging, source, commit);
+    const suite = await probeSealedWorld(executor, proving, source, commit, snapshot ?? undefined);
     const caveats: string[] = [];
     if (plan.recipe.install === undefined) {
       caveats.push(
@@ -1253,9 +1200,7 @@ export async function proveRepository(plan: {
     // The image is the largest thing this leaves on the host, and onboarding runs
     // on somebody else's schedule rather than a run's — so it is removed here for
     // the same reason `orchestrate` removes its own in a `finally`.
-    if (snapshotImage) {
-      await execFile('docker', ['image', 'rm', '--force', snapshotImage]).catch(() => {});
-    }
+    if (snapshot) await executor.dropSnapshot(snapshot).catch(() => {});
   }
 }
 
@@ -1272,6 +1217,8 @@ export type DraftPlan = {
   /** The image with a browser in it, if the agent should have one while drafting. */
   agentImage?: string;
   loop: NonNullable<RunPlan['loop']>;
+  /** Where the drafting session runs. Docker unless the caller brings another (M10). */
+  executor?: Executor;
 };
 
 export type DraftOutcome =
@@ -1320,7 +1267,7 @@ export async function draftRecipe(plan: DraftPlan): Promise<DraftOutcome> {
       agentImage: plan.agentImage,
       baseRef,
       // Dead on the `only: 'agent'` path — `verify()` never runs — and required by
-      // `Job`'s shape regardless. `buildEnvSnapshot` sets the same placeholder for
+      // `Job`'s shape regardless. `buildSnapshot` sets the same placeholder for
       // the same reason.
       symptomPattern: 'x',
       repro: { command: '' },
@@ -1342,26 +1289,26 @@ export async function draftRecipe(plan: DraftPlan): Promise<DraftOutcome> {
     // above, and its whole world, committed or not, is discarded the moment this
     // container exits (ADR-0010). There is nothing here for stripped ancestry to
     // protect, so `plan.repoPath` is mounted as it is.
-    const result = await runContainer(
-      draftPlan,
-      plan.repoPath,
-      0,
-      'agent',
-      {
+    const result = await (plan.executor ?? dockerExecutor()).runPhase({
+      plan: draftPlan,
+      source: plan.repoPath,
+      afterSeq: 0,
+      phase: 'agent',
+      overrides: {
         only: 'agent',
         baseRef,
         serveTools: true,
       },
-      async ({ invoke }) => {
+      driver: async ({ invoke }) => {
         const prompt = await renderPrompt('recipe', {
           environment: describeDraftingEnvironment({ browser: plan.agentImage !== undefined }),
         });
         transcript = await runAgentLoop({ prompt, invoke, ...plan.loop });
       },
-    );
+    });
 
     // This function's own version of the cleanup `orchestrate()` does for every
-    // phase it runs — `runContainer` always opens a handover directory for an
+    // phase it runs — `runPhase` always opens a handover directory for an
     // `agent` phase, and nothing past this point will ever read it, so nothing
     // past this point will clean it up if this does not.
     if (result.handover) await rm(result.handover, { recursive: true, force: true }).catch(() => {});
@@ -1503,138 +1450,6 @@ async function observedOnBase(
   }
 }
 
-/**
- * Build the image the phases judge from: the sealed phase image, plus this
- * repository's dependencies, installed once.
- *
- * Not `--rm`, which is the whole reason this does not go through `runContainer`:
- * the container has to survive its own exit long enough to be committed, and it
- * has to carry a `--name` for `docker commit` to have something to name. It gets a
- * NETWORK, on the same terms the agent sandbox does (ADR-0013): install needs a
- * package registry. The phases it feeds keep `--network none` — that is the whole
- * point of doing it here. They inherit the result of a network they never had.
- *
- * Returns the failure rather than throwing it. A repository whose install does not
- * complete is an operational fault the caller records as `cause: 'environment'` and
- * ends the run on; an exception here would discard the run instead of reporting why
- * it could not start.
- */
-async function buildEnvSnapshot(
-  plan: RunPlan,
-  source: string,
-  base: string,
-  recipe: Recipe,
-): Promise<{ image: string } | { failed: string }> {
-  // Sanitised the same way the handover ref is: a run id reaches this as a docker
-  // name and a tag, and both have a character set.
-  const id = plan.runId.replace(/[^A-Za-z0-9_-]/g, '') || 'run';
-  const container = `engine-env-${id}`;
-  const image = `engine-env:${id}`;
-  // A container left by an earlier run with this id would take the name and this
-  // build would fail on it — and committing SOMEBODY ELSE'S container would be
-  // worse: an environment nobody in this run built, judged as though we had.
-  await execFile('docker', ['rm', '--force', container]).catch(() => {});
-
-  const job: Job = {
-    runId: plan.runId,
-    afterSeq: 0,
-    sourcePath: '/src',
-    baseRef: base,
-    // Never read on this path — the Runner returns before `verify()` — and passed
-    // as base rather than left to a default so nothing here names a commit that
-    // does not exist yet.
-    fixRef: base,
-    repro: { command: '' },
-    symptomPattern: plan.symptomPattern,
-    only: 'env',
-    recipe,
-  };
-
-  const child = spawn(
-    'docker',
-    // `--pull never` for the same reason the phases have it: this image is one we
-    // built, and a pull here would block on a registry with the run already
-    // committed to waiting.
-    ['run', '--pull', 'never', '--name', container, '-i', '-v', `${source}:/src:ro`, plan.image],
-    { stdio: ['pipe', 'pipe', 'pipe'] },
-  );
-  child.stdin.end(`${JSON.stringify(job)}\n`);
-
-  let stdout = '';
-  let stderr = '';
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk: string) => {
-    // Bounded like the event channel is. This container speaks one line, so
-    // anything approaching the ceiling is a container that is not the one we asked
-    // for, and reading it into host memory unbounded is how that becomes our
-    // problem.
-    if (stdout.length < MAX_STREAM_BYTES) stdout += chunk;
-  });
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (chunk: string) => {
-    stderr = (stderr + chunk).slice(-MAX_STDERR_CHARS);
-  });
-  // The same ceiling the phases get, and the container this one needs it most:
-  // it is the only one with a network, so it is the only one whose `install` can
-  // wait on a registry that never answers. The `finally` below removes the
-  // container itself; this only stops the host waiting on it.
-  let timedOut = false;
-  let stopping: Promise<unknown> | undefined;
-  const ceiling = plan.containerTimeoutMs ?? CONTAINER_TIMEOUT_MS;
-  const bell = setTimeout(() => {
-    timedOut = true;
-    child.kill('SIGKILL');
-    // Here rather than in the `finally` below, which this path returns before
-    // reaching — and a container still running is exactly what a wedge is.
-    stopping = execFile('docker', ['rm', '--force', container]).catch(() => {});
-  }, ceiling);
-  const exitCode = await new Promise<number>((resolve) => {
-    child.on('close', (code) => resolve(code ?? 1));
-    child.on('error', () => resolve(1));
-  });
-  clearTimeout(bell);
-  if (timedOut) {
-    await stopping;
-    return { failed: `the environment build was stopped after ${ceiling}ms` };
-  }
-
-  let env: ReplayOutcome | undefined;
-  for (const line of stdout.split('\n')) {
-    if (line.trim() === '') continue;
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (isWorkerReply(parsed) && 'env' in parsed) env = parsed.env;
-    } catch {
-      // Not a reply. This container writes no events, so there is nothing else on
-      // the channel that a line could be.
-    }
-  }
-
-  // Said in the recipe's own words where there are any. `replayRecipe` already
-  // names the step that failed and redacts the command, and a paraphrase of that
-  // would be a diagnosis nobody can act on — the mistake this codebase has made
-  // twice with git's stderr.
-  const failed =
-    exitCode !== 0
-      ? `the environment build exited ${exitCode}: ${stderr.trim().split('\n').at(-1) ?? ''}`
-      : env === undefined
-        ? 'the environment build reported nothing about the recipe it replayed'
-        : env.ready
-          ? null
-          : (env.failed ?? 'the environment did not build');
-
-  try {
-    if (failed !== null) return { failed };
-    await execFile('docker', ['commit', container, image]);
-    return { image };
-  } catch (error) {
-    return { failed: `could not commit the environment: ${String(error)}` };
-  } finally {
-    // Whatever happened. The image is what the run needs; the container it was
-    // committed from is a copy of the same bytes waiting to be forgotten.
-    await execFile('docker', ['rm', '--force', container]).catch(() => {});
-  }
-}
 
 /**
  * What the project's own test command does in the world that judges — observed
@@ -1676,21 +1491,30 @@ export type SealedWorld = { command: string } & (
  * world travels on the reply channel, never on the log (ADR-0006).
  */
 async function probeSealedWorld(
-  judging: RunPlan,
+  executor: Executor,
+  plan: RunPlan,
   source: string,
   base: string,
+  from?: EnvSnapshot,
 ): Promise<SealedWorld | undefined> {
-  const command = judging.recipe?.test;
+  const command = plan.recipe?.test;
   if (command === undefined) return undefined;
-  const result = await runContainer(judging, source, 0, 'base', {
-    only: 'suite',
-    baseRef: base,
-    fixRef: base,
-    // Never read on this path — the Runner returns before `verify()` — and passed
-    // as the base commit rather than left to a default so nothing here names
-    // something that does not exist.
-    repro: { command: '' },
-    suiteCommand: command,
+  const result = await executor.runPhase({
+    plan,
+    source,
+    afterSeq: 0,
+    phase: 'base',
+    overrides: {
+      only: 'suite',
+      baseRef: base,
+      fixRef: base,
+      // Never read on this path — the Runner returns before `verify()` — and passed
+      // as the base commit rather than left to a default so nothing here names
+      // something that does not exist.
+      repro: { command: '' },
+      suiteCommand: command,
+    },
+    ...(from ? { from } : {}),
   });
   const observed = result.suiteReport;
   if (observed === undefined) {
@@ -1703,355 +1527,6 @@ async function probeSealedWorld(
     : { command, exitCode: observed.exit_code, output: observed.output };
 }
 
-/**
- * Drives a tool-serving container from out here.
- *
- * The whole of ADR-0011 in one function type: something on the host is handed a
- * way to execute a tool inside the container, and what it does with that — talk to
- * the model API, replay a script — is not this file's business. The container
- * never learns which.
- */
-export type ContainerDriver = (io: {
-  invoke: (tool: string, input: Record<string, unknown>) => Promise<{ ok: boolean; output: string }>;
-}) => Promise<void>;
-
-async function runContainer(
-  plan: RunPlan,
-  source: string,
-  afterSeq: number,
-  phase: PhaseResult['phase'],
-  overrides: Partial<Job>,
-  /** Present only for a `serveTools` container: what to run while it serves. */
-  driver?: ContainerDriver,
-): Promise<PhaseResult> {
-  // The agent container gets no repro to run; the phase containers get no agent.
-  // Passing both would put an agent beside the phase it is meant to be isolated
-  // from, which is the entire point of doing this.
-  const job: Job = {
-    runId: plan.runId,
-    afterSeq,
-    sourcePath: '/src',
-    baseRef: plan.baseRef,
-    // Resolved rather than planned: with an agent, this is the commit it made.
-    fixRef: overrides.fixRef ?? plan.fixRef ?? plan.baseRef,
-    // Resolved by the caller: with a repro agent it is the spec read out of that
-    // agent's commit, and there is nothing to run before it exists. The empty
-    // fallback reaches ONLY the agent container, which returns before `verify()`
-    // (runner.ts, `only: 'agent'`) and so never runs a reproduction — the plan
-    // type now makes `repro` or `reproPrompt` mandatory, so a phase container
-    // cannot arrive here without one.
-    repro: overrides.repro ?? plan.repro ?? { command: '' },
-    symptomPattern: plan.symptomPattern,
-    // Read off the recipe here rather than asked of the caller, so there is no way to
-    // configure a run whose suite command disagrees with the one its environment was
-    // built from. The agent container ignores it — `only: 'agent'` returns before
-    // `verify()` — so this reaches only the two containers that judge.
-    ...(plan.recipe?.test === undefined ? {} : { suiteCommand: plan.recipe.test }),
-    ...(plan.baseRuns === undefined ? {} : { baseRuns: plan.baseRuns }),
-    ...(plan.flakeRuns === undefined ? {} : { flakeRuns: plan.flakeRuns }),
-    ...(plan.timeoutMs === undefined ? {} : { timeoutMs: plan.timeoutMs }),
-    ...(plan.agentTimeoutMs === undefined ? {} : { agentTimeoutMs: plan.agentTimeoutMs }),
-    ...overrides,
-  };
-
-  // A store of this container's own, empty, with the sentinel the Runner insists
-  // on. Nothing another participant wrote is visible from inside it.
-  const store = await mkdtemp(join(tmpdir(), 'engine-phase-store-'));
-  await writeFile(join(store, '.evidence-store'), '');
-  // Only the agent gets somewhere to put commits. A phase container with an
-  // output mount could write one, and a phase is supposed to observe, not author.
-  const handover = phase === 'agent' ? await mkdtemp(join(tmpdir(), 'engine-handover-')) : undefined;
-
-  // Named so the host can still reach it after the client is gone: killing
-  // `docker run` does not stop the container the daemon is running, so a wedge
-  // would survive the ceiling that is supposed to end it.
-  const name = `engine-${phase}-${plan.runId.replace(/[^A-Za-z0-9_-]/g, '')}-${process.pid}-${++containers}`;
-
-  const args = [
-    // Never from a registry. Every image this engine runs is one it built —
-    // `plan.image`, `plan.agentImage`, the environment snapshot — so a pull is
-    // always a mistake, and it is the mistake that hangs: `docker run` on a
-    // missing image blocks on a registry the daemon may never reach, before PID 1
-    // exists and before any timeout inside the container could apply. Refusing it
-    // turns an indefinite wedge into `Unable to find image ... locally`, which is
-    // the diagnosis the caller wanted anyway.
-    'run', '--rm', '-i', '--pull', 'never', '--name', name,
-    // NO NETWORK for the phases. The agent needs the model API; the containers
-    // that judge a commit need nothing at all, and a reproduction that can reach
-    // the network is a reproduction that can be TOLD what to answer — the same
-    // identity-oracle channel ADR-0008's amendment is about, over a wire instead
-    // of over the tree. It also means the code under judgement cannot exfiltrate
-    // the repository it was handed.
-    //
-    // Dependency install is what this used to foreclose, and for four milestones a
-    // reproduction needing a package the base commit lacked was simply unrunnable.
-    // It is not the seal that changed: the dependencies arrive in the IMAGE now,
-    // installed by a build container before the agent existed, so the phases still
-    // reach nothing and no longer need to (see `buildEnvSnapshot`).
-    // NO NETWORK, for every container including the agent's.
-    //
-    // The phases need none. The agent needs the model API — and the transport for
-    // that is NOT built: `--add-host <name>:host-gateway` requires a network, and
-    // `--network none` removes every interface, so the two cannot coexist. An
-    // earlier version of this line tried to and silently dropped the seal, which
-    // would have handed an untrusted agent the open bridge; `HTTPS_PROXY` is an
-    // environment variable and an agent that ignores it is just on the internet.
-    //
-    // Sealed until the transport exists. An agent that cannot reach the model API
-    // cannot do its job, and a caller who needs one will notice immediately —
-    // which is the failure this project wants, rather than a boundary that reads
-    // as enforced and is not.
-    // The ASYMMETRY ADR-0013 turns on, and the only place it is expressed.
-    //
-    // The phase containers get nothing, always: a reproduction that can reach the
-    // network is a reproduction that can be TOLD what to answer, and the code under
-    // judgement must not be able to exfiltrate the repository it was handed.
-    //
-    // The AGENT sandbox gets a network when — and only when — there is a recipe to
-    // replay, because install needs a package registry and booted services need
-    // localhost. It is the default bridge rather than a registry-only allowlist:
-    // ADR-0011 established that this project cannot express "sealed plus one route"
-    // (`--network none` removes every interface; the transport does not exist), and
-    // ADR-0010's v1.5 amendment says the agent sandbox "is not contained, and it no
-    // longer needs to be" — nothing worth stealing lives there and nothing it
-    // produces is trusted. What makes that affordable is what LEFT it: no model
-    // credential, no GitHub token, no event channel.
-    // `|| plan.draftingEnvironment` is the one addition M6b makes to this line, and
-    // the comment above the field it reads explains why it belongs beside the
-    // recipe check rather than as a separate rule: both are "this agent needs to
-    // install and boot something", and a recipe existing is just the other way
-    // that need can be true.
-    ...(phase === 'agent' && (plan.recipe || plan.draftingEnvironment) ? [] : ['--network', 'none']),
-    '-v', `${source}:/src:ro`,
-    '-v', `${store}:/blobs`,
-    ...(handover ? ['-v', `${handover}:/out`] : []),
-    ...(plan.agentImageMount ? ['-v', `${plan.agentImageMount}:/usr/local/bin/claude:ro`] : []),
-    // The agent's image when there is one, and `plan.image` for everything that
-    // judges. This one line is the whole of "the browser runs in the agent sandbox
-    // only".
-    phase === 'agent' ? (plan.agentImage ?? plan.image) : plan.image,
-  ];
-
-  // `spawn`, not `execFile`. execFile has no `input` option — that belongs to
-  // execFileSync — so the Job never reached the container's stdin, `readStdin()`
-  // waited for an EOF that never came, and the container hung until the test
-  // timed out. A cast had made the type checker stop saying so.
-  //
-  // A non-zero exit is an outcome here, not a crash: the Runner's exit codes say
-  // whether there is a stream worth reading, and a partial stream is evidence.
-  const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'] });
-  // The Job on its own LINE, and stdin left open when something out here is going
-  // to keep writing to it. Without the newline the container's line reader waits
-  // for EOF, which is precisely the deadlock the tool protocol would otherwise
-  // introduce: the host waiting for a result, the container waiting for the end of
-  // the job it already has.
-  if (driver) child.stdin.write(`${JSON.stringify(job)}\n`);
-  else child.stdin.end(JSON.stringify(job));
-
-  // What is on the channel, split as it arrives.
-  //
-  // Incremental rather than parsed at the end, because a tool-serving container
-  // interleaves REPLIES with its events and the driver needs each reply the moment
-  // it lands. A non-driving container behaves exactly as before: every line is an
-  // event and nothing is looked at until the container exits.
-  const eventLines: string[] = [];
-  const pending = new Map<string, (result: { ok: boolean; output: string }) => void>();
-  let ready = () => {};
-  const readied = new Promise<void>((resolve) => (ready = resolve));
-  let handoverReport: string | null | undefined;
-  let envReport: ReplayOutcome | undefined;
-  let suiteReport: SuiteProbe | undefined;
-  let stdout = '';
-  // Counted separately, because `stdout` is now DRAINED per line. Measuring the
-  // ceiling against it would measure the current partial line, and the guard would
-  // silently never fire — a stream cut mid-line reaching the fold is precisely what
-  // it exists to refuse.
-  let totalBytes = 0;
-  let truncated = false;
-  const take = (line: string) => {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      // Not JSON at all. Kept as an event line so `parse` fails loudly rather
-      // than silently dropping something that was supposed to be a fact.
-      eventLines.push(line);
-      return;
-    }
-    if (!isWorkerReply(parsed)) {
-      eventLines.push(line);
-      return;
-    }
-    if ('ready' in parsed) ready();
-    else if ('env' in parsed) envReport = parsed.env;
-    else if ('suite' in parsed) suiteReport = parsed.suite;
-    else if ('finished' in parsed) handoverReport = parsed.finished.handover;
-    else {
-      const settle = pending.get(parsed.result.id);
-      // A reply for a call nobody is waiting on is dropped rather than thrown:
-      // the only writer on this pipe is our own Runner, and a duplicate would be
-      // an engine bug that must not cost the run its transcript.
-      if (settle) {
-        pending.delete(parsed.result.id);
-        settle({ ok: parsed.result.ok, output: parsed.result.output });
-      }
-    }
-  };
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk: string) => {
-    if (totalBytes + chunk.length > MAX_STREAM_BYTES) {
-      truncated = true;
-      return;
-    }
-    totalBytes += chunk.length;
-    stdout += chunk;
-    let newline = stdout.indexOf('\n');
-    while (newline !== -1) {
-      const line = stdout.slice(0, newline).trim();
-      stdout = stdout.slice(newline + 1);
-      if (line !== '') take(line);
-      newline = stdout.indexOf('\n');
-    }
-  });
-  // Kept, not just drained. Draining is still required — a container that says
-  // a lot on stderr blocks writing to it and never reaches its own exit, the
-  // same deadlock the agent supervisor has — but the last few KB are what makes
-  // a non-zero exit diagnosable.
-  let stderr = '';
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (chunk: string) => {
-    stderr = (stderr + chunk).slice(-MAX_STDERR_CHARS);
-  });
-
-  const closed = new Promise<number>((resolve) => {
-    child.on('close', (code) => resolve(code ?? 1));
-    child.on('error', () => resolve(1));
-  });
-
-  // The ceiling. Killing the client unblocks the host; removing the container
-  // stops the work, because with the client gone the daemon keeps running it and
-  // `--rm` only fires on an exit that may never come.
-  let timedOut = false;
-  // Awaited before this function returns. Fired and forgotten, the container is
-  // still being removed when the caller reads `docker ps` — which is the same
-  // "it is gone" claim being false for a shorter time.
-  let stopping: Promise<unknown> | undefined;
-  const ceiling = plan.containerTimeoutMs ?? CONTAINER_TIMEOUT_MS;
-  const bell = setTimeout(() => {
-    timedOut = true;
-    child.kill('SIGKILL');
-    stopping = execFile('docker', ['rm', '--force', name]).catch(() => {});
-  }, ceiling);
-
-  if (driver) {
-    let calls = 0;
-    const invoke = async (tool: string, input: Record<string, unknown>) => {
-      const id = `h${++calls}`;
-      return await new Promise<{ ok: boolean; output: string }>((resolve, reject) => {
-        pending.set(id, resolve);
-        // Races the container's own exit. A container that dies mid-loop would
-        // otherwise leave the driver awaiting a reply forever, and a hung host
-        // process is the one failure mode with no diagnosis at all.
-        closed.then(() => {
-          if (pending.delete(id)) reject(new Error('the container exited before answering'));
-        });
-        child.stdin.write(`${JSON.stringify({ call: { id, tool, input } } satisfies WorkerRequest)}\n`);
-      });
-    };
-    // Wait for the world. `Promise.race` against the exit, because a container
-    // that fails to stand up never sends `ready` and the driver must not block on
-    // a message that is not coming.
-    await Promise.race([readied, closed]);
-    // A world that never came up gets no loop. Spending a model on a container
-    // whose services are down produces a transcript full of connection refusals and
-    // a reproduction of our own outage; the host records the operational fault
-    // instead.
-    try {
-      if (!envReport || envReport.ready) await driver({ invoke });
-    } finally {
-      // Always, however the driver ended. Without this the container serves
-      // forever and the run hangs on a loop that has already finished.
-      child.stdin.write(`${JSON.stringify({ done: true } satisfies WorkerRequest)}\n`);
-      child.stdin.end();
-    }
-  }
-
-  const exitCode = await closed;
-  clearTimeout(bell);
-  if (stopping) await stopping;
-  // On `stderr`, where every other operational failure of this container is
-  // already reported and where `EXIT.silent` tells a reader to look. The events
-  // it did emit are kept: a phase cut off partway is still evidence of what ran.
-  if (timedOut) {
-    stderr = `${stderr}\nthe ${phase} container was stopped after ${ceiling}ms`.slice(-MAX_STDERR_CHARS);
-  }
-
-  // Collect the artifacts into the real store, from the host, once the container
-  // is gone. Whatever a participant planted in its own store comes along, but it
-  // was only ever visible to itself — and the sentinel is skipped so a store that
-  // never held one does not acquire it here.
-  //
-  // Never by throwing, though. Both of these run MID-RUN, so a rejection here
-  // propagated out of `orchestrate()` and destroyed every phase captured so far —
-  // the same evidence-loss shape fixed twice already elsewhere in this file, left
-  // standing at the two sites that were not the one being looked at. A collection
-  // failure is reported instead: the events are the record, and a stream whose
-  // blobs went missing is still worth vastly more than no stream.
-  let collection = '';
-  try {
-    for (const entry of await readdir(store)) {
-      if (entry === '.evidence-store') continue;
-      await cp(join(store, entry), join(plan.blobRoot, entry), { recursive: true, force: true });
-    }
-  } catch (error) {
-    collection = `could not collect this container's artifacts: ${String(error)}`;
-  }
-  await rm(store, { recursive: true, force: true }).catch(() => {});
-
-  if (truncated) {
-    // Refusing beats guessing: a stream cut mid-line is not a stream, and the
-    // fold would reject it anyway on the seq that never arrived.
-    throw new Error(`the ${phase} container produced more than ${MAX_STREAM_BYTES} bytes of events`);
-  }
-  // The tail, if the container's last line had no newline. Then the events, which
-  // is every line that was not a reply.
-  if (stdout.trim() !== '') take(stdout.trim());
-  const events = parse(eventLines);
-  // As an EVENT, not on `PhaseResult.stderr`. This PR condemned that field by
-  // name three files over — the orchestrator keeps it and never persists it, so
-  // nothing folds it and no projection reads it. A half-copied store otherwise
-  // folds to `reproduced: true`, scores 85, and cites `stdout_hash` refs that
-  // were never written to the real store, with nothing anywhere saying the
-  // evidence is missing. `cleanup`, because every phase had already been
-  // observed when this failed: it is a tidy-up failure, not a failure to look.
-  if (collection) {
-    events.push(
-      own(plan.runId, (events.at(-1)?.seq ?? afterSeq) + 1, {
-        type: 'VERIFICATION_ABORTED',
-        payload: {
-          v: 1,
-          phase: 'cleanup',
-          // Not `verify()`'s. Without saying so, the fold reads this as proof the
-          // fix series completed — see the witness rule in fold.ts.
-          cause: 'collection',
-          reason: redact(collection).slice(0, MAX_REASON_CHARS),
-        },
-      }),
-    );
-  }
-  return {
-    phase,
-    events,
-    exitCode,
-    stderr: stderr.trim(),
-    ...(handover ? { handover } : {}),
-    ...(handoverReport === undefined ? {} : { handoverReport }),
-    ...(envReport === undefined ? {} : { envReport }),
-    ...(suiteReport === undefined ? {} : { suiteReport }),
-  };
-}
-
-const parse = (lines: string[]): RunEvent[] => lines.map((line) => JSON.parse(line) as RunEvent);
 
 /**
  * The agent's source: base's ancestry, and nothing else.
