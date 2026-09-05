@@ -340,6 +340,30 @@ describe('starting a run is a write, and gated like one', () => {
     expect(queued(writes)).toHaveLength(0);
   });
 
+  it('the new verbs do not become a second door onto the recipe write', async () => {
+    // Widening the router's method allowlist for the secrets routes (M10) put `PUT` and
+    // `DELETE` in front of every block that has no method check of its own — and the
+    // onboarding block had none, so a `PUT /repos/:repo/onboard` fell into "THE ONE
+    // WRITE" and stored shell commands the engine executes verbatim. Not reachable
+    // cross-site, and a second door onto the highest-privilege write in this surface.
+    for (const method of ['PUT', 'DELETE'] as const) {
+      const writes: { sql: string; params: unknown[] }[] = [];
+      const response = await call(trigger(writes), method, '/repos/mine%2Frepo/onboard', RECIPE, {
+        'content-type': 'application/x-www-form-urlencoded',
+      });
+      expect(response).toBeNull();
+      expect(writes.filter((w) => w.sql.includes('insert into recipes'))).toHaveLength(0);
+    }
+    // THE positive control: the verb that IS the write still works, so this is not a
+    // surface that refuses everything.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const stored = await call(trigger(writes), 'POST', '/repos/mine%2Frepo/onboard', RECIPE, {
+      'content-type': 'application/x-www-form-urlencoded',
+    });
+    expect(stored?.status).toBe(303);
+    expect(writes.filter((w) => w.sql.includes('insert into recipes'))).toHaveLength(1);
+  });
+
   it('a repository with no recipe is answered, not run', async () => {
     // The onboarding gate the webhook path had (M6a), kept: a run against a repository
     // nobody has described would reproduce nothing and call that a finding.

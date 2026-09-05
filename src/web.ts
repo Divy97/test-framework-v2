@@ -759,9 +759,10 @@ const secretsBlock = (repo: string, secrets?: { names: string[]; enabled: boolea
 ${list}
 ${
   secrets.enabled
-    ? `<p>These are injected into runs on this deployment. The sandbox they land in has no route
-out, so a value here satisfies a startup check and a suite that reads it — it cannot reach the
-service it authenticates to, and that is the point.</p>`
+    ? `<p>These are injected into runs on this deployment. The worker injects them only into a
+sandbox it has just observed to have no route out (ADR-0017), so a value here satisfies a
+startup check and a suite that reads it — in a sealed sandbox it cannot reach the service it
+authenticates to, and that is the point.</p>`
     : `<p class="warning-inline"><b>Stored, and not yet injected into any run.</b> The agent
 sandbox is affordable only because nothing worth stealing lives in it — the agent is untrusted
 by construction, its prompt contains text whoever filed the issue wrote, and until the sandbox

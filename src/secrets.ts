@@ -111,16 +111,28 @@ export function open(stored: Buffer, aad: string, key: Buffer = sealingKey()): s
 
 /** What a repository's secret is bound to. A NUL between, so `a/b` + `c` cannot equal `a` + `b/c`. */
 export const repoAad = (repo: string, name: string): string => `${repo}\0${name}`;
-/** What a person's model key is bound to. */
-export const userAad = (githubId: number): string => `user\0${githubId}`;
+/**
+ * What a person's model key is bound to: the person AND the provider.
+ *
+ * The provider is in here rather than beside it because it decides where the plaintext is
+ * SENT (`loop.ts`, `providerName`). Under this design's own threat model — somebody who
+ * can write a row, from a restored backup or an injection — a provider left outside the
+ * seal can be flipped in place, and the worker then puts an OpenRouter key in an
+ * Anthropic auth header. The attacker cannot forge the ciphertext and does not need to.
+ *
+ * Changing this invalidates every row sealed under the old binding. Done before any exist.
+ */
+export const userAad = (githubId: number, provider: string): string => `user\0${githubId}\0${provider}`;
 
 // ── Storage ────────────────────────────────────────────────────────────────────
 //
-// Every function below either takes a value in or gives a NAME out. There is
-// deliberately no `readRepoSecret` for the plane's own routes to call: the only reader
-// is `secretsForRun`, which the worker reaches through an authorized runner route, and
-// keeping it the only one means a route added later cannot casually acquire the ability
-// to show somebody a key.
+// Two readers exist — `repoSecrets` and `modelKey` — and both are called from exactly one
+// place each: the runner routes, which authorize against the `jobs` row. Everything else
+// here takes a value in or gives a NAME out.
+//
+// That is a convention, not a mechanism: this module exports the readers and `open`, and
+// nothing stops a route importing them. The enforcement is the test that stores a
+// recognisable value and greps every response the dashboard can produce for it.
 
 
 /** What a repository has a value for. Names, in the order a person reads them. */
@@ -189,7 +201,7 @@ export async function putModelKey(
        values ($1, $2, $3, $4, now())
        on conflict (github_id) do update
          set provider = $2, ciphertext = $3, key_id = $4, updated_at = now()`,
-    [githubId, provider, seal(value, userAad(githubId)), KEY_ID],
+    [githubId, provider, seal(value, userAad(githubId, provider)), KEY_ID],
   );
 }
 
@@ -210,8 +222,6 @@ export async function modelKey(
     [githubId],
   );
   if (rows.length === 0) return null;
-  return {
-    provider: String(rows[0].provider),
-    key: open(Buffer.from(rows[0].ciphertext as Uint8Array), userAad(githubId)),
-  };
+  const provider = String(rows[0].provider);
+  return { provider, key: open(Buffer.from(rows[0].ciphertext as Uint8Array), userAad(githubId, provider)) };
 }

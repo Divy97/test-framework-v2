@@ -22,8 +22,10 @@ import type { Db } from '../src/store.js';
 import type { Session } from '../src/auth.js';
 import { connect } from '../src/store.js';
 import { dashboardRoutes } from '../src/routes.js';
+import { readPlaneConfig } from '../src/plane-server.js';
 import { runnerRoutes } from '../src/runner-api.js';
-import { enqueueJob, pairRunner, type Runner } from '../src/plane.js';
+import { enqueueJob, pairRunner } from '../src/plane.js';
+import { recordInstallation } from '../src/installations.js';
 import {
   deleteModelKey,
   deleteRepoSecret,
@@ -69,13 +71,25 @@ describe('sealing binds a value to the row it belongs to', () => {
   });
 
   test('a tampered byte is a throw, not a different answer', () => {
-    const sealed = seal(CANARY, userAad(4242), KEY);
+    const sealed = seal(CANARY, userAad(4242, 'openrouter'), KEY);
     const bent = Buffer.from(sealed);
     bent[bent.length - 1] = (bent.at(-1)! ^ 0xff) & 0xff;
-    expect(() => open(bent, userAad(4242), KEY)).toThrow();
+    expect(() => open(bent, userAad(4242, 'openrouter'), KEY)).toThrow();
     // And something far too short to be a sealed value is refused before the cipher is
     // asked, so the error says what is wrong rather than surfacing a node internal.
-    expect(() => open(Buffer.alloc(4), userAad(4242), KEY)).toThrow(/too short/);
+    expect(() => open(Buffer.alloc(4), userAad(4242, 'openrouter'), KEY)).toThrow(/too short/);
+  });
+
+  test('the provider is inside the seal, because it decides where the key is sent', () => {
+    // The attack: somebody who can WRITE a row — a restored backup, a migration, an
+    // injection — cannot forge the ciphertext, and does not need to. Flipping `provider`
+    // in place would have the worker put an OpenRouter key in an Anthropic auth header,
+    // which is the same key leaving for a destination its owner never chose.
+    const sealed = seal(CANARY, userAad(4242, 'openrouter'), KEY);
+    expect(open(sealed, userAad(4242, 'openrouter'), KEY)).toBe(CANARY);
+    expect(() => open(sealed, userAad(4242, 'anthropic'), KEY)).toThrow();
+    // And it is still bound to the person, which was the original point.
+    expect(() => open(sealed, userAad(4243, 'openrouter'), KEY)).toThrow();
   });
 
   test('the key has to be a key, and the refusal says how to make one', () => {
@@ -89,6 +103,34 @@ describe('sealing binds a value to the row it belongs to', () => {
     expect(secretsEnabled({ ENGINE_SECRETS_ENABLED: 'no' } as NodeJS.ProcessEnv)).toBe(false);
     expect(secretsEnabled({ ENGINE_SECRETS_ENABLED: '1' } as NodeJS.ProcessEnv)).toBe(true);
     expect(secretsEnabled({ ENGINE_SECRETS_ENABLED: 'TRUE' } as NodeJS.ProcessEnv)).toBe(true);
+  });
+});
+
+describe('a plane that cannot seal does not start', () => {
+  /** Everything `readPlaneConfig` demands, so a test can remove exactly one thing. */
+  const complete = (): NodeJS.ProcessEnv => ({
+    DATABASE_URL: 'postgres://x/y',
+    GITHUB_APP_ID: '1',
+    GITHUB_PRIVATE_KEY: 'a-pem',
+    GITHUB_WEBHOOK_SECRET: 's',
+    GITHUB_CLIENT_ID: 'c',
+    GITHUB_CLIENT_SECRET: 'cs',
+    ENGINE_PLANE_CALLBACK_URL: 'https://x/callback',
+    ENGINE_BLOB_ROOT: '/tmp/blobs',
+    PLANE_SECRETS_KEY: KEY.toString('base64'),
+  });
+
+  test('a missing sealing key is a boot failure, not a surprise at the first write', () => {
+    // The alternative is a process that accepts a credential and then finds it has
+    // nowhere to seal it — at which point the only options are refusing at the last
+    // moment or writing plaintext. Failing where an operator is looking is the only
+    // version of this that cannot go wrong quietly.
+    const { PLANE_SECRETS_KEY, ...without } = complete();
+    expect(() => readPlaneConfig(without)).toThrow(/PLANE_SECRETS_KEY/);
+    expect(() => readPlaneConfig(without)).toThrow(/openssl rand -base64 32/);
+    // THE positive control: with it, the same environment starts. Without this the
+    // assertion above passes on a config function that refuses everything.
+    expect(() => readPlaneConfig(complete())).not.toThrow();
   });
 });
 
@@ -309,6 +351,50 @@ describe('stored, listed by name, deleted, never read back', () => {
       await expect(repoSecrets(client, elsewhere)).rejects.toThrow();
     } finally {
       await client.query('delete from repo_secrets where repo = $1', [elsewhere]);
+    }
+  });
+});
+
+describe('THE test: a value stored through the surface never comes back out of it', () => {
+  test('every response the dashboard can produce, greppped for the value that was stored', async () => {
+    if (!client) return void expect(why).toBe('SKIP');
+    // Against a REAL database, because the fake client used above stores nothing: with no
+    // value in play, no route test could leak one however it were written. That is how
+    // three separate echoes — `{ stored, value }` on the PUT, `{ stored, provider, key }`
+    // on the model key, and a `values` field on the listing — each survived a green suite.
+    //
+    // So this stores `CANARY` through the surface, then asks the surface for everything it
+    // will say about that repository and that person, and greps all of it. Add a route
+    // that echoes a value and this fails; add a field to an existing response and this
+    // fails too, which is the property the comments in `routes.ts` claim and could not
+    // demonstrate.
+    await recordInstallation(client, { repo: REPO, installationId: 1, account: 'me' });
+    const surface = dashboardRoutes({
+      client: client as unknown as Db,
+      installUrl: 'https://example.invalid',
+      auth: { session: async () => ({ ...SESSION, githubId: GITHUB_ID }), installations: async () => [1] },
+    });
+    const path = `/api/repos/${encodeURIComponent(REPO)}/secrets`;
+
+    const responses: string[] = [];
+    const say = async (method: string, at: string, body = '') =>
+      responses.push(String((await call(surface, method, at, body))?.body ?? ''));
+
+    await say('PUT', `${path}/A_STORED_SECRET`, JSON.stringify({ value: CANARY }));
+    await say('PUT', '/api/settings/model-key', JSON.stringify({ provider: 'openrouter', key: CANARY }));
+    await say('GET', path);
+    await say('GET', `${path}/A_STORED_SECRET`);
+    await say('GET', '/api/settings/model-key');
+    await say('GET', `/repos/${encodeURIComponent(REPO)}/onboard`);
+    await say('DELETE', `${path}/A_STORED_SECRET`);
+    await say('DELETE', '/api/settings/model-key');
+
+    // The value was really stored — without this the assertion below passes on a surface
+    // that refused every write.
+    expect(responses[0]).toContain('A_STORED_SECRET');
+    expect(responses[2]).toContain('A_STORED_SECRET');
+    for (const [index, body] of responses.entries()) {
+      expect(body, `response ${index} carried the stored value`).not.toContain(CANARY);
     }
   });
 });

@@ -88,6 +88,21 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10m** | orientation, plan, critic — off by default, proven inert, then measured | | |
 | **10n** | every line of the record that this milestone made false | all | |
 
+**10k has two deploy prerequisites, and merging without them takes the plane down.**
+`PLANE_SECRETS_KEY` is now in the plane's `REQUIRED` set, so a deployment that does not
+have it fails `readPlaneConfig` at boot, fails its health check, and rolls back. Set it
+and apply the schema BEFORE the merge:
+
+```
+fly secrets set PLANE_SECRETS_KEY="$(openssl rand -base64 32)" -a test-framework
+psql "$DATABASE_URL" -f db/schema.sql        # repo_secrets, user_model_keys
+```
+
+That key is not recoverable and not rotatable yet: lose it and every stored value is
+permanently unreadable. That is the property — a backup of the database is worth nothing
+on its own — and it is also an operational hazard, so it belongs in whatever holds the
+App's private key rather than beside the database URL.
+
 10k ships the storage, the JSON API and the runner routes, and a **read-only** list of
 stored names on the onboarding page. There is no form: a `PUT` with a JSON body is not
 something an HTML form can send, and writing the JavaScript for one into `src/web.ts` — a

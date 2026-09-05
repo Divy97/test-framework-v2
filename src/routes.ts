@@ -324,8 +324,13 @@ export function dashboardRoutes(options: {
     // ── SECRETS (M10, ADR-0017) ──────────────────────────────────────────────────
     //
     // Three routes and none of them returns a value. `GET` answers with names, `PUT`
-    // takes one in, `DELETE` removes one; there is no fourth verb, and `src/secrets.ts`
-    // exports no function these could call to read one back even by mistake.
+    // takes one in, `DELETE` removes one; there is no fourth verb.
+    //
+    // What stops a value coming back is a convention, and it is worth saying so rather
+    // than overstating it: `src/secrets.ts` DOES export readers — `repoSecrets`, `modelKey`
+    // and `open` — and nothing but this file's import list keeps them out of a response.
+    // The mechanism is the test, which stores a recognisable value and greps every
+    // response this surface can produce for it.
     //
     // Storing is allowed while injection is not (`ENGINE_SECRETS_ENABLED`), and that is
     // deliberate rather than an oversight: the injection guard is 10l's and it has to be
@@ -484,7 +489,11 @@ export function dashboardRoutes(options: {
       // Only where there are accounts. The local surface has one operator and takes its
       // key from the environment, which is what every run before the button did.
       if (who !== null && (await hasModelKey(client, who.session.githubId)) === null) {
-        return json({ error: 'no model key', settings: '/settings' }, 412);
+        // `settings` is where the Next.js UI will put the form (10i). There is no such
+        // page yet, and naming it here is a promise this deployment does not keep — so
+        // the answer says what is missing and how to supply it, in words that are true
+        // of the surface that exists.
+        return json({ error: 'no model key', how: 'PUT /api/settings/model-key' }, 412);
       }
       const open = await openJobFor(client, repo, issueNumber);
       if (open !== null) return json({ error: 'a run for this issue is already under way', run_id: open }, 409);
@@ -592,7 +601,14 @@ export function dashboardRoutes(options: {
 
     // ONBOARDING. `owner/repo` has a slash in it, so the repo is the rest of the path.
     const onboard = /^\/repos\/(.+)\/onboard$/.exec(path);
-    if (onboard) {
+    // GET or POST, named rather than left to the allowlist above. That allowlist gained
+    // `PUT` and `DELETE` for the secrets routes, and this block has no method check of its
+    // own — so without this line a `PUT` fell straight into "THE ONE WRITE" below and
+    // stored shell commands the engine executes verbatim, and a `DELETE` rendered a 400
+    // onboarding page. Neither was reachable cross-site (the origin check still applies),
+    // and both were a second door onto the highest-privilege write in this surface, added
+    // as a side effect of an unrelated change.
+    if (onboard && (method === 'GET' || method === 'POST')) {
       const repo = decodeURIComponent(onboard[1]!);
       // BEFORE the installation lookup, and before the body is read. This is the write
       // that stores commands the engine executes verbatim, so the question "may you"
