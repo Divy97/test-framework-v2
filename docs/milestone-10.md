@@ -74,15 +74,15 @@ Two tracks. B never waits on A until 10h and 10l.
 | | | depends on | status |
 |---|---|---|---|
 | **10a** | the spike: what Vercel Sandbox must be shown to do, each with a number (below) | a Vercel login | run 2026-09-06; #68 |
-| **10b** | the `Executor` seam; Docker behind it; `orchestrate.ts` names no docker | | in review; #67 |
-| **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | |
+| **10b** | the `Executor` seam; Docker behind it; `orchestrate.ts` names no docker | | merged; #67 |
+| **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | in review; #69 |
 | **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | |
 | **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | |
 | **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | |
-| **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | in review; #66 |
+| **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | merged; #66 |
 | **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
 | **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | |
-| **10j** | recipe `env` and `required`; `blocked` | | |
+| **10j** | recipe `env` and `required`; `blocked` | | in review; #70 |
 | **10k** | the model key and secrets: stored, listed by name, never read back | | |
 | **10l** | secrets injected only under `deny-all`, with the guard executed | 10d, 10k | |
 | **10m** | orientation, plan, critic — off by default, proven inert, then measured | | |

@@ -126,6 +126,6 @@ containing it — the name is public, the value is not, and a run without it sto
 security boundary — a recipe already runs arbitrary commands, and one that wants a
 different `PATH` can export it in the command itself — but because the Runner hands
 every participant a private `TMPDIR` and `HOME` so the phases cannot see each other's
-leftovers ([ADR-0014](0014-long-lived-services-and-named-shells.md)), and a recipe that
+leftovers ([ADR-0010](0010-the-environment-is-part-of-the-evidence.md)), and a recipe that
 redefined one would break isolation in a way that reads as the user's project being
 broken.

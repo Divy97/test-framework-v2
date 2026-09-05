@@ -12,6 +12,7 @@
 import { describe, expect, test } from 'vitest';
 import type { RunEvent } from '../src/events.js';
 import { fold } from '../src/fold.js';
+import { namesLookingUnset } from '../src/orchestrate.js';
 import { missingRequired, parseRecipe } from '../src/recipe.js';
 import { issueComment } from '../src/report.js';
 
@@ -35,7 +36,7 @@ describe('what a recipe may declare', () => {
   test('a name the engine owns is refused, because taking it over breaks isolation', () => {
     // Not a security boundary — a recipe already runs arbitrary commands — but `TMPDIR`
     // and `HOME` are how the phases are kept from seeing each other's leftovers
-    // (ADR-0014), and a recipe that redefined one would break that in a way that reads
+    // (ADR-0010), and a recipe that redefined one would break that in a way that reads
     // as the user's project being broken.
     for (const name of ['PATH', 'HOME', 'TMPDIR', 'GIT_DIR', 'GIT_WORK_TREE']) {
       expect(() => parseRecipe({ services: [], env: { [name]: '/x' } })).toThrow(/the engine sets it/);
@@ -77,6 +78,35 @@ describe('what a recipe may declare', () => {
       'B_NAME',
       'A_NAME',
     ]);
+  });
+});
+
+describe('the guess onboarding makes, and what it refuses to guess', () => {
+  test('it reads the three shapes, as whole names, and drops what is handled', () => {
+    const output = [
+      'Error: DATABASE_URL is not set',
+      'process.env.STRIPE_SECRET_KEY is undefined',
+      'Missing required environment variable: REDIS_URL',
+      'PORT is not defined',
+    ].join(String.fromCharCode(10));
+    expect(namesLookingUnset(output)).toEqual(['DATABASE_URL', 'STRIPE_SECRET_KEY', 'REDIS_URL', 'PORT']);
+    // A name the recipe already sets, or already lists as required, is not a guess worth
+    // making: the advice it produces is advice somebody has already taken.
+    expect(namesLookingUnset(output, ['PORT', 'REDIS_URL'])).toEqual(['DATABASE_URL', 'STRIPE_SECRET_KEY']);
+  });
+
+  test('a fragment of an identifier is not a name', () => {
+    // Without the word boundary this matched `ATABASE_URL` and quoted it back to a
+    // person as something to go and set.
+    expect(namesLookingUnset('myDATABASE_URL is not set')).toEqual([]);
+    expect(namesLookingUnset('the cache is not set')).toEqual([]);
+  });
+
+  test('it says nothing twice, and stops at eight', () => {
+    const repeated = 'A_ONE is not set. A_ONE is not set.';
+    expect(namesLookingUnset(repeated)).toEqual(['A_ONE']);
+    const many = Array.from({ length: 12 }, (_, index) => `VAR_${index} is not set`).join(' ');
+    expect(namesLookingUnset(many)).toHaveLength(8);
   });
 });
 

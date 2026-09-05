@@ -276,9 +276,14 @@ describe('a required variable with no value ends the run before anything is crea
     const recipe = parseRecipe({ services: [], env: { PORT: '8095' }, required: ['PORT', 'DATABASE_URL'] });
     const { result, events } = await run(recipe, ['DATABASE_URL']);
 
-    expect(result.state.status).not.toBe('blocked');
+    // `errored`, named rather than "not blocked": a status assertion that only excludes
+    // one value passes on a run that never got anywhere for some third reason, and the
+    // whole claim here is WHERE it got to. The image does not exist, so reaching the
+    // environment build and failing there is the proof that the gate let it past.
+    expect(result.state.status).toBe('errored');
     expect(events.some((event) => event.type === 'VERIFICATION_ABORTED' &&
       (event.payload as { cause?: string }).cause === 'missing_env')).toBe(false);
+    expect(events.some((event) => event.type === 'ENV_READY')).toBe(false);
   }, 120_000);
 });
 
@@ -539,7 +544,7 @@ describe.skipIf(!dockerAvailable())('the gate holds in public, on the two bugs t
     // the work back on the reporter with no direction.
     const comment = calls.find((c) => c.url.includes('/comments'))!.body as { body: string };
     expect(comment.body).toContain('**no fix was attempted**');
-    expect(comment.body).toMatch(/label it again to start a new run/);
+    expect(comment.body).toMatch(/start a new run from the dashboard/);
     expect(comment.body).not.toMatch(/sorry|apolog/i);
 
     // 8c, end to end: this used to assert the four-item checklist, and the checklist

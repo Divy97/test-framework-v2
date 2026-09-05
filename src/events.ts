@@ -363,6 +363,13 @@ export type VerificationAbortedV1 = {
    * what ADR-0007's amendment asks for — a boot that never happened produces no
    * tier at all, because tiers describe reproductions and there was never an
    * attempt.
+   *
+   * `missing_env` is the fourth (M10) and is not a failure at all. The other three
+   * describe something that was tried and did not work; this one is written before
+   * anything is tried, by `run.ts` rather than by `verify()`, because a name the
+   * recipe marks required had no value. Nothing booted, nothing was cloned, and the
+   * run ends `blocked` rather than `errored` — a fault on nobody's side, with one
+   * action attached. `missing` beside it carries the names.
    */
   cause?: 'handover' | 'collection' | 'environment' | 'missing_env';
   /**
@@ -402,8 +409,9 @@ export type RunEndedV1 = {
    * A reason rather than a status the fold derives, for the same reason `error` is one:
    * it is a decision the producer made and acted on — the required list is configuration,
    * like the attempt cap — and there is no evidence to derive it from, because the point
-   * is that nothing ran. The fold still refuses to take it on trust alone; it demands the
-   * `missing_env` abort beside it.
+   * is that nothing ran. The fold still refuses to take it on trust alone: it demands the
+   * `missing_env` abort beside it AND a log carrying no test run and no registration,
+   * since "nothing ran" is a claim about the whole stream and not about one event in it.
    */
   reason: 'pr_opened' | 'not_reproduced' | 'attempts_exhausted' | 'error' | 'blocked';
 };

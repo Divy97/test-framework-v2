@@ -207,6 +207,26 @@ describe('the environment paragraph describes what was observed', () => {
     expect(text).not.toMatch(/standard library, and nothing else/);
   });
 
+  test('the recipe’s configuration is named, and named as crossing the boundary', () => {
+    // The prompt/engine disagreement this project has paid for before: the engine sets
+    // `recipe.env` in both worlds, and the paragraph above tells the agent the services
+    // are absent in the judging container. An agent that reads only that concludes the
+    // ports and URLs are absent too, and writes a reproduction that hard-codes them —
+    // or worse, commits a value that stops being true when the recipe changes.
+    const text = describeEnvironment({
+      booted: true,
+      env: { PORT: '8095', DATABASE_URL: 'postgres://127.0.0.1:5432/app' },
+    });
+    expect(text).toContain('`PORT=8095`');
+    expect(text).toContain('`DATABASE_URL=postgres://127.0.0.1:5432/app`');
+    expect(text).toMatch(/for the registered command in the\ncontainer that judges you/);
+    expect(text).toMatch(/Do not write them into a committed file/);
+    // And a recipe that declares none says nothing at all — an empty list here would
+    // read as "the environment is empty", which is false in every container.
+    expect(describeEnvironment({ booted: true, env: {} })).not.toMatch(/set for every command/);
+    expect(describeEnvironment({ booted: true })).not.toMatch(/set for every command/);
+  });
+
   test('an unbooted sandbox is told both worlds are sealed', () => {
     const text = describeEnvironment({ booted: false });
     expect(text).toMatch(/not here, and not in the container that judges your work/);

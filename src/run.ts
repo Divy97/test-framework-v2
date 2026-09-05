@@ -208,6 +208,7 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
     const environmentWith = (sealed?: SealedWorld) =>
       describeEnvironment({
         ...(request.recipe ? { services: request.recipe.services } : {}),
+        ...(request.recipe?.env ? { env: request.recipe.env } : {}),
         ...(request.recipe?.test ? { testCommand: request.recipe.test } : {}),
         ...(sealed ? { sealed } : {}),
         browser: request.agentImage !== undefined,
