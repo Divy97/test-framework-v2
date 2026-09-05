@@ -63,15 +63,43 @@ export const sh = async (
   command: string,
   opts: { sudo?: boolean; timeoutMs?: number; cwd?: string } = {},
 ) => {
-  const finished = await sandbox.runCommand({ cmd: 'sh', args: ['-c', command], ...opts });
+  // A default ceiling, because a probe that hangs under `deny-all` would otherwise block
+  // until the sandbox's own timeout — the very thing item 2 measures.
+  const finished = await sandbox.runCommand({ cmd: 'sh', args: ['-c', command], timeoutMs: 120_000, ...opts });
   return { code: finished.exitCode, out: (await finished.output('both')).trim(), ms: finished.durationMs ?? NaN };
 };
+
+/**
+ * The managed image runs as `ubuntu`, uid 1000, with passwordless sudo — and `writeFiles`
+ * writes as that user. `/opt` and `/` are root's, so the paths the Runner uses (`/opt/env`,
+ * `/work`) have to be made writable first. The executor (10d) needs this same step.
+ */
+export const prepare = async (sandbox: Sandbox) => {
+  const made = await sh(sandbox, 'sudo -n mkdir -p /opt/env /work && sudo -n chown -R "$(id -u):$(id -g)" /opt/env /work && id -u');
+  if (made.code !== 0) throw new Error(`could not prepare /opt/env and /work: ${made.out}`);
+  return made.out;
+};
+
+/** True only when a probe failed the way a sealed sandbox fails — not because node crashed. */
+export const sealedFailure = (probe: { code: number; out: string }) =>
+  probe.code !== 0 && /^(DNS_FAIL|TCP_FAIL|TIMEOUT|HTTP_FAIL)/.test(probe.out);
 
 /**
  * The three egress probes, in node so they work on any image with a node binary. Each
  * prints one word and exits 0 only if the network was REACHED — so "all non-zero" is
  * the sealed answer, and the word says how it failed.
  */
+/**
+ * Fast-failing variants for polling a flip: a resolver with one try and a one-second
+ * timeout, a TCP connect that gives up in a second. Under a policy that DROPS rather than
+ * rejects, the ordinary probes wait out glibc's resolver and a four-second socket timeout,
+ * and a poll that stamps after them would measure the probes, not the seal.
+ */
+export const FAST_PROBES = {
+  dns: `node -e "const r=new (require('dns').promises.Resolver)({timeout:1000,tries:1});r.setServers(['1.1.1.1']);r.resolve4('registry.npmjs.org').then(a=>{console.log('RESOLVED',a[0]);process.exit(0)},e=>{console.log('DNS_FAIL',e.code);process.exit(1)})"`,
+  tcp: `node -e "const s=require('net').connect(53,'1.1.1.1');s.setTimeout(1000,()=>{console.log('TIMEOUT');process.exit(3)});s.on('connect',()=>{console.log('ROUTED');process.exit(0)});s.on('error',e=>{console.log('TCP_FAIL',e.code);process.exit(1)})"`,
+};
+
 export const PROBES = {
   dns: `node -e "require('dns').promises.lookup('registry.npmjs.org').then(r=>{console.log('RESOLVED',r.address);process.exit(0)},e=>{console.log('DNS_FAIL',e.code);process.exit(1)})"`,
   tcp: `node -e "const s=require('net').connect(53,'1.1.1.1');s.setTimeout(4000,()=>{console.log('TIMEOUT');process.exit(3)});s.on('connect',()=>{console.log('ROUTED');process.exit(0)});s.on('error',e=>{console.log('TCP_FAIL',e.code);process.exit(1)})"`,

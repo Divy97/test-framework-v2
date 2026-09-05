@@ -12,7 +12,7 @@ try {
   const finished = await again.wait();
   verdict('12.getCommand', finished.exitCode === 0 && (await finished.stdout()).includes('bye'), `re-attached, exit ${finished.exitCode}`);
   await sh(sandbox, 'echo x > /tmp/x');
-  const snapshot = await sandbox.snapshot({ expiration: 60_000 });
+  const snapshot = await sandbox.snapshot({ expiration: 10 * 60_000 });
   record('12', `snapshot ${snapshot.snapshotId}; sandbox status after snapshot(): ${sandbox.status}`);
   const got = await Snapshot.get({ ...creds(), snapshotId: snapshot.snapshotId });
   record('12', `Snapshot.get → status ${got.status}, ${Math.round(got.sizeBytes / 1024 / 1024)} MB, regions ${got.regions.join(',')}`);

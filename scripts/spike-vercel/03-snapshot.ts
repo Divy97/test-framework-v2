@@ -1,20 +1,25 @@
 // Item 3. Snapshot after a real install; create from it under deny-all; the tree is there
 // and hardlinks work across it (what `restoreEnvironment`'s `cp -al` needs).
 import { Sandbox, Snapshot } from '@vercel/sandbox';
-import { creds, REGION, TAG, create, sh, PROBES, verdict, record, done, stopQuietly, timed } from './lib.js';
+import { creds, REGION, TAG, create, prepare, sh, FAST_PROBES, sealedFailure, verdict, record, done, stopQuietly, timed } from './lib.js';
 
 const build = await create({ networkPolicy: 'allow-all', timeout: 20 * 60_000 });
 let phase: Sandbox | undefined;
 let snapshotId: string | undefined;
 try {
+  record('3', `prepared as uid ${await prepare(build)}`);
   await build.writeFiles([
     {
       path: '/opt/env/repo/package.json',
       content: JSON.stringify({ name: 'spike', private: true, dependencies: { typescript: '5.7.2', vitest: '2.1.8', next: '15.1.0', react: '19.0.0', 'react-dom': '19.0.0' } }),
     },
   ]);
-  const install = await sh(build, 'cd /opt/env/repo && npm install --no-audit --no-fund 2>&1 | tail -2 && du -sm node_modules | cut -f1', { timeoutMs: 15 * 60_000 });
-  record('3', `npm install: exit ${install.code}, ${Math.round(install.ms)}ms; ${install.out.split('\n').at(-1)} MB`);
+  // npm's exit on its own line: piping it into `tail` would report tail's exit and turn
+  // an install failure into a snapshot that looks broken two verdicts later.
+  const install = await sh(build, 'cd /opt/env/repo && npm install --no-audit --no-fund > /tmp/npm.log 2>&1; echo "NPM_EXIT $?"', { timeoutMs: 15 * 60_000 });
+  const size = await sh(build, 'du -sm /opt/env/repo/node_modules | cut -f1; tail -n 2 /tmp/npm.log');
+  record('3', `npm install: ${install.out}, ${Math.round(install.ms)}ms; node_modules ${size.out.split('\n')[0]} MB; ${size.out.split('\n').slice(1).join(' | ')}`);
+  verdict('3.install', install.out.includes('NPM_EXIT 0'), install.out);
   await sh(build, 'echo marker > /opt/env/ignored.txt');
 
   const snap = await timed(() => build.snapshot({ expiration: 6 * 60 * 60_000 }));
@@ -28,10 +33,11 @@ try {
   verdict('3.create-from-snapshot<15s', made.ms < 15_000, `${Math.round(made.ms)}ms`);
   const present = await sh(phase, 'test -f /opt/env/ignored.txt && test -d /opt/env/repo/node_modules && echo PRESENT');
   verdict('3.tree-present', present.out.includes('PRESENT'), present.out || `exit ${present.code}`);
+  // Same filesystem, so a hardlinked copy shares inodes: link count ≥ 2 on a file inside.
   const link = await sh(phase, 'mkdir -p /work/clone && cp -al /opt/env/repo/node_modules /work/clone/node_modules && stat -c %h /work/clone/node_modules/typescript/package.json');
   verdict('3.cp-al', link.code === 0 && Number(link.out) >= 2, `link count ${link.out} (exit ${link.code})`);
-  const sealed = await sh(phase, PROBES.dns);
-  verdict('3.sealed', sealed.code !== 0, sealed.out);
+  const sealed = await sh(phase, FAST_PROBES.dns, { timeoutMs: 10_000 });
+  verdict('3.sealed', sealedFailure(sealed), sealed.out);
 } finally {
   await stopQuietly(phase);
   if (build.status === 'running') await stopQuietly(build);

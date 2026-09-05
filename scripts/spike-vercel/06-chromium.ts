@@ -21,7 +21,7 @@ try {
     const probe = await sh(sandbox, `node -e "fetch('http://127.0.0.1:9222/json/version').then(r=>r.json()).then(j=>console.log(j.Browser),()=>process.exit(1))"`);
     if (probe.code === 0) version = probe.out;
   }
-  verdict('6.cdp', version !== '', version || (await sh(sandbox, 'tail -5 /tmp/chromium.log')).out);
+  verdict('6.cdp', version !== '', version || (await sh(sandbox, 'tail -n 5 /tmp/chromium.log')).out);
 } finally {
   await stopQuietly(sandbox);
 }
