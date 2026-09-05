@@ -36,6 +36,7 @@ const issueIntake = (payload: unknown): IssueIntake => {
 import { runFromIssue, symptomFrom } from '../src/run.js';
 import { call, fakeModel, type FakeModel } from './fixtures/model.js';
 import { cleanupFixtures, demoRecipe, demoRepo } from './fixtures/repo.js';
+import { parseRecipe, type Recipe } from '../src/recipe.js';
 import { get } from '../src/blobs.js';
 import type { ArtifactRef } from '../src/events.js';
 
@@ -193,6 +194,92 @@ describe('the symptom pattern comes from the report, and is escaped', () => {
     expect(long.startsWith(symptom)).toBe(true);
     expect([' ', undefined]).toContain(long[symptom.length]);
   });
+});
+
+/**
+ * A run that never starts (M10).
+ *
+ * No Docker gate, and that is the point: if this path ever reached a container the image
+ * below does not exist, so the test would fail loudly rather than pass slowly. What it
+ * proves is the ordering — the check happens before anything is created, before triage,
+ * before a model is spent — which is the difference between telling somebody a variable
+ * is missing and telling them their bug could not be reproduced.
+ */
+describe('a required variable with no value ends the run before anything is created', () => {
+  const nowhere = 'test-framework-v2-sandbox:this-image-does-not-exist';
+
+  const run = async (recipe: Recipe, secretNames: string[] = []) => {
+    const fixture = demoRepo();
+    const remotePath = bareRemote(fixture.repo);
+    const comments: string[] = [];
+    const recorder = (async (url: string | URL | Request, init?: RequestInit) => {
+      const target = String(url);
+      if (target.endsWith('/access_tokens')) {
+        return new Response(JSON.stringify({ token: 'an-installation-token' }), { status: 201 });
+      }
+      if (target.includes('/comments')) {
+        comments.push(String((JSON.parse(String(init?.body)) as { body: string }).body));
+      }
+      return new Response('{}', { status: 201 });
+    }) as typeof fetch;
+
+    const events: RunEvent[] = [];
+    const result = await runFromIssue({
+      intake: issueIntake(delivery('the orders total is wrong')),
+      app: { appId: '1', privateKeyPem: PEM, fetch: recorder, api: 'https://api.github.invalid' },
+      recipe,
+      image: nowhere,
+      blobRoot: hostBlobs(),
+      append: async (event) => void events.push(event),
+      remote: () => remotePath,
+      secretNames,
+    });
+    return { result, events, comments };
+  };
+
+  test('the log says which names, and shows no sandbox was ever made', async () => {
+    const recipe = parseRecipe({
+      install: 'npm ci',
+      services: [],
+      env: { PORT: '8095' },
+      required: ['PORT', 'DATABASE_URL', 'STRIPE_SECRET_KEY'],
+    });
+    const { result, events, comments } = await run(recipe);
+
+    expect(result.state.status).toBe('blocked');
+    // Four events and no more: requested, an attempt declared, the abort that names the
+    // variables, the ending. Anything else would mean something ran.
+    expect(events.map((event) => event.type)).toEqual([
+      'RUN_REQUESTED',
+      'ATTEMPT_STARTED',
+      'VERIFICATION_ABORTED',
+      'RUN_ENDED',
+    ]);
+    expect(result.state.aborts.at(-1)).toMatchObject({
+      cause: 'missing_env',
+      missing: ['DATABASE_URL', 'STRIPE_SECRET_KEY'],
+    });
+    // `PORT` is required AND supplied, so it is not among them.
+    expect(result.state.aborts.at(-1)?.missing).not.toContain('PORT');
+    expect(result.prUrl).toBeUndefined();
+
+    // And the reporter was told, in one comment, naming only the names.
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain('`DATABASE_URL`');
+    expect(comments[0]).toMatch(/Do not paste/);
+  }, 60_000);
+
+  test('THE control: supply the names and the run proceeds — the block is not a blanket refusal', async () => {
+    // Without this the test above passes on an engine that refuses every run. The image
+    // is still nonexistent, so proceeding means failing at the container — which is
+    // exactly the evidence that the block was not what stopped it.
+    const recipe = parseRecipe({ services: [], env: { PORT: '8095' }, required: ['PORT', 'DATABASE_URL'] });
+    const { result, events } = await run(recipe, ['DATABASE_URL']);
+
+    expect(result.state.status).not.toBe('blocked');
+    expect(events.some((event) => event.type === 'VERIFICATION_ABORTED' &&
+      (event.payload as { cause?: string }).cause === 'missing_env')).toBe(false);
+  }, 120_000);
 });
 
 describe.skipIf(!dockerAvailable())('an issue produces a pull request, with no human step', () => {

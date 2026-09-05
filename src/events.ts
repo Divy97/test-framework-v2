@@ -364,7 +364,19 @@ export type VerificationAbortedV1 = {
    * tier at all, because tiers describe reproductions and there was never an
    * attempt.
    */
-  cause?: 'handover' | 'collection' | 'environment';
+  cause?: 'handover' | 'collection' | 'environment' | 'missing_env';
+  /**
+   * The environment variable names a run was missing, when `cause` is `missing_env` (M10).
+   *
+   * Machine-readable, beside the prose, because this is the one abort a person is
+   * expected to ACT on: the comment lists the names, and a UI links them to the form
+   * that supplies them. Reading them back out of `reason` would be the regex-the-English
+   * mistake the field above forbids.
+   *
+   * Additive, so the payload stays `v: 1` — absent means an abort that is not about a
+   * missing name, which is every abort written before M10.
+   */
+  missing?: string[];
 };
 
 /**
@@ -383,7 +395,17 @@ export type VerificationAbortedV1 = {
  */
 export type RunEndedV1 = {
   v: 1;
-  reason: 'pr_opened' | 'not_reproduced' | 'attempts_exhausted' | 'error';
+  /**
+   * `blocked` (M10) is the run that never started: a name the recipe marks required had
+   * no value, so no sandbox was created and nothing about the report was tested.
+   *
+   * A reason rather than a status the fold derives, for the same reason `error` is one:
+   * it is a decision the producer made and acted on — the required list is configuration,
+   * like the attempt cap — and there is no evidence to derive it from, because the point
+   * is that nothing ran. The fold still refuses to take it on trust alone; it demands the
+   * `missing_env` abort beside it.
+   */
+  reason: 'pr_opened' | 'not_reproduced' | 'attempts_exhausted' | 'error' | 'blocked';
 };
 
 export type EventPayload =

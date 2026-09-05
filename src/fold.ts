@@ -26,6 +26,8 @@ export type RunStatus =
   | 'attempting'
   | 'pr_opened'
   | 'unresolved'
+  /** Nothing ran: a required environment variable had no value (M10). */
+  | 'blocked'
   | 'errored';
 
 export type TestRunRecord = {
@@ -200,7 +202,14 @@ export type RunState = {
    * status — but a `base` or `fix` abort does disqualify its own attempt from
    * being credited a reproduction. See `reproducedAttempt`.
    */
-  aborts: { attempt: number; phase: VerificationPhase; reason: string; cause?: VerificationAbortedV1['cause'] }[];
+  aborts: {
+    attempt: number;
+    phase: VerificationPhase;
+    reason: string;
+    cause?: VerificationAbortedV1['cause'];
+    /** The names a `missing_env` abort was missing (M10). Absent on every other cause. */
+    missing?: string[];
+  }[];
   /**
    * Event types that arrived after RUN_ENDED, recorded and NOT applied.
    *
@@ -467,6 +476,10 @@ export function apply(state: RunState, event: RunEvent): RunState {
           phase: event.payload.phase,
           reason: event.payload.reason,
           ...(event.payload.cause ? { cause: event.payload.cause } : {}),
+          // Carried through rather than re-read from `reason`: the names are what a
+          // person acts on, and parsing them back out of prose is the mistake the
+          // payload's own comment forbids.
+          ...(event.payload.missing ? { missing: event.payload.missing } : {}),
         },
       ];
       // An abort in `diff` or `cleanup` witnesses completion just as
@@ -521,7 +534,19 @@ export function apply(state: RunState, event: RunEvent): RunState {
         // obvious alternative, deriving it from `aborts`, is worse: an abort is a
         // failure to observe and the repro can cause one, so the agent under
         // judgement could flip its own run out of `unresolved` by hanging.
-        status: state.pr ? 'pr_opened' : event.payload.reason === 'error' ? 'errored' : 'unresolved',
+        //
+        // `blocked` is NOT taken on the producer's word the way `errored` is, and the
+        // difference is that a witness exists: a run that never started has a
+        // `missing_env` abort naming what it was missing, emitted immediately before.
+        // Without it the reason folds to `unresolved` — a claim that nothing was tested
+        // has to be as checkable as a claim that something was.
+        status: state.pr
+          ? 'pr_opened'
+          : event.payload.reason === 'error'
+            ? 'errored'
+            : event.payload.reason === 'blocked' && state.aborts.some((abort) => abort.cause === 'missing_env')
+              ? 'blocked'
+              : 'unresolved',
       };
     case 'PR_OPENED':
       return {

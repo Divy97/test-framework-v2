@@ -207,6 +207,27 @@ export function issueComment(state: RunState, context: ReportContext): string {
     );
   }
 
+  // NOTHING RAN (M10). Above `errored` on purpose: this run also failed on our side of
+  // the line, but it failed for a reason the reporter can fix in one action, and burying
+  // that under "a fault on our side" would hide the one sentence worth reading. Below the
+  // PR branch, because a run that opened one is not blocked by definition.
+  if (state.status === 'blocked') {
+    const missing = state.aborts.find((abort) => abort.cause === 'missing_env')?.missing ?? [];
+    return (
+      `This run did not start, and nothing about the report was tested.\n\n` +
+      `The environment recipe for this repository marks ` +
+      `${missing.map((name: string) => `\`${name}\``).join(', ')} as required, and no value is stored ` +
+      `for ${missing.length === 1 ? 'it' : 'them'}. Without ${missing.length === 1 ? 'it' : 'them'} ` +
+      `the project boots half-configured, and a reproduction that fails for that reason would be ` +
+      `reported as a finding about your bug, which it is not.\n\n` +
+      `Add ${missing.length === 1 ? 'the value' : 'the values'} to this repository's environment ` +
+      `and start the run again. **Do not paste ${missing.length === 1 ? 'it' : 'them'} into this ` +
+      `issue** — anything that authenticates to another system belongs in the encrypted store, ` +
+      `not in a public thread.\n\n` +
+      `No fix was attempted and no pull request was opened.`
+    );
+  }
+
   if (state.status === 'errored') {
     const abort = state.aborts.at(-1);
     return (
@@ -240,8 +261,8 @@ export function issueComment(state: RunState, context: ReportContext): string {
       `**No fix was attempted, and nothing here is a finding about your report.** It was not ` +
       `tested to a conclusion. The evidence trail for what did happen is kept, including ` +
       `${state.transcript.length} transcript messages.\n\n` +
-      `Label this issue again to start a new run. If it stops here twice, the report is probably ` +
-      `fine and the bug is ours.`
+      `Start a new run from the dashboard when you want another attempt. If it stops here ` +
+      `twice, the report is probably fine and the bug is ours.`
     );
   }
 

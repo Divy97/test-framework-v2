@@ -1203,6 +1203,28 @@ export async function proveRepository(plan: {
       );
     }
 
+    // A GUESS, labelled as one (M10). A suite that fails complaining about an unset
+    // variable is the commonest way a repository turns out to need configuration nobody
+    // wrote down, and saying so at approval — while a human is looking — is worth far
+    // more than discovering it inside a stranger's issue. It is a regex over somebody
+    // else's error message, so it never gates and never becomes an event: it is a
+    // sentence on the onboarding page, and `recipe.required` is the thing that acts.
+    if (suite !== undefined && 'output' in suite) {
+      const named = [...suite.output.matchAll(UNSET_VARIABLE)]
+        .map((match) => match[1] ?? match[2] ?? match[3])
+        .filter((name): name is string => name !== undefined && !(name in (plan.recipe.env ?? {})));
+      const unique = [...new Set(named)].slice(0, 8);
+      if (unique.length > 0) {
+        caveats.push(
+          `the test command's output mentions ${unique.map((name) => `\`${name}\``).join(', ')}, ` +
+            'which this recipe does not set. That is a guess read off an error message, not a ' +
+            'finding — but if the project needs those to run, set them in the recipe now, or list ' +
+            'them as required so a run without them stops and says so instead of failing to ' +
+            'reproduce and calling that a finding about somebody\'s bug',
+        );
+      }
+    }
+
     return {
       state: caveats.length === 0 ? 'ready' : 'ready_with_caveats',
       commit,
@@ -1499,6 +1521,17 @@ async function observedOnBase(
  * network, which taught the agent to write a reproduction that needed one. That
  * cost three model runs to diagnose and one sealed container to have prevented.
  */
+/**
+ * The shapes an unset environment variable takes in somebody else's error message.
+ *
+ * Three, because three cover node, shells and python between them, and a longer list
+ * would be a parser for every runtime rather than a hint. Deliberately not exhaustive —
+ * what it produces is a sentence on a page, and a miss costs nothing a person would
+ * notice.
+ */
+const UNSET_VARIABLE =
+  /([A-Z][A-Z0-9_]{2,})\s+is not (?:set|defined)|process\.env\.([A-Z][A-Z0-9_]{2,})\s+is undefined|Missing (?:required )?(?:environment )?variable:?\s+([A-Z][A-Z0-9_]{2,})/g;
+
 export type SealedWorld = { command: string } & (
   | { exitCode: number; output: string }
   | { failed: string }

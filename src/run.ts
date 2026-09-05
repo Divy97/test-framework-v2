@@ -42,7 +42,7 @@ import {
 import { orchestrate, type RunPlan, type SealedWorld } from './orchestrate.js';
 import { describeEnvironment, renderPrompt } from './prompts.js';
 import { redact } from './redact.js';
-import type { Recipe } from './recipe.js';
+import { missingRequired, type Recipe } from './recipe.js';
 import { issueComment, pullRequestBody, pullRequestTitle, triageComment } from './report.js';
 import { triage } from './triage.js';
 
@@ -126,6 +126,14 @@ export type RunRequest = {
    */
   triageModel?: string;
   flakeRuns?: number;
+  /**
+   * Names this repository has a stored secret for (M10).
+   *
+   * Only the NAMES: a value never reaches this function, and the check below only asks
+   * whether a required name is supplied at all. Values are resolved later, at the moment
+   * of injection, into a sandbox that has no route out (ADR-0017).
+   */
+  secretNames?: readonly string[];
 };
 
 export type RunResult = {
@@ -208,6 +216,68 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
         booted: request.recipe !== null,
       });
     const issue = intake.event.raw_text;
+
+    /**
+     * Say what happened on the issue, whatever happened.
+     *
+     * Best effort and never at the cost of the run: a comment that cannot be posted must
+     * not discard a pull request that exists, and there is no event class for "we could
+     * not reach GitHub" — inventing one to describe our own outage would put a fact about
+     * us in a log about the user's bug.
+     */
+    const sayWhatHappened = async (final: RunState) => {
+      try {
+        const fresh = await installationToken(app, intake.installationId);
+        await commentOnIssue(
+          app,
+          fresh,
+          intake.repo,
+          intake.issueNumber,
+          issueComment(final, {
+            issue,
+            threadRef: intake.event.thread_ref,
+            ...(await lastWord(request.blobRoot, final)),
+          }),
+        );
+      } catch {
+        // Deliberately unrecorded; see above.
+      }
+    };
+
+    // BLOCKED, before a sandbox exists (M10). A recipe can name variables this repository
+    // cannot run without. Starting anyway boots a half-configured project, fails to
+    // reproduce, and reports that failure as a finding about somebody's bug — the one
+    // presentation ADR-0007's amendment forbids. Ending here is not the gate bending: no
+    // reproduction was shown, so no fix is attempted and no pull request is opened. What
+    // is different from a Tier 3 is that nothing was TESTED, and the comment says so and
+    // asks only for the names.
+    //
+    // Before triage, too: a cheap model's question about a report is worth asking while
+    // the reporter is still at their keyboard, and worth not asking at all about a run
+    // that is not going to happen.
+    const missing = request.recipe ? missingRequired(request.recipe, request.secretNames ?? []) : [];
+    if (missing.length > 0) {
+      let seq = 1;
+      const at = () => ({ run_id: runId, seq: ++seq, ts: new Date().toISOString() });
+      // Every event belongs to an attempt — including the one that says an attempt never
+      // began, which the fold would otherwise refuse to place.
+      await emit({ ...at(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } });
+      await emit({
+        ...at(),
+        type: 'VERIFICATION_ABORTED',
+        payload: {
+          v: 1,
+          phase: 'setup',
+          cause: 'missing_env',
+          reason: `required and unset: ${missing.join(', ')}`,
+          missing,
+        },
+      });
+      await emit({ ...at(), type: 'RUN_ENDED', payload: { v: 1, reason: 'blocked' } });
+      const blocked = fold(events);
+      await sayWhatHappened(blocked);
+      return { runId, state: blocked };
+    }
 
     // TRIAGE, before a container starts (8e). The reporter is at the keyboard now and
     // nowhere near it in twenty minutes, so this is the only moment a question is
@@ -373,18 +443,7 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
     //
     // Best effort, and last. A failed comment must not discard a pull request that
     // exists — the PR is the deliverable.
-    try {
-      const fresh = await installationToken(app, intake.installationId);
-      await commentOnIssue(app, fresh, intake.repo, intake.issueNumber, issueComment(state, {
-        issue,
-        threadRef: intake.event.thread_ref,
-        ...(await lastWord(request.blobRoot, state)),
-      }));
-    } catch {
-      // Recorded nowhere, deliberately: there is no event class for "we could not
-      // reach GitHub to say what happened", and inventing one to describe our own
-      // outage would put a fact about us in a log about the user's bug.
-    }
+    await sayWhatHappened(state);
 
     // What the agent phases spent. Carried out rather than logged, for the reason above:
     // our bill is not a fact about the user's bug.
