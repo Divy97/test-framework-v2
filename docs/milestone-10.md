@@ -2,7 +2,7 @@
 status: in progress
 ---
 
-# Milestone 10 — one microVM per issue, and a button that starts it
+# Milestone 10 — a microVM per phase, and a button that starts the run
 
 Milestone 9 split the product into a plane GitHub can always reach and a runner on
 somebody's laptop. That was the right split and the wrong end state: the demo needs the
@@ -11,8 +11,8 @@ whose thesis is verification cannot be tried by a stranger. This milestone remov
 laptop.
 
 What a person does, when it is built: sign in, pick a repository the App is installed on,
-pick an open issue, and press **Start**. A microVM is created for that run, the repository
-is cloned into it with no credential, the recipe is replayed and snapshotted, the agent
+pick an open issue, and press **Start**. A microVM is created for each phase of that run,
+the repository is cloned into it with no credential, the recipe is replayed and snapshotted, the agent
 reads the code and the report, reproduces the bug in a sealed sandbox, drafts a plan a
 second model reviews, fixes, is judged on both commits in sandboxes with no network, and a
 pull request opens with the evidence — or the run ends `blocked` because a variable the
@@ -45,9 +45,9 @@ destroyed when the run ends.
 - **The user's own OpenRouter key**, stored like a secret, spent by the worker on that
   user's runs.
 - **A Next.js dashboard in `web/`, same origin, behind the plane**, which becomes a JSON API
-  and an SSE feed. ADR-0022 reverses the README's no-framework decision and says what does
-  not move: the plane stays the only public process, the only holder of cookies, and the
-  only place authorization is decided.
+  and an SSE feed. ADR-0022, written in 10i, will reverse the README's no-framework decision
+  and say what does not move: the plane stays the only public process, the only holder of
+  cookies, and the only place authorization is decided.
 - **Not in this milestone, deliberately:** an MCP surface (first item of M11, cheap once the
   API exists); serving blobs by ref (refs stay text until redaction-at-read is designed);
   diff-coverage.
@@ -72,7 +72,7 @@ Two tracks. B never waits on A until 10h and 10l.
 
 | | | depends on | status |
 |---|---|---|---|
-| **10a** | the spike: thirteen things Vercel Sandbox must do, each with a number | a `VERCEL_TOKEN` | |
+| **10a** | the spike: what Vercel Sandbox must be shown to do, each with a number (below) | a `VERCEL_TOKEN` | |
 | **10b** | the `Executor` seam; Docker behind it; `orchestrate.ts` names no docker | | |
 | **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | |
 | **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | |
@@ -91,8 +91,31 @@ Rough order: week 1 — 10a and 10g; weeks 2–3 — 10b, 10c, 10j, 10k; weeks 4
 week 6 — 10e, 10h; week 7 — 10f, 10l, 10m; week 8 — 10n and real runs on repositories the
 author did not write. Eight to ten weeks at this repository's review discipline.
 
-If the spike fails on egress (criterion 1 or 2), the substrate becomes E2B through the same
-seam and ADR-0021 is rewritten; nothing else in the table changes.
+If the spike fails on egress (items 1 or 2 below), the substrate becomes E2B through the
+same seam and ADR-0021 is rewritten; nothing else in the table changes.
+
+### The spike, itemised
+
+Each is a script under `scripts/spike-vercel/`, gated on `VERCEL_TOKEN`, printing PASS or
+FAIL with the number beside it:
+
+1. `deny-all` at create: `getent`, `nc 1.1.1.1 53` and `wget 1.1.1.1` all fail; loopback works.
+2. The policy flipped `allow-all` → `deny-all` on a *running* sandbox: both probes fail
+   within five seconds, no restart, and a loopback server started before the flip answers.
+3. Snapshot after a ~200 MB `npm ci`: how long `snapshot()` takes; create-from-snapshot
+   under 15 s p50; `/opt/env` present; `cp -al` works.
+4. `writeFiles` at 1, 10, 50, 100 and 250 MB, and `git clone --no-local -- bundle` from the
+   result. Pass at 100 MB, or chunk-and-`cat` works.
+5. Fifty `runCommand('true')` — p50 and p95 under 300 ms; a detached command's `logs()` at
+   ten lines a second for five minutes with no gap; re-attach after dropping the iterator.
+6. Chromium in the agent image answers CDP `/json/version` under Firecracker.
+7. An exposed port under `deny-all` — recorded only; the design exposes none.
+8. `stop()` reports plausible active-CPU and transfer numbers after a known burn.
+9. Cold start, ten times from the image and ten from a snapshot — under 10 s p50.
+10. The root model: `sudo`, uid 1000, root can `SIGSTOP` uid 1000, `chown` works.
+11. What a session timeout looks like to a detached command's `logs()` and `wait()`.
+12. Snapshot delete, sandbox list, tags on create, command re-attach — the APIs exist.
+13. Both images pushed to Vercel's registry: time and size.
 
 ## The honest unknowns, before starting
 

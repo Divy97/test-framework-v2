@@ -15,9 +15,10 @@ The research behind it is [milestone-10-substrate.md](../milestone-10-substrate.
 ## Decision
 
 **Every phase of a run executes in a Firecracker microVM created for that run and destroyed
-when it ends, on Vercel Sandbox.** Nothing long-lived executes anything. The plane still
-mints the run id and writes no events; the worker that drives the sandboxes is the single
-producer ADR-0009 requires, and it is ours again.
+when it ends, on Vercel Sandbox.** Nothing long-lived executes a stranger's code. The plane
+still mints the run id and writes no events; the worker that drives the sandboxes is the
+single producer ADR-0009 requires and ADR-0019 re-established as a check, and it is ours
+again.
 
 Four properties are the reason, in the order the criteria were ranked:
 
@@ -44,9 +45,11 @@ Four properties are the reason, in the order the criteria were ranked:
 ## What this stops claiming
 
 ADR-0006's milestone-9 amendment — evidence is scoped to *"this installation's runner
-observed it"* — **reverses**. The engine executes on infrastructure the project controls;
-"the engine executed this" is true again, and the attestation question that amendment
-opened closes.
+observed"* — **reverses**. The observer is ours again: the worker that reads exit codes and
+hashes outputs is a process this project runs, on machines it provisions and destroys, so
+"the engine executed this" is true again and the attestation question that amendment opened
+closes. (The isolation beneath it rests partly on a vendor's firewall — see below — which
+is a different claim, and priced separately.)
 
 ## What this starts owing
 
@@ -57,9 +60,8 @@ opened closes.
 - **An `Executor` seam that does not exist.** `orchestrate.ts` reaches Docker at 9 call
   sites (7 `execFile`, 2 `spawn`), mounts 5 host paths, and seals with one `--network none`
   — and there is no `docker exec`: every container is driven over the stdio of a single
-  `docker run -i`, so the seam is a phase, not a primitive. The first PR of the milestone
-  extracts the interface with Docker as its only implementation and the suite green; the
-  second implements it on Vercel. The Docker implementation stays:
+  `docker run -i`, so the seam is a phase, not a primitive. 10b extracts the interface with
+  Docker as its only implementation and the suite green; 10d implements it on Vercel. The Docker implementation stays:
   it is what the suite runs against without a Vercel credential, and it is the local path.
 - **A provider dependency.** The engine's isolation claims now rest partly on a vendor's
   firewall. That is a real cost and the README will say so: the claim becomes "denied by
@@ -67,8 +69,9 @@ opened closes.
   by a flag we pass to Docker". The Docker `Executor` remains the implementation whose
   every guarantee is ours.
 - **Session bounds as run bounds.** 45 minutes on Hobby, 24 hours on Pro. 8a's wall clock
-  already bounds a run below that; the session timeout becomes a second ceiling the fold
-  must recognise as `errored`, never as a finding.
+  is an hour *per container* (`CONTAINER_TIMEOUT_MS`), so on Hobby the session is the
+  tighter ceiling, not the looser one; it becomes a second ceiling the fold must recognise
+  as `errored`, never as a finding. Pro removes it.
 
 ## Rejected
 
@@ -89,15 +92,18 @@ opened closes.
   covered.
 - **Self-hosted Firecracker**: exactly the guarantee, and a VMM host, an image pipeline, a
   jailer and an exec agent to build first. The BYOC story, if there is ever one.
-- **Topology A only** (the existing runner plus `dockerd` inside one VM per run): one week,
-  hosted, and the right first spike. Rejected as the *end state* because it keeps the agent
+- **Topology A only** (the existing runner plus `dockerd` inside one VM per run): one to
+  two weeks, hosted, and the right first spike. Rejected as the *end state* because it keeps the agent
   on a network route during its session, keeps one kernel under every phase, and keeps
   `docker commit` where a snapshot should be. It stays the fallback if the seam slips.
 
 ## Consequences
 
-- `ENV_READY` carries the snapshot id beside the image digest
-  ([ADR-0010](0010-the-environment-is-part-of-the-evidence.md)).
+- A new event class, `ENV_BUILT`, records the image reference and the snapshot id the
+  phases ran from ([ADR-0010](0010-the-environment-is-part-of-the-evidence.md)). Not a
+  field on `ENV_READY`: that event is the *agent* sandbox's replay, a different sandbox,
+  and `SANDBOX_CREATED` — typed, folded, and never emitted — is not an optional field
+  either.
 - ADR-0017's "done when" gains a second satisfying condition: the agent sandbox's policy is
   `deny-all` before `AGENT_MESSAGE` seq 1, observable in the log.
 - The README's "Two credentials, and where they are not" gains a third: the model key,

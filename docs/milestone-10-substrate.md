@@ -6,8 +6,8 @@ researched: 2026-09-05, from each provider's current documentation (sources at t
 ## The question
 
 Milestone 9 split the product into a plane GitHub can always reach and a runner on
-somebody's laptop. Milestone 10 removes the laptop: **one sandbox per issue**, created when a
-person presses the button, destroyed when the run ends. This document answers *which*
+somebody's laptop. Milestone 10 removes the laptop: **a sandbox per phase**, created for the
+run a person starts by pressing a button, destroyed when that run ends. This document answers *which*
 sandbox — and it answers against this engine's requirements rather than against a feature
 list, because the claims the README makes are exactly the things a substrate can take away
 without anybody noticing.
@@ -193,8 +193,9 @@ checkpoint-to-new-Sprite and Docker.
 
 Vercel bills *active* CPU — *"Time spent waiting for I/O (such as network requests,
 database queries, or AI model calls) does not count."* A run here is mostly I/O wait: the
-agent waits on the model, the phases run for seconds. Estimate for the milestone-7 real run
-(95 s of agent time, five phase executions, two suite runs, one install): roughly 6–8
+agent waits on the model, the phases run for seconds. Estimate, using the milestone-7 real
+run's shape as inputs (95 s issue-to-PR, five phase executions, two suite runs) plus one
+install the demo does not have: roughly 6–8
 minutes of active CPU and ~1.6 GB-hours of memory across the sandboxes, **≈ $0.05 in
 compute** against $0.064 for the model. Hobby's 5 CPU-hours a month is ~40 runs free.
 Creation is $0.60 per million.
@@ -210,8 +211,8 @@ Creation is $0.60 per million.
 - **ADR-0006**'s milestone-9 amendment — evidence scoped to "this installation's runner" —
   **reverses**: the engine executes on infrastructure the project controls again, so the
   attestation question closes rather than opens.
-- **ADR-0010**: the environment is part of the evidence — the snapshot id joins the image
-  digest in `ENV_READY`.
+- **ADR-0010**: the environment is part of the evidence — a new event class, `ENV_BUILT`,
+  records the image reference and the snapshot id the phases ran from.
 
 ## Sources
 
