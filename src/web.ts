@@ -741,6 +741,37 @@ ${
 </div>`;
 }
 
+/**
+ * What this repository has a value for, and whether a run would receive it (M10).
+ *
+ * Names, never values — there is no route that returns one. And the second sentence is
+ * load-bearing rather than decorative: a secret injected into a sandbox with no route out
+ * satisfies a startup check and a suite that reads `process.env`, and cannot make a live
+ * third-party call. Somebody who is not told that stores a real key and files a bug about
+ * a timeout.
+ */
+const secretsBlock = (repo: string, secrets?: { names: string[]; enabled: boolean }): string => {
+  if (!secrets) return '';
+  const list = secrets.names.length
+    ? `<ul class="names">${secrets.names.map((name) => `<li><code>${escapeHtml(name)}</code></li>`).join('')}</ul>`
+    : `<p class="muted">Nothing is stored for ${escapeHtml(repo)} yet.</p>`;
+  return `<h2>Stored secrets</h2>
+${list}
+${
+  secrets.enabled
+    ? `<p>These are injected into runs on this deployment. The worker injects them only into a
+sandbox it has just observed to have no route out (ADR-0017), so a value here satisfies a
+startup check and a suite that reads it — in a sealed sandbox it cannot reach the service it
+authenticates to, and that is the point.</p>`
+    : `<p class="warning-inline"><b>Stored, and not yet injected into any run.</b> The agent
+sandbox is affordable only because nothing worth stealing lives in it — the agent is untrusted
+by construction, its prompt contains text whoever filed the issue wrote, and until the sandbox
+is sealed it has network egress. Injection is enabled per deployment once the executor has been
+shown to close that route before the agent's first turn (ADR-0017). Configuration in the
+recipe's <code>env</code> is injected today; these are not.</p>`
+}`;
+};
+
 export function onboardPage(
   repo: string,
   current: Recipe | null,
@@ -748,6 +779,7 @@ export function onboardPage(
   error?: string,
   stored?: { proof?: unknown; approvedAt?: string | null } | null,
   chrome: Chrome = {},
+  secrets?: { names: string[]; enabled: boolean },
 ): string {
   const mode = chrome.mode ?? 'plane';
   const proof = stored?.proof ?? undefined;
@@ -861,18 +893,15 @@ writes.</p>
 <code>DATABASE_URL</code> pointing at a database one of the services above starts,
 <code>NODE_ENV</code>. Those are values that are worthless outside the sandbox, and every
 command in the recipe runs with them.</p>
-<p>A value that <em>authenticates to something outside the sandbox</em> is a different thing
-and there is still no field for it. That is a decision, not an omission: the agent sandbox is
-affordable only because nothing worth stealing lives in it, and the agent is untrusted by
-construction, its prompt contains text whoever filed the issue wrote, and it has network
-egress. Real credentials in there make all three of those facts expensive at once. The fix is
-to pre-warm dependencies into the agent image so a recipe needs no registry at all and the
-sandbox can be sealed for its whole session; only then is a value in that container
-defensible.</p>
-<p>Until then, name it in <code>required</code> instead. A run that cannot find a required
-value stops before any container starts and says which name it was missing — a
-<code>blocked</code> run, which is not a finding about anybody's bug and does not pretend to
-be one.</p>`;
+<p>A value that <em>authenticates to something outside the sandbox</em> is a different thing,
+and it never goes in the recipe. Name it in <code>required</code> instead: the name is public,
+the value is not, and a run that cannot find one stops before any container starts and says
+which name it was missing — a <code>blocked</code> run, which is not a finding about anybody's
+bug and does not pretend to be one.</p>` +
+    secretsBlock(repo, secrets) +
+    `<p class="small muted">Values are sealed with AES-256-GCM and bound to this repository, so
+a ciphertext lifted from the database opens nowhere else. Nothing here, and no other page, can
+show you one again once it is stored.</p>`;
   return layout(`Onboard ${repo}`, body, { current: '/repos', ...who(chrome) });
 }
 

@@ -205,7 +205,7 @@ describe('starting a run is a write, and gated like one', () => {
   /** Answers the lookups the trigger makes, and records every write WITH its params. */
   const triggerClient = (
     writes: { sql: string; params: unknown[] }[],
-    options: { recipe?: boolean; open?: boolean } = {},
+    options: { recipe?: boolean; open?: boolean; modelKey?: boolean } = {},
   ) =>
     ({
       query: vi.fn(async (sql: string, params: unknown[] = []) => {
@@ -219,11 +219,18 @@ describe('starting a run is a write, and gated like one', () => {
             ? (options.recipe ?? true)
               ? [RECIPE_ROW]
               : []
-            : sql.includes('from jobs')
-              ? options.open
-                ? [{ run_id: 'already-running' }]
+            : // Whoever presses Start pays for the run (M10), so the button asks whether
+              // they have a key before it queues anything. Default present, because every
+              // test in this file is about authorization and not about billing.
+              sql.includes('from user_model_keys')
+              ? (options.modelKey ?? true)
+                ? [{ provider: 'openrouter' }]
                 : []
-              : [];
+              : sql.includes('from jobs')
+                ? options.open
+                  ? [{ run_id: 'already-running' }]
+                  : []
+                : [];
         return { rows, rowCount: rows.length };
       }),
     }) as unknown as Db;
@@ -265,7 +272,14 @@ describe('starting a run is a write, and gated like one', () => {
 
   const trigger = (
     writes: { sql: string; params: unknown[] }[],
-    options: { recipe?: boolean; open?: boolean; asked?: string[]; session?: Session | null; app?: boolean } = {},
+    options: {
+      recipe?: boolean;
+      open?: boolean;
+      modelKey?: boolean;
+      asked?: string[];
+      session?: Session | null;
+      app?: boolean;
+    } = {},
   ) =>
     dashboardRoutes({
       client: triggerClient(writes, options),
@@ -326,6 +340,30 @@ describe('starting a run is a write, and gated like one', () => {
     expect(queued(writes)).toHaveLength(0);
   });
 
+  it('the new verbs do not become a second door onto the recipe write', async () => {
+    // Widening the router's method allowlist for the secrets routes (M10) put `PUT` and
+    // `DELETE` in front of every block that has no method check of its own — and the
+    // onboarding block had none, so a `PUT /repos/:repo/onboard` fell into "THE ONE
+    // WRITE" and stored shell commands the engine executes verbatim. Not reachable
+    // cross-site, and a second door onto the highest-privilege write in this surface.
+    for (const method of ['PUT', 'DELETE'] as const) {
+      const writes: { sql: string; params: unknown[] }[] = [];
+      const response = await call(trigger(writes), method, '/repos/mine%2Frepo/onboard', RECIPE, {
+        'content-type': 'application/x-www-form-urlencoded',
+      });
+      expect(response).toBeNull();
+      expect(writes.filter((w) => w.sql.includes('insert into recipes'))).toHaveLength(0);
+    }
+    // THE positive control: the verb that IS the write still works, so this is not a
+    // surface that refuses everything.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const stored = await call(trigger(writes), 'POST', '/repos/mine%2Frepo/onboard', RECIPE, {
+      'content-type': 'application/x-www-form-urlencoded',
+    });
+    expect(stored?.status).toBe(303);
+    expect(writes.filter((w) => w.sql.includes('insert into recipes'))).toHaveLength(1);
+  });
+
   it('a repository with no recipe is answered, not run', async () => {
     // The onboarding gate the webhook path had (M6a), kept: a run against a repository
     // nobody has described would reproduce nothing and call that a finding.
@@ -335,6 +373,21 @@ describe('starting a run is a write, and gated like one', () => {
     expect(response?.status).toBe(409);
     expect(JSON.parse(String(response?.body))).toMatchObject({ error: 'not onboarded' });
     expect(queued(writes)).toHaveLength(0);
+  });
+
+  it('a person with no model key is told so, before GitHub is asked anything', async () => {
+    // A run spends the key of whoever pressed Start (M10). Without one the worker would
+    // claim the job, fail to drive a model, and end the run `errored` — our configuration
+    // problem wearing the shape of a finding about their bug. 412, and nothing queued.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const asked: string[] = [];
+    const response = await start(trigger(writes, { modelKey: false, asked }), 'mine/repo');
+
+    expect(response?.status).toBe(412);
+    expect(JSON.parse(String(response?.body))).toMatchObject({ error: 'no model key' });
+    expect(queued(writes)).toHaveLength(0);
+    // And no installation token was spent reading an issue for a run that cannot start.
+    expect(asked).toHaveLength(0);
   });
 
   it('a run already under way is not queued twice', async () => {

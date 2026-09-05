@@ -140,6 +140,13 @@ const fixtureClient = (): Db => {
     if (sql.includes('from run_usage where run_id = $1')) {
       return params[0] === DEMO_RUN_ID ? USAGE : [];
     }
+    // The onboarding GET lists this repository's stored secret names (M10). Neither
+    // fixture repository has any, and — per this fake's own rule — that is answered
+    // explicitly rather than left to fall through: a page rendering "nothing stored" for
+    // a query nobody wrote is exactly the false green the throw below exists to prevent.
+    if (sql.includes('from repo_secrets where repo = $1')) {
+      return [];
+    }
     throw new Error(`the fixture database was asked something nobody wrote: ${sql}`);
   };
   return {

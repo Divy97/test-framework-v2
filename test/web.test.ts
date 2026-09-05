@@ -644,10 +644,44 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     // engine this repository no longer contains.
     expect(html).toContain('Environment variables: configuration here, secrets not yet');
     expect(html).not.toContain('Environment variables are not supported yet');
-    expect(html).toContain('nothing worth stealing lives in it');
     // And it names the outcome a person actually gets, which is the whole of 10j.
     expect(html).toMatch(/<code>blocked<\/code> run/);
+    // The REASON a credential is different moved rather than went: it now sits with the
+    // stored names, which is where somebody about to paste one is looking. The test below
+    // asserts it there.
     expect(html).toMatch(/name it in <code>required<\/code>/i);
+  });
+
+  test('stored secrets are listed by name, and the page says they are not injected', () => {
+    // The sentence this asserts is the one that stops somebody storing a live
+    // `STRIPE_SECRET_KEY` and filing a bug when nothing reaches Stripe. A page that
+    // accepted a credential under an implication it does not honour would be worse than
+    // one with no field at all.
+    const held = onboardPage('acme/widgets', RECIPE, undefined, undefined, null, {}, {
+      names: ['DATABASE_URL', 'STRIPE_SECRET_KEY'],
+      enabled: false,
+    });
+    expect(held).toContain('<code>DATABASE_URL</code>');
+    expect(held).toContain('<code>STRIPE_SECRET_KEY</code>');
+    expect(held).toMatch(/not yet injected into any run/);
+    expect(held).toMatch(/nothing worth stealing lives in it/);
+    expect(held).toMatch(/ADR-0017/);
+    // Still no field: 10k stores through the JSON API, and the form on this page submits
+    // one thing.
+    expect(held).not.toMatch(/<input/i);
+
+    // And once a deployment injects, the copy stops promising it does not — and says what
+    // a secret under `deny-all` is actually good for, which is not "everything".
+    const live = onboardPage('acme/widgets', RECIPE, undefined, undefined, null, {}, {
+      names: ['DATABASE_URL'],
+      enabled: true,
+    });
+    expect(live).not.toMatch(/not yet injected/);
+    expect(live).toMatch(/no route\s*\nout|no route out/);
+
+    // A repository with nothing stored says so, rather than rendering an empty list.
+    const empty = onboardPage('acme/widgets', RECIPE, undefined, undefined, null, {}, { names: [], enabled: false });
+    expect(empty).toMatch(/Nothing is stored for acme\/widgets yet/);
   });
 
   test('a script tag in the repository name or the error cannot break out', () => {

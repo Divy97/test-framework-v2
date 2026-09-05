@@ -267,6 +267,12 @@ const REQUIRED: Record<string, string> = {
   GITHUB_CLIENT_SECRET: 'a sign-in could start and never complete',
   ENGINE_PLANE_CALLBACK_URL: 'GitHub would have nowhere to send anyone back to',
   ENGINE_BLOB_ROOT: 'artifacts would be written somewhere this process does not own',
+  // Required even on a deployment that injects nothing (M10). The plane stores model
+  // keys the moment anyone signs in and saves one, and a process that accepts a
+  // credential before it has somewhere to seal it would have to either refuse the write
+  // at the last moment or write plaintext. Failing at boot, where an operator is
+  // looking, is the only version of this that cannot go wrong quietly.
+  PLANE_SECRETS_KEY: 'a stored model key or secret could not be encrypted (`openssl rand -base64 32`)',
 };
 
 export function readPlaneConfig(env: NodeJS.ProcessEnv = process.env): PlaneConfig {
