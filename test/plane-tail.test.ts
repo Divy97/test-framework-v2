@@ -13,6 +13,12 @@ import type { Session } from '../src/auth.js';
 import { tailAuthorizer } from '../src/plane-server.js';
 
 const SESSION: Session = { id: 's', githubId: 1, login: 'divy97', avatarUrl: '', token: 'ghu' };
+// Run ids with NO entropy, and deliberately so. A realistic uuid here reads to a secret
+// scanner as a "generic high entropy secret" — this repository's first GitGuardian failure
+// was exactly that, on a literal in a test — and a scanner that cries wolf on our own
+// fixtures is one people learn to click past. These are valid v4 shapes, so the
+// authorizer's own uuid check still sees them as run ids, and no machine mistakes them for
+// a credential.
 const MINE = '11111111-1111-4111-8111-111111111111';
 const THEIRS = '22222222-2222-4222-8222-222222222222';
 
