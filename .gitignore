@@ -25,3 +25,6 @@ dist/
 *.log
 .DS_Store
 .neon
+
+# The Vercel CLI writes the linked project ids here (`vercel link`); ids are configuration, not source.
+.vercel/

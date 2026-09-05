@@ -1,0 +1,94 @@
+== scripts/spike-vercel/00-cleanup.ts
+INFO  cleanup  2 tagged, 0 stopped
+== scripts/spike-vercel/01-deny-all.ts
+INFO  1  created in 605ms, policy "deny-all"
+INFO  1  raw connect() to 1.1.1.1:53: CONNECT_ACCEPTED — a proxy completes the handshake; the data probes below say whether anything gets through
+PASS  1.dns  DNS_FAIL EAI_AGAIN (exit 1)
+PASS  1.udp  UDP_TIMEOUT (exit 3)
+PASS  1.tcp  TCP_CONNECTED_THEN_CLOSED (exit 2)
+PASS  1.tls  TLS_FAIL ECONNRESET (exit 1)
+PASS  1.http  HTTP_FAIL UND_ERR_SOCKET (exit 1)
+PASS  1.loopback  LOOPBACK ok (exit 0)
+== scripts/spike-vercel/02-live-flip.ts
+PASS  2.before  allow-all reaches 1.1.1.1 over UDP: UDP_ANSWERED 61
+INFO  2  updateNetworkPolicy took 350ms; now "allow-all"
+INFO  2  sealed between 351ms and 2029ms after the flip: UDP_TIMEOUT / TCP_CONNECTED_THEN_CLOSED
+PASS  2.sealed-within-5s  upper bound 2029ms
+PASS  2.loopback-survives  LOOPBACK ok
+PASS  2.same-session  status running
+== scripts/spike-vercel/03-snapshot.ts
+INFO  3  prepared as uid 1000
+INFO  3  npm install: NPM_EXIT 0, 17368ms; node_modules 349 MB; npm notice To update run: npm install -g npm@12.0.2 | npm notice
+PASS  3.install  NPM_EXIT 0
+CRASH  scripts/spike-vercel/03-snapshot.ts  exit 1
+       }
+       
+       Node.js v25.2.1
+== scripts/spike-vercel/04-writefiles.ts
+INFO  4  1 MB: 1936ms, 0.5 MB/s, hash matches
+INFO  4  10 MB: 7651ms, 1.3 MB/s, hash matches
+INFO  4  50 MB: 29677ms, 1.7 MB/s, hash matches
+INFO  4  100 MB: 48447ms, 2.1 MB/s, hash matches
+INFO  4  250 MB: 147392ms, 1.7 MB/s, hash matches
+INFO  4  chunk-and-cat, 120 MB in 40 MB parts: 63518ms, hash matches
+PASS  4.transfer  largest single write 250 MB; chunking works
+PASS  4.bundle-clone  1.1 MB bundle in 1995ms; clone exit 0 3a9311047132
+== scripts/spike-vercel/05-latency.ts
+FAIL  5.runCommand-p50-p95<300ms  p50 332ms p95 651ms
+INFO  5  writeFiles 1KB p50 349ms p95 760ms
+INFO  5  stream: 1500 lines over 154s before dropping the iterator (half of 3000), worst gap 576ms
+INFO  5  re-attach via getCommand(cmdId).logs(): 2258 lines → continued (partial); END not seen
+PASS  5.stream-no-gap>5s  worst gap 576ms over 154s
+FAIL  5.reattach  reached END after re-attach: false
+INFO  5  exit 0 after 308117ms
+== scripts/spike-vercel/06-chromium.ts
+SKIP  6  set ENGINE_VERCEL_AGENT_IMAGE to the agent image pushed by 13-push-images.sh
+== scripts/spike-vercel/07-inbound.ts
+INFO  7  inbound to https://sb-4rxt0sdz45wn.vercel.run under deny-all: HTTP 200 ok
+== scripts/spike-vercel/08-usage.ts
+INFO  8  burn: burned in 15138ms
+INFO  8  stop(): activeCpuDurationMs=17167 sandbox.activeCpuUsageMs=17167 networkTransfer={"ingress":2627,"egress":1605} duration=16725
+PASS  8.cpu-plausible  17167ms for a 15s burn
+== scripts/spike-vercel/09-cold-start.ts
+PASS  9.image-p50<10s  10/10 ok; create+first command p50 918ms p95 1390ms
+INFO  9  seed snapshot snap_dfzYSfcmElA74eFN16HMMTc2w4gq
+PASS  9.snapshot-p50<10s  10/10 ok; create+first command p50 1219ms p95 1717ms
+== scripts/spike-vercel/10-root-model.ts
+INFO  10  default user uid 1000 (ubuntu); sudo -n id -u → 0
+PASS  10.uid-1000  default user is uid 1000
+PASS  10.sudo  sudo -n id -u → 0
+PASS  10.root-stops-uid-1000  State:	T (stopped) | 1000
+PASS  10.chown  1000
+FAIL  10.fd-unreadable  /tmp/root-out
+== scripts/spike-vercel/11-session-timeout.ts
+INFO  11  59586ms after start (timeout 60s): logs() threw after 12 ticks: StreamError Sandbox stream was closed and is not accepting commands. | wait() threw: APIError Status code 410 is not ok: Sandbox has stopped execution and is no longer available | sandbox.status=running
+== scripts/spike-vercel/12-apis.ts
+PASS  12.list-by-tag  1 listed with item=12
+PASS  12.getCommand  re-attached, exit 0
+INFO  12  snapshot snap_YrNqBI83LJDj2X9oxt6vzXsZuwrd; sandbox status after snapshot(): snapshotting
+INFO  12  Snapshot.get → status created, 128 MB, regions iad1
+PASS  12.snapshot-list  2 snapshots listed
+PASS  12.snapshot-delete  status after delete: deleted
+== scripts/spike-vercel/00-cleanup.ts
+INFO  cleanup  35 tagged, 0 stopped
+== scripts/spike-vercel/03-snapshot.ts (re-run with the one-day expiration floor)
+INFO  3  prepared as uid 1000
+INFO  3  npm install: NPM_EXIT 0, 17864ms; node_modules 349 MB; npm notice To update run: npm install -g npm@12.0.2 | npm notice
+PASS  3.install  NPM_EXIT 0
+INFO  3  snapshot() 3221ms → snap_wohaCXlTrpaqzWjebJIfceuuWUnp (build sandbox status now snapshotting)
+PASS  3.create-from-snapshot<15s  504ms
+PASS  3.tree-present  PRESENT
+PASS  3.cp-al  link count 2 (exit 0)
+PASS  3.sealed  UDP_TIMEOUT
+INFO  3  snapshot created, 338 MB
+INFO  3  snapshot deleted
+== scripts/spike-vercel/06-chromium.ts (run separately after item 13, against the pushed agent image)
+INFO  6  /usr/bin/chromium-browser | lrwxrwxrwx    1 root     root            36 Sep  5 19:09 /usr/bin/chromium-browser -> ../lib/chromium/chromium-launcher.sh
+PASS  6.cdp  Chrome/152.0.7977.64
+== scripts/spike-vercel/13-push-images.sh
+INFO  13  using the Vercel CLI session and the linked project
+INFO  13  sandbox: vcr.vercel.com/divys-projects-b8417293/test-framework-v2/test-framework-v2-sandbox:3a93110  build+push 101s
+INFO  13  ENGINE_VERCEL_IMAGE=vcr.vercel.com/divys-projects-b8417293/test-framework-v2/test-framework-v2-sandbox@sha256:2c911957501babcb1ba3d0341205ee093dfcc39826fcfe091f6da49876efa381
+INFO  13  agent: vcr.vercel.com/divys-projects-b8417293/test-framework-v2/test-framework-v2-agent:3a93110  build+push 354s
+INFO  13  ENGINE_VERCEL_AGENT_IMAGE=vcr.vercel.com/divys-projects-b8417293/test-framework-v2/test-framework-v2-agent@sha256:f7461d6d400f2fb82409affb3269115c80e83c2fa991475b3001cee38c099010
+PASS  13  pushed both; set the two variables above in .env (the @sha256 digest form is the honest one), wait for VCR to finish preparing, then run item 6
