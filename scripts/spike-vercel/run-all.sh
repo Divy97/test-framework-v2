@@ -16,7 +16,9 @@ for script in scripts/spike-vercel/00-cleanup.ts scripts/spike-vercel/0[1-9]-*.t
   grep -E '^(PASS|FAIL|INFO|SKIP)' "$tmp" | tee -a "$out"
   fails=$(grep -c '^FAIL' "$tmp")
   if [ "$rc" -gt 2 ] || { [ "$rc" -eq 1 ] && [ "$fails" -eq 0 ]; }; then
-    { echo "CRASH  $script  exit $rc"; tail -n 3 "$tmp" | sed 's/^/       /'; } | tee -a "$out"
+    # The error's own lines, then the tail: a Node stack ends in a brace and a version
+    # string, which is what a three-line tail showed the first time and told nobody why.
+    { echo "CRASH  $script  exit $rc"; grep -E 'Error|error' "$tmp" | head -n 5 | sed 's/^/       /'; tail -n 15 "$tmp" | sed 's/^/       /'; } | tee -a "$out"
   fi
 done
 rm -f "$tmp"

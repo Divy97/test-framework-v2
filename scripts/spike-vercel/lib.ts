@@ -40,6 +40,13 @@ export const IMAGE = process.env.ENGINE_VERCEL_IMAGE ?? 'vercel/sandbox/node:22'
 export const AGENT_IMAGE = process.env.ENGINE_VERCEL_AGENT_IMAGE;
 export const TAG = { spike: 'm10' };
 
+/**
+ * The shortest snapshot expiration the API accepts: `0` (never) or at least one day —
+ * anything shorter is a 400, which item 3's first live run found. Every snapshot a spike
+ * takes is deleted explicitly; this is the floor under a delete that does not happen.
+ */
+export const DAY = 24 * 60 * 60_000;
+
 export const ms = (t: number) => `${Math.round(t)}ms`;
 export const timed = async <T>(fn: () => Promise<T>): Promise<{ value: T; ms: number }> => {
   const start = performance.now();

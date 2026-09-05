@@ -21,6 +21,12 @@ What the review of these scripts established about the managed image, without a 
 `/opt/env` and `/work` made writable first (`prepare()` in `lib.ts`, which the executor
 will need too), the probes are node one-liners, and nothing uses `pgrep` or bash-isms.
 
+The linked Vercel project exists for two things only — Sandbox microVMs and the container
+registry — and nothing is ever deployed to it. `vercel link` connects the GitHub repo by
+default, and Vercel then tries to build every push (there is no `public/`, so it fails
+loudly); the project has been disconnected from Git, and `vercel.json` at the repository
+root says `git.deploymentEnabled: false` so a future re-link cannot quietly re-enable it.
+
 `SPIKE_STREAM_SECONDS` (default 300, the criterion's five minutes) sets item 5's stream; `SPIKE_COLD_N` (default 10)
 sets item 9's sample. `00-cleanup.ts` stops anything tagged `spike=m10` a crashed script
 left running. Nothing here is engine code, and nothing here is asserted by the suite;

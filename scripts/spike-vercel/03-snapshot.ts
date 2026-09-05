@@ -1,7 +1,7 @@
 // Item 3. Snapshot after a real install; create from it under deny-all; the tree is there
 // and hardlinks work across it (what `restoreEnvironment`'s `cp -al` needs).
 import { Sandbox, Snapshot } from '@vercel/sandbox';
-import { creds, REGION, TAG, create, prepare, sh, FAST_PROBES, sealedFailure, verdict, record, done, stopQuietly, timed } from './lib.js';
+import { creds, REGION, TAG, create, prepare, sh, FAST_PROBES, sealedFailure, verdict, record, done, stopQuietly, timed, DAY } from './lib.js';
 
 const build = await create({ networkPolicy: 'allow-all', timeout: 20 * 60_000 });
 let phase: Sandbox | undefined;
@@ -22,7 +22,7 @@ try {
   verdict('3.install', install.out.includes('NPM_EXIT 0'), install.out);
   await sh(build, 'echo marker > /opt/env/ignored.txt');
 
-  const snap = await timed(() => build.snapshot({ expiration: 6 * 60 * 60_000 }));
+  const snap = await timed(() => build.snapshot({ expiration: DAY }));
   snapshotId = snap.value.snapshotId;
   record('3', `snapshot() ${Math.round(snap.ms)}ms → ${snapshotId} (build sandbox status now ${build.status})`);
 

@@ -2,7 +2,7 @@
 // includes the first `runCommand`, because a sandbox that exists but cannot yet run is
 // not started. Every handle is stopped, including one whose first command threw.
 import { Sandbox, Snapshot } from '@vercel/sandbox';
-import { creds, REGION, TAG, create, sh, verdict, record, done, stopQuietly, timed, pct } from './lib.js';
+import { creds, REGION, TAG, create, sh, verdict, record, done, stopQuietly, timed, pct, DAY } from './lib.js';
 
 const N = Number(process.env.SPIKE_COLD_N ?? '10');
 
@@ -33,7 +33,7 @@ let snapshotId: string | undefined;
 const seed = await create({ networkPolicy: 'allow-all' });
 try {
   await sh(seed, 'echo seeded > "$HOME/seed"');
-  snapshotId = (await seed.snapshot({ expiration: 60 * 60_000 })).snapshotId;
+  snapshotId = (await seed.snapshot({ expiration: DAY })).snapshotId;
   record('9', `seed snapshot ${snapshotId}`);
 } finally {
   if (seed.status === 'running') await stopQuietly(seed);

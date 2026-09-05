@@ -27,9 +27,12 @@ if command -v vercel >/dev/null 2>&1 && [ -f .vercel/project.json ]; then
     # The CLI names the image for the linked project; `-- -f` hands the Dockerfile to docker.
     vercel vcr build docker . "test-framework-v2-$name:$sha" --push --platform linux/amd64 -- -f "$file" >/dev/null
     end=$(date +%s)
-    ref=$(vercel vcr tag inspect "test-framework-v2-$name" "$sha" 2>/dev/null | grep -o 'vcr.vercel.com/[^[:space:]]*' | head -1)
-    echo "INFO  13  $name: ${ref:-vcr.vercel.com/<team-slug>/<project>/test-framework-v2-$name:$sha}  build+push $((end - start))s"
-    echo "INFO  13  $var=${ref:-<see vercel vcr tag inspect test-framework-v2-$name $sha>}"
+    # The CLI prints its table on stderr, so `2>&1` or the ref is lost.
+    info=$(vercel vcr tag inspect "test-framework-v2-$name" "$sha" 2>&1)
+    ref=$(printf '%s\n' "$info" | awk '/^[[:space:]]*Image[[:space:]]/ {print $2}')
+    digest=$(printf '%s\n' "$info" | awk '/^[[:space:]]*Digest[[:space:]]/ {print $2}')
+    echo "INFO  13  $name: ${ref:-unknown}  digest ${digest:-unknown}  build+push $((end - start))s"
+    echo "INFO  13  $var=${ref%%:*}@${digest:-unknown}"
   done
 else
   : "${VERCEL_TOKEN:?no CLI session: set VERCEL_TOKEN (vercel.com/account/tokens), or install the CLI and run vercel login && vercel link}"

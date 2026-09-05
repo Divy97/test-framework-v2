@@ -1,7 +1,7 @@
 // Item 12. The APIs the executor will lean on exist: list by tag, snapshot get/delete,
 // command re-attach, and what `Sandbox.get` does to a stopped sandbox.
 import { Sandbox, Snapshot } from '@vercel/sandbox';
-import { creds, TAG, create, sh, verdict, record, done, stopQuietly } from './lib.js';
+import { creds, TAG, create, sh, verdict, record, done, stopQuietly, DAY } from './lib.js';
 
 const sandbox = await create({ networkPolicy: 'deny-all', tags: { ...TAG, item: '12' } });
 try {
@@ -12,7 +12,7 @@ try {
   const finished = await again.wait();
   verdict('12.getCommand', finished.exitCode === 0 && (await finished.stdout()).includes('bye'), `re-attached, exit ${finished.exitCode}`);
   await sh(sandbox, 'echo x > /tmp/x');
-  const snapshot = await sandbox.snapshot({ expiration: 10 * 60_000 });
+  const snapshot = await sandbox.snapshot({ expiration: DAY });
   record('12', `snapshot ${snapshot.snapshotId}; sandbox status after snapshot(): ${sandbox.status}`);
   const got = await Snapshot.get({ ...creds(), snapshotId: snapshot.snapshotId });
   record('12', `Snapshot.get → status ${got.status}, ${Math.round(got.sizeBytes / 1024 / 1024)} MB, regions ${got.regions.join(',')}`);
