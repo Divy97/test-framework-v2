@@ -109,9 +109,10 @@ export function dashboardRoutes(options: {
   const { client } = options;
   const install = options.installUrl ?? installUrl();
 
+  /** Lowercased: a media type is case-insensitive, and `Application/JSON` is JSON. */
   const contentType = (headers: Record<string, string | string[] | undefined>): string => {
     const value = headers['content-type'];
-    return (Array.isArray(value) ? value[0] : value) ?? '';
+    return ((Array.isArray(value) ? value[0] : value) ?? '').toLowerCase();
   };
 
   /**
@@ -314,7 +315,10 @@ export function dashboardRoutes(options: {
       const installation = await loadInstallation(client, repo);
       if (!installation) return json({ error: 'not connected' }, 404);
       if (!options.github) return json({ error: 'this surface has no GitHub App' }, 501);
-      const page = Math.max(1, Math.floor(Number(query.get('page') ?? '1')) || 1);
+      // A whole number from 1, or 1. `Infinity` and `1e300` are numbers too, and GitHub
+      // answers them with a 422 that would surface here as our 500.
+      const asked = Number(query.get('page') ?? '1');
+      const page = Number.isInteger(asked) && asked >= 1 ? Math.min(asked, 1_000) : 1;
       const token = await options.github.token(installation.installationId);
       return json(await listOpenIssues(options.github, token, repo, page));
     }
@@ -328,12 +332,18 @@ export function dashboardRoutes(options: {
     if (method === 'POST' && path === '/api/runs') {
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
-      let asked: { repo?: unknown; issue_number?: unknown };
+      let parsed: unknown;
       try {
-        asked = JSON.parse(await body()) as { repo?: unknown; issue_number?: unknown };
+        parsed = JSON.parse(await body());
       } catch {
         return json({ error: 'the body is not JSON' }, 400);
       }
+      // `null` parses. So does `42`. Neither has a `repo`, and reading one off them is
+      // a throw that would arrive as a 500 where every other bad body is a 400.
+      if (typeof parsed !== 'object' || parsed === null) {
+        return json({ error: 'send { "repo": "owner/name", "issue_number": N }' }, 400);
+      }
+      const asked = parsed as { repo?: unknown; issue_number?: unknown };
       const repo = typeof asked.repo === 'string' ? asked.repo : null;
       const issueNumber =
         typeof asked.issue_number === 'number' && Number.isInteger(asked.issue_number) && asked.issue_number > 0

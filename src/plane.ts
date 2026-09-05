@@ -185,6 +185,12 @@ export async function enqueueJob(
  * stamped by the runner on every ending, so an unfinished job is one that is genuinely
  * in flight; the two-hour ceiling is for the one whose runner died with it, which would
  * otherwise block this issue forever.
+ *
+ * Check-then-insert, not a constraint, and honestly so: two presses in the same instant
+ * can both pass. A unique partial index cannot express the two-hour ceiling, and an
+ * advisory lock needs one connection held across a transaction, which `Db` being a pool
+ * (ADR-0020) does not hand a route. The button disables itself on click (10i); this is
+ * the server's best effort behind it, and it is worth knowing which of the two is which.
  */
 export async function openJobFor(client: Db, repo: string, issueNumber: number): Promise<string | null> {
   const { rows } = await client.query(

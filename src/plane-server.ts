@@ -16,10 +16,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureBlobRoot } from './blobs.js';
 import { authRoutes } from './auth-routes.js';
-import { installationsFor, readSession, cookieValue, type OAuthConfig } from './auth.js';
+import { installationsFor, readSession, cookieValue, type OAuthConfig, type Session } from './auth.js';
 import { webhookRoute, WEBHOOK_PATH, installationToken, type GitHubApp, type Intake } from './github.js';
-import { forgetInstallation, loadInstallation, reconcileInstallation } from './installations.js';
-import { readRunRow } from './readmodel.js';
+import { forgetInstallation, reconcileInstallation } from './installations.js';
 import { dashboardRoutes } from './routes.js';
 import { runnerRoutes } from './runner-api.js';
 import { startStatusServer, type Route } from './sse.js';
@@ -135,6 +134,43 @@ export function planeIntake(deps: {
   };
 }
 
+type Headers = Record<string, string | string[] | undefined>;
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * May this request tail this run? (M10)
+ *
+ * Answered from `jobs`, not from the projection. The job row exists from the moment
+ * `POST /api/runs` answered 202; `run_projection` exists from the first event a worker
+ * appends, minutes later — so a page that opened the tail right after pressing Start
+ * would have been told its own run does not exist, and EventSource does not retry a
+ * 404. The installation on the job is the one the run was dispatched under, and GitHub
+ * is asked whether this person may see it, exactly as `visible()` asks for a page.
+ *
+ * A function of its dependencies for the reason `planeIntake` is: this is the decision,
+ * and `startPlane` needs a database and every credential to be constructed.
+ */
+export function tailAuthorizer(deps: {
+  client: Db;
+  session: (headers: Headers) => Promise<Session | null>;
+  installations: (session: Session) => Promise<number[]>;
+}): (runId: string, headers: Headers) => Promise<'ok' | 'anonymous' | 'forbidden'> {
+  return async (runId, headers) => {
+    const who = await deps.session(headers);
+    if (!who) return 'anonymous';
+    // A run id is a uuid, and Postgres refuses to compare a `uuid` column with anything
+    // else — which would be a 500 for a malformed id where the run's page gives a 404.
+    if (!UUID.test(runId)) return 'forbidden';
+    const { rows } = await deps.client.query('select installation_id from jobs where run_id = $1', [runId]);
+    const job = rows[0] as { installation_id: string | number } | undefined;
+    if (!job) return 'forbidden';
+    // `installationsFor` answers `[]` when GitHub will not answer: an outage denies.
+    const allowed = await deps.installations(who);
+    return allowed.includes(Number(job.installation_id)) ? 'ok' : 'forbidden';
+  };
+}
+
 export async function startPlane(config: PlaneConfig): Promise<{
   port: number;
   close: () => Promise<void>;
@@ -157,8 +193,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
     void handle(intake).catch((error: unknown) => log(`a delivery could not be handled: ${String(error)}`));
   };
 
-  const session = (headers: Record<string, string | string[] | undefined>) =>
-    readSession(client, cookieValue(headers['cookie'], 'tf_session'));
+  const session = (headers: Headers) => readSession(client, cookieValue(headers['cookie'], 'tf_session'));
 
   const surface = await startStatusServer({
     port: config.port,
@@ -167,16 +202,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
     // The tail is authorized the way the run's own page is (M10). It streams every event
     // raw, and a run id being a uuid makes it hard to guess — which was never the same
     // thing as being allowed.
-    authorize: async (runId, headers) => {
-      const who = await session(headers);
-      if (!who) return 'anonymous';
-      const row = await readRunRow(client, runId);
-      if (!row) return 'forbidden';
-      const installation = await loadInstallation(client, row.repo);
-      if (!installation) return 'forbidden';
-      const allowed = await installationsFor(who);
-      return allowed.includes(installation.installationId) ? 'ok' : 'forbidden';
-    },
+    authorize: tailAuthorizer({ client, session, installations: installationsFor }),
     routes: chain(
       // First. Its path is disjoint from every other, it carries no session, and a
       // delivery GitHub will retry should not wait behind a human's page.

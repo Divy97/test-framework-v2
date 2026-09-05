@@ -228,9 +228,16 @@ describe('starting a run is a write, and gated like one', () => {
       }),
     }) as unknown as Db;
 
-  /** GitHub as the picker and the button see it: one open issue, and one pull request. */
+  /**
+   * GitHub as the picker and the button see it: one open issue, and one pull request.
+   * `asked` records the token mint as well as every fetch, so "GitHub is never asked"
+   * covers the credential and not only the call made with it.
+   */
   const github = (asked: string[] = []) => ({
-    token: async () => 'ghs_test',
+    token: async () => {
+      asked.push('token');
+      return 'ghs_test';
+    },
     api: 'http://github.invalid',
     fetch: (async (input: string | URL | Request) => {
       const url = String(input instanceof Request ? input.url : input);
@@ -354,8 +361,17 @@ describe('starting a run is a write, and gated like one', () => {
 
     const theirs = await call(trigger([], { asked }), 'GET', '/api/repos/theirs%2Frepo/issues');
     expect(theirs?.status).toBe(404);
-    // One fetch for the list that was allowed, none for the one that was not.
-    expect(asked).toHaveLength(1);
+    // One token and one fetch for the list that was allowed; nothing for the other.
+    expect(asked).toEqual(['token', expect.stringContaining('/repos/mine/repo/issues')]);
+  });
+
+  it('a body that is JSON but not an object is a 400, like every other bad body', async () => {
+    // `null` parses. Reading `.repo` off it threw, and the server's catch made that a
+    // 500 — the one malformed body that was answered differently from the rest.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const response = await call(trigger(writes), 'POST', '/api/runs', 'null', { 'content-type': 'application/json' });
+    expect(response?.status).toBe(400);
+    expect(queued(writes)).toHaveLength(0);
   });
 
   it('a form body is refused as the wrong kind, before anything is looked up', async () => {

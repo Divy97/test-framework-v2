@@ -73,7 +73,8 @@ recipe, starting a run, pairing or revoking a runner, and asking for a run's art
 destroyed — every one of them a decision a person makes, none of them a fact about anybody's
 bug. Starting a run is a write to `jobs`, the same act a webhook delivery performed in
 milestone 9; the log's first event still comes from the worker (ADR-0019), so the plane
-dispatches and never produces. An `issues` delivery, since milestone 10, starts nothing.
+dispatches and never produces. On the hosted plane an `issues` delivery, since milestone 10,
+starts nothing; the local product still runs from one.
 
 Each is refused unless it comes from the dashboard's own page, and hosted, unless GitHub says
 you may act on that repository. That second check is not decoration: approving a recipe stores

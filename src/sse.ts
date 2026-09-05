@@ -301,8 +301,16 @@ export function startStatusServer(options: {
       return;
     }
     const runId = decodeURIComponent(match[1]!);
+    // Attached BEFORE the authorizer is awaited. That await is a database query and a
+    // GitHub round-trip; a client that hangs up inside it has already emitted `close`
+    // by the time a listener attached afterwards could hear it, and a tail nobody is
+    // reading would then poll the database every 250ms forever.
+    let connected = true;
+    request.on('close', () => (connected = false));
+    response.on('close', () => (connected = false));
     void (async () => {
       const verdict = options.authorize ? await options.authorize(runId, request.headers) : 'ok';
+      if (!connected) return;
       if (verdict !== 'ok') {
         response.writeHead(verdict === 'anonymous' ? 401 : 404, { 'content-type': 'application/json' });
         response.end(`${JSON.stringify({ error: verdict === 'anonymous' ? 'not signed in' : 'no such run' })}\n`);
@@ -318,10 +326,6 @@ export function startStatusServer(options: {
         'x-accel-buffering': 'no',
       });
 
-      let connected = true;
-      request.on('close', () => (connected = false));
-      response.on('close', () => (connected = false));
-
       await tailRun({
         runId,
         afterSeq: resumeFrom(request.headers['last-event-id']),
@@ -334,10 +338,18 @@ export function startStatusServer(options: {
         if (connected) response.end();
       });
     })().catch((error: unknown) => {
-      // The authorizer asked a database and it did not answer. A 500 rather than a
-      // stream, and never an unhandled rejection — the same rule the route branch keeps.
-      if (!response.headersSent) response.writeHead(500, { 'content-type': 'text/plain' });
-      response.end(`${String((error as Error)?.message ?? error)}\n`);
+      // The authorizer, or the tail's own read, asked a database and it did not answer.
+      // Before headers: a 500, never an unhandled rejection — the rule the route branch
+      // keeps. After headers — a read that failed mid-stream — the frames already sent
+      // are the answer and the connection closes; writing a message into a response the
+      // tail's `finally` has already ended is the `write after end` that takes the
+      // process down, which is the outcome this catch exists to refuse.
+      if (!response.headersSent) {
+        response.writeHead(500, { 'content-type': 'text/plain' });
+        response.end(`${String((error as Error)?.message ?? error)}\n`);
+      } else if (!response.writableEnded) {
+        response.end();
+      }
     });
   });
 

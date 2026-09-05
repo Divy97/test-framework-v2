@@ -211,7 +211,11 @@ describe('the tail is authorized like the run page', () => {
 
       // The same answer a run that does not exist gets: a stranger probing ids learns
       // nothing about which ones this service holds.
-      const theirs = await fetch(`${base}/runs/somebody-elses-run/events`, { headers: { cookie: 'tf_session=x' } });
+      // A uuid, because a real plane's authorizer refuses anything else before it asks
+      // the database — the shape this test's fake authorizer stands in for.
+      const theirs = await fetch(`${base}/runs/22222222-2222-4222-8222-222222222222/events`, {
+        headers: { cookie: 'tf_session=x' },
+      });
       expect(theirs.status).toBe(404);
       await theirs.text();
 
