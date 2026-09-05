@@ -5,9 +5,12 @@ the list is `docs/milestone-10.md` § "The spike, itemised". Each script prints 
 `FAIL` with the number beside it, or `SKIP` with what it needs.
 
 ```sh
-# .env needs VERCEL_TOKEN, VERCEL_TEAM_ID, VERCEL_PROJECT_ID (Hobby is enough)
+# Either: log the Vercel CLI in and link this directory — the SDK reads that session and
+# resolves the team and project itself (creating a default project if none exists):
+npm i -g vercel && vercel login && vercel link --yes
+# Or: an account token plus ids in .env — VERCEL_TOKEN, VERCEL_TEAM_ID, VERCEL_PROJECT_ID.
 scripts/spike-vercel/run-all.sh            # items 0–12, results in docs/milestone-10-spike.log
-scripts/spike-vercel/13-push-images.sh     # loads .env; needs VERCEL_TEAM_SLUG + VERCEL_PROJECT_NAME too
+scripts/spike-vercel/13-push-images.sh     # CLI: vercel vcr; token path also needs VERCEL_TEAM_SLUG + VERCEL_PROJECT_NAME
 # …wait for VCR to finish preparing the pushed image (Sandbox.create says `image_not_ready` until then), then:
 ENGINE_VERCEL_AGENT_IMAGE=<ref> npx tsx --env-file=.env scripts/spike-vercel/06-chromium.ts
 ```

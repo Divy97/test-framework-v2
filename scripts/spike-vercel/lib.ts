@@ -6,17 +6,32 @@
 
 import { Sandbox } from '@vercel/sandbox';
 
-export type Creds = { token: string; teamId: string; projectId: string };
+export type Creds = { token?: string; teamId?: string; projectId?: string };
 
+/**
+ * How the SDK is told who we are. Two ways, and the first needs nothing in `.env`:
+ *
+ *   - **The Vercel CLI's login.** `vercel login` writes a session the SDK reads itself
+ *     (`getAuth()`), and it resolves the team and project on its own (`inferScope()`: a
+ *     linked `.vercel/project.json` if `vercel link` was run, else your default team and
+ *     a default project it creates). Pass nothing and it does all of that.
+ *   - **An account token** in `VERCEL_TOKEN` with `VERCEL_TEAM_ID` and `VERCEL_PROJECT_ID`,
+ *     for a machine with no CLI session — the worker, later.
+ *
+ * Nothing here can tell whether a CLI session exists without asking the SDK, so with no
+ * env the scripts simply try; an unauthenticated SDK throws a clear error on the first
+ * call and `run-all.sh` records it as a CRASH with that message.
+ */
 export const creds = (): Creds => {
   const token = process.env.VERCEL_TOKEN;
   const teamId = process.env.VERCEL_TEAM_ID;
   const projectId = process.env.VERCEL_PROJECT_ID;
-  if (!token || !teamId || !projectId) {
-    console.error('SKIP  set VERCEL_TOKEN, VERCEL_TEAM_ID and VERCEL_PROJECT_ID (the SDK needs all three)');
+  if (token && teamId && projectId) return { token, teamId, projectId };
+  if (token || teamId || projectId) {
+    console.error('SKIP  VERCEL_TOKEN, VERCEL_TEAM_ID and VERCEL_PROJECT_ID go together; set all three, or none and use `vercel login`');
     process.exit(2);
   }
-  return { token, teamId, projectId };
+  return {};
 };
 
 export const REGION = process.env.ENGINE_VERCEL_REGION ?? 'iad1';
