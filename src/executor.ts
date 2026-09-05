@@ -48,18 +48,20 @@ export type PhaseResult = {
   /** Host directory the agent container left its commits in, when it had one. */
   handover?: string;
   /**
-   * Which wall clock ended this phase, when one did (M10).
+   * The phase was stopped by this engine's wall clock rather than finishing (M10).
    *
-   * `wall` is ours — `containerTimeoutMs`, enforced by the process driving the phase.
-   * `session` is the substrate's, enforced with that process dead, which is the failure
-   * mode a microVM adds: a worker that dies leaves a machine the platform ends on its own
-   * schedule. Absent means the phase finished on its own terms.
+   * Beside the `VERIFICATION_ABORTED{cause:'ceiling'}` the executor also emits, not
+   * instead of it: the event is what the fold reads and what disqualifies the attempt.
+   * This field is for a caller that wants the fact without re-reading the events, and
+   * nothing reads it today.
    *
-   * Beside the `ceiling` abort rather than instead of it: the event is what a reader of
-   * the log sees, and this is what the orchestrator branches on without re-reading its
-   * own events.
+   * `'wall'` only. The substrate's own session timeout — enforced with our process dead —
+   * is the other ceiling a microVM adds, and it is not reported here because a process
+   * that is dead reports nothing; what surfaces then is a stream that ends and a sandbox
+   * the boot sweep finds. A `'session'` value would be a name for an observation this
+   * design cannot make.
    */
-  ceiling?: 'wall' | 'session';
+  ceiling?: 'wall';
   /**
    * What the container said on stderr, bounded.
    *

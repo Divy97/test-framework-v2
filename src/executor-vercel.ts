@@ -32,7 +32,7 @@
 
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { put } from './blobs.js';
@@ -43,7 +43,7 @@ import type { Recipe, ReplayOutcome } from './recipe.js';
 import { redact } from './redact.js';
 import { isWorkerReply, type Job, type SuiteProbe, type WorkerRequest } from './runner.js';
 import { MAX_REASON_CHARS } from './verify.js';
-import { asLines, type Compute, type SandboxClient, type SandboxHandle } from './vercel-client.js';
+import { asLines, type Compute, type Finished, type SandboxClient, type SandboxHandle } from './vercel-client.js';
 
 const execFile = promisify(execFileCb);
 
@@ -58,6 +58,16 @@ const PHASE_TIMEOUT_MS = 3_600_000;
 const WORK = '/work';
 const BLOBS = '/blobs';
 const SPOOL = `${WORK}/rpc`;
+/**
+ * Where the agent's bundle is left, and it has to be a DIRECTORY before the Runner looks.
+ *
+ * `handOverCommits` stats this and silently returns null when it is not one — correct on
+ * Docker, where `-v <dir>:/out` creates it, and a silent no-handover on every agent phase
+ * here until `PREPARE` made it. The Runner then reports nothing wrong, because "not
+ * mounted" is a legitimate configuration, and `applyHandover` refuses the run one layer
+ * up with "the agent handed nothing over".
+ */
+const HANDOVER = '/out';
 const BUNDLE = `${WORK}/src.bundle`;
 const JOB = `${WORK}/job.json`;
 
@@ -70,11 +80,17 @@ const JOB = `${WORK}/job.json`;
  * because the Runner refuses a store it cannot prove pre-existed.
  */
 const PREPARE = [
-  `sudo -n mkdir -p ${WORK} ${SPOOL}/in ${SPOOL}/out /opt/env ${BLOBS}`,
-  `sudo -n chown -R "$(id -u):$(id -g)" ${WORK} /opt/env ${BLOBS}`,
+  `sudo -n mkdir -p ${WORK} ${SPOOL}/in ${SPOOL}/out /opt/env ${BLOBS} ${HANDOVER}`,
+  `sudo -n chown -R "$(id -u):$(id -g)" ${WORK} /opt/env ${BLOBS} ${HANDOVER}`,
   `: > ${BLOBS}/.evidence-store`,
   // Root-owned 0700, so the repro — uid 1000 — cannot forge a `{done: true}` and choose
   // its own ending, or answer a tool call on the host's behalf.
+  //
+  // Which means the HOST cannot write it either: `writeFiles` runs as uid 1000, the same
+  // user the repro drops to, so there is no ownership that lets one write and not the
+  // other. Tool calls therefore go in through `sudo` (see `deliver`), not through
+  // `writeFiles`. An earlier version of this file did both, and the spool would have
+  // been unwritable on the first live agent phase.
   `sudo -n chown -R root:root ${SPOOL} && sudo -n chmod -R 0700 ${SPOOL}`,
 ].join(' && ');
 
@@ -100,19 +116,62 @@ const PROBE = {
 const runnerCommand = (entry: string) => `sudo -n ${entry} --job ${JOB} --spool ${SPOOL}`;
 
 /**
- * What a run leaves behind if this process dies: one line per live sandbox.
+ * Put one line into the root-owned spool, as root.
  *
- * A file rather than a table, and written BEFORE the sandbox exists rather than after.
- * The window this closes is the one that matters — a worker killed between `create` and
- * the first line of bookkeeping leaves a machine nobody knows about, billing by the
- * second until its own session timeout. Written first, the worst case is a line naming a
- * sandbox that was never made, which `sweep` handles by getting null and moving on.
+ * `writeFiles` cannot: it runs as uid 1000, which is the uid the repro drops to, and a
+ * spool uid 1000 can write is a spool the agent can forge `{done: true}` into. So the
+ * content travels base64-encoded inside a command — base64 has no shell metacharacters,
+ * so nothing here has to reason about quoting somebody else's JSON — and `sudo tee`
+ * writes it on the other side.
+ *
+ * One round trip, the same as `writeFiles` would have cost. The spike measured
+ * `runCommand` at a p50 under 300ms, which is the same order as a file write.
+ */
+const deliver = async (sandbox: SandboxHandle, name: string, line: string): Promise<void> => {
+  const encoded = Buffer.from(line, 'utf8').toString('base64');
+  const written = await sandbox.run(
+    `printf %s '${encoded}' | base64 -d | sudo -n tee ${SPOOL}/in/${name} > /dev/null`,
+  );
+  if (written.exitCode !== 0) {
+    // Loudly. A swallowed failure here is an agent loop waiting for a reply that will
+    // never come, and then a phase burning its whole wall clock with no diagnosis.
+    throw new Error(`could not deliver a tool call to the sandbox: ${written.output.trim().slice(-300)}`);
+  }
+};
+
+/**
+ * What a run leaves behind if this process dies: one line per sandbox it created.
+ *
+ * A file rather than a table, appended the instant `create` returns and before anything
+ * else can fail. It cannot be written earlier — the id does not exist until then — so the
+ * create-to-append window is real and this does not close it; what it closes is every
+ * window after it, which is where the work happens and where the failures are.
+ *
+ * `sweep()` reads this file rather than only asking the platform, because a tag query is
+ * the whole deployment's sandboxes and a worker must not stop another worker's phases.
  */
 type Ledger = { path: string };
 
 const remember = async (ledger: Ledger | undefined, entry: { sandboxId: string; runId: string }) => {
   if (!ledger) return;
   await writeFile(ledger.path, `${JSON.stringify(entry)}\n`, { flag: 'a' }).catch(() => {});
+};
+
+/** The ids this worker's ledger names, deduplicated, or none if it cannot be read. */
+const remembered = async (ledger: Ledger | undefined): Promise<string[]> => {
+  if (!ledger) return [];
+  const raw = await readFile(ledger.path, 'utf8').catch(() => '');
+  const ids = new Set<string>();
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue;
+    try {
+      ids.add((JSON.parse(line) as { sandboxId: string }).sandboxId);
+    } catch {
+      // A half-written last line is a line we have not finished appending. Skipping it
+      // costs one sandbox on this sweep and the platform's own timeout catches it.
+    }
+  }
+  return [...ids];
 };
 
 /** A git bundle of everything in a bare repository, as one file on the host. */
@@ -130,7 +189,14 @@ export type VercelExecutorOptions = {
   region?: string;
   /** A file listing live sandboxes, so a crashed worker's can be swept on the next boot. */
   ledger?: Ledger;
-  /** What every sandbox is tagged with, so `sweep` can find them. */
+  /**
+   * What every sandbox is tagged with, so `sweep` can find them.
+   *
+   * It must identify THIS worker, not the deployment: `sweep` stops what the tag matches,
+   * and a tag shared between workers turns one booting worker into an outage for the
+   * others. The default carries the process id for that reason; a real deployment passes
+   * something stable across a restart of the same worker.
+   */
   tags?: Record<string, string>;
   /** The command that starts `runner-vm.ts` inside the image. */
   entrypoint?: string;
@@ -141,7 +207,7 @@ export type VercelExecutorOptions = {
 export function vercelExecutor(options: VercelExecutorOptions): Executor & { sweep: () => Promise<number> } {
   const { client } = options;
   const entry = options.entrypoint ?? 'node --import tsx /engine/src/runner-vm.ts';
-  const tags = options.tags ?? { engine: 'test-framework-v2' };
+  const tags = options.tags ?? { engine: 'test-framework-v2', worker: String(process.pid) };
 
   /** Create, prepare, and record — in the order that leaves nothing unaccounted for. */
   const open = async (
@@ -180,15 +246,23 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
      * number rather than a shrug.
      */
     sweep: async () => {
-      const live = await client.list(tags).catch(() => []);
+      // THIS WORKER'S sandboxes, from two sources that agree. The ledger is the record a
+      // crashed process left; the tag query is the backstop for a ledger that was lost
+      // with the disk. Both are scoped to this worker — a tag shared across a deployment
+      // would have a booting worker stop every in-flight phase of every other one.
+      const listed = await client.list(tags).catch(() => []);
+      const ids = new Set([...(await remembered(options.ledger)), ...listed.map((one) => one.id)]);
       let stopped = 0;
-      for (const { id } of live) {
+      for (const id of ids) {
         const sandbox = await client.get(id);
         if (!sandbox) continue;
         // A sandbox already gone answers with a throw, which is the same outcome as one
         // we stopped and not worth telling apart.
         if (await sandbox.stop().then(() => true, () => false)) stopped += 1;
       }
+      // The file has done its job. Left to grow it is an ever-longer list of dead ids
+      // that every later sweep re-asks the platform about.
+      if (options.ledger) await rm(options.ledger.path, { force: true }).catch(() => {});
       return stopped;
     },
 
@@ -218,9 +292,18 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
           { path: BUNDLE, content: bytes },
           { path: JOB, content: Buffer.from(`${JSON.stringify(job)}\n`) },
         ]);
-        const finished = await sandbox.run(runnerCommand(entry), {
-          timeoutMs: plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS,
-        });
+        // A wall clock of OUR own, beside the one handed to `run`. The Docker executor's
+        // equivalent is emphatic that this is the guard against a wedge rather than a
+        // scheduling policy, and it guards the one sandbox in a run with a network — the
+        // longest operation and the one most able to hang on somebody else's registry.
+        // Without it a control plane that stalls wedges the worker indefinitely.
+        const ceiling = plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS;
+        const finished = await Promise.race([
+          sandbox.run(runnerCommand(entry), { timeoutMs: ceiling }),
+          new Promise<Finished>((resolve) =>
+            setTimeout(() => resolve({ exitCode: -1, output: `the environment build was stopped after ${ceiling}ms` }), ceiling + 30_000).unref(),
+          ),
+        ]);
 
         let env: ReplayOutcome | undefined;
         for (const line of finished.output.split('\n')) {
@@ -251,8 +334,16 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
         // reproduction could read the symptom pattern it is supposed to be tested against.
         await sandbox.run(`sudo -n rm -rf ${WORK} ${BLOBS}`);
         const snapshot = await sandbox.snapshot();
-        // `snapshot()` stops the sandbox, so there is nothing left to stop; asking again
-        // is an error we do not want to report as one.
+        // `snapshot()` stops the sandbox, and the SDK reports what a session cost only
+        // from `stop()` — so the environment build, the longest-lived sandbox in a run,
+        // reports no compute. Asked for anyway, in case a later SDK answers; a throw here
+        // is the expected outcome and is not an error worth reporting.
+        await sandbox
+          .stop()
+          .then((compute) => {
+            if (compute && options.onCompute) options.onCompute({ ...compute, runId: plan.runId, phase: 'env' });
+          })
+          .catch(() => {});
         sandbox = undefined;
         return { snapshot, steps: (env?.steps ?? []).map(({ step, exit_code }) => ({ step, exit_code })) };
       } catch (error) {
@@ -322,10 +413,19 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
   let stderr = '';
   let totalBytes = 0;
   let truncated = false;
-  let ceiling: 'wall' | 'session' | undefined;
+  let ceiling: 'wall' | undefined;
   let sandbox: SandboxHandle | undefined;
-  const events: RunEvent[] = [];
-  let nextSeq = afterSeq;
+  /**
+   * Events this executor writes BEFORE the container says anything, and after.
+   *
+   * Split because seqs have to be contiguous and the container allocates its own from
+   * `job.afterSeq`. A judging phase is probed before its Runner starts, so its seal
+   * genuinely precedes everything the container observed and must be numbered that way —
+   * the Job's `afterSeq` is bumped past it. Anything written afterwards (the ceiling, a
+   * collection failure) continues from the container's last.
+   */
+  const pre: RunEvent[] = [];
+  const post: RunEvent[] = [];
 
   const take = (line: string) => {
     let parsed: unknown;
@@ -368,10 +468,96 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
         : spec.from
           ? { snapshot: spec.from.ref }
           : { image: plan.image };
+    // Refused rather than ignored. Docker mounts this binary into the container; there is
+    // no bind mount here, so a plan carrying one would run an agent phase with no agent
+    // and report whatever that produced. Only the Docker-gated tests set it today, which
+    // is exactly why a silent divergence between two implementations of one contract
+    // would go unnoticed.
+    if (plan.agentImageMount !== undefined) {
+      throw new Error('agentImageMount is a bind mount and this executor has none; build the binary into the image');
+    }
     sandbox = await inner.open(from, wantsNetwork ? 'allow-all' : 'deny-all', plan);
+
+    /** Set when a probe found a way out, which refuses the phase without losing it. */
+    let unsealed: string | undefined;
+
+    /**
+     * The phase, refused, with the record kept.
+     *
+     * Returned rather than thrown for the reason `executor.ts` gives — this method must
+     * not throw for an outcome the design has a name for — and the design has one:
+     * `SANDBOX_SEALED` carries `probe: true`, and `cause: 'environment'` is what makes
+     * the fold disqualify the attempt and the run end `errored`. Throwing unwound the
+     * whole run and took every fact observed before this phase with it.
+     */
+    const refusal = (): PhaseResult => {
+      pre.push(
+        own(plan.runId, 0, {
+          type: 'VERIFICATION_ABORTED',
+          payload: { v: 1, phase: 'setup', cause: 'environment', reason: unsealed!.slice(0, MAX_REASON_CHARS) },
+        }),
+      );
+      let seq = afterSeq;
+      return {
+        phase,
+        events: pre.map((event) => ({ ...event, seq: ++seq })),
+        exitCode: 1,
+        stderr: unsealed!,
+      };
+    };
+
+    /**
+     * Establish, and RECORD, that this sandbox has no way out.
+     *
+     * Run for every sandbox whose word this engine then takes — which is all of them, and
+     * the judging ones most of all. The agent's sandbox is the one ADR-0010 says "is not
+     * contained, and it no longer needs to be": nothing worth stealing lives there and
+     * nothing it produces is trusted. Base and fix are the opposite. Their output IS the
+     * evidence, and `executor-docker.ts` names the risk in its own words — "a
+     * reproduction that can reach the network is a reproduction that can be TOLD what to
+     * answer". A `deny-all` the platform accepted and did not apply would produce a
+     * fabricated verdict that nothing else in this design would notice.
+     *
+     * So the ADR's own argument — the policy you sent is not the policy the platform
+     * holds — is applied to every sandbox rather than to the one that is easiest to
+     * reason about.
+     */
+    const seal = async (at: SandboxHandle, flip: boolean) => {
+      if (flip) await at.setNetworkPolicy('deny-all');
+      const observed = await probe(at);
+      // Into `pre`, for both kinds. A judging phase is probed before its Runner starts.
+      // The agent's is probed mid-stream — but in `serveTools` mode the container writes
+      // no events at all (ADR-0006's amendment moves the pen to the host), so this is
+      // still the first event of the phase, and it has to be: the orchestrator writes
+      // every `AGENT_MESSAGE` afterwards, numbering from where this executor stopped.
+      pre.push(
+        own(plan.runId, 0, {
+          type: 'SANDBOX_SEALED',
+          payload: { v: 1, sandbox_id: at.id, policy: 'deny-all', probe: observed },
+        }),
+      );
+      if (observed.dns || observed.route) {
+        unsealed =
+          `the ${phase} sandbox still reached the network under deny-all ` +
+          `(dns ${observed.dns}, route ${observed.route})`;
+      }
+    };
+
+
+    // FIRST, for a phase that judges, and before it is given the source or the Job. It was
+    // created sealed; this is the check that it is. Doing it here rather than after the
+    // Runner starts has two consequences that are both wanted: the seal genuinely
+    // precedes every observation the container makes, and a sandbox the platform failed
+    // to seal never receives this repository's code at all.
+    if (!wantsNetwork) await seal(sandbox, false);
+    if (unsealed) return refusal();
+
+    // The Runner continues the log after whatever this executor wrote first, so its own
+    // events cannot collide with the seal's seq. The fold refuses a gap and a duplicate
+    // alike, and neither would be visible until a real run folded.
     await sandbox.writeFiles([
       { path: BUNDLE, content: bytes },
-      { path: JOB, content: Buffer.from(`${JSON.stringify(job)}\n`) },
+      { path: JOB, content: Buffer.from(`${JSON.stringify({ ...job, afterSeq: afterSeq + pre.length })}\n`) },
     ]);
 
     const started = await sandbox.start(runnerCommand(inner.entry));
@@ -414,16 +600,13 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
         void settled.then(() => {
           if (pending.delete(id)) reject(new Error('the sandbox stopped before answering'));
         });
-        void sandbox!
-          .writeFiles([
-            {
-              path: `${SPOOL}/in/${String(calls).padStart(9, '0')}.json`,
-              content: Buffer.from(`${JSON.stringify({ call: { id, tool, input } } satisfies WorkerRequest)}\n`),
-            },
-          ])
-          .catch((error: unknown) => {
-            if (pending.delete(id)) reject(error instanceof Error ? error : new Error(String(error)));
-          });
+        void deliver(
+          sandbox!,
+          `${String(calls).padStart(9, '0')}.json`,
+          `${JSON.stringify({ call: { id, tool, input } } satisfies WorkerRequest)}\n`,
+        ).catch((error: unknown) => {
+          if (pending.delete(id)) reject(error instanceof Error ? error : new Error(String(error)));
+        });
       });
     };
 
@@ -437,44 +620,31 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
     try {
       if (driver) {
         await Promise.race([readied, settled]);
-        // THE SEAL. After the world is up and before the agent's first turn, which is the
-        // only ordering that is both useful and safe: `install` has had its registry, and
-        // nothing the model says has reached this machine yet.
-        if (wantsNetwork && (!envReport || envReport.ready)) {
-          await sandbox.setNetworkPolicy('deny-all');
-          const observed = await probe(sandbox);
-          events.push(
-            own(plan.runId, ++nextSeq, {
-              type: 'SANDBOX_SEALED',
-              payload: { v: 1, sandbox_id: sandbox.id, policy: 'deny-all', probe: observed },
-            }),
-          );
-          if (observed.dns || observed.route) {
-            // Nothing more will be read from this machine, and the `finally` below stops
-            // it. Abandoning first means the drain does not hold the throw up.
-            await started.kill().catch(() => {});
-            abandon();
-            // Refused rather than reported. The whole claim this substrate was chosen for
-            // is that the agent works with no route out; running one that still has a
-            // route and calling the result evidence would be the lie in the other
-            // direction from the one ADR-0006 is about.
-            throw new SealFailed(
-              `the sandbox still reached the network after the policy was set to deny-all ` +
-                `(dns ${observed.dns}, route ${observed.route})`,
-            );
-          }
+        // THE SEAL, for the agent. After the world is up and before its first turn, which
+        // is the only ordering that is both useful and safe: `install` has had its
+        // registry, and nothing the model says has reached this machine yet.
+        if (wantsNetwork && (!envReport || envReport.ready)) await seal(sandbox, true);
+        if (unsealed) {
+          // Nothing more will be read from this machine, and the `finally` below stops it.
+          await started.kill().catch(() => {});
+          abandon();
         }
         try {
-          if (!envReport || envReport.ready) await driver({ invoke });
+          if (!unsealed && (!envReport || envReport.ready)) await driver({ invoke });
         } finally {
-          await sandbox
-            .writeFiles([
-              {
-                path: `${SPOOL}/in/${String(++calls).padStart(9, '0')}.json`,
-                content: Buffer.from(`${JSON.stringify({ done: true } satisfies WorkerRequest)}\n`),
-              },
-            ])
-            .catch(() => {});
+          // NOT swallowed. Without this line the Runner serves forever, `wait()` never
+          // resolves, and the phase burns its whole wall clock before reporting a
+          // ceiling that says nothing about the real cause.
+          await deliver(
+            sandbox,
+            `${String(++calls).padStart(9, '0')}.json`,
+            `${JSON.stringify({ done: true } satisfies WorkerRequest)}\n`,
+          ).catch((error: unknown) => {
+            stderr = `${stderr}\ncould not tell the sandbox to stop serving: ${String(error)}`.slice(
+              -MAX_STDERR_CHARS,
+            );
+            abandon();
+          });
         }
       }
       exitCode = ceiling ? 1 : await Promise.race([started.wait(), abandoned.then(() => 1)]);
@@ -496,12 +666,33 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
       if (left && left.length > 0) await writeFile(join(handover, 'agent.bundle'), left);
     }
 
+    // A SEAL THAT DID NOT TAKE, recorded rather than thrown (ADR-0006, ADR-0007).
+    //
+    // Throwing here unwound the whole run: `orchestrate()` accumulates events locally and
+    // returns them only at the end, so an exception from the fix agent's phase discarded
+    // `ATTEMPT_STARTED`, the registration, every base `TEST_RUN` — every fact observed so
+    // far — and left a message string as the only record. That is the evidence-loss shape
+    // `executor-docker.ts` says it fixed twice, and `executor.ts` says this method must
+    // never throw for an outcome the design has a name for. It has one: the
+    // `SANDBOX_SEALED` above carries `probe: true`, the fold has a branch for it, and
+    // `cause: 'environment'` is what makes the fold disqualify the attempt and the run end
+    // `errored`. Refusing this way refuses just as hard and keeps the record.
+    if (unsealed) {
+      post.push(
+        own(plan.runId, 0, {
+          type: 'VERIFICATION_ABORTED',
+          payload: { v: 1, phase: 'setup', cause: 'environment', reason: unsealed.slice(0, MAX_REASON_CHARS) },
+        }),
+      );
+      exitCode = exitCode === 0 ? 1 : exitCode;
+    }
+
     if (ceiling) {
       stderr = `${stderr}\nthe ${phase} sandbox was stopped after ${plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS}ms`.slice(
         -MAX_STDERR_CHARS,
       );
-      events.push(
-        own(plan.runId, ++nextSeq, {
+      post.push(
+        own(plan.runId, 0, {
           type: 'VERIFICATION_ABORTED',
           payload: { v: 1, phase: 'setup', cause: 'ceiling', reason: `the ${phase} sandbox exceeded its wall clock` },
         }),
@@ -512,15 +703,9 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
       throw new Error(`the ${phase} sandbox produced more than ${MAX_STREAM_BYTES} bytes of events`);
     }
     const observed = eventLines.map((line) => JSON.parse(line) as RunEvent);
-    // The executor's own events go AFTER the Runner's, renumbered from the last seq the
-    // Runner used. Interleaving them would need a seq nobody has allocated yet, and the
-    // fold refuses a gap.
-    const last = observed.at(-1)?.seq ?? afterSeq;
-    const mine = events.map((event, index) => ({ ...event, seq: last + index + 1 }));
-    const all = [...observed, ...mine];
     if (collection) {
-      all.push(
-        own(plan.runId, (all.at(-1)?.seq ?? afterSeq) + 1, {
+      post.push(
+        own(plan.runId, 0, {
           type: 'VERIFICATION_ABORTED',
           payload: {
             v: 1,
@@ -531,6 +716,12 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
         }),
       );
     }
+    // Numbered here, in one place, so nothing has to guess a seq while it is being
+    // written. `pre` occupies the range the Job's `afterSeq` was bumped past.
+    let seq = afterSeq;
+    const numbered = pre.map((event) => ({ ...event, seq: ++seq }));
+    const last = observed.at(-1)?.seq ?? seq;
+    const all = [...numbered, ...observed, ...post.map((event, index) => ({ ...event, seq: last + index + 1 }))];
     return {
       phase,
       events: all,
@@ -549,9 +740,6 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
     await rm(staging, { recursive: true, force: true }).catch(() => {});
   }
 }
-
-/** A seal that did not take. Its own class so a caller can tell it from a transport fault. */
-export class SealFailed extends Error {}
 
 /** What the sandbox could still reach, observed by running commands inside it. */
 async function probe(sandbox: SandboxHandle): Promise<{ dns: boolean; route: boolean }> {
@@ -575,23 +763,45 @@ async function probe(sandbox: SandboxHandle): Promise<{ dns: boolean; route: boo
  */
 async function collect(sandbox: SandboxHandle, blobRoot: string, staging: string): Promise<string> {
   try {
-    const tarred = await sandbox.run(`tar -cf ${WORK}/blobs.tar -C ${BLOBS} . 2>/dev/null; echo TAR $?`);
-    if (!tarred.output.includes('TAR 0')) return `could not archive this sandbox's artifacts: ${tarred.output.trim()}`;
+    // Tar's own words kept, not sent to `/dev/null`. The exit code alone turns "no space
+    // left on device" into `TAR 2`, which is the drops-the-tool's-diagnosis mistake this
+    // codebase has made more than once. `TAR <n>` on its own line is read from the END,
+    // because the archive listing precedes it and a substring match anywhere in a stream
+    // the guest influences is not a check.
+    const tarred = await sandbox.run(`tar -cf ${WORK}/blobs.tar -C ${BLOBS} .; echo "TAR $?"`);
+    const status = tarred.output.trim().split('\n').at(-1) ?? '';
+    if (status !== 'TAR 0') {
+      return `could not archive this sandbox's artifacts (${status}): ${tarred.output.trim().slice(-500)}`;
+    }
     const bytes = await sandbox.readFile(`${WORK}/blobs.tar`);
     if (!bytes) return "this sandbox's artifacts could not be read back";
     const archive = join(staging, 'blobs.tar');
     await writeFile(archive, bytes);
     const into = join(staging, 'blobs');
-    await execFile('mkdir', ['-p', into]);
+    await mkdir(into, { recursive: true });
     await execFile('tar', ['-xf', archive, '-C', into]);
-    for (const entry of await readdir(into)) {
-      if (entry === '.evidence-store') continue;
-      const path = join(into, entry);
-      if (!(await stat(path)).isFile()) continue;
-      // Re-digested: `put` names the bytes by what they ARE, so a blob altered in transit
-      // lands under a ref nothing cites rather than under the ref it claimed.
-      await put(blobRoot, await readFile(path));
-    }
+
+    // RECURSIVELY, and this is not a nicety. `put()` writes `<root>/<aa>/<bb>/<rest>` —
+    // two levels of fan-out — so a store contains directories at its top level and no
+    // files at all. A loop over the top level that skipped non-files skipped every blob
+    // and then returned success, which is the worst available outcome: a complete event
+    // stream whose `stdout_hash` refs name bytes that are not in the evidence store, a
+    // fold that says `reproduced: true`, and an ENOENT for whoever opens the report.
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        if (entry.name === '.evidence-store') continue;
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(path);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        // Re-digested: `put` names the bytes by what they ARE, so a blob altered in
+        // transit lands under a ref nothing cites rather than under the ref it claimed.
+        await put(blobRoot, await readFile(path));
+      }
+    };
+    await walk(into);
     return '';
   } catch (error) {
     return `could not collect this sandbox's artifacts: ${String((error as Error).message ?? error)}`;

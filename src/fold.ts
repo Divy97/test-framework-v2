@@ -151,17 +151,23 @@ export type RunState = {
   // real fold always sets it; absent and `null` mean the same thing to every reader.
   environment?: { executor: string; imageRef: string; snapshot: string } | null;
   /**
-   * The agent's sandbox was sealed before the agent said anything (M10, ADR-0017).
+   * EVERY agent sandbox in this run was sealed before its own agent said anything
+   * (M10, ADR-0017).
    *
-   * An ORDERING, derived here rather than believed: the seq of `SANDBOX_SEALED` against
-   * the seq of the first `AGENT_MESSAGE`. A seal recorded after the agent's first turn
-   * proves nothing about the turn, and a seal whose probe reached the network is not a
-   * seal at all — both fold to `false`.
+   * An ordering, derived rather than believed — and derived per AGENT PHASE, not per run.
+   * A standard run has two agents per attempt (the repro agent and the fix agent) and up
+   * to ten attempts, so "was the transcript empty when the seal arrived" is the right
+   * question only for the first: the second seal necessarily follows the first agent's
+   * messages, and reading it that way made the field `false` for every run in which both
+   * sandboxes were sealed correctly. `AGENT_FINISHED` is the phase boundary the log
+   * already carries, and it is what makes the per-phase question answerable.
+   *
+   * A seal whose probe reached the network is not a seal, whenever it arrived.
    *
    * Honestly `false` on Docker, where the agent sandbox keeps its network by design
-   * (ADR-0013's asymmetry) and emits no seal. This is what ADR-0017's injection guard
-   * reads, which is why it says "was", not "is": it is a claim about a moment in a log,
-   * and the guard that acts on it runs in the worker against a live observation.
+   * (ADR-0013's asymmetry) and emits no seal at all. This is what ADR-0017's injection
+   * guard reads, which is why it says "was", not "is": it is a claim about moments in a
+   * log, and the guard that acts on it runs in the worker against a live observation.
    */
   sealedBeforeAgent?: boolean;
   /**
@@ -411,17 +417,10 @@ export function apply(state: RunState, event: RunEvent): RunState {
         },
       };
     case 'SANDBOX_SEALED':
-      // The ORDER is the fact, so it is decided here and not by a consumer. `transcript`
-      // holds the agent's messages and is empty until the first one — which is exactly
-      // the question: did this arrive before the agent had said anything?
-      //
-      // A probe that reached the network is not a seal, whenever it arrived. Reading the
-      // policy field instead would be reading what we asked for rather than what happened.
-      return {
-        ...next,
-        sealedBeforeAgent:
-          state.transcript.length === 0 && !event.payload.probe.dns && !event.payload.probe.route,
-      };
+      // Recorded, not interpreted. The ordering question is answered over the whole
+      // stream by `sealedBeforeEveryAgent` below, because a run has more than one agent
+      // phase and "was the transcript empty" is only the right question for the first.
+      return next;
     case 'ATTEMPT_STARTED':
       return { ...next, status: 'attempting', currentAttempt: event.payload.n };
     case 'ENV_READY': {
@@ -868,5 +867,44 @@ function reproducedAttempt(
 export function fold(events: RunEvent[]): RunState {
   const first = events[0];
   if (!first) throw new Error('cannot fold an empty event stream');
-  return events.reduce(apply, initialState(first.run_id));
+  const folded = events.reduce(apply, initialState(first.run_id));
+  return { ...folded, sealedBeforeAgent: sealedBeforeEveryAgent(events) };
+}
+
+
+/**
+ * Did every agent in this run speak inside a sandbox that had already been sealed?
+ *
+ * A second pass rather than an accumulator, because the question is about a WINDOW —
+ * one agent phase — and the fold's state carries no phase boundaries. `AGENT_FINISHED`
+ * is emitted once per agent phase and is what closes each window.
+ *
+ * The rule, per window: if the agent said anything, a seal must have come first, and its
+ * probe must have found nothing. A run with no seals at all answers `false` — that is
+ * Docker, where the agent sandbox keeps its network by design, and the honest answer for
+ * a substrate that never closes the route is not "yes".
+ */
+function sealedBeforeEveryAgent(events: RunEvent[]): boolean {
+  let sealedHere = false;
+  let spokeHere = false;
+  let anySeal = false;
+  let broken = false;
+  for (const event of events) {
+    if (event.type === 'SANDBOX_SEALED') {
+      anySeal = true;
+      // A seal that arrives after this phase's agent has spoken says nothing about the
+      // turns it already took; a probe that reached says nothing at all.
+      if (spokeHere || event.payload.probe.dns || event.payload.probe.route) broken = true;
+      else sealedHere = true;
+    } else if (event.type === 'AGENT_MESSAGE') {
+      spokeHere = true;
+    } else if (event.type === 'AGENT_FINISHED') {
+      if (spokeHere && !sealedHere) broken = true;
+      sealedHere = false;
+      spokeHere = false;
+    }
+  }
+  // A phase still open at the end of the log counts too — a run cut short mid-agent.
+  if (spokeHere && !sealedHere) broken = true;
+  return anySeal && !broken;
 }

@@ -67,6 +67,8 @@ export type FakeOptions = {
   handover?: Buffer;
   /** Make `create` throw, to test that a failed build is reported and not thrown. */
   refuseCreate?: boolean;
+  /** What `tar` says when it fails, so the collection path can be exercised. */
+  tarFails?: string;
 };
 
 /**
@@ -106,6 +108,20 @@ export function tarOf(files: Record<string, string>): Buffer {
 
 /** One JSON line, as the Runner would write it. */
 export const line = (value: unknown): string => `${JSON.stringify(value)}\n`;
+
+/**
+ * The seq the Runner in this sandbox would start from.
+ *
+ * Read out of the Job the executor wrote, rather than assumed — the executor bumps
+ * `afterSeq` past the events it writes itself, and a script that numbered from 1
+ * regardless would be a fake agreeing with an implementation instead of with the Runner.
+ * `fold()` refuses both a gap and a duplicate, so getting this wrong is a real defect
+ * that only a faithful fixture can show.
+ */
+export const afterSeqOf = (sandbox: FakeSandbox): number => {
+  const raw = sandbox.files.get('/work/job.json');
+  return raw ? ((JSON.parse(raw.toString('utf8')) as { afterSeq?: number }).afterSeq ?? 0) : 0;
+};
 
 export function fakeSandboxes(options: FakeOptions = {}): {
   client: SandboxClient;
@@ -157,7 +173,18 @@ export function fakeSandboxes(options: FakeOptions = {}): {
         if (command.includes("require('dgram')")) {
           return reachable(fake) ? { exitCode: 0, output: 'UDP_ANSWERED 45' } : { exitCode: 3, output: 'UDP_TIMEOUT' };
         }
-        if (command.includes('tar -cf')) return { exitCode: 0, output: 'TAR 0' };
+        if (command.includes('tar -cf')) {
+          return options.tarFails
+            ? { exitCode: 0, output: `${options.tarFails}\nTAR 2` }
+            : { exitCode: 0, output: './\nTAR 0' };
+        }
+        // A tool call, delivered the way the executor delivers one: base64 inside a
+        // command, because the spool is root-owned and `writeFiles` runs as uid 1000.
+        const delivered = /printf %s '([A-Za-z0-9+/=]*)'/.exec(command);
+        if (delivered && command.includes('/rpc/in/')) {
+          notice(Buffer.from(delivered[1]!, 'base64').toString('utf8').trim());
+          return { exitCode: 0, output: '' };
+        }
         // The environment build awaits the Runner whole rather than streaming it, so the
         // same script has to answer both shapes. Joined into `output`, which is what the
         // executor parses there.
@@ -225,6 +252,10 @@ export function fakeSandboxes(options: FakeOptions = {}): {
         return { ref };
       },
       stop: async (): Promise<Compute | null> => {
+        // A session that has already ended cannot be ended again, and the executor's
+        // sweep counts what it actually stopped — so a fake that answered twice would
+        // make the sweep's number a lie.
+        if (fake.stopped) throw new Error('this sandbox is not running');
         fake.stopped = true;
         return { sandboxId: fake.id, activeCpuMs: 1234, durationMs: 5678 };
       },

@@ -159,10 +159,20 @@ consequences of that shape are decisions rather than style:
   written against either would be a guard against our own cache. So the interface has no
   method to read one, and the seal is established by running two data-exchanging probes
   inside the sandbox and recording what they found (`SANDBOX_SEALED.probe`).
-- **A probe that still reaches the network refuses the phase.** Not reports it: the claim
-  this substrate was chosen for is that the agent works with no route out, and running one
-  that still has a route and calling the result evidence is the same class of mistake as
-  letting the agent write its own facts (ADR-0006).
+- **Every sandbox is probed, not only the agent's.** The argument above — the policy you
+  sent is not the policy the platform holds — applies hardest to the containers that
+  judge. The agent's sandbox is the one ADR-0010 says "is not contained, and it no longer
+  needs to be"; base and fix are the opposite, and their output IS the evidence. A
+  `deny-all` the platform accepted and failed to apply on a base sandbox would produce a
+  reproduction that could have been told what to answer, and nothing else in this design
+  would notice. So a judging phase is probed before it is given the source or the Job.
+- **A probe that still reaches the network refuses the phase.** Refuses by RETURNING,
+  though. Throwing unwound the whole run — `orchestrate()` accumulates events locally and
+  returns them at the end — so an exception from the fix agent's phase discarded the
+  attempt, the registration and every base observation. The design has a name for this
+  outcome (`SANDBOX_SEALED` with `probe: true`, and `cause: 'environment'`, which
+  disqualifies the attempt and ends the run `errored`), and `Executor.runPhase` must not
+  throw for an outcome the design has a name for.
 
 Two costs this adds, named rather than left to be discovered:
 
@@ -171,7 +181,17 @@ Two costs this adds, named rather than left to be discovered:
   up where it left off. `runner-vm.ts` mirrors every reply to `<spool>/out/<id>.json` for
   that reason; the events themselves are durable in the plane once appended.
 - **A phase now has two ceilings.** Ours, enforced by the process driving it, and the
-  platform's session timeout, enforced with that process dead. `PhaseResult.ceiling` says
-  which fired, and `VERIFICATION_ABORTED{cause:'ceiling'}` puts it in the log — where the
-  fold disqualifies the attempt, because a comparison cut short mid-observation is half a
+  platform's session timeout, enforced with that process dead. `PhaseResult.ceiling`
+  reports the first; the second cannot be reported by a process that is dead, and what
+  surfaces then is a stream that ends and a sandbox the boot sweep finds.
+  `VERIFICATION_ABORTED{cause:'ceiling'}` puts ours in the log — where the fold
+  disqualifies the attempt, because a comparison cut short mid-observation is half a
   comparison and must not be credited with a reproduction.
+- **The host cannot write the spool, and that is the point.** `writeFiles` runs as uid
+  1000 — the uid the repro drops to — so there is no ownership that lets the host write a
+  spool the agent cannot. Tool calls therefore go in base64 inside a `sudo tee`, one round
+  trip, the same cost the file write would have been. The spool stays root-owned 0700, so
+  the agent cannot forge `{done: true}` and choose its own ending.
+- **`sweep()` is scoped to one worker.** It reads this worker's ledger and a tag carrying
+  this worker's identity. A tag shared across a deployment would turn one booting worker
+  into an outage for every other one.

@@ -19,10 +19,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import type { RunEvent } from '../src/events.js';
+import { digest, get } from '../src/blobs.js';
 import { fold } from '../src/fold.js';
-import { SealFailed, vercelExecutor } from '../src/executor-vercel.js';
+import { vercelExecutor } from '../src/executor-vercel.js';
 import type { RunPlan } from '../src/orchestrate.js';
-import { fakeSandboxes, line, type RunnerContext } from './fixtures/sandbox.js';
+import { afterSeqOf, fakeSandboxes, line, type RunnerContext } from './fixtures/sandbox.js';
 
 const RUN = '7c1e5f20-6b3a-4c8d-9e11-3f4a5b6c7d8e';
 const dirs: string[] = [];
@@ -76,8 +77,8 @@ const event = (seq: number, type: string, payload: unknown) =>
 describe('a container that judges never has a network', () => {
   test('it is created deny-all, from the snapshot, and the policy is never touched', async () => {
     const fake = fakeSandboxes({
-      runner: async function* () {
-        yield event(1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 5, symptom_matched: true });
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 5, symptom_matched: true });
       },
     });
     const executor = vercelExecutor({ client: fake.client });
@@ -91,7 +92,10 @@ describe('a container that judges never has a network', () => {
     });
 
     expect(result.exitCode).toBe(0);
-    expect(result.events).toHaveLength(1);
+    // Two: the seal this executor observed, then what the container reported. The seal is
+    // first because the sandbox is probed before it is given the source or the Job.
+    expect(result.events.map((one) => one.type)).toEqual(['SANDBOX_SEALED', 'TEST_RUN']);
+    expect(result.events.map((one) => one.seq)).toEqual([1, 2]);
     const sandbox = fake.sandboxes[0]!;
     expect(sandbox.createdWith).toBe('deny-all');
     expect(sandbox.from).toEqual({ snapshot: 'snap-1' });
@@ -183,26 +187,75 @@ describe('the agent sandbox is sealed before it is asked anything', () => {
     expect(sealed.seq).toBe(1);
   });
 
-  test('a probe that still reaches the network refuses the phase', async () => {
+  test('a probe that still reaches the network refuses the phase, and KEEPS the record', async () => {
     // The failure this exists for is a policy the platform accepts and does not apply.
     // Running an agent in that sandbox and calling the result evidence would be the same
-    // class of lie as an agent writing its own facts — so the phase throws, and the run
-    // records an operational fault rather than a finding.
+    // class of lie as an agent writing its own facts.
+    //
+    // Refused by RETURNING, not by throwing. `orchestrate()` accumulates events locally
+    // and returns them at the end, so an exception out of the fix agent's phase would
+    // discard the attempt, the registration and every base observation — the
+    // evidence-loss shape the Docker executor says it fixed twice. The design has a name
+    // for this outcome (`probe: true`, and `cause: 'environment'` disqualifies the
+    // attempt), and `executor.ts` says this method must not throw for one.
+    let called = 0;
     const fake = fakeSandboxes({ runner: serving, reachable: () => true });
     const executor = vercelExecutor({ client: fake.client });
-    await expect(
-      executor.runPhase({
-        plan: plan({ recipe: { install: 'npm ci', services: [] } }),
-        source: repo(),
-        afterSeq: 0,
-        phase: 'agent',
-        overrides: { serveTools: true },
-        driver: async ({ invoke }) => void (await invoke('read', { path: 'README' })),
-      }),
-    ).rejects.toThrow(SealFailed);
+    const result = await executor.runPhase({
+      plan: plan({ recipe: { install: 'npm ci', services: [] } }),
+      source: repo(),
+      afterSeq: 0,
+      phase: 'agent',
+      overrides: { serveTools: true },
+      driver: async ({ invoke }) => {
+        called += 1;
+        await invoke('read', { path: 'README' });
+      },
+    });
+
+    // The model was never asked for a turn.
+    expect(called).toBe(0);
+    expect(result.exitCode).not.toBe(0);
+    const sealed = result.events.find((one) => one.type === 'SANDBOX_SEALED')!;
+    expect(sealed.payload).toMatchObject({ probe: { dns: true, route: true } });
+    const abort = result.events.find((one) => one.type === 'VERIFICATION_ABORTED')!;
+    expect(abort.payload).toMatchObject({ cause: 'environment' });
+    expect((abort.payload as { reason: string }).reason).toMatch(/still reached the network/);
     // And the machine is gone anyway. A refusal that leaked a running sandbox would cost
     // money for as long as its session lasts.
     expect(fake.sandboxes[0]!.stopped).toBe(true);
+  });
+
+  test('a phase that JUDGES is probed too, and refused if the seal did not take', async () => {
+    // The ADR's argument — the policy you sent is not the policy the platform holds —
+    // applies hardest here. The agent's sandbox is the one ADR-0010 says nothing worth
+    // stealing lives in; base and fix are the opposite, and their output IS the evidence.
+    // A `deny-all` the platform accepted and failed to apply on a base sandbox produces a
+    // reproduction that could have been TOLD what to answer.
+    const honest = fakeSandboxes({
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
+      },
+    });
+    const clean = await vercelExecutor({ client: honest.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    // Observed, not assumed: the phase carries a seal event of its own, and it precedes
+    // everything the container said.
+    expect(clean.events[0]!.type).toBe('SANDBOX_SEALED');
+    expect(clean.events[0]!.payload).toMatchObject({ probe: { dns: false, route: false } });
+    expect(clean.exitCode).toBe(0);
+
+    // THE control: the same phase on a platform that did not apply the policy.
+    const open = fakeSandboxes({ reachable: () => true });
+    const refused = await vercelExecutor({ client: open.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(refused.events.some((one) => one.type === 'TEST_RUN')).toBe(false);
+    expect(refused.events.find((one) => one.type === 'VERIFICATION_ABORTED')?.payload).toMatchObject({
+      cause: 'environment',
+    });
+    expect(open.sandboxes[0]!.stopped).toBe(true);
   });
 
   test('the fold reads the order, and refuses a seal that arrived too late', async () => {
@@ -220,6 +273,30 @@ describe('the agent sandbox is sealed before it is asked anything', () => {
     // THE control: the same events, the other way round. A seal recorded after the agent
     // has spoken says nothing about what it could reach while speaking.
     expect(fold(stream(4, 3)).sealedBeforeAgent).toBe(false);
+  });
+
+  test('a run with TWO agent phases is not punished for the first one having spoken', () => {
+    // The defect this pins. A standard run has two agents per attempt — the repro agent
+    // and the fix agent — and up to ten attempts. Reading the rule as "was the transcript
+    // empty when the seal arrived" makes every seal after the first one false, so the
+    // field was false for every run in which both sandboxes were sealed correctly. The
+    // question is per AGENT PHASE, and `AGENT_FINISHED` is the boundary the log carries.
+    const at = (seq: number, type: string, payload: unknown): RunEvent =>
+      ({ run_id: RUN, seq, ts: 'T', type, payload }) as RunEvent;
+    const seal = (seq: number, reached = false) =>
+      at(seq, 'SANDBOX_SEALED', { v: 1, sandbox_id: 's', policy: 'deny-all', probe: { dns: reached, route: false } });
+    const said = (seq: number) => at(seq, 'AGENT_MESSAGE', { v: 1, n: 0, claimed_type: 'text', bytes: 1 });
+    const done = (seq: number) => at(seq, 'AGENT_FINISHED', { v: 1, messages: 1, exit_code: 0, stopped: 'end' });
+
+    // Both phases sealed before their own agent spoke.
+    expect(fold([seal(1), said(2), done(3), seal(4), said(5), done(6)]).sealedBeforeAgent).toBe(true);
+    // THE control: the SECOND phase's agent spoke before its seal. The first was fine,
+    // and the run is still not one where every agent was sealed.
+    expect(fold([seal(1), said(2), done(3), said(4), seal(5), done(6)]).sealedBeforeAgent).toBe(false);
+    // A second phase with no seal at all — the case a partial rollout would produce.
+    expect(fold([seal(1), said(2), done(3), said(4), done(5)]).sealedBeforeAgent).toBe(false);
+    // And a phase still open at the end of a log, which is a run cut short mid-agent.
+    expect(fold([seal(1), said(2), done(3), said(4)]).sealedBeforeAgent).toBe(false);
   });
 
   test('a seal whose probe reached the network folds to false, whenever it arrived', async () => {
@@ -281,8 +358,17 @@ describe('the environment build keeps nothing of ours in the snapshot', () => {
 describe('nothing is left running, and nothing is left uncollected', () => {
   test('artifacts are re-digested into the host store, and a handover is written out', async () => {
     const root = blobRoot();
+    // THE REAL LAYOUT. `put()` writes `<root>/<aa>/<bb>/<rest>` — two levels of fan-out —
+    // so a store contains directories at its top level and no files at all. An earlier
+    // version of this test used a flat `sha256-abc`, which `put()` can never produce, and
+    // the collection loop it was written against skipped every blob and returned success:
+    // a complete event stream whose refs named bytes that were not in the store, a fold
+    // that said `reproduced: true`, and an ENOENT for whoever opened the report.
+    const captured = 'the captured stdout';
+    const ref = digest(Buffer.from(captured));
+    const hex = ref.slice('sha256:'.length);
     const fake = fakeSandboxes({
-      blobs: { 'sha256-abc': 'the captured stdout' },
+      blobs: { [`./${hex.slice(0, 2)}/${hex.slice(2, 4)}/${hex.slice(4)}`]: captured },
       handover: Buffer.from('a bundle'),
       runner: async function* ({ awaitSpool }: RunnerContext) {
         yield line({ env: { ready: true, steps: [], services: [] } });
@@ -304,13 +390,34 @@ describe('nothing is left running, and nothing is left uncollected', () => {
     // `applyHandover` does `lstat` on exactly this path, so writing it anywhere else is a
     // handover that silently did not happen.
     expect(result.handover).toBeDefined();
-    const { readFileSync, readdirSync } = await import('node:fs');
+    const { readFileSync } = await import('node:fs');
     expect(readFileSync(join(result.handover!, 'agent.bundle'), 'utf8')).toBe('a bundle');
-    // Named by what the bytes ARE, not by what the sandbox called them: `put` re-digests,
-    // so a blob altered in transit lands under a ref nothing cites.
-    const stored = readdirSync(root).filter((name) => name !== '.evidence-store');
-    expect(stored).toHaveLength(1);
-    expect(stored[0]).not.toBe('sha256-abc');
+    // Readable through the store's own reader, which re-digests: that is the whole claim,
+    // and a directory listing could not make it.
+    expect((await get(root, ref)).toString('utf8')).toBe(captured);
+    // And no collection failure was reported, because there was none.
+    expect(result.events.some((one) => (one.payload as { cause?: string }).cause === 'collection')).toBe(false);
+  });
+
+  test('a store that cannot be archived is REPORTED, not lost', async () => {
+    // The events are the record, and a stream whose blobs went missing is still worth
+    // vastly more than no stream. So a collection failure is an event beside them, never
+    // a throw that discards the phase.
+    const fake = fakeSandboxes({
+      tarFails: 'tar: /blobs: Cannot open: No such file or directory',
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
+      },
+    });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {},
+    });
+    expect(result.events.some((one) => one.type === 'TEST_RUN')).toBe(true);
+    const abort = result.events.find((one) => (one.payload as { cause?: string }).cause === 'collection')!;
+    expect(abort).toBeDefined();
+    // Tar's own words, not a paraphrase: the exit code alone turns "no space left on
+    // device" into `TAR 2`.
+    expect((abort.payload as { reason: string }).reason).toMatch(/Cannot open/);
   });
 
   test('the ledger names a sandbox BEFORE it exists, and sweep stops what it finds', async () => {
@@ -320,21 +427,38 @@ describe('nothing is left running, and nothing is left uncollected', () => {
     const state = temp('engine-vercel-ledger-');
     const ledger = { path: join(state, 'sandboxes.json') };
     const fake = fakeSandboxes({
-      runner: async function* () {
-        yield event(1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
       },
     });
-    const executor = vercelExecutor({ client: fake.client, ledger });
+    // Tagged for THIS worker, not for the deployment. A tag shared between workers turns
+    // one booting worker into an outage for every other one, because `sweep` stops what
+    // the tag matches.
+    const tags = { engine: 'test-framework-v2', worker: 'this-one' };
+    const executor = vercelExecutor({ client: fake.client, ledger, tags });
     await executor.runPhase({ plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {} });
 
-    const { readFileSync } = await import('node:fs');
+    const { existsSync, readFileSync } = await import('node:fs');
     expect(readFileSync(ledger.path, 'utf8')).toContain('"sandboxId":"sbx-1"');
 
-    // Nothing to sweep once a run tidied up after itself — and something to sweep when it
-    // did not, which is the case the sweep exists for.
+    // Nothing to sweep once a run tidied up after itself: the ledger still names the
+    // sandbox, and stopping an already-stopped session is not something this counts.
     expect(await executor.sweep()).toBe(0);
-    await fake.client.create({ from: { image: 'engine:test' }, policy: 'deny-all', timeoutMs: 1000, tags: { engine: 'test-framework-v2' } });
+    // And the file is gone, so a later sweep does not re-ask the platform about the dead.
+    expect(existsSync(ledger.path)).toBe(false);
+
+    // The case the sweep exists for: a sandbox this worker made and did not stop.
+    await fake.client.create({ from: { image: 'engine:test' }, policy: 'deny-all', timeoutMs: 1000, tags });
     expect(await executor.sweep()).toBe(1);
+    // THE control: another worker's sandbox, carrying another worker's tag, is left alone.
+    await fake.client.create({
+      from: { image: 'engine:test' },
+      policy: 'deny-all',
+      timeoutMs: 1000,
+      tags: { engine: 'test-framework-v2', worker: 'somebody-else' },
+    });
+    expect(await executor.sweep()).toBe(0);
+    expect(fake.sandboxes.at(-1)!.stopped).toBe(false);
   });
 
   test('an attempt cut short by the ceiling cannot be credited with a reproduction', () => {
@@ -368,8 +492,8 @@ describe('nothing is left running, and nothing is left uncollected', () => {
 
   test('a phase whose stream never ends is stopped, and says so in the log', async () => {
     const fake = fakeSandboxes({
-      runner: async function* () {
-        yield event(1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
         // Then nothing, forever — the wedge the ceiling exists for.
         await new Promise(() => {});
       },
