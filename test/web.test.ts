@@ -627,7 +627,7 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     expect(onboardPage('acme/widgets', null)).not.toContain('This recipe was not stored.');
   });
 
-  test('there is no field for a secret, and the page says why', () => {
+  test('there is no field for a secret, and the page draws the line M10 drew', () => {
     // M6e is blocked on a security decision and an ADR that do not exist. A form is the
     // easiest half of that problem, and shipping it would settle the question by accident.
     const html = onboardPage('acme/widgets', RECIPE);
@@ -637,8 +637,17 @@ describe('the onboarding screen is the only write, and its copy carries the weig
     const form = html.slice(html.indexOf('<form'), html.indexOf('</form>'));
     expect([...form.matchAll(/name="([^"]*)"/g)].map((m) => m[1])).toEqual(['recipe']);
     expect(form).not.toMatch(/env|secret|token|password|credential/i);
-    expect(html).toContain('Environment variables are not supported yet');
+    // M10 split the sentence in two rather than lifting it. Configuration ships — a port,
+    // a URL for a service the recipe itself starts — and a credential still does not, for
+    // the reason that has not changed. A page that went on saying "not supported yet"
+    // while `recipe.env` was being injected into every container would be describing an
+    // engine this repository no longer contains.
+    expect(html).toContain('Environment variables: configuration here, secrets not yet');
+    expect(html).not.toContain('Environment variables are not supported yet');
     expect(html).toContain('nothing worth stealing lives in it');
+    // And it names the outcome a person actually gets, which is the whole of 10j.
+    expect(html).toMatch(/<code>blocked<\/code> run/);
+    expect(html).toMatch(/name it in <code>required<\/code>/i);
   });
 
   test('a script tag in the repository name or the error cannot break out', () => {

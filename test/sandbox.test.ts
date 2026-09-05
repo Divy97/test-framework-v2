@@ -2978,6 +2978,87 @@ describe.skipIf(!haveDocker)('the engine runs inside the sandbox', () => {
     expect('output' in sealed! ? sealed.output : '').toMatch(/bad address|not found|resolve/i);
   }, 900_000);
 
+  // ── M10: the recipe's configuration reaches both worlds ────────────────────
+
+  test("a recipe's `env` reaches the install step AND the container that judges", async () => {
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+    let sealed: SealedWorld | undefined;
+
+    // One run, two sites, and the command can only pass if BOTH worked. The install
+    // step writes the variable's value into a gitignored path — so the file's content
+    // is evidence about the env-build container, which is a different container from
+    // the one that then reads it. The probe compares its OWN `$ENGINE_TEST_GREETING`
+    // against that file, in the judging container, where the phases run.
+    //
+    // Asserting the exit code alone would not do: `test "$A" = "$A"` passes when both
+    // are empty, which is exactly what an unplumbed variable looks like. So the value
+    // is echoed and asserted on, and it is a string nothing else in this repository
+    // sets.
+    await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: hostBlobs(),
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      flakeRuns: 0,
+      baseRuns: 0,
+      symptomPattern: 'wrong',
+      reproPrompt: (world) => {
+        sealed = world;
+        return 'write a reproduction';
+      },
+      recipe: {
+        install:
+          'mkdir -p node_modules/dep && printf "%s" "$ENGINE_TEST_GREETING" > node_modules/dep/greeting',
+        services: [],
+        test: 'test "$ENGINE_TEST_GREETING" = "$(cat node_modules/dep/greeting)" && echo "both:$ENGINE_TEST_GREETING"',
+        env: { ENGINE_TEST_GREETING: 'set-by-the-recipe' },
+      },
+    });
+
+    expect(sealed).toBeDefined();
+    expect(sealed).toMatchObject({ exitCode: 0 });
+    expect('output' in sealed! ? sealed.output : '').toContain('both:set-by-the-recipe');
+  }, 900_000);
+
+  test('THE control: the same recipe without `env` fails in the same place', async () => {
+    // Without this the test above passes on an engine that sets the variable from
+    // somewhere else entirely — the image, the host's own environment, a leftover.
+    // Identical commands, one field removed: the install writes an empty file, the
+    // probe compares empty to empty and prints `both:`, which is the string that
+    // proves the comparison was vacuous.
+    execFileSync('docker', ['build', '-q', '-t', IMAGE, '.'], { cwd: process.cwd() });
+    const fixture = needsInstalledDependency();
+    let sealed: SealedWorld | undefined;
+
+    await orchestrate({
+      runId: RUN_ID,
+      repoPath: fixture.repo,
+      blobRoot: hostBlobs(),
+      image: IMAGE,
+      baseRef: fixture.base,
+      fixRef: fixture.fix,
+      flakeRuns: 0,
+      baseRuns: 0,
+      symptomPattern: 'wrong',
+      reproPrompt: (world) => {
+        sealed = world;
+        return 'write a reproduction';
+      },
+      recipe: {
+        install:
+          'mkdir -p node_modules/dep && printf "%s" "$ENGINE_TEST_GREETING" > node_modules/dep/greeting',
+        services: [],
+        test: 'test "$ENGINE_TEST_GREETING" = "$(cat node_modules/dep/greeting)" && echo "both:$ENGINE_TEST_GREETING"',
+      },
+    });
+
+    expect(sealed).toBeDefined();
+    expect('output' in sealed! ? sealed.output : '').not.toContain('both:set-by-the-recipe');
+  }, 900_000);
+
   // ── 8f: onboarding proves the repository, not just the recipe ───────────────
   //
   // Milestone 7: "6b's drafting run has a trigger now — installation — and a human

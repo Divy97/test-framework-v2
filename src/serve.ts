@@ -250,7 +250,7 @@ export async function serve(options: ServeOptions): Promise<Service> {
       `Until then this is the honest answer. Starting a run anyway would boot nothing, ` +
       `reproduce nothing, and report that we could not reproduce your bug — which would ` +
       `be a statement about our setup wearing the shape of a finding about your code.\n\n` +
-      `**Next:** approve a recipe for \`${intake.repo}\`, then re-label this issue.`;
+      `**Next:** approve a recipe for \`${intake.repo}\`, then start a run for this issue.`;
     await comment(intake.repo, intake.issueNumber, body, intake.installationId);
   };
 

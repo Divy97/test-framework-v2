@@ -92,3 +92,40 @@ API with no sandbox, a paid dependency, a database version the image lacks. The
 answer at that point is a Tier 3 info-request, and the interesting question is
 whether the recipe should be able to declare an unsatisfiable requirement up front
 instead of discovering it at boot.
+
+## Amended at milestone 10: the recipe carries its own configuration
+
+The question this ADR ends on — *"whether the recipe should be able to declare an
+unsatisfiable requirement up front instead of discovering it at boot"* — is answered
+yes, and the answer is two fields rather than one.
+
+**`env`** is configuration every command in the recipe runs with: a port, a
+`DATABASE_URL` pointing at a Postgres the recipe's own `services` entry starts,
+`NODE_ENV=test`. It lives in the recipe's jsonb beside the commands because that is
+what it is — a project that needs `PORT=8095` to boot needs it every replay, and until
+now the only way to say so was to write it inline into a command string, which
+`redact.ts` has a whole paragraph about. It reaches the environment build, the agent's
+shells, and every command a phase container judges.
+
+**`required`** names variables this repository cannot run without, whatever their
+value. A run missing one ends `blocked` before any sandbox is created, naming what is
+missing on the issue and asking for nothing else. That is not the reproduce-first gate
+bending: no reproduction was shown, so no fix is attempted and no pull request opens
+([ADR-0007](0007-reproduce-first-gate.md)). It is the difference between telling
+somebody their bug could not be reproduced — a finding about their report — and telling
+them a variable is unset, which is a fact about ours.
+
+The split is not about how sensitive a value looks. It is about whether knowing it
+grants access to something outside the sandbox. Anything that does is a **secret**, and
+secrets are not in the recipe at all: they are stored encrypted, apart, and
+[ADR-0017](0017-environment-secrets-and-the-network-that-has-to-close.md) governs when
+one may be injected. `required` is how a recipe names a secret it needs without
+containing it — the name is public, the value is not, and a run without it stops.
+
+`parseRecipe` refuses `PATH`, `HOME`, `TMPDIR`, `GIT_DIR` and `GIT_WORK_TREE`. Not as a
+security boundary — a recipe already runs arbitrary commands, and one that wants a
+different `PATH` can export it in the command itself — but because the Runner hands
+every participant a private `TMPDIR` and `HOME` so the phases cannot see each other's
+leftovers ([ADR-0010](0010-the-environment-is-part-of-the-evidence.md)), and a recipe that
+redefined one would break isolation in a way that reads as the user's project being
+broken.

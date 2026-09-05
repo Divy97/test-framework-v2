@@ -195,6 +195,17 @@ export const pullRequestTitle = (state: RunState, context: ReportContext): strin
  * infrastructure being wrong about someone's project and must never be presented
  * as a finding about their bug (ADR-0007's v1.5 amendment), and a PR is a link.
  */
+/**
+ * A blocked run whose abort named nothing. Unreachable through this engine — `run.ts`
+ * only emits the abort with a non-empty list — and written anyway, because the fold
+ * accepts any producer's stream and a sentence with a hole in it is worse than a vaguer
+ * true one.
+ */
+const blockedWithoutNames =
+  'This run did not start: the environment recipe for this repository requires a value ' +
+  'that is not stored, so nothing about the report was tested and no fix was attempted. ' +
+  'The run log records which one.';
+
 export function issueComment(state: RunState, context: ReportContext): string {
   if (state.pr) {
     const score = confidence(state);
@@ -204,6 +215,31 @@ export function issueComment(state: RunState, context: ReportContext): string {
       `Tier ${score.tier}, confidence ${score.score}/${score.ceiling}. The pull request carries the failing test, ` +
       `both exit codes, the diff, and every artifact by hash.\n\n` +
       `Nothing has been merged. That is always yours.`
+    );
+  }
+
+  // NOTHING RAN (M10). Above `errored` on purpose: this run also failed on our side of
+  // the line, but it failed for a reason the reporter can fix in one action, and burying
+  // that under "a fault on our side" would hide the one sentence worth reading. Below the
+  // PR branch, because a run that opened one is not blocked by definition.
+  if (state.status === 'blocked') {
+    // `.at(-1)`, as every other branch here reads its abort, and only when it names
+    // something: an abort with no names would render "marks  as required", which is a
+    // sentence about nothing.
+    const missing = [...state.aborts].reverse().find((abort) => abort.cause === 'missing_env')?.missing ?? [];
+    if (missing.length === 0) return blockedWithoutNames;
+    return (
+      `This run did not start, and nothing about the report was tested.\n\n` +
+      `The environment recipe for this repository marks ` +
+      `${missing.map((name: string) => `\`${name}\``).join(', ')} as required, and no value is stored ` +
+      `for ${missing.length === 1 ? 'it' : 'them'}. Without ${missing.length === 1 ? 'it' : 'them'} ` +
+      `the project boots half-configured, and a reproduction that fails for that reason would be ` +
+      `reported as a finding about your bug, which it is not.\n\n` +
+      `Add ${missing.length === 1 ? 'the value' : 'the values'} to this repository's environment ` +
+      `and start the run again. **Do not paste ${missing.length === 1 ? 'it' : 'them'} into this ` +
+      `issue** — anything that authenticates to another system belongs in the encrypted store, ` +
+      `not in a public thread.\n\n` +
+      `No fix was attempted and no pull request was opened.`
     );
   }
 
@@ -240,8 +276,8 @@ export function issueComment(state: RunState, context: ReportContext): string {
       `**No fix was attempted, and nothing here is a finding about your report.** It was not ` +
       `tested to a conclusion. The evidence trail for what did happen is kept, including ` +
       `${state.transcript.length} transcript messages.\n\n` +
-      `Label this issue again to start a new run. If it stops here twice, the report is probably ` +
-      `fine and the bug is ours.`
+      `Start a new run from the dashboard when you want another attempt. If it stops here ` +
+      `twice, the report is probably fine and the bug is ours.`
     );
   }
 
@@ -273,7 +309,7 @@ export function issueComment(state: RunState, context: ReportContext): string {
       `That is the agent's account, not a finding: nothing here checked it. It is quoted because ` +
       `the run that just spent twenty turns on your issue is the only thing that knows which fact ` +
       `it was missing.\n\n` +
-      `Add what it asked for to this issue and label it again to start a new run.`
+      `Add what it asked for to this issue, then start a new run from the dashboard.`
     );
   }
 
@@ -284,7 +320,7 @@ export function issueComment(state: RunState, context: ReportContext): string {
     `2. What you saw and what you expected instead — a screenshot or the literal text is ideal.\n` +
     `3. The account or data state involved, if the behaviour depends on it.\n` +
     `4. Where it happened: which environment, which version or commit.\n\n` +
-    `Add any of that to this issue and label it again to start a new run.`
+    `Add any of that to this issue, then start a new run from the dashboard.`
   );
 }
 

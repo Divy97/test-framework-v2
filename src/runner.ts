@@ -566,7 +566,15 @@ async function buildEnvironment(job: Job, emit: (line: string) => void): Promise
   // As root, and not as the repro user. Nothing untrusted runs in this container —
   // it exists before the agent does — and the phases receive these bytes through
   // `chown -R` on their own clone, so ownership here decides nothing downstream.
-  const host = new ToolHost({ root: ENV_REPO, gitDir: `${ENV_REPO}/.git`, env: { TMPDIR: '/tmp', HOME: '/root' } });
+  // The recipe's configuration FIRST, so `TMPDIR` and `HOME` win on a collision — the
+  // engine sets those for its own reasons and `parseRecipe` refuses a recipe that tries
+  // to (M10). A project whose `install` reads `NPM_CONFIG_REGISTRY` or whose `migrate`
+  // reads `DATABASE_URL` gets them here, in the one container that has a network.
+  const host = new ToolHost({
+    root: ENV_REPO,
+    gitDir: `${ENV_REPO}/.git`,
+    env: { ...job.recipe.env, TMPDIR: '/tmp', HOME: '/root' },
+  });
   let env: ReplayOutcome;
   try {
     env = await replayRecipe(host, { ...job.recipe, services: [] });
@@ -977,7 +985,11 @@ export async function runJob(
       `mark ${name} safe for git`,
       execFileAsync('git', ['config', '--global', '--add', 'safe.directory', tree]),
     );
-    return { tree, gitDir: `${root}/gitdir`, env: { TMPDIR: tmp, HOME: home } };
+    // Same order, same reason: the recipe's configuration, then the two names the engine
+    // owns. This env reaches the agent's shells, the recipe replay in the agent sandbox,
+    // and — through `runEnv` — every command a phase container judges, which is the point:
+    // a project that needs `PORT` to boot needs it to be reproduced, too.
+    return { tree, gitDir: `${root}/gitdir`, env: { ...job.recipe?.env, TMPDIR: tmp, HOME: home } };
   };
 
   // The agent goes first and gets its own seq range, so the log reads in the

@@ -230,6 +230,20 @@ async function runPhase(spec: PhaseSpec): Promise<PhaseResult> {
     // built from. The agent container ignores it — `only: 'agent'` returns before
     // `verify()` — so this reaches only the two containers that judge.
     ...(plan.recipe?.test === undefined ? {} : { suiteCommand: plan.recipe.test }),
+    // THE RECIPE ITSELF, for its `env` (M10). `world()` reads `job.recipe?.env` and
+    // hands it to every command a phase runs, and without this line a phase job carried
+    // no recipe at all — so a project that needs `PORT` to boot got it in the agent's
+    // sandbox and in the environment build, and not in the container that judges. The
+    // sealed probe found exactly that.
+    //
+    // Safe to pass whole: a phase container never replays a recipe. `replayRecipe` is
+    // reached only from the agent world and from the environment build, both keyed on
+    // fields a phase job does not set. What a phase reads here is the configuration and
+    // nothing else.
+    //
+    // `agentContainer` sets its own `recipe` through `overrides`, which spread after
+    // this, so the agent path is unchanged.
+    ...(plan.recipe ? { recipe: plan.recipe } : {}),
     ...(plan.baseRuns === undefined ? {} : { baseRuns: plan.baseRuns }),
     ...(plan.flakeRuns === undefined ? {} : { flakeRuns: plan.flakeRuns }),
     ...(plan.timeoutMs === undefined ? {} : { timeoutMs: plan.timeoutMs }),

@@ -123,6 +123,8 @@ export function describeEnvironment(options: {
    * under which the agent has a registry and the judge has node_modules.
    */
   booted?: boolean;
+  /** Configuration the recipe sets for every command, including in the judging container. */
+  env?: Record<string, string>;
 }): string {
   const lines: string[] = [
     'The repository is checked out at your working directory. Your tools are the only way to act on it:',
@@ -200,6 +202,25 @@ export function describeEnvironment(options: {
     );
   } else {
     lines.push('', 'No services are running. This repository has no recipe, or its recipe declares none.');
+  }
+
+  // The one thing about the recipe that DOES cross the boundary the paragraph above
+  // draws. Services do not: they run here and not in the judging container, and the
+  // text says so. Configuration is the opposite — the same `env` is set for every
+  // command in both worlds — and an agent that has been told the services are absent
+  // there will assume the ports and URLs are absent too unless this says otherwise.
+  const env = Object.entries(options.env ?? {});
+  if (env.length > 0) {
+    lines.push(
+      '',
+      'These variables are set for every command you run, and for the registered command in the',
+      'container that judges you. They are the repository’s own local-development configuration,',
+      'and you may rely on them:',
+      ...env.map(([name, value]) => `- \`${name}=${value}\``),
+      '',
+      'Do not write them into a committed file. They are already in the environment on both sides,',
+      'and a value hard-coded into a test is one that stops being true the moment it is changed.',
+    );
   }
 
   // NOT "it passes on this commit" — that sentence asserted a result nothing had

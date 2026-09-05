@@ -27,7 +27,9 @@ last thing in your final message:
       "healthcheck": "http://127.0.0.1:8080/some-path-that-returns-200"
     }
   ],
-  "test": "the project's own test command, or omit it"
+  "test": "the project's own test command, or omit it",
+  "env": { "PORT": "8080" },
+  "required": ["DATABASE_URL"]
 }
 ```
 
@@ -44,6 +46,34 @@ last thing in your final message:
   A healthcheck that answers before the app can serve a request is worse than none,
   because it turns a boot failure into a confusing reproduction failure.
 
+## Environment variables
+
+`env` is the configuration every command above runs with. `required` names the
+variables this project cannot run without, whatever their value.
+
+Find the names the way you find the commands: `.env.example`, a `docker-compose.yml`,
+`process.env.X` / `os.environ["X"]` in the source, a README's setup section. Then split
+them in two, and the split is not about how secret a value looks:
+
+- **Put it in `env`** when the value is worthless outside this sandbox and you can
+  determine it from the repository itself — a port, `NODE_ENV=test`, a feature flag, or
+  a URL pointing at a service YOU declared above (`DATABASE_URL` for a Postgres your
+  own `services` entry starts).
+- **List it in `required`** when the value authenticates to something outside the
+  sandbox, or when only the repository's owner can know it — an API key, a licence, a
+  webhook secret, the URL of a database this recipe does not start.
+
+**Never invent a value.** A made-up API key does not fail at boot; it fails later,
+somewhere confusing, and the run reports that as though it were a finding about the
+user's bug. A name in `required` stops the run before anything starts and asks the
+owner for exactly that name, which is the honest outcome — put it there and move on.
+
+You may not set `PATH`, `HOME`, `TMPDIR`, `GIT_DIR` or `GIT_WORK_TREE`; the harness
+owns those and a recipe that sets one is refused.
+
+If a variable is unset and the project still boots and tests pass, it belongs in
+neither list. Do not pad these.
+
 ## How to work
 
 Read the project. `package.json` scripts, a Makefile, a `docker-compose.yml`, a
@@ -59,7 +89,8 @@ attempted.
 
 State clearly in your final message:
 
-1. What you ran, and what you saw.
+1. What you ran, and what you saw — including which variables you set to get it to run,
+   and which you had to leave to the owner.
 2. Anything you could not verify, and why. If a service needs something this
    environment cannot provide — an external API, a paid dependency, a database
    version that is not here — say so plainly instead of writing a command that will

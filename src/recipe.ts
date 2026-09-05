@@ -41,11 +41,65 @@ export type Recipe = {
   services: Service[];
   /** The project's own test command. Not the reproduction — that is the agent's to write. */
   test?: string;
+  /**
+   * Non-secret configuration every command in this recipe runs with (M10).
+   *
+   * Ports, the URL of a database this recipe itself provisions, `SMTP_HOST=mailpit`,
+   * a feature flag: values that are worthless outside the sandbox, derivable, and
+   * ephemeral. Recipe content, stored in the same jsonb as the commands, because that
+   * is what they are — a project that needs `PORT=8095` to boot needs it every time.
+   *
+   * What does NOT belong here is anything that authenticates to a system outside the
+   * sandbox. Those are secrets, they live encrypted apart from the recipe, and
+   * ADR-0017 governs when they may be injected at all. The split is not about how
+   * sensitive a string looks; it is about whether knowing it grants access to
+   * something.
+   */
+  env?: Record<string, string>;
+  /**
+   * Names this repository cannot be run without.
+   *
+   * A run that starts anyway boots a half-configured project, fails to reproduce, and
+   * reports that as a finding about somebody's bug — which is the presentation
+   * ADR-0007's amendment forbids. So a required name with no value ends the run
+   * `blocked` before any sandbox exists, naming what is missing.
+   *
+   * A name here need not appear in `env`: the point is that it must be SUPPLIED,
+   * whether as configuration above or as a stored secret.
+   */
+  required?: string[];
 };
 
 /** Bounds on a stored, human-approved, agent-drafted document. Generous, and finite. */
 const MAX_COMMAND_CHARS = 4096;
 const MAX_SERVICES = 8;
+const MAX_ENV_NAMES = 64;
+
+/** The shape an environment variable name has, everywhere this engine reads one. */
+const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+/**
+ * Names the engine sets for its own reasons, which a recipe may not take over.
+ *
+ * Not a security boundary — a recipe already runs arbitrary commands, and one that
+ * wants a different `PATH` can export it in the command itself. It is a compatibility
+ * rule: the Runner hands every participant a private `TMPDIR` and `HOME` so the phases
+ * cannot see each other's leftovers (ADR-0010), and `GIT_DIR`/`GIT_WORK_TREE` are how
+ * git is kept out of a worktree the repro owns. A recipe that overrode one would break
+ * isolation in a way that reads as the user's project being broken.
+ */
+const RESERVED = ['PATH', 'HOME', 'TMPDIR', 'GIT_DIR', 'GIT_WORK_TREE', 'LD_PRELOAD', 'BASH_ENV'];
+
+/**
+ * Names that say the value behind them authenticates to something.
+ *
+ * Refused in `env` and pointed at `required` instead, because `env` is stored in plaintext
+ * jsonb, replayed into the onboarding textarea, and `redact()` matches `NAME=value` text
+ * rather than a JSON field — so a key put here is a key on a page and in a backup. This is
+ * a keyword check and it will miss a name that does not say what it is; it is a guard on
+ * the obvious case, not the enforcement of the split, and the ADR says so.
+ */
+const LOOKS_SECRET = /(SECRET|PASSWORD|PASSWD|TOKEN|_KEY|^KEY$|APIKEY|CREDENTIAL|PRIVATE)/;
 
 /**
  * Validate a recipe's shape. Nothing here judges its content.
@@ -101,14 +155,74 @@ export function parseRecipe(input: unknown): Recipe {
     });
   }
 
+  const env: Record<string, string> = {};
+  const declaredEnv = raw.env ?? {};
+  if (typeof declaredEnv !== 'object' || declaredEnv === null || Array.isArray(declaredEnv)) {
+    throw new Error('recipe.env must be an object of NAME: value');
+  }
+  const names = Object.keys(declaredEnv as Record<string, unknown>);
+  if (names.length > MAX_ENV_NAMES) throw new Error(`recipe.env declares more than ${MAX_ENV_NAMES} names`);
+  for (const name of names) {
+    if (!ENV_NAME.test(name)) throw new Error(`${name} is not an environment variable name`);
+    if (RESERVED.includes(name)) throw new Error(`recipe.env may not set ${name}; the engine sets it`);
+    if (LOOKS_SECRET.test(name)) {
+      throw new Error(
+        `recipe.env may not carry ${name}: a value that authenticates to something is a secret, ` +
+          'not configuration — list the name in recipe.required and store the value separately',
+      );
+    }
+    const value = (declaredEnv as Record<string, unknown>)[name];
+    if (typeof value !== 'string') throw new Error(`recipe.env.${name} must be a string`);
+    if (value.length > MAX_COMMAND_CHARS) throw new Error(`recipe.env.${name} is longer than ${MAX_COMMAND_CHARS} characters`);
+    // A newline would let one name's value declare another to a shell that sources it,
+    // and a NUL cannot survive `execve` at all — both are a value that is not the value.
+    if (/[\0\n\r]/.test(value)) throw new Error(`recipe.env.${name} contains a newline or a NUL`);
+    env[name] = value;
+  }
+
+  const required: string[] = [];
+  const declaredRequired = raw.required ?? [];
+  if (!Array.isArray(declaredRequired)) throw new Error('recipe.required must be an array of names');
+  if (declaredRequired.length > MAX_ENV_NAMES) throw new Error(`recipe.required lists more than ${MAX_ENV_NAMES} names`);
+  for (const name of declaredRequired) {
+    if (typeof name !== 'string' || !ENV_NAME.test(name)) {
+      throw new Error('recipe.required must list environment variable names');
+    }
+    // Nothing can ever supply one of these — `env` refuses it and a secret will not carry
+    // it — so a recipe listing one would block every run on that repository forever, with
+    // a message asking for something no form can accept.
+    if (RESERVED.includes(name)) {
+      throw new Error(`recipe.required may not list ${name}; the engine sets it, so nothing could supply it`);
+    }
+    if (!required.includes(name)) required.push(name);
+  }
+
   return {
     ...(command('install') === undefined ? {} : { install: command('install')! }),
     ...(command('migrate') === undefined ? {} : { migrate: command('migrate')! }),
     ...(command('seed') === undefined ? {} : { seed: command('seed')! }),
     services,
     ...(command('test') === undefined ? {} : { test: command('test')! }),
+    ...(names.length === 0 ? {} : { env }),
+    ...(required.length === 0 ? {} : { required }),
   };
 }
+
+/**
+ * Which required names have no value anywhere (M10).
+ *
+ * Configuration in the recipe, or a secret stored for this repository — the check does
+ * not care which, only that the name is supplied. Order follows `required`, so the
+ * message a person reads lists them the way they wrote them.
+ */
+export const missingRequired = (recipe: Recipe, secretNames: readonly string[] = []): string[] =>
+  (recipe.required ?? []).filter(
+    // An EMPTY value does not satisfy a required name. `name in env` would, and that is the
+    // cheapest way around the drafting rule this ships beside — an agent that cannot find a
+    // value and must not invent one could otherwise write `""` and unblock the run into
+    // exactly the half-configured boot the field exists to prevent.
+    (name) => (recipe.env ?? {})[name] === undefined || (recipe.env ?? {})[name] === ''
+  ).filter((name) => !secretNames.includes(name));
 
 /** Keyed by repository, on our side. `full_name` — the same string GitHub uses. */
 export async function saveRecipe(client: Db, repo: string, recipe: Recipe): Promise<void> {

@@ -1073,6 +1073,37 @@ export async function orchestrate(plan: RunPlan): Promise<RunOutcome> {
 }
 
 /**
+ * The shapes an unset environment variable takes in somebody else's error message.
+ *
+ * Three, because three cover node, shells and python between them, and a longer list
+ * would be a parser for every runtime rather than a hint. Deliberately not exhaustive —
+ * what it produces is a sentence on a page, and a miss costs nothing a person would
+ * notice.
+ *
+ * `\b` before each name, so a name is a whole token: `myDATABASE_URL is not set` names
+ * a variable this project does not have, and quoting a fragment of an identifier back
+ * to somebody as advice is worse than saying nothing.
+ */
+const UNSET_VARIABLE =
+  /\b([A-Z][A-Z0-9_]{2,})\s+is not (?:set|defined)|process\.env\.\b([A-Z][A-Z0-9_]{2,})\s+is undefined|Missing (?:required )?(?:environment )?variable:?\s+\b([A-Z][A-Z0-9_]{2,})/g;
+
+/**
+ * The names a failing suite's output complains about, minus the ones already handled.
+ *
+ * Separate from its one caller so it can be tested without a container: everything
+ * around it in `proveRepository` needs Docker, and a heuristic nobody can exercise is
+ * a heuristic that quietly stops matching. Capped at eight, because this ends up in a
+ * sentence a person reads and a list longer than that is a log.
+ */
+export function namesLookingUnset(output: string, handled: Iterable<string> = []): string[] {
+  const known = new Set(handled);
+  const named = [...output.matchAll(UNSET_VARIABLE)]
+    .map((match) => match[1] ?? match[2] ?? match[3])
+    .filter((name): name is string => name !== undefined && !known.has(name));
+  return [...new Set(named)].slice(0, 8);
+}
+
+/**
  * What onboarding proved about a repository, and what it could not (8f).
  *
  * Milestone 7: *"Onboarding proves a recipe, not a repository."* 6b's drafting run
@@ -1201,6 +1232,35 @@ export async function proveRepository(plan: {
           'what a fix broke. Nothing here is a claim that the repository is wrong — a red suite at HEAD ' +
           'is a normal state and this is only what it costs',
       );
+    }
+
+    // A GUESS, labelled as one (M10). A suite that fails complaining about an unset
+    // variable is the commonest way a repository turns out to need configuration nobody
+    // wrote down, and saying so at approval — while a human is looking — is worth far
+    // more than discovering it inside a stranger's issue. It is a regex over somebody
+    // else's error message, so it never gates and never becomes an event: it is a
+    // sentence on the onboarding page, and `recipe.required` is the thing that acts.
+    //
+    // Only on a suite that FAILED. A green run that happens to print the sentence — a
+    // test asserting its own error message, which is exactly what a project with good
+    // coverage of its configuration does — is not evidence of anything missing, and a
+    // caveat on a repository that just proved itself is the kind of noise that teaches
+    // people to skip the list. And a name the recipe already sets or already requires is
+    // handled; repeating it as a guess would advise a change that is already made.
+    if (suite !== undefined && 'output' in suite && suite.exitCode !== 0) {
+      const unique = namesLookingUnset(suite.output, [
+        ...Object.keys(plan.recipe.env ?? {}),
+        ...(plan.recipe.required ?? []),
+      ]);
+      if (unique.length > 0) {
+        caveats.push(
+          `the test command's output mentions ${unique.map((name) => `\`${name}\``).join(', ')}, ` +
+            'which this recipe neither sets nor requires. That is a guess read off an error ' +
+            'message, not a finding — but if the project needs those to run, set them in the ' +
+            'recipe now, or list them as required so a run without them stops and says so instead ' +
+            'of failing to reproduce and calling that a finding about somebody\'s bug',
+        );
+      }
     }
 
     return {

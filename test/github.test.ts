@@ -416,7 +416,7 @@ describe('every terminal outcome gets a comment', () => {
     const comment = issueComment(fold(events), context);
     expect(comment).toContain('**no fix was attempted**');
     expect(comment).toMatch(/1\. The exact steps/);
-    expect(comment).toMatch(/label it again to start a new run/);
+    expect(comment).toMatch(/start a new run from the dashboard/);
     expect(comment).not.toMatch(/sorry|apolog/i);
   });
 

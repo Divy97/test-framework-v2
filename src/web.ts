@@ -856,17 +856,23 @@ writes.</p>
 <textarea name="recipe" rows="20" spellcheck="false" aria-label="recipe">${escapeHtml(prefill)}</textarea>
 <button type="submit">${current ? 'Approve this recipe' : 'Approve and store'}</button>
 </form>
-<h2>Environment variables are not supported yet</h2>
-<p>That is a decision, not an omission. Your project almost certainly needs them, and there is
-no field for them here because putting them in would break the claim the rest of this system
-rests on: the agent sandbox is affordable only because nothing worth stealing lives in it. The
-agent is untrusted by construction, its prompt contains text whoever filed the issue wrote,
-and it has network egress. Real credentials in there make all three of those facts expensive
-at once.</p>
-<p>The fix is to pre-warm dependencies into the agent image so a recipe needs no registry at
-all, and only then is a value in that container defensible. Until that exists, recipes that
-require secrets to boot are recipes this system will report honestly that it could not
-run — which is an <code>errored</code> run, never a finding about your bug.</p>`;
+<h2>Environment variables: configuration here, secrets not yet</h2>
+<p>A recipe carries its own configuration in an <code>env</code> field — a port, a
+<code>DATABASE_URL</code> pointing at a database one of the services above starts,
+<code>NODE_ENV</code>. Those are values that are worthless outside the sandbox, and every
+command in the recipe runs with them.</p>
+<p>A value that <em>authenticates to something outside the sandbox</em> is a different thing
+and there is still no field for it. That is a decision, not an omission: the agent sandbox is
+affordable only because nothing worth stealing lives in it, and the agent is untrusted by
+construction, its prompt contains text whoever filed the issue wrote, and it has network
+egress. Real credentials in there make all three of those facts expensive at once. The fix is
+to pre-warm dependencies into the agent image so a recipe needs no registry at all and the
+sandbox can be sealed for its whole session; only then is a value in that container
+defensible.</p>
+<p>Until then, name it in <code>required</code> instead. A run that cannot find a required
+value stops before any container starts and says which name it was missing — a
+<code>blocked</code> run, which is not a finding about anybody's bug and does not pretend to
+be one.</p>`;
   return layout(`Onboard ${repo}`, body, { current: '/repos', ...who(chrome) });
 }
 
