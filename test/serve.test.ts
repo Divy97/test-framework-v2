@@ -755,9 +755,14 @@ describe('the setup document cannot drift from the calls we make', () => {
     .map((match) => match[1]!.replace(/\$\{[^}]+\}/g, ':x'))
     .sort();
 
-  it('calls exactly the three endpoints the guide accounts for', () => {
+  it('calls exactly the five endpoints the guide accounts for', () => {
+    // Two more since M10: the issue picker lists, and the button reads one issue before
+    // it queues a run. Both are covered by the Issues permission the comment already
+    // needed, so the table gained words rather than a row.
     expect(called).toEqual([
       '/app/installations/:x/access_tokens',
+      '/repos/:x/issues',
+      '/repos/:x/issues/:x',
       '/repos/:x/issues/:x/comments',
       '/repos/:x/pulls',
     ]);

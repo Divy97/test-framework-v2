@@ -16,11 +16,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureBlobRoot } from './blobs.js';
 import { authRoutes } from './auth-routes.js';
-import { installationsFor, readSession, cookieValue, type OAuthConfig } from './auth.js';
+import { installationsFor, readSession, cookieValue, type OAuthConfig, type Session } from './auth.js';
 import { webhookRoute, WEBHOOK_PATH, installationToken, type GitHubApp, type Intake } from './github.js';
 import { forgetInstallation, reconcileInstallation } from './installations.js';
-import { enqueueJob } from './plane.js';
-import { loadRecipe } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runnerRoutes } from './runner-api.js';
 import { startStatusServer, type Route } from './sse.js';
@@ -84,6 +82,95 @@ export const chain =
     return null;
   };
 
+/**
+ * What the plane does with a delivery (M6a, M10).
+ *
+ * A function of its dependencies rather than a closure inside `startPlane`, so a test can
+ * hand it a fake client and a fake token minter and watch what it writes — `startPlane`
+ * needs a database and every credential, and this is the one part of it with a decision
+ * in it. It throws; the caller decides what an escape costs.
+ */
+export function planeIntake(deps: {
+  client: Db;
+  mint: (installationId: number) => Promise<string>;
+  log: (line: string) => void;
+  /** Injected for tests, exactly as `reconcileInstallation` already accepts it. */
+  github?: { fetch?: typeof fetch; api?: string };
+}): (intake: Intake) => Promise<void> {
+  return async (intake) => {
+    if (intake.kind === 'installation') {
+      // An UNINSTALL is not reconciled, because there is nothing left to ask. Minting a
+      // token for a deleted installation 404s and throws, so routing this through the
+      // reconcile meant an uninstall marked nothing removed and the rows stayed live
+      // forever — M6a's "removed means removed", quietly undone.
+      if (intake.scope === 'app' && intake.action === 'removed') {
+        const removed = await forgetInstallation(deps.client, intake.installationId);
+        deps.log(`installation ${intake.installationId}: uninstalled, ${removed} marked removed`);
+        return;
+      }
+      // Otherwise the DELTA is not applied. GitHub is asked what this installation
+      // actually covers and the table is made to match, because a delta is only enough
+      // if you heard every previous one — and a plane deployed today heard none.
+      const { held, removed } = await reconcileInstallation(
+        deps.client,
+        intake.installationId,
+        deps.mint,
+        deps.github ?? {},
+      );
+      deps.log(
+        `installation ${intake.installationId}: ${intake.action} ${intake.repos.length} named, ` +
+          `reconciled to ${held} held${removed > 0 ? `, ${removed} marked removed` : ''}`,
+      );
+      return;
+    }
+    // AN ISSUE DELIVERY STARTS NOTHING (M10). Runs start from the dashboard, pressed by a
+    // person who has a model key and a decision to make about the repository's
+    // environment — two things a webhook cannot carry. The subscription stays, and the
+    // delivery is acknowledged and written to the log here, so a repository somebody
+    // configured the old way says so in this process's output rather than in a run that
+    // never appears. `serve.ts`, the local product, still starts a run from the same
+    // delivery; `intake()` is unchanged, and this is the one place the two diverge.
+    deps.log(`${intake.repo}#${intake.issueNumber}: issues delivery ignored — runs start from the dashboard`);
+  };
+}
+
+type Headers = Record<string, string | string[] | undefined>;
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * May this request tail this run? (M10)
+ *
+ * Answered from `jobs`, not from the projection. The job row exists from the moment
+ * `POST /api/runs` answered 202; `run_projection` exists from the first event a worker
+ * appends, minutes later — so a page that opened the tail right after pressing Start
+ * would have been told its own run does not exist, and EventSource does not retry a
+ * 404. The installation on the job is the one the run was dispatched under, and GitHub
+ * is asked whether this person may see it, exactly as `visible()` asks for a page.
+ *
+ * A function of its dependencies for the reason `planeIntake` is: this is the decision,
+ * and `startPlane` needs a database and every credential to be constructed.
+ */
+export function tailAuthorizer(deps: {
+  client: Db;
+  session: (headers: Headers) => Promise<Session | null>;
+  installations: (session: Session) => Promise<number[]>;
+}): (runId: string, headers: Headers) => Promise<'ok' | 'anonymous' | 'forbidden'> {
+  return async (runId, headers) => {
+    const who = await deps.session(headers);
+    if (!who) return 'anonymous';
+    // A run id is a uuid, and Postgres refuses to compare a `uuid` column with anything
+    // else — which would be a 500 for a malformed id where the run's page gives a 404.
+    if (!UUID.test(runId)) return 'forbidden';
+    const { rows } = await deps.client.query('select installation_id from jobs where run_id = $1', [runId]);
+    const job = rows[0] as { installation_id: string | number } | undefined;
+    if (!job) return 'forbidden';
+    // `installationsFor` answers `[]` when GitHub will not answer: an outage denies.
+    const allowed = await deps.installations(who);
+    return allowed.includes(Number(job.installation_id)) ? 'ok' : 'forbidden';
+  };
+}
+
 export async function startPlane(config: PlaneConfig): Promise<{
   port: number;
   close: () => Promise<void>;
@@ -96,63 +183,26 @@ export async function startPlane(config: PlaneConfig): Promise<{
   const app: GitHubApp = { appId: config.appId, privateKeyPem: config.privateKeyPem };
   const oauth: OAuthConfig = { ...config.oauth };
   const log = (line: string) => console.log(line);
+  const mint = (installationId: number) => installationToken(app, installationId);
+  const handle = planeIntake({ client, mint, log });
 
-  /**
-   * A delivery becomes a queued job, or a comment saying why it did not.
-   *
-   * The gate is the same one `serve.ts` applies and for the same reason (M6a): a
-   * repository nobody has onboarded gets an answer, not a run that reproduces nothing
-   * and reports it as a finding about their bug.
-   */
   const onIntake = (intake: Intake) => {
-    void (async () => {
-      try {
-        if (intake.kind === 'installation') {
-          // An UNINSTALL is not reconciled, because there is nothing left to ask. Minting a
-          // token for a deleted installation 404s and throws, so routing this through the
-          // reconcile meant an uninstall marked nothing removed and the rows stayed live
-          // forever — M6a's "removed means removed", quietly undone.
-          if (intake.scope === 'app' && intake.action === 'removed') {
-            const removed = await forgetInstallation(client, intake.installationId);
-            log(`installation ${intake.installationId}: uninstalled, ${removed} marked removed`);
-            return;
-          }
-          // Otherwise the DELTA is not applied. GitHub is asked what this installation
-          // actually covers and the table is made to match, because a delta is only enough
-          // if you heard every previous one — and a plane deployed today heard none.
-          const { held, removed } = await reconcileInstallation(client, intake.installationId, (id) =>
-            installationToken(app, id),
-          );
-          log(
-            `installation ${intake.installationId}: ${intake.action} ${intake.repos.length} named, ` +
-              `reconciled to ${held} held${removed > 0 ? `, ${removed} marked removed` : ''}`,
-          );
-          return;
-        }
-        const recipe = await loadRecipe(client, intake.repo);
-        if (!recipe) {
-          log(`${intake.repo}#${intake.issueNumber}: not onboarded — nothing queued`);
-          return;
-        }
-        const runId = await enqueueJob(client, {
-          installationId: intake.installationId,
-          repo: intake.repo,
-          intake,
-        });
-        log(`${intake.repo}#${intake.issueNumber}: queued as ${runId}`);
-      } catch (error) {
-        // Never rethrown: this is called without being awaited, so an escape here is
-        // an unhandled rejection that ends the process — and the process is the thing
-        // GitHub is talking to.
-        log(`a delivery could not be queued: ${String(error)}`);
-      }
-    })();
+    // Never rethrown: this is called without being awaited, so an escape here is an
+    // unhandled rejection that ends the process — and the process is the thing GitHub
+    // is talking to.
+    void handle(intake).catch((error: unknown) => log(`a delivery could not be handled: ${String(error)}`));
   };
+
+  const session = (headers: Headers) => readSession(client, cookieValue(headers['cookie'], 'tf_session'));
 
   const surface = await startStatusServer({
     port: config.port,
     host: config.host,
     read: (runId, afterSeq) => readRunAfter(client, runId, afterSeq),
+    // The tail is authorized the way the run's own page is (M10). It streams every event
+    // raw, and a run id being a uuid makes it hard to guess — which was never the same
+    // thing as being allowed.
+    authorize: tailAuthorizer({ client, session, installations: installationsFor }),
     routes: chain(
       // First. Its path is disjoint from every other, it carries no session, and a
       // delivery GitHub will retry should not wait behind a human's page.
@@ -164,15 +214,17 @@ export async function startPlane(config: PlaneConfig): Promise<{
       runnerRoutes({
         client,
         blobRoot: config.blobRoot,
-        mintToken: (installationId) => installationToken(app, installationId),
+        mintToken: mint,
       }),
       dashboardRoutes({
         client,
         blobRoot: config.blobRoot,
         auth: {
-          session: (headers) => readSession(client, cookieValue(headers['cookie'], 'tf_session')),
-          installations: (session) => installationsFor(session),
+          session,
+          installations: (who) => installationsFor(who),
         },
+        // The plane holds the App key, so it is the surface that may read issues (M10).
+        github: { token: mint },
       }),
     ),
   });

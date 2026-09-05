@@ -200,6 +200,16 @@ create table if not exists jobs (
 -- Partial, because the queue is only ever read for jobs nobody has taken.
 create index if not exists jobs_queued on jobs (installation_id, queued_at) where runner_id is null;
 
+-- Who pressed Start, and on which issue (M10).
+--
+-- `requested_by` is a GitHub user id, null for a job that arrived by webhook — which no
+-- longer starts a run on the plane — so absence reads as "before the button existed"
+-- rather than as unknown. `issue_number` is copied out of `intake` so that "is a run for
+-- this issue already under way" is one indexed query and not a jsonb scan.
+alter table jobs add column if not exists requested_by bigint;
+alter table jobs add column if not exists issue_number integer;
+create index if not exists jobs_open_issue on jobs (repo, issue_number) where finished_at is null;
+
 -- Who is logged in (9c). GitHub OAuth is the only human authentication there is.
 --
 -- The row holds a user-to-server token, and that is a real secret worth naming: it is

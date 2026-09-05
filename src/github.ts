@@ -22,7 +22,7 @@
 //     held. That is what the one-hour lifetime actually implies.
 //
 // No dependency: `node:crypto` signs the JWT and the global `fetch` talks to the
-// API. An SDK here would be a large surface for six requests.
+// API. An SDK here would be a large surface for five requests.
 
 import { createServer } from 'node:http';
 import type { Route } from './sse.js';
@@ -594,4 +594,107 @@ export async function commentOnIssue(
   if (!response.ok) {
     throw new Error(`could not comment on ${repo}#${issueNumber}: HTTP ${response.status}`);
   }
+}
+
+/** What the issue picker shows (M10): enough to choose from, never the whole thread. */
+export type IssueSummary = {
+  number: number;
+  title: string;
+  /** Cut at `MAX_ISSUE_BODY_CHARS` for the picker. `readIssue` returns it whole. */
+  body: string;
+  labels: string[];
+  updated_at: string;
+  html_url: string;
+};
+
+const MAX_ISSUE_BODY_CHARS = 2_000;
+const ISSUES_PER_PAGE = 50;
+
+const readHeaders = (token: string) => ({
+  authorization: `Bearer ${token}`,
+  accept: 'application/vnd.github+json',
+  'x-github-api-version': '2022-11-28',
+});
+
+/**
+ * One entry of GitHub's issues list, or nothing.
+ *
+ * Every pull request is also an issue to this endpoint, distinguishable only by a
+ * `pull_request` key — and a run against a pull request is a run against a fix that
+ * already exists. Dropped here, so neither the picker nor the button can be handed one.
+ */
+const asIssue = (entry: unknown): IssueSummary | null => {
+  if (typeof entry !== 'object' || entry === null) return null;
+  const json = entry as {
+    number?: unknown;
+    title?: unknown;
+    body?: unknown;
+    html_url?: unknown;
+    labels?: unknown;
+    updated_at?: unknown;
+    pull_request?: unknown;
+  };
+  if (json.pull_request !== undefined || typeof json.number !== 'number') return null;
+  const labels = Array.isArray(json.labels)
+    ? json.labels.flatMap((label) => {
+        const name = (label as { name?: unknown } | null)?.name;
+        return typeof name === 'string' ? [name] : [];
+      })
+    : [];
+  return {
+    number: json.number,
+    title: typeof json.title === 'string' ? json.title : '',
+    body: typeof json.body === 'string' ? json.body : '',
+    labels,
+    updated_at: typeof json.updated_at === 'string' ? json.updated_at : '',
+    html_url: typeof json.html_url === 'string' ? json.html_url : '',
+  };
+};
+
+/**
+ * One page of a repository's open issues, for a person to pick from (M10).
+ *
+ * Read from GitHub on every request rather than cached: the list is small, the token is
+ * minted per call anyway, and a cached list is one that still offers an issue somebody
+ * closed. The query string is built separately from the path so the setup document's
+ * drift test (`test/serve.test.ts`) sees `/repos/:x/issues` and not the parameters.
+ */
+export async function listOpenIssues(
+  app: Pick<GitHubApp, 'fetch' | 'api'>,
+  token: string,
+  repo: string,
+  page = 1,
+): Promise<IssueSummary[]> {
+  const api = app.api ?? 'https://api.github.com';
+  const call = app.fetch ?? fetch;
+  const url = new URL(`${api}/repos/${repo}/issues`);
+  url.searchParams.set('state', 'open');
+  url.searchParams.set('per_page', String(ISSUES_PER_PAGE));
+  url.searchParams.set('page', String(page));
+  const response = await call(url, { headers: readHeaders(token) });
+  if (!response.ok) throw new Error(`could not list issues on ${repo}: HTTP ${response.status}`);
+  const body = (await response.json()) as unknown;
+  if (!Array.isArray(body)) throw new Error(`the issues list for ${repo} was not a list`);
+  return body.flatMap((entry) => {
+    const issue = asIssue(entry);
+    return issue ? [{ ...issue, body: issue.body.slice(0, MAX_ISSUE_BODY_CHARS) }] : [];
+  });
+}
+
+/**
+ * One issue, whole, or `null` when there is no such issue — or when the number names a
+ * pull request, which the picker never offered and the button must not accept.
+ */
+export async function readIssue(
+  app: Pick<GitHubApp, 'fetch' | 'api'>,
+  token: string,
+  repo: string,
+  number: number,
+): Promise<IssueSummary | null> {
+  const api = app.api ?? 'https://api.github.com';
+  const call = app.fetch ?? fetch;
+  const response = await call(`${api}/repos/${repo}/issues/${number}`, { headers: readHeaders(token) });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`could not read ${repo}#${number}: HTTP ${response.status}`);
+  return asIssue(await response.json());
 }

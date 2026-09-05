@@ -4,15 +4,18 @@
 // split is what keeps the SSE module drivable by a test with no database — the property
 // `test/sse.test.ts` depends on — while letting these routes hold a `Db`.
 //
-// Everything here is READ-ONLY except one POST, and that asymmetry is the design. The
-// dashboard renders projections that can be rebuilt from the log; the single write is a
-// human approving a recipe, which ADR-0013 calls "the only control there is on a stored
-// command we will execute". A dashboard that could start runs, edit evidence or retry
-// phases would be a second producer, and ADR-0009 has one.
+// Everything here is a projection except a handful of writes, and each write is a
+// decision a person makes: approving a recipe (ADR-0013's "the only control there is on a
+// stored command we will execute"), pairing or revoking a runner, destroying a run's
+// artifacts — and, since M10, starting a run. Starting one is a write to `jobs`, the same
+// act a webhook delivery performed in M9; the log's first event still comes from the
+// worker (ADR-0019), so this surface dispatches and never produces. A dashboard that could
+// edit evidence or retry a phase would be a second producer, and ADR-0009 has one.
 
 import { confidence } from './confidence.js';
 import { clearDraft, loadDraft } from './drafts.js';
 import { fold } from './fold.js';
+import { intake, listOpenIssues, readIssue, type Fetcher } from './github.js';
 import { listInstallations, loadInstallation } from './installations.js';
 import { listRuns, readRunRow, readUsage } from './readmodel.js';
 import { loadStored, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
@@ -20,7 +23,7 @@ import { readRun, type Db } from './store.js';
 import { sameOrigin, type Route } from './sse.js';
 import type { Session } from './auth.js';
 import { forgetRun, tombstoneFor } from './forget.js';
-import { listRunners, pairRunner, revokeRunner } from './plane.js';
+import { enqueueJob, listRunners, openJobFor, pairRunner, revokeRunner } from './plane.js';
 import {
   escapeHtml,
   evidencePage,
@@ -94,9 +97,23 @@ export function dashboardRoutes(options: {
     session: (headers: Record<string, string | string[] | undefined>) => Promise<Session | null>;
     installations: (session: Session) => Promise<number[]>;
   };
+  /**
+   * How this surface reads GitHub on a person's behalf (M10). The issue picker and the run
+   * it starts both need an installation token, and the App key that mints one lives in the
+   * plane — never here, never in a runner (ADR-0012). Absent, both routes answer 501: the
+   * local surface has no App, and a page that pretended otherwise would list nothing and
+   * say nothing about why.
+   */
+  github?: { token: (installationId: number) => Promise<string>; api?: string; fetch?: Fetcher };
 }): Route {
   const { client } = options;
   const install = options.installUrl ?? installUrl();
+
+  /** Lowercased: a media type is case-insensitive, and `Application/JSON` is JSON. */
+  const contentType = (headers: Record<string, string | string[] | undefined>): string => {
+    const value = headers['content-type'];
+    return ((Array.isArray(value) ? value[0] : value) ?? '').toLowerCase();
+  };
 
   /**
    * The repositories this request may see, or `null` for "everything" in local mode.
@@ -165,6 +182,13 @@ export function dashboardRoutes(options: {
           'Approving a recipe stores commands this engine executes verbatim, so it is only\n' +
           'accepted from its own page (ADR-0013: the approval is the control).\n',
       };
+    }
+    // A JSON write has to say it is one. `sameOrigin` above is the control; this makes
+    // sure a `/api/` route never parses a body that arrived as a form, whatever sent it —
+    // the one request shape a browser can send with no preflight is exactly the one no
+    // JSON client sends. 415, because the body is the wrong kind rather than forbidden.
+    if (method === 'POST' && path.startsWith('/api/') && !contentType(headers).startsWith('application/json')) {
+      return json({ error: 'send application/json' }, 415);
     }
 
     if (method === 'GET' && (path === '/' || path === '')) {
@@ -276,6 +300,96 @@ export function dashboardRoutes(options: {
         body: 'forgotten\n',
         headers: { location: `/runs/${encodeURIComponent(runId)}` },
       };
+    }
+
+    // THE ISSUE PICKER (M10). Authorized like every other page — may you see this
+    // repository — and then GitHub is asked, on every request, what is open there.
+    const issues = /^\/api\/repos\/(.+)\/issues$/.exec(path);
+    if (method === 'GET' && issues) {
+      const repo = decodeURIComponent(issues[1]!);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      // 404 and the same words for "not yours" and "unknown": a stranger probing names
+      // learns nothing about which repositories this service knows.
+      if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
+      const installation = await loadInstallation(client, repo);
+      if (!installation) return json({ error: 'not connected' }, 404);
+      if (!options.github) return json({ error: 'this surface has no GitHub App' }, 501);
+      // A whole number from 1, or 1. `Infinity` and `1e300` are numbers too, and GitHub
+      // answers them with a 422 that would surface here as our 500.
+      const asked = Number(query.get('page') ?? '1');
+      const page = Number.isInteger(asked) && asked >= 1 ? Math.min(asked, 1_000) : 1;
+      const token = await options.github.token(installation.installationId);
+      return json(await listOpenIssues(options.github, token, repo, page));
+    }
+
+    // THE BUTTON (M10). Starting a run is a write to `jobs`: dispatch, not the log. The
+    // worker that claims the job writes `RUN_REQUESTED` as seq 1, exactly as it did when
+    // a webhook delivery put the job there, so the plane still produces nothing
+    // (ADR-0019). What changed is who decides a run should exist — a person, who has a
+    // model key and an opinion about the repository's environment, which are the two
+    // things a webhook could never supply.
+    if (method === 'POST' && path === '/api/runs') {
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await body());
+      } catch {
+        return json({ error: 'the body is not JSON' }, 400);
+      }
+      // `null` parses. So does `42`. Neither has a `repo`, and reading one off them is
+      // a throw that would arrive as a 500 where every other bad body is a 400.
+      if (typeof parsed !== 'object' || parsed === null) {
+        return json({ error: 'send { "repo": "owner/name", "issue_number": N }' }, 400);
+      }
+      const asked = parsed as { repo?: unknown; issue_number?: unknown };
+      const repo = typeof asked.repo === 'string' ? asked.repo : null;
+      const issueNumber =
+        typeof asked.issue_number === 'number' && Number.isInteger(asked.issue_number) && asked.issue_number > 0
+          ? asked.issue_number
+          : null;
+      if (repo === null || issueNumber === null) {
+        return json({ error: 'send { "repo": "owner/name", "issue_number": N }' }, 400);
+      }
+      // BEFORE the installation lookup and before GitHub is asked anything about the
+      // issue: the question "may you" comes first, and is answered by GitHub, not by us.
+      if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
+      const installation = await loadInstallation(client, repo);
+      if (!installation) return json({ error: 'not connected' }, 404);
+      if (!options.github) return json({ error: 'this surface has no GitHub App' }, 501);
+      // The onboarding gate, the same one the webhook path applied (M6a): a repository
+      // with no recipe gets an answer, not a run that reproduces nothing and reports it as
+      // a finding about the bug.
+      if ((await loadRecipe(client, repo)) === null) {
+        return json({ error: 'not onboarded', onboard: `/repos/${encodeURIComponent(repo)}/onboard` }, 409);
+      }
+      const open = await openJobFor(client, repo, issueNumber);
+      if (open !== null) return json({ error: 'a run for this issue is already under way', run_id: open }, 409);
+      const token = await options.github.token(installation.installationId);
+      const issue = await readIssue(options.github, token, repo, issueNumber);
+      if (!issue) return json({ error: 'no such issue' }, 404);
+      // Through `intake()`, so what a run starts from has ONE author. A hand-built
+      // `IssueIntake` here would be a second definition of what a report is, free to
+      // drift from the webhook's the day either changes.
+      const mapped = intake('issues', {
+        action: 'opened',
+        issue: { number: issue.number, title: issue.title, body: issue.body, html_url: issue.html_url },
+        repository: { full_name: repo },
+        installation: { id: installation.installationId },
+      });
+      if (!mapped || mapped.kind !== 'issue') return json({ error: 'the issue could not be read as a report' }, 502);
+      const runId = await enqueueJob(client, {
+        installationId: installation.installationId,
+        repo,
+        intake: {
+          ...mapped,
+          event: { ...mapped.event, ...(who === null ? {} : { requested_by: who.session.login }) },
+        },
+        ...(who === null ? {} : { requestedBy: who.session.githubId }),
+        issueNumber,
+      });
+      return json({ run_id: runId }, 202);
     }
 
     const api = /^\/api\/runs\/([^/]+)$/.exec(path);

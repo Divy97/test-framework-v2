@@ -10,6 +10,15 @@ export type RunRequestedV1 = {
   source: string; // e.g. "slack", "github"
   thread_ref: string;
   raw_text: string;
+  /**
+   * The GitHub login of the person who pressed Start (M10).
+   *
+   * Optional because it did not exist before runs were started by hand, and a log
+   * written by an older engine is still a valid log — its absence reads as "the
+   * webhook", which is exactly what it was. `source` stays `github_issue`: that is
+   * where the report lives and what `thread_ref` keys on; this is who asked.
+   */
+  requested_by?: string;
 };
 
 export type SandboxCreatedV1 = {
