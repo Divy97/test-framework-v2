@@ -99,7 +99,8 @@ same seam and ADR-0021 is rewritten; nothing else in the table changes.
 Each is a script under `scripts/spike-vercel/`, gated on `VERCEL_TOKEN`, printing PASS or
 FAIL with the number beside it:
 
-1. `deny-all` at create: `getent`, `nc 1.1.1.1 53` and `wget 1.1.1.1` all fail; loopback works.
+1. `deny-all` at create: a DNS lookup, a raw TCP connect to `1.1.1.1:53` and an HTTP fetch all
+   fail — as node one-liners, since the managed image has neither `nc` nor `wget`; loopback works.
 2. The policy flipped `allow-all` → `deny-all` on a *running* sandbox: both probes fail
    within five seconds, no restart, and a loopback server started before the flip answers.
 3. Snapshot after a ~200 MB `npm ci`: how long `snapshot()` takes; create-from-snapshot
