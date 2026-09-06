@@ -14,7 +14,7 @@
 // on every path, including the ones that throw.
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
@@ -454,6 +454,34 @@ describe('reaching root, on an image that may or may not have sudo', () => {
     });
     expect(fake.sandboxes[0]!.commands.some((c) => c.includes('sudo -n mkdir'))).toBe(true);
     expect(fake.sandboxes[0]!.commands.some((c) => c.includes('sudo -n ') && c.includes('runner-vm'))).toBe(true);
+  });
+
+  test('the Runner is started at the path our own Dockerfiles put it', async () => {
+    // Not a string pinned against itself: both facts are READ, from the two files that
+    // decide them. The executor's default named `/engine/src/runner-vm.ts`, which no
+    // Dockerfile has ever created — the third failure of the live run, queued behind the
+    // session clamp and `sudo: not found`, and invisible to every test in this file
+    // because the fake answers any command with a plausible Runner.
+    //
+    // `scripts/spike-vercel/14-our-image.ts` measured the rest against the pushed image:
+    // a sandbox created from it starts in `/app`, so `--import tsx` — a bare specifier
+    // node resolves from the cwd upwards — finds `/app/node_modules`.
+    const fake = fakeSandboxes({ runsAs: { uid: 0, sudo: false }, runner });
+    await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    const started = fake.sandboxes[0]!.commands.find((c) => c.includes('runner-vm'))!;
+
+    for (const file of ['Dockerfile', 'Dockerfile.agent']) {
+      const dockerfile = readFileSync(join(process.cwd(), file), 'utf8');
+      const workdir = /^WORKDIR\s+(\S+)/m.exec(dockerfile)?.[1];
+      expect(workdir, `${file} has no WORKDIR`).toBeTruthy();
+      // `COPY src ./src` under that WORKDIR is what puts the Runner where the command
+      // says it is. If either file stops doing that, this stops being true.
+      expect(dockerfile).toMatch(/^COPY src \.\/src$/m);
+      expect(started).toContain(`${workdir}/src/runner-vm.ts`);
+    }
+    expect(existsSync(join(process.cwd(), 'src/runner-vm.ts'))).toBe(true);
   });
 
   test('and an image that is neither is refused with a reason, not a shell error', async () => {

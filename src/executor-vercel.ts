@@ -278,7 +278,17 @@ export type VercelExecutorOptions = {
    * something stable across a restart of the same worker.
    */
   tags?: Record<string, string>;
-  /** The command that starts `runner-vm.ts` inside the image. */
+  /**
+   * The command that starts `runner-vm.ts` inside the image.
+   *
+   * The default is where OUR images put it: `Dockerfile` and `Dockerfile.agent` both
+   * `WORKDIR /app` and `COPY src ./src`, and a sandbox created from one starts in `/app`
+   * — measured, in `scripts/spike-vercel/14-our-image.ts`. That last part is why `tsx`
+   * can be a bare specifier here: node resolves `--import` from the cwd upwards, so the
+   * same command run from `/` would die in the loader rather than in the script.
+   *
+   * An image that lays its code out differently passes its own.
+   */
   entrypoint?: string;
   /**
    * The longest session to ask the platform for. Defaults to the Hobby ceiling, which is
@@ -291,7 +301,7 @@ export type VercelExecutorOptions = {
 
 export function vercelExecutor(options: VercelExecutorOptions): Executor & { sweep: () => Promise<number> } {
   const { client } = options;
-  const entry = options.entrypoint ?? 'node --import tsx /engine/src/runner-vm.ts';
+  const entry = options.entrypoint ?? 'node --import tsx /app/src/runner-vm.ts';
   const tags = options.tags ?? { engine: 'test-framework-v2', worker: String(process.pid) };
 
   /** Create, prepare, and record — in the order that leaves nothing unaccounted for. */
