@@ -205,6 +205,58 @@ describe('the symptom pattern comes from the report, and is escaped', () => {
  * before a model is spent — which is the difference between telling somebody a variable
  * is missing and telling them their bug could not be reproduced.
  */
+describe('the executor a run is given is the one it uses', () => {
+  test('a supplied executor runs the phases, and Docker is never reached', async () => {
+    // The OTHER half of the seam. `runner-main.ts` hands an executor to `runFromIssue`;
+    // this is `runFromIssue` handing it to `orchestrate`. Deleting the one line that does
+    // so left the whole suite green — the mock in `runner-main.test.ts` cannot see past
+    // `runFromIssue`, so only a real call through it can.
+    //
+    // The image does not exist, so if the threading is dropped and `dockerExecutor()` is
+    // used instead, the fake below is never called and this fails.
+    const fixture = demoRepo();
+    const remotePath = bareRemote(fixture.repo);
+    const phases: string[] = [];
+    const fake = {
+      kind: 'vercel' as const,
+      runPhase: async (spec: { phase: string; afterSeq: number }) => {
+        phases.push(spec.phase);
+        // Enough of a `PhaseResult` to end the run without a container: no events, a
+        // non-zero exit, and nothing observed. What is under test is that we got here.
+        return { phase: spec.phase, events: [], exitCode: 1, stderr: 'the fake executor' } as never;
+      },
+      buildSnapshot: async () => ({ failed: 'the fake executor builds nothing' }),
+      dropSnapshot: async () => {},
+    };
+
+    await runFromIssue({
+      intake: issueIntake(delivery('the orders total is wrong')),
+      app: {
+        appId: '1',
+        privateKeyPem: PEM,
+        // The token mint has to answer with a token; everything else can be an empty
+        // object. Without it the run dies before it reaches an executor at all, which
+        // would make this test pass for the wrong reason on the mutation.
+        fetch: (async (url: string | URL | Request) =>
+          String(url).endsWith('/access_tokens')
+            ? new Response(JSON.stringify({ token: 'an-installation-token' }), { status: 201 })
+            : new Response('{}', { status: 201 })) as typeof fetch,
+        api: 'https://api.github.invalid',
+      },
+      recipe: null,
+      image: 'test-framework-v2-sandbox:this-image-does-not-exist',
+      blobRoot: hostBlobs(),
+      append: async () => {},
+      remote: () => remotePath,
+      executor: fake,
+    });
+
+    // It reached the executor rather than Docker. Which phase came first is the
+    // orchestrator's business and not asserted here.
+    expect(phases.length).toBeGreaterThan(0);
+  }, 120_000);
+});
+
 describe('a required variable with no value ends the run before anything is created', () => {
   const nowhere = 'test-framework-v2-sandbox:this-image-does-not-exist';
 

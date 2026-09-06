@@ -43,6 +43,15 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+# THE PROMPTS, which are not code and are not optional.
+#
+# `prompts.ts` resolves `PROMPT_DIR` as `../prompts` from its own directory, and
+# `tsconfig.build.json` emits a flat `dist/`, so in this image that is `/app/prompts`.
+# Without this the worker boots, claims a job, and dies on ENOENT at the first
+# `renderPrompt` — after the claim, so the job sits dispatched-and-unfinished and
+# `openJobFor` blocks that issue for two hours. The failure is as far from the cause as
+# it is possible to get.
+COPY prompts ./prompts
 
 # The evidence store and the sandbox ledger, made here and owned by the user that writes
 # them — the same `/var/lib` ownership trap the plane's comment records, and the same fix.

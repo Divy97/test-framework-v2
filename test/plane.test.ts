@@ -215,14 +215,19 @@ describe('work goes to the machine it was dispatched to', () => {
     const theirs = installation();
     const { token } = await pair(null, 'the worker');
 
-    // DRAINED FIRST, and the need to is itself the evidence: a global runner claims any
-    // unclaimed job in the table, including ones other tests in this file — and other
-    // files running beside it — left queued. A version of this test that assumed an empty
-    // queue asserted on somebody else's run id and failed for the right reason.
-    while ((await call(token, 'GET', '/runner/jobs')).status === 200) {
-      // Claiming, not counting. What is being established is a known starting point.
-    }
-
+    // NO DRAIN, and the reason is the sharpest thing in this file.
+    //
+    // The first version of this test claimed every unclaimed job first, to get a known
+    // starting point. That is a global runner doing exactly what it is for — and
+    // `vitest.config.ts` calls `process.loadEnvFile('.env')`, whose `DATABASE_URL` in the
+    // main checkout is the PRODUCTION Neon pooler. `npm test` would have stamped
+    // `runner_id` on every real queued run, making each permanently undeliverable and
+    // blocking its issue for two hours, then failed to clean up on the foreign key and
+    // left a live, unrevokable global runner behind.
+    //
+    // This file's own rule (see `installation()`) is a fresh id per test so nothing can
+    // claim another test's work. A drain is the one operation that cannot honour it. The
+    // bounded collect below already tolerates foreign jobs, which is all that was needed.
     const first = await queue(mine);
     const second = await queue(theirs);
     const claimed: string[] = [];
@@ -275,6 +280,69 @@ describe('work goes to the machine it was dispatched to', () => {
     // The job's installation, not `null` — which is what the runner's own field holds and
     // what a token minted "for the runner" would have been.
     expect(minted).toEqual([owner]);
+  });
+
+  test('a global worker CAN be revoked, which `=` made impossible', async () => {
+    if (skipped()) return;
+    // The credential this is about: one token that claims any installation's job and then
+    // mints that installation's GitHub App token. `installation_id = $2` matched nothing
+    // for a null row — `null = null` is null — so no value revoked it, including null,
+    // and the only remedy was hand-written SQL.
+    const { runner, token } = await pair(null, 'the worker');
+    expect((await call(token, 'GET', '/runner/jobs')).status).not.toBe(401);
+
+    expect(await revokeRunner(client!, runner.id, null)).toBe(true);
+    expect((await call(token, 'GET', '/runner/jobs')).status).toBe(401);
+    // Once, not twice: a revoked runner is not revoked again.
+    expect(await revokeRunner(client!, runner.id, null)).toBe(false);
+  });
+
+  test('and revoking is still scoped — the widening admits nobody new', async () => {
+    if (skipped()) return;
+    // The worry with `is not distinct from` is that it loosens who may revoke what. It
+    // does not: the caller supplies the installation, and a confined runner still cannot
+    // be revoked by naming the wrong one, or by naming none.
+    const mine = installation();
+    const { runner, token } = await pair(mine);
+    expect(await revokeRunner(client!, runner.id, installation())).toBe(false);
+    expect(await revokeRunner(client!, runner.id, null)).toBe(false);
+    expect((await call(token, 'GET', '/runner/jobs')).status).not.toBe(401);
+    // THE positive control: its own installation still works.
+    expect(await revokeRunner(client!, runner.id, mine)).toBe(true);
+  });
+
+  test('and a confined runner still gets its OWN installation minted', async () => {
+    if (skipped()) return;
+    // The other half of the comment on that change: "for a confined runner the two values
+    // are equal by construction, so nothing changed for it." Asserted rather than
+    // asserted-in-prose — reading the job's row must not have altered the answer for the
+    // runner shape that already worked.
+    const owner = installation();
+    const runId = await queue(owner);
+    const { runner, token } = await pair(owner);
+    await client!.query('update jobs set runner_id = $2 where run_id = $1', [runId, runner.id]);
+
+    const minted: (number | null)[] = [];
+    const route = runnerRoutes({
+      client: client!,
+      blobRoot: blobRoot(),
+      mintToken: async (id) => {
+        minted.push(id);
+        return 'an-installation-token';
+      },
+    });
+    const response = await route({
+      method: 'POST',
+      path: `/runner/runs/${runId}/token`,
+      query: new URLSearchParams(),
+      headers: { authorization: `Bearer ${token}` },
+      body: async () => '',
+      raw: async () => Buffer.alloc(0),
+    });
+
+    expect(response?.status).toBe(200);
+    expect(minted).toEqual([owner]);
+    expect(minted).toEqual([runner.installationId]);
   });
 
   test('two runners on one installation never take the same job', async () => {

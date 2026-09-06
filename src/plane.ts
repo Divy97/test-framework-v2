@@ -149,11 +149,21 @@ export async function listRunners(
 export async function revokeRunner(
   client: Db,
   runnerId: string,
-  installationId: number,
+  installationId: number | null,
 ): Promise<boolean> {
   const { rowCount } = await client.query(
+    // `is not distinct from`, not `=`. A global runner's `installation_id` is null, and
+    // `null = null` is null — so with `=` the row matched nothing and the most valuable
+    // credential in the system could not be revoked by any value at all, including null.
+    // One `tfr_` string claims any installation's job and then mints that installation's
+    // GitHub token; the only remedy was hand-written SQL.
+    //
+    // This does NOT widen who may revoke what. The caller supplies the installation, and
+    // the only caller that can supply null is the operator script — the dashboard route
+    // passes an installation the signed-in person can see, exactly as before, and a
+    // confined runner still cannot be revoked by naming the wrong one.
     `update runners set revoked_at = now()
-       where id = $1 and installation_id = $2 and revoked_at is null`,
+       where id = $1 and installation_id is not distinct from $2::bigint and revoked_at is null`,
     [runnerId, installationId],
   );
   return (rowCount ?? 0) > 0;

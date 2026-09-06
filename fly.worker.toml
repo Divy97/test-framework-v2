@@ -11,14 +11,35 @@ primary_region = 'iad'
 [build]
   dockerfile = 'Dockerfile.worker'
 
+# Everything this machine needs that is not a secret. The two image references are
+# digests of images we pushed — public facts, and pinned rather than tagged so a
+# redeploy cannot silently pick up a different build. `npm run images:push` prints them.
+#
+# What is NOT here, and must be set with `fly secrets set` before the first deploy:
+#   ENGINE_PLANE_URL      where to take work from
+#   ENGINE_RUNNER_TOKEN   from `scripts/pair-worker.mts`, AFTER the plane has applied the
+#                         schema — pairing writes a null installation_id, which the
+#                         column only accepts once `db/schema.sql` has run
+#   OPENROUTER_API_KEY    what pays for the agent
+#   VERCEL_TOKEN, VERCEL_TEAM_ID, VERCEL_PROJECT_ID
+#
+# `readRunnerConfig` refuses to start without them, which on a machine with no health
+# check is a restart loop that `fly deploy` reports as success — see the check below.
 [env]
   ENGINE_EXECUTOR = 'vercel'
   ENGINE_VERCEL_REGION = 'iad1'
   ENGINE_BLOB_ROOT = '/var/lib/worker/blobs'
 
-[[mounts]]
-  source = 'worker_state'
-  destination = '/var/lib/worker'
+# NO VOLUME, and the ledger is why it is safe not to have one.
+#
+# `/var/lib/worker/blobs` holds artifacts on their way to the plane, which uploads them
+# and does not need them again; and `sandboxes.jsonl`, the record of machines this worker
+# created. Losing either on a restart costs nothing that is not already covered: the
+# sweep's second source is a tag query carrying `FLY_MACHINE_ID`, which is stable across
+# restarts of the same machine, and beneath both is the platform's own session ceiling,
+# which ends an abandoned sandbox within the hour regardless.
+#
+# So the volume would buy a faster sweep in one case and bill continuously in every case.
 
 # NO `[http_service]`, and that is the whole shape of this machine. It accepts nothing:
 # it long-polls the plane for work and calls Vercel. Adding one would give the process
@@ -27,10 +48,33 @@ primary_region = 'iad'
 # Which also means Fly cannot wake it on traffic — there is no traffic. `auto_stop` is
 # off and one machine runs continuously, and that is the honest cost of a design where
 # the agent loop lives outside the sandbox (ADR-0011).
+# A CHECK ON A MACHINE THAT SERVES NOTHING.
+#
+# Without one, a worker that throws in `readRunnerConfig` — a missing secret, a bad image
+# reference — restart-loops forever while `fly deploy` reports success and nothing
+# anywhere says otherwise. The plane at least fails its HTTP check and rolls back; this
+# machine has no port to check, so the check is the process itself.
+#
+# `pgrep` rather than a port: the honest question for this machine is "is the runner
+# still running", and a runner that has exited is one that failed to start or crashed.
+[checks]
+  [checks.alive]
+    type = 'command'
+    command = ['/bin/sh', '-c', 'pgrep -f dist/runner-main.js > /dev/null']
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '20s'
+
 [[vm]]
   size = 'shared-cpu-1x'
-  # 1GB rather than the plane's 512MB: this process holds an agent transcript, a git
-  # bundle of the repository in memory on its way to a sandbox, and the blobs it reads
-  # back out. Measured before lowering it.
+  # 1GB rather than the plane's 512MB, and NOT a guess to be trimmed later.
+  #
+  # I nearly halved this to save a couple of dollars and it would have been wrong. Three
+  # things land in this process's heap at once: a git bundle of the repository, read whole
+  # by `bundle()` on its way to a sandbox; the tar of a phase's evidence store, read back
+  # by `collect()`, whose own ceiling is `MAX_STORE_BYTES` — 256 MB by itself; and the
+  # agent transcript. 512 MB is under the documented ceiling of one of the three.
+  #
+  # An OOM here kills a run mid-flight and costs far more than the difference.
   memory = '1gb'
   cpus = 1

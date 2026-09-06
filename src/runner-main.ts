@@ -185,8 +185,23 @@ export async function executorFor(
   return vercelExecutor({
     client: await vercelClient({ credentials: config.vercel!.credentials, region: config.vercel!.region }),
     ledger: { path: join(config.blobRoot, '..', 'sandboxes.jsonl') },
-    // This worker's own tag, so a booting worker never stops another one's live phases.
-    tags: { engine: 'test-framework-v2', worker: config.token.slice(-12) },
+    // THE MACHINE, not the token and not the app.
+    //
+    // This was `config.token.slice(-12)`, which is wrong twice. `ENGINE_RUNNER_TOKEN` is a
+    // Fly APP secret, so every machine in the app holds the same value — two machines
+    // during a rolling deploy would share a tag, and `sweep()` stops everything the tag
+    // matches, which is precisely the outage the tag exists to prevent. And it exported
+    // ~72 bits of a 256-bit bearer credential into sandbox metadata, where it shows in
+    // listings and logs.
+    //
+    // `FLY_MACHINE_ID` is injected by the platform, is per-machine, is stable across
+    // restarts, and is not a secret — exactly what this needs. The fallback is for a
+    // developer running the worker outside Fly, where the pid is per-process and the
+    // sweep's ledger half carries the rest.
+    tags: {
+      engine: 'test-framework-v2',
+      worker: process.env.FLY_MACHINE_ID ?? `local-${process.pid}`,
+    },
   });
 }
 

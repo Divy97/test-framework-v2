@@ -77,7 +77,7 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10b** | the `Executor` seam; Docker behind it; `orchestrate.ts` names no docker | | merged; #67 |
 | **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | merged; #69 |
 | **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | merged; #72 |
-| **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | |
+| **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | in review; #75 (plane half) |
 | **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | |
 | **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | merged; #66 |
 | **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
