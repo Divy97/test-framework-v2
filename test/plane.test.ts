@@ -18,7 +18,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import type { RunEvent } from '../src/events.js';
 import { digest, get } from '../src/blobs.js';
 import type { ArtifactRef } from '../src/events.js';
-import { enqueueJob, pairRunner, revokeRunner, type Runner } from '../src/plane.js';
+import { claimJob, enqueueJob, pairRunner, revokeRunner, type Runner } from '../src/plane.js';
 import { runnerRoutes } from '../src/runner-api.js';
 import { readCompute, readUsage } from '../src/readmodel.js';
 import type pg from 'pg';
@@ -722,5 +722,188 @@ describe('the bill is written by the runner that holds the run, and nobody else'
     });
     expect((await readCompute(client!, mineRun)).map((r) => r.sandbox_id)).toEqual(['sbx-1']);
     expect(await readCompute(client!, otherRun)).toEqual([]);
+  });
+});
+
+describe('a job nobody ever came for goes back on the queue', () => {
+  /**
+   * The incident, reproduced: a runner dies holding an open long-poll, the plane claims
+   * the next job FOR it and writes the answer to a socket nobody is reading.
+   *
+   * Staged rather than simulated, because the socket is not the point — the ROW is. What
+   * a dead claim leaves behind is a job with a `runner_id`, no events, and a `heard_at`
+   * that stays null because nobody ever made a request about this run.
+   */
+  const stranded = async (installationId: number, name = 'the one that died') => {
+    const runId = await queue(installationId);
+    const gone = await pair(installationId, name);
+    await call(gone.token, 'GET', '/runner/jobs');
+    await client!.query(
+      `update jobs set runner_id = $2, dispatched_at = now() - interval '5 minutes', heard_at = null
+         where run_id = $1`,
+      [runId, gone.runner.id],
+    );
+    return { runId, gone };
+  };
+
+  test('another runner claims it, and the dead one can no longer write to it', async () => {
+    if (skipped()) return;
+    const id = installation();
+    const { runId, gone } = await stranded(id);
+
+    const alive = await pair(id, 'the one that took over');
+    expect((await claimJob(client!, alive.runner))?.runId).toBe(runId);
+
+    // AND THE HANDOVER IS TOTAL. If the reclaim is ever wrong it must be wrong safely:
+    // the moment the row moves, the old runner's first append is refused — before it
+    // could write seq 1, because seq 1 is the append it would have been making.
+    const refused = await call(gone.token, 'POST', `/runner/runs/${runId}/events`, {
+      body: { events: [event(runId, 1)] },
+    });
+    expect(refused.status).toBe(403);
+    const { rows } = await client!.query('select count(*)::int as n from events where run_id = $1', [runId]);
+    expect(rows[0].n).toBe(0);
+  });
+
+  test('THE rolling-deploy case: the SAME runner row takes it back', async () => {
+    if (skipped()) return;
+    // The worker's pairing token is a Fly APP secret, so every machine across a deploy
+    // authenticates as one `runners` row. The first version of this fix compared
+    // `runners.last_seen` to `dispatched_at` — and a runner heartbeats BEFORE it claims,
+    // so the replacement's very first poll vouched for the job it was meant to rescue and
+    // stranded it permanently. This is the case the commit message named and did not fix.
+    const id = installation();
+    const { runId, gone } = await stranded(id, 'the app, both instances');
+
+    // The replacement polls as the same row — which stamps `runners.last_seen` — and must
+    // still be handed the job, because it has never said anything about THIS RUN.
+    //
+    // Through the ROUTE, because the route is where the old fix failed: the poll's own
+    // `sawRunner` runs above the claim, so under `last_seen >= dispatched_at` this exact
+    // request was the one that made the job unclaimable by anybody, itself included.
+    const polled = await call(gone.token, 'GET', '/runner/jobs');
+    expect(polled.status).toBe(200);
+    expect(polled.body['runId']).toBe(runId);
+  });
+
+  test('THE control: a run that has started is never taken from its author', async () => {
+    if (skipped()) return;
+    // ADR-0009's single producer. Once seq 1 exists the run has an author, and no lease
+    // may take that away — an agent phase can think for an hour without a plane request.
+    const id = installation();
+    const { runId } = await stranded(id);
+    await client!.query(
+      `insert into events (run_id, seq, ts, type, payload) values ($1, 1, now(), 'RUN_REQUESTED', $2)`,
+      [runId, JSON.stringify({ v: 1, source: 'github_issue', thread_ref: 'o/r#1', raw_text: 'x' })],
+    );
+    const alive = await pair(id, 'must not take it');
+    expect(await claimJob(client!, alive.runner)).toBeNull();
+  });
+
+  test('and a runner that has said anything ABOUT THIS RUN keeps it', async () => {
+    if (skipped()) return;
+    // The other half, and through a real route rather than an UPDATE: `run.ts` mints an
+    // installation token before the clone, that mint goes through `appendFromRunner` like
+    // every run-scoped route, and stamping there is what tells a still-working runner
+    // apart from one that never came.
+    const id = installation();
+    const { runId, gone } = await stranded(id);
+    expect((await call(gone.token, 'POST', `/runner/runs/${runId}/cost`, { body: {} })).status).toBe(204);
+
+    const other = await pair(id, 'must not take it either');
+    expect(await claimJob(client!, other.runner)).toBeNull();
+    const { rows } = await client!.query('select runner_id from jobs where run_id = $1', [runId]);
+    expect(rows[0].runner_id).toBe(gone.runner.id);
+  });
+
+  test('and one still inside the grace period is left alone, right up to the edge', async () => {
+    if (skipped()) return;
+    // BACKDATED TO JUST UNDER the interval, not to `now()`. Dispatching and claiming a
+    // few milliseconds later only proves "0ms is inside 2 minutes" — it pins the constant
+    // from above and not from below, and `milliseconds` → `microseconds` (a 1000x
+    // shortening, straight through the window this is sized against) stays green.
+    const id = installation();
+    const runId = await queue(id);
+    const gone = await pair(id, 'only just died');
+    await call(gone.token, 'GET', '/runner/jobs');
+    await client!.query(
+      `update jobs set runner_id = $2, dispatched_at = now() - interval '110 seconds', heard_at = null
+         where run_id = $1`,
+      [runId, gone.runner.id],
+    );
+
+    const other = await pair(id, 'too soon');
+    expect(await claimJob(client!, other.runner)).toBeNull();
+
+    // And ten seconds past it, the same job is taken.
+    await client!.query(
+      `update jobs set dispatched_at = now() - interval '130 seconds' where run_id = $1`,
+      [runId],
+    );
+    expect((await claimJob(client!, other.runner))?.runId).toBe(runId);
+  });
+
+  test('and a FINISHED job is never re-dispatched, even having written nothing', async () => {
+    if (skipped()) return;
+    // A run that failed before seq 1 and was marked finished has no events at all, so the
+    // `not exists (events)` clause alone would hand it out forever.
+    const id = installation();
+    const { runId } = await stranded(id);
+    await client!.query(`update jobs set finished_at = now() where run_id = $1`, [runId]);
+
+    const other = await pair(id, 'must not take a finished job');
+    expect(await claimJob(client!, other.runner)).toBeNull();
+  });
+
+  test('and the installation boundary holds on the reclaim, which is a SECOND way in', async () => {
+    if (skipped()) return;
+    // The comment above `claimJob` calls widening this "the worst bug in this file", and
+    // this change doubles the number of ways a row can be selected. Moving the
+    // `installation_id` filter inside the `runner_id is null` branch — leaving the reclaim
+    // unfiltered — passed every other test in this file.
+    const mine = installation();
+    const theirs = installation();
+    const { runId } = await stranded(theirs, 'somebody else, entirely');
+
+    const confined = await pair(mine, 'mine, and confined to it');
+    expect(await claimJob(client!, confined.runner)).toBeNull();
+    const { rows } = await client!.query('select runner_id from jobs where run_id = $1', [runId]);
+    expect(rows[0].runner_id).not.toBe(confined.runner.id);
+  });
+
+  test('and a job that strands every time stops being handed out', async () => {
+    if (skipped()) return;
+    // Without a ceiling, a job whose runner dies on every attempt is re-dispatched every
+    // two minutes for as long as the queue exists, each attempt paying for a clone and a
+    // token mint.
+    const id = installation();
+    const { runId } = await stranded(id);
+    const taker = await pair(id, 'keeps dying');
+    let taken = 0;
+    for (let round = 0; round < 8; round += 1) {
+      const got = await claimJob(client!, taker.runner);
+      if (got?.runId === runId) taken += 1;
+      await client!.query(
+        `update jobs set dispatched_at = now() - interval '5 minutes', heard_at = null where run_id = $1`,
+        [runId],
+      );
+    }
+    // Five in total, counting the dispatch `stranded()` staged.
+    expect(taken).toBe(4);
+  });
+
+  test('and revoking a runner puts back what it never started', async () => {
+    if (skipped()) return;
+    // A revoked runner never comes back: its next request is a 401, including the
+    // `/finished` that would have released the job — and the daemon swallows that one. If
+    // it had already stamped `heard_at`, the job would wait forever rather than two
+    // minutes.
+    const id = installation();
+    const { runId, gone } = await stranded(id);
+    await call(gone.token, 'POST', `/runner/runs/${runId}/cost`, { body: {} });
+    expect(await revokeRunner(client!, gone.runner.id, id)).toBe(true);
+
+    const other = await pair(id, 'takes over from a revoked one');
+    expect((await claimJob(client!, other.runner))?.runId).toBe(runId);
   });
 });

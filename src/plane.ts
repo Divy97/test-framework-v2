@@ -52,6 +52,38 @@ const TOKEN_BYTES = 32;
 /** How often the long poll looks again. Presence is worth more than a tight loop. */
 const POLL_INTERVAL_MS = 500;
 
+/**
+ * How long a dispatched job may produce nothing before another runner may take it.
+ *
+ * Sized against the ONE silent window a live runner has: between being handed a job and
+ * minting its installation token, which is a single HTTP round trip. Two minutes is about
+ * a hundred times that.
+ *
+ * NOT against how long a run takes, which is the tempting mistake. A run that has started
+ * has written seq 1 and stamped `heard_at`, and either clause alone makes its duration
+ * irrelevant — an hour-long agent phase is never a candidate for reclaim.
+ *
+ * What would make this wrong is anything inserted between the claim and that first plane
+ * request which does not touch the plane: a container pull, a sandbox pre-warm, a recipe
+ * fetched from somewhere else. `run.ts` mints the token before `mkdtemp` and before the
+ * clone today, and that ordering is load-bearing here.
+ *
+ * Both sides of the comparison are Postgres `now()`, so a runner with a wrong clock cannot
+ * lengthen or shorten this.
+ */
+const STRANDED_AFTER_MS = 2 * 60_000;
+
+/**
+ * How many times one job may be handed out.
+ *
+ * A job that strands on every attempt — a runner that dies on this particular intake, a
+ * mint that keeps failing — would otherwise be re-dispatched every two minutes for as long
+ * as the queue exists, each attempt paying for a clone and a token. Five is enough for the
+ * failures this exists to survive (a deploy, a dropped response) and few enough that a job
+ * which is simply poison stops costing money.
+ */
+const MAX_DISPATCHES = 5;
+
 const digest = (token: string): string => createHash('sha256').update(token).digest('hex');
 const wait = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
@@ -166,7 +198,23 @@ export async function revokeRunner(
        where id = $1 and installation_id is not distinct from $2::bigint and revoked_at is null`,
     [runnerId, installationId],
   );
-  return (rowCount ?? 0) > 0;
+  if ((rowCount ?? 0) === 0) return false;
+  // AND ITS UNSTARTED WORK GOES BACK ON THE QUEUE.
+  //
+  // A revoked runner will never come back for a job it was holding — its next request is
+  // a 401, including the `/finished` that would have released it, and the daemon swallows
+  // that one. Without this the job waits out `STRANDED_AFTER_MS` for nothing, or waits
+  // forever if the runner had already stamped `heard_at` before being revoked.
+  //
+  // Only what never started, on the same terms `claimJob` reclaims by: a run that has
+  // written seq 1 has an author, and revoking the machine does not unmake the log.
+  await client.query(
+    `update jobs set runner_id = null, dispatched_at = null, heard_at = null
+       where runner_id = $1 and finished_at is null
+         and not exists (select 1 from events e where e.run_id = jobs.run_id)`,
+    [runnerId],
+  );
+  return true;
 }
 
 /** Note that a runner is alive. Called on every poll, so presence is never stale by more than one. */
@@ -270,16 +318,65 @@ export async function claimJob(
       // Cast, because pg cannot infer a type for a parameter that is only ever compared
       // to null — without it the driver sends an untyped null and the comparison against
       // `bigint` fails at plan time.
-      `update jobs set runner_id = $2, dispatched_at = now()
+      //
+      // AND A JOB NOBODY EVER CAME FOR, which was stranded forever.
+      //
+      // A runner that dies holding an open long-poll leaves the plane about to answer a
+      // socket nobody is reading. The next job to arrive is claimed FOR it — `runner_id`
+      // stamped, response written into the void — and since this predicate only ever took
+      // `runner_id is null`, no runner could take it again. Seen live on 2026-09-06:
+      // killing the laptop worker to hand over to the Fly one stranded the very next job,
+      // and every rolling deploy of the worker would have done the same.
+      //
+      // Reclaimed on four conditions, and each one is load-bearing:
+      //
+      //   - `not exists (events)`. THE guard on ADR-0009's single producer. Once seq 1 is
+      //     written the run has an author, and no lease may take that away. Also what
+      //     stops a job that finished with no events from being re-dispatched forever,
+      //     with `finished_at is null` beside it saying the same thing twice on purpose.
+      //   - `heard_at is null` — nobody has made a request ABOUT THIS RUN since it was
+      //     handed out. `run.ts` mints an installation token before the clone, "because a
+      //     clone we cannot do makes the rest moot", and that mint goes through
+      //     `appendFromRunner` like every other run-scoped route, so a working runner
+      //     stamps this within a round trip of claiming.
+      //
+      //     This was `runners.last_seen >= dispatched_at` and that was WRONG, in the exact
+      //     case the paragraph above cites. The worker's pairing token is a Fly APP secret,
+      //     so every machine across a rolling deploy authenticates as one runner row — and
+      //     a runner heartbeats before it claims, so the replacement's first poll vouched
+      //     for the job it was meant to rescue. Same hole for a live runner whose long-poll
+      //     response died in transit: still heartbeating, job stranded. Liveness had to be
+      //     a fact about the RUN, not about the machine.
+      //   - `dispatches < 5`, because a job whose runner dies on every attempt would
+      //     otherwise be handed out every two minutes forever, each attempt paying for a
+      //     clone and a token mint. `openJobFor` already carries a ceiling of its own.
+      //   - and a grace period, because the window between claiming and stamping is about
+      //     one round trip and the interval below is a hundred times that.
+      //
+      // If the reclaim is ever wrong, it is wrong SAFELY: `appendFromRunner` authorizes on
+      // `job.runner_id = runner.id`, so the moment this row moves, the old runner's first
+      // append is refused with "this run was dispatched to another runner" — before it can
+      // write seq 1, because seq 1 is the append it would have been making.
+      `update jobs set runner_id = $2, dispatched_at = now(), heard_at = null, dispatches = dispatches + 1
          where run_id = (
-           select run_id from jobs
-             where ($1::bigint is null or installation_id = $1::bigint) and runner_id is null
-             order by queued_at
+           select j.run_id from jobs j
+             where ($1::bigint is null or j.installation_id = $1::bigint)
+               and j.finished_at is null
+               and (
+                 j.runner_id is null
+                 or (
+                   j.heard_at is null
+                   and j.dispatches < $4
+                   and j.dispatched_at < now() - ($3::bigint * interval '1 millisecond')
+                   and not exists (select 1 from events e where e.run_id = j.run_id)
+                 )
+               )
+             order by j.queued_at
              limit 1
              for update skip locked
          )
        returning run_id, installation_id, repo, intake`,
-      [runner.installationId, runner.id],
+      [runner.installationId, runner.id, STRANDED_AFTER_MS, MAX_DISPATCHES],
     );
     const row = rows[0] as { run_id: string; installation_id: string; repo: string; intake: unknown } | undefined;
     if (row) {
@@ -359,8 +456,19 @@ export async function appendFromRunner(
   runId: string,
   events: RunEvent[],
 ): Promise<{ appended: number } | Refusal> {
+  // THE AUTHORIZATION AND THE HEARTBEAT, in one statement.
+  //
+  // `heard_at` is what `claimJob` reads to decide a job was never taken, and it has to be
+  // a fact about THIS RUN rather than about the machine: the worker's pairing token is a
+  // Fly app secret, so every instance across a rolling deploy is one `runners` row and a
+  // replacement's poll would vouch for work it has never heard of.
+  //
+  // Every run-scoped route reaches this function — events, blobs, token, secrets,
+  // model-key, cost, finished — so stamping here needs no caller to remember. `coalesce`
+  // keeps the FIRST contact, which is the only one the reclaim rule cares about, and makes
+  // the value stable for a reader.
   const { rows } = await client.query(
-    'select runner_id from jobs where run_id = $1',
+    'update jobs set heard_at = coalesce(heard_at, now()) where run_id = $1 returning runner_id',
     [runId],
   );
   const job = rows[0] as { runner_id: string | null } | undefined;
