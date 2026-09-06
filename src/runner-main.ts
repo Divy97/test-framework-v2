@@ -35,6 +35,8 @@ export type ExecutorKind = 'docker' | 'vercel';
  */
 export type VercelConfig = {
   region: string;
+  /** The longest sandbox session this plan permits. Absent, the executor's Hobby-safe default. */
+  maxSessionMs?: number;
   credentials: { token?: string; teamId?: string; projectId?: string };
 };
 
@@ -109,6 +111,11 @@ export function readRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
     }
     vercel = {
       region: env.ENGINE_VERCEL_REGION ?? DEFAULT_VERCEL_REGION,
+      // A plan's ceiling, not a preference. Absent, the executor uses the Hobby limit,
+      // which is the value that cannot be refused at create time.
+      ...(env.ENGINE_VERCEL_MAX_SESSION_MS === undefined
+        ? {}
+        : { maxSessionMs: Number(env.ENGINE_VERCEL_MAX_SESSION_MS) }),
       credentials: {
         ...(token === undefined ? {} : { token }),
         ...(teamId === undefined ? {} : { teamId }),
@@ -184,6 +191,7 @@ export async function executorFor(
   const { vercelExecutor } = await import('./executor-vercel.js');
   return vercelExecutor({
     client: await vercelClient({ credentials: config.vercel!.credentials, region: config.vercel!.region }),
+    ...(config.vercel!.maxSessionMs === undefined ? {} : { maxSessionMs: config.vercel!.maxSessionMs }),
     ledger: { path: join(config.blobRoot, '..', 'sandboxes.jsonl') },
     // THE MACHINE, not the token and not the app.
     //

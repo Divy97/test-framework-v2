@@ -36,6 +36,8 @@ export type FakeSandbox = {
   /** When the policy last changed, as a count of commands run — enough to order events. */
   flippedAfter: number | null;
   stopped: boolean;
+  /** The session length this sandbox was created with, so a test can assert the clamp. */
+  timeoutMs: number;
   tags: Record<string, string>;
   /** The paths `PREPARE` made, so a test can assert the Runner's world exists. */
   prepared: Set<string>;
@@ -315,7 +317,7 @@ export function fakeSandboxes(options: FakeOptions = {}): {
     snapshots,
     dropped,
     client: {
-      create: async ({ from, policy, tags }) => {
+      create: async ({ from, policy, timeoutMs, tags }) => {
         if (options.refuseCreate) throw new Error('the platform refused to create a sandbox');
         const fake: FakeSandbox = {
           id: `sbx-${sandboxes.length + 1}`,
@@ -326,6 +328,7 @@ export function fakeSandboxes(options: FakeOptions = {}): {
           commands: [],
           flippedAfter: null,
           stopped: false,
+          timeoutMs,
           tags: tags ?? {},
           prepared: new Set<string>(),
         };

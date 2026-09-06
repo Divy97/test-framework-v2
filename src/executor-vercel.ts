@@ -70,6 +70,22 @@ const MAX_STORE_BYTES = 256 * 1024 * 1024;
 /** The wall clock one phase gets from this process. The platform enforces its own beside it. */
 const PHASE_TIMEOUT_MS = 3_600_000;
 
+/**
+ * The longest session this executor will ASK the platform for.
+ *
+ * Hobby caps a sandbox at 45 minutes and refuses anything longer at create time — not
+ * with a clamp, with `400: timeout restricted to <= 45m on Hobby plans`. The first live
+ * run died on exactly that, eight seconds in, because `PHASE_TIMEOUT_MS` is an hour and
+ * was passed straight through.
+ *
+ * So the request is clamped rather than the engine's own ceiling lowered: our wall clock
+ * is a guard against a wedge and has nothing to say about somebody's billing plan. On a
+ * plan with a longer limit, raise this and the two converge again — and if the session is
+ * still the shorter of the two, #76's `ceiling: 'session'` is what reports it, which is
+ * the case this default guarantees.
+ */
+const MAX_SESSION_MS = 45 * 60_000;
+
 /** Where the engine puts things inside a sandbox. Root-owned until `PREPARE` runs. */
 const WORK = '/work';
 const BLOBS = '/blobs';
@@ -222,6 +238,11 @@ export type VercelExecutorOptions = {
   tags?: Record<string, string>;
   /** The command that starts `runner-vm.ts` inside the image. */
   entrypoint?: string;
+  /**
+   * The longest session to ask the platform for. Defaults to the Hobby ceiling, which is
+   * the value that cannot fail; raise it on a plan that allows more.
+   */
+  maxSessionMs?: number;
   /** Called with what each sandbox cost, once it is stopped. 10f writes these to a table. */
   onCompute?: (compute: Compute & { runId: string; phase: string }) => void;
 };
@@ -237,7 +258,9 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
     policy: 'allow-all' | 'deny-all',
     plan: { runId: string; containerTimeoutMs?: number },
   ): Promise<SandboxHandle> => {
-    const timeoutMs = plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS;
+    // The smaller of what this phase wants and what the plan permits. Asking for more is
+    // not a slow failure — the platform refuses the create outright.
+    const timeoutMs = Math.min(plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS, options.maxSessionMs ?? MAX_SESSION_MS);
     const sandbox = await client.create({ from, policy, timeoutMs, tags });
     await remember(options.ledger, { sandboxId: sandbox.id, runId: plan.runId });
     const prepared = await sandbox.run(PREPARE);
