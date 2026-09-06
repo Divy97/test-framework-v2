@@ -24,7 +24,8 @@ primary_region = 'iad'
 #   VERCEL_TOKEN, VERCEL_TEAM_ID, VERCEL_PROJECT_ID
 #
 # `readRunnerConfig` refuses to start without them, which on a machine with no health
-# check is a restart loop that `fly deploy` reports as success — see the check below.
+# check is a restart loop that `fly deploy` reports as success — see the note below the
+# `[http_service]` section for what to read after every deploy instead.
 [env]
   ENGINE_EXECUTOR = 'vercel'
   ENGINE_VERCEL_REGION = 'iad1'
@@ -48,22 +49,27 @@ primary_region = 'iad'
 # Which also means Fly cannot wake it on traffic — there is no traffic. `auto_stop` is
 # off and one machine runs continuously, and that is the honest cost of a design where
 # the agent loop lives outside the sandbox (ADR-0011).
-# A CHECK ON A MACHINE THAT SERVES NOTHING.
+# NO CHECK, AND THAT IS A LIMIT RATHER THAN A DECISION.
 #
-# Without one, a worker that throws in `readRunnerConfig` — a missing secret, a bad image
-# reference — restart-loops forever while `fly deploy` reports success and nothing
-# anywhere says otherwise. The plane at least fails its HTTP check and rolls back; this
-# machine has no port to check, so the check is the process itself.
+# This said `type = 'command'` with a `pgrep`, which is a real Fly Machines check type and
+# is NOT one `fly.toml` accepts: the first deploy answered
 #
-# `pgrep` rather than a port: the honest question for this machine is "is the runner
-# still running", and a runner that has exited is one that failed to start or crashed.
-[checks]
-  [checks.alive]
-    type = 'command'
-    command = ['/bin/sh', '-c', 'pgrep -f dist/runner-main.js > /dev/null']
-    interval = '30s'
-    timeout = '5s'
-    grace_period = '20s'
+#   Can't process top level check 'alive': Missing or invalid check type, must be
+#   'http' or 'tcp'
+#
+# Both of those want a port, and the section above says why this machine opens none.
+#
+# What is lost: a worker that throws in `readRunnerConfig` — a missing secret, a bad image
+# reference — restart-loops while `fly deploy` reports success. The plane fails its HTTP
+# check and rolls back; this machine cannot.
+#
+# What replaces it, and it has to be done rather than assumed: `runner-main.ts` logs
+# `runner up on <executor>: taking work from <plane>` once it has read its config and
+# swept. After every deploy of this app, READ FOR THAT LINE —
+#
+#   fly logs -a test-framework-worker | grep 'runner up on'
+#
+# and if it is not there, the machine is looping and `fly status` shows the restart count.
 
 [[vm]]
   size = 'shared-cpu-1x'
