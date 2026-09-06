@@ -99,6 +99,21 @@ create table if not exists run_usage (
   primary key (run_id, phase)
 );
 
+-- WHICH agent phase, because a run has two and `(run_id, phase)` cannot tell them apart.
+--
+-- The repro agent and the fix agent both report `phase: 'agent'` (`orchestrate.ts`), so
+-- the second row's `on conflict do update` landed on the first and the repro agent's spend
+-- was silently replaced. Half the model bill, wrong since M6d, and invisible while the
+-- only runs anyone read closely were local ones — 10f is what starts writing this for
+-- hosted runs, and what puts it on a page beside two agent SANDBOXES.
+--
+-- Migrated in three idempotent steps rather than by re-declaring the key: a `create table
+-- if not exists` cannot change a table that already exists, and `add primary key` is not
+-- re-runnable. A unique index does the same work and says `if not exists`.
+alter table run_usage add column if not exists n integer not null default 0;
+create unique index if not exists run_usage_key on run_usage (run_id, phase, n);
+alter table run_usage drop constraint if exists run_usage_pkey;
+
 -- What the SANDBOXES cost (M10, 10f), beside the log for the same reason `run_usage` is.
 --
 -- One row per sandbox, not per phase: a run creates five — the environment build, two

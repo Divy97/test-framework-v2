@@ -96,6 +96,21 @@ const USAGE = [
 ];
 
 /**
+ * What the sandboxes cost (M10, 10f), in the shape a real run produces.
+ *
+ * TWO agent sandboxes, because every run makes two and a fixture with one would let a
+ * `(run_id, phase)` key pass. And the environment build with every measure null, because
+ * that is the one sandbox whose cost the platform does not report — the page has to draw
+ * a dash there rather than a zero, and only a null row can show it does.
+ */
+const COMPUTE = [
+  { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-env', phase: 'env', active_cpu_ms: null, duration_ms: null, ingress_bytes: null, egress_bytes: null },
+  { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-repro', phase: 'agent', active_cpu_ms: 4_120, duration_ms: 186_400, ingress_bytes: 25_769, egress_bytes: 14_956 },
+  { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-fix', phase: 'agent', active_cpu_ms: 3_048, duration_ms: 141_200, ingress_bytes: 21_310, egress_bytes: 9_882 },
+  { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-base', phase: 'base', active_cpu_ms: 1_902, duration_ms: 26_187, ingress_bytes: 0, egress_bytes: 0 },
+];
+
+/**
  * A `Db` that dispatches on the SQL it is handed.
  *
  * `test/serve.test.ts`'s one-shape fake answers every query with the same rows, which is
@@ -139,6 +154,9 @@ const fixtureClient = (): Db => {
     }
     if (sql.includes('from run_usage where run_id = $1')) {
       return params[0] === DEMO_RUN_ID ? USAGE : [];
+    }
+    if (sql.includes('from run_compute where run_id = $1')) {
+      return params[0] === DEMO_RUN_ID ? COMPUTE : [];
     }
     // The onboarding GET lists this repository's stored secret names (M10). Neither
     // fixture repository has any, and — per this fake's own rule — that is answered

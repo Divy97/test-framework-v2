@@ -96,6 +96,14 @@ export function runnerRoutes(options: {
    * than hand back something that fails later inside a git clone.
    */
   mintToken?: (installationId: number) => Promise<string>;
+  /**
+   * Where a row this plane could not store goes.
+   *
+   * Only the bill uses it, and only because that path swallows on purpose: an unwritable
+   * cost must not fail a run whose evidence is already shipped, but it must not be
+   * invisible either. Absent, the swallow is silent — which is the shape a review found.
+   */
+  log?: (line: string) => void;
 }): Route {
   const { client, blobRoot } = options;
 
@@ -310,13 +318,28 @@ export function runnerRoutes(options: {
       } catch {
         return json({ error: 'the body is not JSON' }, 400);
       }
+      // REFUSED rather than truncated, like the two routes above it. A real run posts
+      // about five compute rows and four usage rows; anything near the ceiling is a
+      // runner with a bug, and silently keeping the first 500 would hide it.
+      const rows = (value: unknown) => (Array.isArray(value) ? value : []);
+      if (rows(sent.usage).length > MAX_BATCH || rows(sent.compute).length > MAX_BATCH) {
+        return json({ error: `at most ${MAX_BATCH} rows of each kind` }, 400);
+      }
       // `run_id` comes from the PATH, never from the body — a runner authorized for this
       // run must not be able to write a row against another one.
-      for (const row of Array.isArray(sent.usage) ? sent.usage.slice(0, MAX_BATCH) : []) {
-        await saveUsage(client, { ...(row as UsageRow), run_id: runId }).catch(() => {});
+      //
+      // SAID OUT LOUD when a row is refused. Swallowing is right — a bill that cannot be
+      // written must not fail a run whose evidence is already shipped — but swallowing
+      // silently is not: a mis-shaped row hits a NOT NULL or a type error, the runner
+      // does not retry, and the page is empty forever with nothing anywhere to say why.
+      // `serve.ts` already logs its own `saveUsage` failure for exactly this reason.
+      const refused = (kind: string) => (error: unknown) =>
+        options.log?.(`${runId}: could not record ${kind} — ${String((error as Error).message ?? error)}`);
+      for (const row of rows(sent.usage)) {
+        await saveUsage(client, { ...(row as UsageRow), run_id: runId }).catch(refused('usage'));
       }
-      for (const row of Array.isArray(sent.compute) ? sent.compute.slice(0, MAX_BATCH) : []) {
-        await saveCompute(client, { ...(row as ComputeRow), run_id: runId }).catch(() => {});
+      for (const row of rows(sent.compute)) {
+        await saveCompute(client, { ...(row as ComputeRow), run_id: runId }).catch(refused('compute'));
       }
       return { status: 204, type: 'application/json', body: '' };
     }

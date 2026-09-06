@@ -659,6 +659,34 @@ describe('the bill is written by the runner that holds the run, and nobody else'
     expect(rows.find((r) => r.sandbox_id === 'sbx-b')).toMatchObject({ active_cpu_ms: 20, egress_bytes: 8 });
     expect(await readUsage(client!, runId)).toMatchObject([{ phase: 'agent', turns: 4 }]);
 
+    // BOTH AGENT PHASES SURVIVE. A run has two — the repro agent and the fix agent — and
+    // both report `phase: 'agent'`. Keyed `(run_id, phase)` the second overwrote the
+    // first and half the model bill vanished, wrong since M6d and invisible until 10f put
+    // it on a page beside two agent SANDBOXES.
+    const second = await call(token, 'POST', `/runner/runs/${runId}/cost`, {
+      body: {
+        usage: [{ phase: 'agent', n: 1, turns: 9, input_tokens: 700, output_tokens: 60,
+                  cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+                  provider: 'openrouter', model: 'x/y' }],
+      },
+    });
+    expect(second.status).toBe(204);
+    expect(await readUsage(client!, runId)).toMatchObject([
+      { phase: 'agent', n: 0, turns: 4 },
+      { phase: 'agent', n: 1, turns: 9 },
+    ]);
+
+    // And a REPEAT of a row already written updates it rather than duplicating — the
+    // idempotency the `on conflict` is there for, which a runner retrying would need.
+    await call(token, 'POST', `/runner/runs/${runId}/cost`, {
+      body: {
+        compute: [{ sandbox_id: 'sbx-a', phase: 'agent', active_cpu_ms: 11, duration_ms: 100, ingress_bytes: 5, egress_bytes: 6 }],
+      },
+    });
+    const again = await readCompute(client!, runId);
+    expect(again).toHaveLength(3);
+    expect(again.find((r) => r.sandbox_id === 'sbx-a')).toMatchObject({ active_cpu_ms: 11 });
+
     // And none of it reached the log, which is the whole reason it is a route.
     const { rows: events } = await client!.query('select count(*)::int as n from events where run_id = $1', [runId]);
     expect(events[0].n).toBe(0);

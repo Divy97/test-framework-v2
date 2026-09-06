@@ -118,6 +118,14 @@ export async function rebuildProjection(client: Db): Promise<{ rebuilt: number; 
 export type UsageRow = {
   run_id: string;
   phase: string;
+  /**
+   * Which phase of this name it was — 0 for the first, 1 for the second.
+   *
+   * A run has TWO `agent` phases, the repro agent and the fix agent, and without this the
+   * second overwrote the first. Optional so every existing caller keeps compiling and
+   * defaults to 0, which is right for every phase there is only one of.
+   */
+  n?: number;
   turns: number;
   input_tokens: number;
   output_tokens: number;
@@ -129,15 +137,15 @@ export type UsageRow = {
 
 export async function saveUsage(client: Db, row: UsageRow): Promise<void> {
   await client.query(
-    `insert into run_usage (run_id, phase, turns, input_tokens, output_tokens,
+    `insert into run_usage (run_id, phase, n, turns, input_tokens, output_tokens,
                             cache_read_input_tokens, cache_creation_input_tokens, provider, model)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-       on conflict (run_id, phase) do update set
-         turns = $3, input_tokens = $4, output_tokens = $5,
-         cache_read_input_tokens = $6, cache_creation_input_tokens = $7,
-         provider = $8, model = $9`,
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       on conflict (run_id, phase, n) do update set
+         turns = $4, input_tokens = $5, output_tokens = $6,
+         cache_read_input_tokens = $7, cache_creation_input_tokens = $8,
+         provider = $9, model = $10`,
     [
-      row.run_id, row.phase, row.turns, row.input_tokens, row.output_tokens,
+      row.run_id, row.phase, row.n ?? 0, row.turns, row.input_tokens, row.output_tokens,
       row.cache_read_input_tokens, row.cache_creation_input_tokens, row.provider, row.model,
     ],
   );
@@ -186,14 +194,15 @@ export async function readCompute(client: Db, runId: string): Promise<ComputeRow
 
 export async function readUsage(client: Db, runId: string): Promise<UsageRow[]> {
   const { rows } = await client.query(
-    `select run_id, phase, turns, input_tokens, output_tokens,
+    `select run_id, phase, n, turns, input_tokens, output_tokens,
             cache_read_input_tokens, cache_creation_input_tokens, provider, model
-       from run_usage where run_id = $1 order by phase`,
+       from run_usage where run_id = $1 order by phase, n`,
     [runId],
   );
   return rows.map((row) => ({
     run_id: String(row.run_id),
     phase: String(row.phase),
+    n: Number(row.n ?? 0),
     turns: Number(row.turns),
     input_tokens: Number(row.input_tokens),
     output_tokens: Number(row.output_tokens),

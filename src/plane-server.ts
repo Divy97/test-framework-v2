@@ -215,6 +215,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
         client,
         blobRoot: config.blobRoot,
         mintToken: mint,
+        log: (line) => console.log(line),
       }),
       dashboardRoutes({
         client,

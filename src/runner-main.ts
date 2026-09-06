@@ -20,6 +20,7 @@ import { providerName } from './loop.js';
 import type { RunPlan } from './orchestrate.js';
 import { runFromIssue } from './run.js';
 import { loadEnv } from './store.js';
+import type { ComputeRow } from './readmodel.js';
 
 /** Which substrate the phases run on. `docker` is this machine; `vercel` is a microVM. */
 export type ExecutorKind = 'docker' | 'vercel';
@@ -193,8 +194,15 @@ export function readRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
  *
  * Drained rather than accumulated: a worker takes jobs forever, and a map that only ever
  * grows is a leak with a very slow fuse.
+ *
+ * TYPED WITH THE ROW THE DATABASE TAKES, not `unknown[]`. As `unknown[]` the shape written
+ * here and the shape `saveCompute` inserts were two claims nobody compared: renaming this
+ * end's `sandbox_id` to `sandboxId` typechecks, passes every test, and in production every
+ * insert fails a NOT NULL constraint — which the route swallows, the daemon does not log,
+ * and the page reports as an empty table forever. The same shape of defect as the
+ * `sandboxId` the SDK never had, and the same one-line fix: let the compiler compare them.
  */
-export type ComputeLog = Map<string, unknown[]>;
+export type ComputeLog = Map<string, Omit<ComputeRow, 'run_id'>[]>;
 
 export async function executorFor(
   config: RunnerConfig,
@@ -276,10 +284,19 @@ export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor
       // table was empty for hosted runs and nobody had noticed, because the only runs
       // anyone read closely were local ones.
       const compute = spent?.get(job.runId) ?? [];
-      spent?.delete(job.runId);
+      // CLEARED, not just deleted. A worker runs one job at a time — `runDaemon` awaits
+      // `execute` before claiming again — so anything left under another key was written
+      // when `plan.runId` and `job.runId` disagreed. They cannot today, because
+      // `engineExecute` passes `job.runId` in and `run.ts` uses what it is given; if that
+      // ever changed, `delete` alone would leak those rows forever under a uuid nobody
+      // holds. Dropping them loses a number; keeping them grows without bound.
+      spent?.clear();
       await io.cost({
-        usage: (result?.usage ?? []).map(({ phase, usage }) => ({
+        // `n` counts phases of the same NAME, so the repro agent and the fix agent get 0
+        // and 1 rather than one row overwriting the other.
+        usage: (result?.usage ?? []).map(({ phase, usage }, index, all) => ({
           phase,
+          n: all.slice(0, index).filter((one) => one.phase === phase).length,
           turns: usage.turns,
           input_tokens: usage.input_tokens,
           output_tokens: usage.output_tokens,
