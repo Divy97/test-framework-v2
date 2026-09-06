@@ -88,22 +88,31 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10m** | orientation, plan, critic — off by default, proven inert, then measured | | |
 | **10n** | every line of the record that this milestone made false | all | |
 
-**10e is done, and it took four live failures to get there.** Every one was this executor
-assuming Vercel's *managed* image — ubuntu, uid 1000, passwordless sudo, code wherever the
-spike put it — where ours are alpine, root, no sudo, code at `/app`. A session length the
-plan refuses; `sh: sudo: not found`; an entrypoint at a path no Dockerfile creates; and a
-`sweep()` that had never stopped a single sandbox, because a structural type this
-repository wrote itself claimed a `sandboxId` the SDK has never had.
+**10e is done, and it took four defects to get there — three of one kind and one of another.**
 
-None of the four was findable against the fake, and the last one is why: **a fake cannot
-disagree with the SDK about the SDK.** What replaced finding them one live run at a time is
+Three were this executor assuming Vercel's *managed* image — ubuntu, uid 1000, passwordless
+sudo, code wherever the spike put it — where ours are alpine, root, no sudo, code at
+`/app`: `sh: sudo: not found`, an entrypoint at a path no Dockerfile creates, and #78's
+session length, which is a Hobby plan ceiling rather than an image difference and was named
+in the plan's own risk list.
+
+The fourth is a different animal. `sweep()` had **never stopped a single sandbox**, and it
+never failed either — it silently returned 0, and was caught by the live smoke test's own
+cleanup check rather than by anything failing. Two independent causes in the same adapter:
+a structural type this repository wrote itself claimed a `sandboxId` the SDK has never had,
+and `Sandbox.list` returns a Paginator that `.map` throws on, which `sweep` swallows by
+design so a failed listing cannot stop a worker taking work.
+
+None was findable against the fake, and the fourth is why: **a fake cannot disagree with
+the SDK about the SDK.** What replaced finding them one live run at a time is
 `scripts/live-smoke-vercel.mts` — the whole engine on real microVMs with no plane, no queue
 and no worker in the way — plus spike items 14 and 15, which ask *our* images and *our*
-sweep the questions the first thirteen items only ever asked the managed one.
+sweep the questions the first thirteen only ever asked the managed one.
 
-The first hosted run to open a real pull request was `f8d10681` on 2026-09-06: four
-sandboxes, every one sealed `deny-all` with a probe from inside, base red twice, fix green
-three times, Tier 2 at 98/103.
+The first hosted run to open a real pull request was `f8d10681` on 2026-09-06: five
+sandboxes, the four that judge or run an agent each sealed `deny-all` with a probe from
+inside (the fifth is the environment build, which is `allow-all` by design because
+`install` needs a registry), base red twice, fix green three times, Tier 2 at 98/103.
 
 What is left of the worker's own deploy is a Vercel account token, which the CLI refuses to
 mint (`403 cannot create tokens for this app`). Until it exists the worker runs on the

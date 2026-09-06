@@ -131,6 +131,13 @@ export interface SandboxHandle {
   snapshot(): Promise<{ ref: string }>;
   /** End the session. Returns what it cost, when the platform says. */
   stop(): Promise<Compute | null>;
+  /**
+   * What this sandbox used, read off it rather than returned by stopping it.
+   *
+   * For the environment build, which `snapshot()` ends: `stop()` on it throws or reports
+   * nothing, and without this it is the one machine in a run with no row at all.
+   */
+  usage?: () => Compute;
 }
 
 export interface SandboxClient {
@@ -234,6 +241,20 @@ type Assert<T extends true> = T;
 type _SandboxIsNamed = Assert<RealSandbox['name'] extends string ? true : false>;
 /** And what `get` takes to find one again — `{ sandboxId }` was not it. */
 type _GetTakesAName = Assert<Parameters<typeof RealSandbox.get>[0] extends { name: string } ? true : false>;
+/**
+ * And that the two session getters are really there, under these names.
+ *
+ * `stop()` returns `ingressBytes`/`egressBytes` and the getter returns `ingress`/`egress`
+ * — the same measure under two names, one object apart. Exactly the kind of near-miss the
+ * `sandboxId` that never existed was, so it is compared rather than believed.
+ */
+type _SessionGettersExist = Assert<
+  RealSandbox['activeCpuUsageMs'] extends number | undefined
+    ? RealSandbox['networkTransfer'] extends { ingress: number; egress: number } | undefined
+      ? true
+      : false
+    : false
+>;
 /** And that a listed row carries the three fields the sweep reads off it. */
 type _ListedIsAsClaimed = Assert<
   Awaited<ReturnType<typeof RealSandbox.list>> extends { sandboxes: (infer Row)[] }
@@ -273,6 +294,17 @@ type SdkSandbox = {
     duration?: number;
     networkTransfer?: { ingressBytes?: number; egressBytes?: number };
   }>;
+  /**
+   * What the session used, ON THE SANDBOX, once the VM is stopped.
+   *
+   * The same numbers `stop()` returns, reachable without having called it. Which matters
+   * for exactly one sandbox: the environment build is ended by `snapshot()`, not by
+   * `stop()`, so it is the longest-lived machine in a run and was the only one whose cost
+   * nothing could read. Note `ingress`/`egress` here against `stop()`'s
+   * `ingressBytes`/`egressBytes` — the same measure under two names, one object apart.
+   */
+  readonly activeCpuUsageMs?: number;
+  readonly networkTransfer?: { ingress: number; egress: number };
 };
 
 /** One row of `Sandbox.list`, which is not a `Sandbox` and shares almost nothing with one. */
@@ -348,18 +380,29 @@ const wrap = (sandbox: SdkSandbox): SandboxHandle => ({
   snapshot: async () => ({ ref: (await sandbox.snapshot({ expiration: SNAPSHOT_EXPIRATION_MS })).snapshotId }),
   stop: async () => {
     const result = await sandbox.stop();
+    // `stop()`'s answer first, the getters second. They are the same numbers by the SDK's
+    // own documentation, and reading both means a sandbox this process did not stop — the
+    // environment build, ended by `snapshot()` — still reports what it used instead of
+    // being the one machine in every run with no cost at all.
+    const cpu = result.activeCpuDurationMs ?? sandbox.activeCpuUsageMs;
+    const ingress = result.networkTransfer?.ingressBytes ?? sandbox.networkTransfer?.ingress;
+    const egress = result.networkTransfer?.egressBytes ?? sandbox.networkTransfer?.egress;
     return {
       sandboxId: sandbox.name,
-      ...(result.activeCpuDurationMs === undefined ? {} : { activeCpuMs: result.activeCpuDurationMs }),
+      ...(cpu === undefined ? {} : { activeCpuMs: cpu }),
       ...(result.duration === undefined ? {} : { durationMs: result.duration }),
-      ...(result.networkTransfer?.ingressBytes === undefined
-        ? {}
-        : { ingressBytes: result.networkTransfer.ingressBytes }),
-      ...(result.networkTransfer?.egressBytes === undefined
-        ? {}
-        : { egressBytes: result.networkTransfer.egressBytes }),
+      ...(ingress === undefined ? {} : { ingressBytes: ingress }),
+      ...(egress === undefined ? {} : { egressBytes: egress }),
     };
   },
+  /** The getters alone, for a sandbox already ended by something other than `stop()`. */
+  usage: () => ({
+    sandboxId: sandbox.name,
+    ...(sandbox.activeCpuUsageMs === undefined ? {} : { activeCpuMs: sandbox.activeCpuUsageMs }),
+    ...(sandbox.networkTransfer === undefined
+      ? {}
+      : { ingressBytes: sandbox.networkTransfer.ingress, egressBytes: sandbox.networkTransfer.egress }),
+  }),
 });
 
 /**

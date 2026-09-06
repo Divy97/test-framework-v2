@@ -120,11 +120,16 @@ alter table run_usage drop constraint if exists run_usage_pkey;
 -- agents, base and fix — and `agent` appears twice, so `(run_id, phase)` is not unique
 -- and would silently keep only the second one.
 --
--- Every measure is nullable because the platform does not always report one. The
--- environment build is the clearest case: `snapshot()` stops the sandbox, and the SDK
--- reports a session's cost only from `stop()` — so the longest-lived sandbox in a run
--- reports nothing at all. A zero there would be a measurement; null is the absence of
--- one, and the difference matters when the question is what a run cost.
+-- Every measure is nullable because the platform does not always report one — a sandbox
+-- abandoned before it was usable, or one whose session ended in a way that answered
+-- nothing. A zero there would be a measurement; null is the absence of one, and the
+-- difference matters when the question is what a run cost.
+--
+-- `bigint` and not `integer` (the reason `run_usage` above gives for its own choice is
+-- real: node-postgres returns bigint as a STRING). Milliseconds and bytes over a session
+-- outgrow `integer` where token counts do not, so the width is right and `readCompute`
+-- carries the `Number()` that makes the string a number. Any future `sum()` in SQL has to
+-- do the same.
 create table if not exists run_compute (
   run_id        uuid        not null,
   sandbox_id    text        not null,

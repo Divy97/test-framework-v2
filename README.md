@@ -106,15 +106,18 @@ Those are different requirements, so they are different processes:
  │  the GitHub App key · the event log · the UI    │    │  the model key              │
  │  GitHub OAuth · a queue of jobs                 │◄───┤  dials OUT, never listens   │
  │  mints run ids · authorizes every append        │poll│  writes every event         │
- │  NO model key · executes nothing                │ship│  holds NO GitHub key        │
+ │  executes nothing · NO Docker                   │ship│  holds NO GitHub key        │
  └─────────────────────────────────────────────────┘    └──────────────┬──────────────┘
-                                                                       │ a phase per
+                                                                       │ one per phase
                                                       ┌────────────────┴─────────────┐
                                                       │  Docker here, OR a microVM   │
                                                       │  on a substrate we operate   │
                                                       │  no part of  (ADR-0021)      │
                                                       └──────────────────────────────┘
 ```
+
+The plane holds no key it can *spend*: it stores a user's model credential encrypted and
+hands it to the runner that holds their run, and it never consults a model itself.
 
 **Where a phase runs is a seam, not a fact about the runner.** `ENGINE_EXECUTOR=docker` is
 the laptop, and `vercel` is a Firecracker microVM per phase — created `deny-all`, then

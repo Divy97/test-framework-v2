@@ -1340,10 +1340,9 @@ said, not what the engine saw.</p>` +
   );
 
   if (usage.length > 0 || compute.length > 0) {
-    // A dash, not a zero, for a measure the platform did not report. The environment
-    // build is the standing case: `snapshot()` stops that sandbox, and a session's cost
-    // comes back only from `stop()`, so the longest-lived machine in a run reports
-    // nothing — and printing `0ms` for it would be inventing a measurement.
+    // A dash, not a zero, for a measure the platform did not report — a sandbox abandoned
+    // before it was usable, or one whose session ended answering nothing. Printing `0ms`
+    // there would be inventing a measurement.
     const ms = (value: number | null) => (value === null ? '—' : `${Math.round(value)}ms`);
     const kb = (value: number | null) => (value === null ? '—' : `${Math.round(value / 1024)}KB`);
     sections.push(
