@@ -368,17 +368,25 @@ export function dashboardRoutes(options: {
     // FORGETTING (9e). A POST, behind the same origin check every write here gets, and
     // behind the same authorization the run's own page gets — deleting somebody's
     // evidence is not a lesser thing to be allowed to do than reading it.
-    const forgetting = /^\/runs\/([^/]+)\/forget$/.exec(path);
+    const forgetting = /^\/(?:api\/runs\/([^/]+)\/forget|runs\/([^/]+)\/forget)$/.exec(path);
     if (method === 'POST' && forgetting) {
-      const runId = decodeURIComponent(forgetting[1]!);
+      // The same destruction either way. The second path exists because a page that is
+      // not a form has nowhere to put a 303: `fetch` follows it, and following it here
+      // means pulling a whole evidence document down as the side effect of a delete.
+      const asJson = forgetting[1] !== undefined;
+      const runId = decodeURIComponent((forgetting[1] ?? forgetting[2])!);
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, runId);
       if (!row || (who !== null && !who.repos.has(row.repo))) {
-        return html(`<!doctype html><title>not found</title><p>No such run.</p>`, 404);
+        return asJson
+          ? json({ error: 'no such run' }, 404)
+          : html(`<!doctype html><title>not found</title><p>No such run.</p>`, 404);
       }
       if (!options.blobRoot) {
-        return html(`<!doctype html><title>not here</title><p>This surface stores no artifacts.</p>`, 501);
+        return asJson
+          ? json({ error: 'this surface stores no artifacts' }, 501)
+          : html(`<!doctype html><title>not here</title><p>This surface stores no artifacts.</p>`, 501);
       }
       await forgetRun(client, {
         runId,
@@ -387,12 +395,18 @@ export function dashboardRoutes(options: {
         requestedBy: who === null ? 'the local operator' : who.session.login,
         blobRoot: options.blobRoot,
       });
-      return {
-        status: 303,
-        type: 'text/plain',
-        body: 'forgotten\n',
-        headers: { location: `/runs/${encodeURIComponent(runId)}` },
-      };
+      // The count, because it is the only thing about a deletion anybody can check
+      // afterwards — the bytes are gone by definition, and `requestedBy` above is the
+      // only other part of it that survives.
+      const tombstone = await tombstoneFor(client, runId);
+      return asJson
+        ? json({ forgotten: true, removed: tombstone?.removed ?? 0 })
+        : {
+            status: 303,
+            type: 'text/plain',
+            body: 'forgotten\n',
+            headers: { location: `/runs/${encodeURIComponent(runId)}` },
+          };
     }
 
     // ── SECRETS (M10, ADR-0017) ──────────────────────────────────────────────────
@@ -512,6 +526,66 @@ export function dashboardRoutes(options: {
       const page = Number.isInteger(asked) && asked >= 1 ? Math.min(asked, 1_000) : 1;
       const token = await options.github.token(installation.installationId);
       return json(await listOpenIssues(options.github, token, repo, page));
+    }
+
+    // ── RUNNERS, AS JSON (10i) ───────────────────────────────────────────────────
+    //
+    // The screen `runnersPage` rendered, for a UI that is not a form. Pairing is the
+    // interesting one: the token exists in exactly one response and can never be shown
+    // again, which is why the HTML version RENDERED rather than redirected. A JSON
+    // answer carries it the same way and is the more honest shape for it — there is no
+    // page here that could be mistaken for somewhere to find it later.
+    //
+    // Behind the same origin check and the same authorization as every write on this
+    // surface. A pairing token is a credential for a machine that will execute somebody's
+    // recipe, so `may you see this repository` is asked by GitHub first, as always.
+    const apiRunners = /^\/api\/repos\/(.+?)\/runners(?:\/([^/]+)\/revoke)?$/.exec(path);
+    if (apiRunners && (method === 'GET' || method === 'POST')) {
+      const repo = decodeURIComponent(apiRunners[1]!);
+      const revoke = apiRunners[2] === undefined ? null : decodeURIComponent(apiRunners[2]);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
+      const installation = await loadInstallation(client, repo);
+      if (!installation) return json({ error: 'not connected' }, 404);
+
+      if (revoke !== null) {
+        if (method !== 'POST') return json({ error: 'POST to revoke' }, 405);
+        // The INSTALLATION, not just the repository in the path. Authorizing the repo and
+        // then trusting the id from the URL let anyone with access to any repository
+        // revoke somebody else's machine — the bug the HTML route records above.
+        return (await revokeRunner(client, revoke, installation.installationId))
+          ? json({ revoked: revoke })
+          : json({ error: 'no such runner' }, 404);
+      }
+      if (method === 'GET') {
+        return json({
+          runners: await listRunners(client, installation.installationId),
+          // The URL the operator is READING this on, which is the one their runner has to
+          // dial. The HTML page printed the literal string `<this service>` here once,
+          // served from the host it should have been naming.
+          planeUrl: origin(headers),
+        });
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await body());
+      } catch {
+        return json({ error: 'the body is not JSON' }, 400);
+      }
+      const name = typeof (parsed as { name?: unknown } | null)?.name === 'string'
+        ? (parsed as { name: string }).name.trim()
+        : '';
+      if (!name) return json({ error: 'send { "name": "…" }' }, 400);
+      const { token, runner } = await pairRunner(client, {
+        installationId: installation.installationId,
+        name,
+      });
+      // ONCE. Nothing stores this in a form we can read back, and no route returns it
+      // again — the same property the secrets routes have, arrived at from the other
+      // direction: there, a value goes in and never comes out; here, one comes out and
+      // is never asked for.
+      return json({ paired: runner, token, planeUrl: origin(headers) }, 201);
     }
 
     // ── APPROVING A RECIPE, AS JSON (10i) ────────────────────────────────────────

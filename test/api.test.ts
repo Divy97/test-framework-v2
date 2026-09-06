@@ -263,6 +263,17 @@ describe('the catch-all does not swallow the routes above it', () => {
     expect(answer?.status).toBe(501);
   });
 
+  it('the runners route is not read as a repository called .../runners', async () => {
+    // This one was actually wrong when it was written: the block sat below the catch-all,
+    // so `GET` fell into the repository read, looked up an installation for
+    // `mine/repo/runners`, and answered 404 — while the `POST` beside it worked, because
+    // the catch-all only matches `GET`. A half-shadowed route is the shape this describe
+    // block exists to catch.
+    const { status, json } = await bodyOf(surface(), 'GET', `/api/repos/${MINE}/runners`);
+    expect(status).toBe(200);
+    expect(json).toHaveProperty('runners');
+  });
+
   it('the recipe route is not read as a repository called .../recipe', async () => {
     const { status, json } = await bodyOf(surface(), 'GET', `/api/repos/${MINE}/recipe`);
     expect(status).toBe(200);
@@ -381,5 +392,86 @@ describe('the evidence view, as JSON, is the same view the page is', () => {
     expect(answer?.status).toBe(200);
     expect(answer?.type).toMatch(/text\/html/);
     expect(String(answer?.body)).toContain('mine/repo');
+  });
+});
+
+describe('destroying a run says so in the envelope it was asked in', () => {
+  // `fetch` follows a 303, so the HTML route's redirect means pulling a whole evidence
+  // document down as the side effect of a delete. What is asserted here is the ENVELOPE
+  // and the gate — `test/forget.test.ts` owns whether the bytes actually go.
+  it('answers JSON, not a redirect to a page', async () => {
+    const { status, json } = await bodyOf(surface(), 'POST', '/api/runs/r-mine/forget');
+    // 501: this surface holds no artifacts, which is the honest answer rather than a
+    // pretended deletion. The shape is the point — a 303 here would be the bug.
+    expect(status).toBe(501);
+    expect(json.error).toMatch(/no artifacts/);
+  });
+
+  it("somebody else's run cannot be destroyed, and the refusal is JSON too", async () => {
+    const { status, json } = await bodyOf(surface(), 'POST', '/api/runs/r-theirs/forget');
+    expect(status).toBe(404);
+    expect(json).toEqual({ error: 'no such run' });
+  });
+
+  it('the form route still redirects, for the page that still posts to it', async () => {
+    const answer = await call(surface(), 'POST', '/runs/r-theirs/forget');
+    expect(answer?.type).toMatch(/text\/html/);
+  });
+});
+
+describe('pairing a runner hands over the token exactly once', () => {
+  it('mints it, and the answer carries the URL the machine has to dial', async () => {
+    const { status, json } = await bodyOf(
+      surface(),
+      'POST',
+      `/api/repos/${MINE}/runners`,
+      JSON.stringify({ name: 'laptop' }),
+    );
+    expect(status).toBe(201);
+    expect(json.token).toMatch(/^\S+$/);
+    expect(json.paired.name).toBe('laptop');
+    // The host this was read on. The HTML page printed the literal string
+    // `<this service>` here once, served from the host it should have been naming.
+    expect(json.planeUrl).toBe('http://127.0.0.1');
+  });
+
+  it('a nameless machine is refused', async () => {
+    for (const body of [JSON.stringify({}), JSON.stringify({ name: '   ' }), 'null']) {
+      const { status } = await bodyOf(surface(), 'POST', `/api/repos/${MINE}/runners`, body);
+      expect(status, body).toBe(400);
+    }
+  });
+
+  it('the listing never carries a token', async () => {
+    // Paired first, so this is a listing with something in it — an empty list cannot
+    // demonstrate the absence of a field.
+    const route = surface();
+    const paired = await bodyOf(route, 'POST', `/api/repos/${MINE}/runners`, JSON.stringify({ name: 'laptop' }));
+    const listed = await bodyOf(route, 'GET', `/api/repos/${MINE}/runners`);
+    expect(listed.status).toBe(200);
+    expect(JSON.stringify(listed.json)).not.toContain(paired.json.token);
+  });
+
+  it("a stranger cannot pair a machine against somebody else's repository", async () => {
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const { status } = await bodyOf(
+      surface({ writes }),
+      'POST',
+      `/api/repos/${THEIRS}/runners`,
+      JSON.stringify({ name: 'laptop' }),
+    );
+    expect(status).toBe(404);
+    expect(writes.some((write) => /insert into runners/.test(write.sql))).toBe(false);
+  });
+
+  it('revoking checks the installation, not just the repository in the path', async () => {
+    // Authorizing the repo and then trusting the id from the URL let anyone with access
+    // to ANY repository revoke somebody else's machine. `revokeRunner` requires the
+    // installation and updates nothing on a mismatch, which arrives here as a 404.
+    const writes: { sql: string; params: unknown[] }[] = [];
+    const { status } = await bodyOf(surface({ writes }), 'POST', `/api/repos/${MINE}/runners/not-mine/revoke`);
+    expect(status).toBe(404);
+    const revoke = writes.find((write) => /update runners/.test(write.sql));
+    expect(revoke?.params).toContain(1);
   });
 });
