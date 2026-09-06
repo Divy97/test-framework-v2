@@ -328,6 +328,27 @@ export function dashboardRoutes(options: {
       return json(runs);
     }
 
+    // ── THE LOG, READ RATHER THAN TAILED (10i) ───────────────────────────────────
+    //
+    // `GET /runs/:id/events` is the SSE tail (ADR-0005) and stays exactly what it is. This
+    // is the same rows for a run that has ALREADY ENDED, and it exists because the tail is
+    // the wrong tool for one: `tailRun` polls `seq > $2` every 250ms for as long as the
+    // client is connected, and the dashboard passes no `until`, so an evidence page left
+    // open in a tab would poll a log that cannot gain another row, four times a second,
+    // forever.
+    //
+    // So the page streams a live run and reads a finished one. Same authorization as the
+    // evidence view — deciding it twice is how the two come to disagree.
+    const log = /^\/api\/runs\/([^/]+)\/events$/.exec(path);
+    if (method === 'GET' && log) {
+      const runId = decodeURIComponent(log[1]!);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      const row = await readRunRow(client, runId);
+      if (!row || (who !== null && !who.repos.has(row.repo))) return json({ error: 'no such run' }, 404);
+      return json(await readRun(client, runId));
+    }
+
     const run = /^\/api\/runs\/([^/]+)\/evidence$/.exec(path);
     if (method === 'GET' && run) {
       const runId = decodeURIComponent(run[1]!);

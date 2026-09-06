@@ -385,13 +385,14 @@ describe('the evidence view, as JSON, is the same view the page is', () => {
     expect(json).toEqual({ error: 'no such run' });
   });
 
-  it('the HTML page at /runs/:id still renders', async () => {
-    // The two share a block now. A refactor that broke the page while keeping the JSON
-    // green would be invisible to every other assertion in this file.
-    const answer = await call(surface(), 'GET', '/runs/r-mine');
-    expect(answer?.status).toBe(200);
-    expect(answer?.type).toMatch(/text\/html/);
-    expect(String(answer?.body)).toContain('mine/repo');
+  it('there is no HTML page left on this surface at all', async () => {
+    // `/runs/:id` was a rendered document until 10i deleted `src/web.ts`. It is now a path
+    // this route declines, so the static bundle answers it — which is what makes "every
+    // route here is `/api/`" a checkable statement rather than a claim in a comment.
+    expect(await call(surface(), 'GET', '/runs/r-mine')).toBeNull();
+    expect(await call(surface(), 'GET', '/repos')).toBeNull();
+    expect(await call(surface(), 'GET', `/repos/${MINE}/onboard`)).toBeNull();
+    expect(await call(surface(), 'GET', `/repos/${MINE}/runners`)).toBeNull();
   });
 });
 
@@ -413,9 +414,8 @@ describe('destroying a run says so in the envelope it was asked in', () => {
     expect(json).toEqual({ error: 'no such run' });
   });
 
-  it('the form route still redirects, for the page that still posts to it', async () => {
-    const answer = await call(surface(), 'POST', '/runs/r-theirs/forget');
-    expect(answer?.type).toMatch(/text\/html/);
+  it('the form route is gone with the form', async () => {
+    expect(await call(surface(), 'POST', '/runs/r-theirs/forget')).toBeNull();
   });
 });
 
@@ -473,5 +473,32 @@ describe('pairing a runner hands over the token exactly once', () => {
     expect(status).toBe(404);
     const revoke = writes.find((write) => /update runners/.test(write.sql));
     expect(revoke?.params).toContain(1);
+  });
+});
+
+describe('a finished run is read, not tailed', () => {
+  it('answers the log as JSON, with the same authorization the evidence view has', async () => {
+    const { status, json } = await bodyOf(surface(), 'GET', '/api/runs/r-mine/events');
+    expect(status).toBe(200);
+    expect(Array.isArray(json)).toBe(true);
+    expect(json[0]).toHaveProperty('seq');
+    expect(json[0]).toHaveProperty('type');
+  });
+
+  it("somebody else's log is no such run", async () => {
+    const { status, json } = await bodyOf(surface(), 'GET', '/api/runs/r-theirs/events');
+    expect(status).toBe(404);
+    expect(json).toEqual({ error: 'no such run' });
+  });
+
+  it('is not the evidence route wearing a different name', async () => {
+    // The two share authorization and nothing else. If `/events` fell through to the
+    // evidence pattern the page would render a fold where it expects a list, and the
+    // timeline would silently show nothing.
+    const events = await bodyOf(surface(), 'GET', '/api/runs/r-mine/events');
+    const evidence = await bodyOf(surface(), 'GET', '/api/runs/r-mine/evidence');
+    expect(Array.isArray(events.json)).toBe(true);
+    expect(Array.isArray(evidence.json)).toBe(false);
+    expect(evidence.json).toHaveProperty('score');
   });
 });

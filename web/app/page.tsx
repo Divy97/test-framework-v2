@@ -49,14 +49,29 @@ export default function App() {
     if (path !== null) document.title = `${title(path)} — Test Framework v2`;
   }, [path]);
 
+  // The front door of a surface that is showing the application on it. `replace`, not
+  // `push`, so Back leaves rather than bouncing off a redirect.
+  const signedInAtTheDoor = (path === '/' || path === '') && me.data?.signedIn === true;
+  useEffect(() => {
+    if (signedInAtTheDoor) window.history.replaceState(null, '', '/repos');
+  }, [signedInAtTheDoor]);
+
   // Before the browser has told us where we are, and at build time. The landing page is
   // the honest thing to render for both.
-  if (path === null || path === '/' || path === '') {
+  const atTheDoor = path === null || path === '/' || path === '';
+  if (atTheDoor) {
     if (me.data?.signedIn) {
-      // Signed in and looking at the front door. The server route used to answer this with
-      // a 302; here it is a replace, so Back does not bounce off the redirect.
-      if (typeof window !== 'undefined') window.history.replaceState(null, '', '/repos');
-      return <Shell me={me.data} path="/repos" go={go} main={main} announced={announced}><Repos me={me.data} go={go} /></Shell>;
+      // Signed in and looking at the front door. The plane's own `/` route already 302s a
+      // signed-in visitor to `/repos`, so this is the case it cannot catch: a surface with
+      // no accounts, where `visible()` answers "the local operator" and there is no cookie
+      // to have redirected on. The URL is corrected in an effect below, never in render —
+      // a `replaceState` during render is a side effect in a function React is free to
+      // call twice.
+      return (
+        <Shell me={me.data} path="/repos" go={go} main={main} announced={announced}>
+          <Repos me={me.data} go={go} />
+        </Shell>
+      );
     }
     return (
       <div className="landing">

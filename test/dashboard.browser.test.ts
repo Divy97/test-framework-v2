@@ -478,6 +478,21 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     expect(page).toMatch(/testimony/i);
     expect(page).toMatch(/input to no verdict/);
 
+    // The timeline, which for a FINISHED run is read rather than tailed. Asserted here
+    // because the two paths are easy to get backwards: this fixture's SSE `read` answers
+    // with nothing at all, so a page that streamed a finished run would show "waiting for
+    // the first event" under a completed verdict and every other assertion here would still
+    // pass.
+    expect(page).toMatch(/what happened/i);
+    // Each of these is a row the timeline built from a real event in `demoRunEvents`. The
+    // log ends at `PR_OPENED` — it carries no `RUN_ENDED`, which is why the projection's
+    // `ended_at` is null and why the screens ask the fold's status instead.
+    expect(page).toMatch(/the run was requested/i);
+    expect(page).toMatch(/a reproduction was registered/i);
+    expect(page).toMatch(/a pull request was opened/i);
+    expect(page).toMatch(/exactly as stored/i);
+    expect(page).not.toMatch(/waiting for the first event/i);
+
     // What the run cost, beside the log and never inside it — including the dash for the
     // environment sandbox, whose measures the platform does not report.
     expect(page).toMatch(/what this run cost/i);

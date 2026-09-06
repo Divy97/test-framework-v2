@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { send, type Me } from '../../lib/api';
 import { Said } from '../bits';
 
@@ -20,6 +20,14 @@ const PROVIDERS = ['openrouter', 'anthropic'] as const;
  */
 export function Settings({ me, onChanged }: { me: Me | null; onChanged: () => void }) {
   const [provider, setProvider] = useState<string>(me?.modelKey?.provider ?? 'openrouter');
+  // `me` arrives from a fetch, so this component mounts before it: the initial state above
+  // is `openrouter` for everyone, including somebody whose stored key is Anthropic's. The
+  // select would then have shown the wrong provider beside a correct "a key is stored for
+  // anthropic" — and replacing the key would have silently changed which service it is for.
+  const stored = me?.modelKey?.provider;
+  useEffect(() => {
+    if (stored) setProvider(stored);
+  }, [stored]);
   const [key, setKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [said, setSaid] = useState<{ ok: boolean; text: string } | null>(null);

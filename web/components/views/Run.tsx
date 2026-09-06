@@ -1,8 +1,8 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { isOver, send, type Evidence as EvidenceData, type Me } from '../../lib/api';
-import { useJson, useTail } from '../../lib/hooks';
+import { useJson, useTail, type Frame } from '../../lib/hooks';
 import { Failed, Loading, Said, When } from '../bits';
 import { RawLog, Timeline } from '../Timeline';
 import { Evidence, REGRESSION_LABEL, TIER_MEANING } from './Evidence';
@@ -30,15 +30,32 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
   // Throttled, because the events that matter can arrive in bursts — three `TEST_RUN`
   // frames land within a second of each other — and three identical folds of the same log
   // is two round trips for an answer that did not change between them.
-  const [last, setLast] = useState(0);
+  //
+  // A ref rather than state, for two reasons. It does not re-render the page fifteen times
+  // per run to store a number nothing displays; and it is read at the moment the frame
+  // arrives rather than from a closure, so two events in one tick cannot both see the old
+  // value and both refetch — which is exactly the burst this exists to collapse.
+  const last = useRef(0);
   const onMeaningful = useCallback(() => {
     const now = Date.now();
-    if (now - last < 1200) return;
-    setLast(now);
+    if (now - last.current < 1200) return;
+    last.current = now;
     reload();
-  }, [last, reload]);
+  }, [reload]);
 
-  const tail = useTail(runId, { onMeaningful });
+  const over = evidence.data ? isOver(evidence.data.state.status, evidence.data.row.ended_at) : false;
+  // STREAM A LIVE RUN, READ A FINISHED ONE, and the difference is the whole reason both
+  // exist. The tail resumes by `seq`, so a live run's stream from zero carries the history
+  // as well as what happens next — one connection, no gap to stitch. A finished run has no
+  // "next", and holding a socket open to discover that costs the plane four queries a
+  // second per open tab.
+  //
+  // `null` for the URL until the evidence has said which this is: opening a stream and then
+  // closing it a moment later is worse than waiting, and `useJson`/`useTail` both treat null
+  // as "not yet".
+  const tail = useTail(over || !evidence.data ? null : runId, { onMeaningful });
+  const stored = useJson<Frame[]>(over ? `/api/runs/${encodeURIComponent(runId)}/events` : null);
+  const frames = over ? (stored.data ?? []) : tail.frames;
 
   if (evidence.loading) return <Loading what="this run" />;
   if (evidence.status === 404) {
@@ -56,7 +73,7 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
   if (!evidence.data) return <Failed error={evidence.error ?? 'unknown'} retry={reload} />;
 
   const { row, state, score, usage, compute, forgotten } = evidence.data;
-  const ended = isOver(state.status, row.ended_at);
+  const ended = over;
   const refused = score.tier === 3;
   const attempt = state.reproducedAttempt;
   const repro = state.registrations.filter((r) => r.attempt === attempt).at(-1) ?? state.registeredRepro;
@@ -87,7 +104,7 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
           {tail.state === 'retrying' ? (
             <span className="disconnected">Reconnecting to the log…</span>
           ) : (
-            <span>Live — {tail.frames.length} events</span>
+            <span>Live — {frames.length} events</span>
           )}
         </p>
       ) : null}
@@ -141,8 +158,8 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
       ) : null}
 
       <h2>What happened</h2>
-      <Timeline frames={tail.frames} ended={ended} />
-      <RawLog frames={tail.frames} />
+      <Timeline frames={frames} ended={ended} />
+      <RawLog frames={frames} />
 
       <Evidence data={evidence.data} ended={ended} />
 

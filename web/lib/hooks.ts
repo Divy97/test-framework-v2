@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { get, type Answer } from './api';
 
 /**
@@ -64,10 +64,26 @@ export function useJson<T>(url: string | null): Answer<T> & { loading: boolean; 
  * `index.html` for every route — which is exactly what we DO want for the landing page and
  * would be wrong for the rest, so the distinction has to be visible rather than implicit.
  */
+/**
+ * BEFORE THE PAINT, in the browser; an ordinary effect at build time.
+ *
+ * `useLayoutEffect` runs after React has committed and before the browser draws, which is
+ * the difference between "the landing page appears for a frame and is replaced" and "the
+ * right view is the first thing anybody sees". It matters here more than it usually would:
+ * the pre-rendered document IS the landing page — deliberately, so a crawler and a link
+ * preview get real markup — so the flash is not an empty shell but a full marketing page,
+ * shown to somebody who asked for a run.
+ *
+ * React warns if a layout effect runs where there is no layout, so at build time this is
+ * the ordinary one. Nothing paints there, and the branch is the standard shape rather than
+ * a trick.
+ */
+const useBeforePaint = typeof window === 'undefined' ? useEffect : useLayoutEffect;
+
 export function usePath(): { path: string | null; go: (to: string) => void } {
   const [path, setPath] = useState<string | null>(null);
 
-  useEffect(() => {
+  useBeforePaint(() => {
     setPath(window.location.pathname);
     const onPop = () => setPath(window.location.pathname);
     window.addEventListener('popstate', onPop);
@@ -101,14 +117,26 @@ export type Frame = { seq: number; type: string; payload: unknown; ts: string };
  * folded for itself would be a second implementation of what happened, free to disagree
  * with the pull request, and this codebase has made that mistake twice (ADR-0009).
  */
-export function useTail(runId: string | null, options: { onMeaningful?: () => void } = {}) {
+export function useTail(runId: string | null, options: { onMeaningful?: () => void; stop?: boolean } = {}) {
   const [frames, setFrames] = useState<Frame[]>([]);
   const [state, setState] = useState<'idle' | 'open' | 'retrying'>('idle');
   const meaningful = useRef(options.onMeaningful);
   meaningful.current = options.onMeaningful;
+  const stop = options.stop === true;
 
   useEffect(() => {
     if (runId === null) return;
+    // CLOSED once the run is over, and this is not tidiness — it is the difference between
+    // a page and a load generator. `tailRun` is deliberately dumb: it polls
+    // `where run_id = $1 and seq > $2` every 250ms for as long as the client is there, and
+    // the dashboard passes no `until`, so a finished run's tail never ends on its own. Every
+    // evidence page left open in a tab would have been four queries a second against the
+    // plane's database, for a log that cannot gain another row.
+    //
+    // The order is what makes it safe: `RUN_ENDED` arrives on this stream, which is what
+    // tells the page to re-read the fold, which is what sets `stop`. Nothing is missed by
+    // closing after that, because there is nothing after it.
+    if (stop) return;
     setFrames([]);
     const source = new EventSource(`/runs/${encodeURIComponent(runId)}/events`);
     source.onopen = () => setState('open');
@@ -126,7 +154,7 @@ export function useTail(runId: string | null, options: { onMeaningful?: () => vo
       if (CHANGES_THE_VERDICT.has(frame.type)) meaningful.current?.();
     };
     return () => source.close();
-  }, [runId]);
+  }, [runId, stop]);
 
   return { frames, state };
 }
