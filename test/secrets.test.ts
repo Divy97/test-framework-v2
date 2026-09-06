@@ -386,6 +386,15 @@ describe('THE test: a value stored through the surface never comes back out of i
     await say('GET', `${path}/A_STORED_SECRET`);
     await say('GET', '/api/settings/model-key');
     await say('GET', `/repos/${encodeURIComponent(REPO)}/onboard`);
+    // The JSON surface 10i added, and it is the half most likely to leak: these routes
+    // exist to hand a client the state of a repository and a person, which is exactly the
+    // shape of answer a value slips into as one more field. `/api/repos/:repo` returns a
+    // `secrets` object; `/api/me` returns a `modelKey` one. Both must be names and
+    // providers only.
+    await say('GET', '/api/me');
+    await say('GET', '/api/repos');
+    await say('GET', `/api/repos/${encodeURIComponent(REPO)}`);
+    await say('GET', `/api/repos/${encodeURIComponent(REPO)}/recipe`);
     await say('DELETE', `${path}/A_STORED_SECRET`);
     await say('DELETE', '/api/settings/model-key');
 
