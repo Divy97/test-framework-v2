@@ -40,6 +40,8 @@ export function Register({ rows, me, go }: { rows: RepoRow[]; me: Me | null; go:
   const ready = rows.filter((row) => row.onboarded);
   const waiting = rows.filter((row) => !row.onboarded);
 
+  // The caption carries the COUNT, which the `<h2>` above it does not. A caption that
+  // repeats its own heading is read twice by a screen reader and is noise on the page.
   const register = (of: RepoRow[], caption: string) => (
     <div className="scroll">
       <table>
@@ -136,7 +138,7 @@ export function Register({ rows, me, go }: { rows: RepoRow[]; me: Me | null; go:
           {ready.length > 0 ? (
             <>
               <h2>Onboarded</h2>
-              {register(ready, 'Repositories with an approved recipe')}
+              {register(ready, `${ready.length} with an approved recipe, and able to take work`)}
             </>
           ) : null}
           {waiting.length > 0 ? (
@@ -148,10 +150,10 @@ export function Register({ rows, me, go }: { rows: RepoRow[]; me: Me | null; go:
                     {waiting.length} repositories — expand to onboard one, then use your
                     browser&rsquo;s find to locate it
                   </summary>
-                  {register(waiting, 'Repositories waiting for a recipe')}
+                  {register(waiting, `${waiting.length} connected, each waiting for a recipe`)}
                 </details>
               ) : (
-                register(waiting, 'Repositories waiting for a recipe')
+                register(waiting, `${waiting.length} connected, each waiting for a recipe`)
               )}
             </>
           ) : null}

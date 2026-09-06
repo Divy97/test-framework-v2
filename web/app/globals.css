@@ -299,6 +299,11 @@ details[open] summary{margin-bottom:.5rem}
 .timeline li[data-state=doing] .dot{animation:pulse 1.6s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 
+/* The live region is in the DOM before it has anything to say — inserting one together
+ * with its content announces nothing — but a run that has ENDED leaves it permanently
+ * empty, and an empty flex box with a margin is a gap in the page nobody can explain.
+ * `:empty` collapses it, and only ever after the last thing it had to announce. */
+.live:empty{display:none}
 .live{display:inline-flex;gap:.5rem;align-items:baseline;font-family:var(--mono);
   font-size:.7rem;text-transform:uppercase;letter-spacing:.12em;color:var(--pending)}
 .live .dot{animation:pulse 1.6s ease-in-out infinite}

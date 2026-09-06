@@ -850,6 +850,9 @@ describe('the repository register', () => {
       <Repos.Register rows={[repo(), repo({ repo: 'acme/legacy', onboarded: false })]} me={me} go={() => {}} />,
     );
     expect(html.indexOf('Onboarded')).toBeLessThan(html.indexOf('Connected, not onboarded'));
+    // The caption counts rather than repeating the heading above it.
+    expect(html).toMatch(/1 with an approved recipe/);
+    expect(html).toMatch(/1 connected, each waiting for a recipe/);
     // The plural agrees with the total. "1 of 2 repository is onboarded" is what agreeing
     // with the onboarded count produces, and that is what this said.
     expect(html).toMatch(/1 of 2 repositories are onboarded/);

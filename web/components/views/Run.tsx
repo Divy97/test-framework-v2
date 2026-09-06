@@ -85,6 +85,11 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
   // verdict of every run whose log has no `RUN_ENDED` — which is every fixture in this
   // repository and every run recorded before that event existed.
   const ended = isOver(stateOf(evidence.data), evidence.data?.row.ended_at ?? null);
+  // `closing` gates the SOCKET and nothing a reader sees. It was gating the live indicator
+  // too, and the result was a page saying "LIVE — 8 events" directly above "Tier 1,
+  // reproduced by a failing test whose independence is established": the fold had reached a
+  // verdict, and the log had no `RUN_ENDED` to close the stream on, so both were true at
+  // once and the page asserted the contradiction. What a reader is told is `ended`.
   const closing = frames.some((frame) => frame.type === 'RUN_ENDED') || evidence.data?.row.ended_at != null;
 
   if (evidence.loading) return <><h1>Run</h1><Loading what="this run" /></>;
@@ -141,7 +146,7 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
           reader who cannot see the list actually needs — how far along it is, and what just
           happened. */}
       <p className="live" role="status" aria-live="polite">
-        {!closing ? (
+        {!ended ? (
           <>
             <span className="dot" aria-hidden="true">
               ●
@@ -219,7 +224,7 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
         <Failed error={stored.error} retry={stored.reload} />
       ) : (
         <>
-          <Timeline frames={frames} ended={closing} />
+          <Timeline frames={frames} ended={ended} />
           <RawLog frames={frames} />
         </>
       )}
