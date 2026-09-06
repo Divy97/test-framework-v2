@@ -25,6 +25,16 @@ primary_region = 'sin'
   auto_start_machines = true
   min_machines_running = 0
 
+  # `/` — and since 10i that path checks one more thing than it used to.
+  #
+  # It was a rendered landing page, so a 200 meant the process was up. It is now the
+  # dashboard's static bundle, served by `src/static.ts` from `/app/web/out`, and a
+  # deployment whose image did not build that bundle answers 503 here rather than a page.
+  # So this check now also fails a deploy that shipped a plane with no front end — which is
+  # the right outcome, and worth writing down because the failure would otherwise present
+  # as "the site is blank" long after the deploy reported success.
+  #
+  # The JSON API and the SSE tail are unaffected by that state, and the 503 body says so.
   [[http_service.checks]]
     interval = '30s'
     timeout = '5s'
