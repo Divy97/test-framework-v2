@@ -257,7 +257,31 @@ create table if not exists jobs (
 );
 
 -- Partial, because the queue is only ever read for jobs nobody has taken.
-create index if not exists jobs_queued on jobs (installation_id, queued_at) where runner_id is null;
+-- WHEN THE RUNNER HOLDING THIS JOB LAST SAID ANYTHING ABOUT *THIS RUN* (M10).
+--
+-- `runners.last_seen` cannot answer that. It is a fact about a MACHINE, and the worker's
+-- pairing token is a Fly APP secret — so every instance across a rolling deploy
+-- authenticates as one runner row, and the replacement's first poll would vouch for a job
+-- it has never heard of. It also says nothing about a live runner whose long-poll response
+-- died in transit: still heartbeating, job stranded.
+--
+-- Stamped by `appendFromRunner`, which every run-scoped route goes through — events,
+-- blobs, token, secrets, model-key, cost, finished. A runner mints an installation token
+-- within a round trip of claiming (`run.ts`, before the clone), so `heard_at is null` at
+-- the two-minute mark means nobody ever came for this run.
+alter table jobs add column if not exists heard_at timestamptz;
+
+-- A CEILING ON RE-DISPATCH. A job whose runner dies on every attempt would otherwise be
+-- handed out every two minutes forever, each one paying for a clone and a token mint.
+-- `openJobFor` already carries a two-hour ceiling for the same reason; this is the count.
+alter table jobs add column if not exists dispatches integer not null default 0;
+
+-- `where runner_id is null` no longer matches the claim query: a job may now also be taken
+-- back from a runner that never came for it, so the scan is over unfinished jobs. Ordered
+-- by `queued_at` so `limit 1` short-circuits instead of sorting every open job on every
+-- poll — which, at a 500ms poll interval per runner, is the difference between 16 buffers
+-- and forty thousand.
+create index if not exists jobs_open on jobs (queued_at) where finished_at is null;
 
 -- Who pressed Start, and on which issue (M10).
 --
