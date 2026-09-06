@@ -99,6 +99,29 @@ create table if not exists run_usage (
   primary key (run_id, phase)
 );
 
+-- What the SANDBOXES cost (M10, 10f), beside the log for the same reason `run_usage` is.
+--
+-- One row per sandbox, not per phase: a run creates five — the environment build, two
+-- agents, base and fix — and `agent` appears twice, so `(run_id, phase)` is not unique
+-- and would silently keep only the second one.
+--
+-- Every measure is nullable because the platform does not always report one. The
+-- environment build is the clearest case: `snapshot()` stops the sandbox, and the SDK
+-- reports a session's cost only from `stop()` — so the longest-lived sandbox in a run
+-- reports nothing at all. A zero there would be a measurement; null is the absence of
+-- one, and the difference matters when the question is what a run cost.
+create table if not exists run_compute (
+  run_id        uuid        not null,
+  sandbox_id    text        not null,
+  phase         text        not null,
+  active_cpu_ms bigint,
+  duration_ms   bigint,
+  ingress_bytes bigint,
+  egress_bytes  bigint,
+  observed_at   timestamptz not null default now(),
+  primary key (run_id, sandbox_id)
+);
+
 -- The read model. A DISPOSABLE CACHE, and the README's first architectural claim
 -- depends on it staying one (M6c).
 --

@@ -24,6 +24,7 @@ import {
   verifyRunner,
   type Runner,
 } from './plane.js';
+import { saveCompute, saveUsage, type ComputeRow, type UsageRow } from './readmodel.js';
 import { modelKey, repoSecrets, secretsEnabled } from './secrets.js';
 import type { Route } from './sse.js';
 
@@ -283,6 +284,41 @@ export function runnerRoutes(options: {
       // every run did before the button existed.
       if (facts.requestedBy === null) return json(null);
       return json(await modelKey(client, facts.requestedBy));
+    }
+
+    // WHAT THE RUN COST, which is ours and not the repository's.
+    //
+    // A route rather than events, because a fact about our spending does not belong in a
+    // log about somebody's bug (ADR-0006) — `readmodel.ts` says so at the top and this is
+    // the hosted half of it. Before this, `saveUsage` had exactly one caller, `serve.ts`,
+    // so every run driven by a worker lost what it spent: the tokens on the floor and the
+    // sandboxes never recorded at all.
+    //
+    // Best-effort by design. A bill that cannot be written must not fail a run that has
+    // already produced its evidence, so this answers 204 for a body it partly rejected
+    // and the runner does not retry.
+    const costing = /^\/runner\/runs\/([^/]+)\/cost$/.exec(path);
+    if (method === 'POST' && costing) {
+      const runId = decodeURIComponent(costing[1]!);
+      // The same door as an append: writing somebody else's bill is not a lesser thing to
+      // be allowed to do than writing to their log.
+      const check = await appendFromRunner(client, runner, runId, []);
+      if ('refused' in check) return json({ error: check.refused }, 403);
+      let sent: { usage?: unknown; compute?: unknown };
+      try {
+        sent = JSON.parse(await body()) as typeof sent;
+      } catch {
+        return json({ error: 'the body is not JSON' }, 400);
+      }
+      // `run_id` comes from the PATH, never from the body — a runner authorized for this
+      // run must not be able to write a row against another one.
+      for (const row of Array.isArray(sent.usage) ? sent.usage.slice(0, MAX_BATCH) : []) {
+        await saveUsage(client, { ...(row as UsageRow), run_id: runId }).catch(() => {});
+      }
+      for (const row of Array.isArray(sent.compute) ? sent.compute.slice(0, MAX_BATCH) : []) {
+        await saveCompute(client, { ...(row as ComputeRow), run_id: runId }).catch(() => {});
+      }
+      return { status: 204, type: 'application/json', body: '' };
     }
 
     const finished = /^\/runner\/runs\/([^/]+)\/finished$/.exec(path);

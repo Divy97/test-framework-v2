@@ -47,6 +47,8 @@ const fakePlane = async (options: {
   appendStatus?: (attempt: number) => number;
   /** What the poll answers. 401/403 is the plane refusing this runner's credential. */
   pollStatus?: number;
+  /** What the bill route answers, so a plane that refuses one can be exercised. */
+  costStatus?: number;
 } = {}) => {
   const seen: Seen[] = [];
   let handed = false;
@@ -77,6 +79,7 @@ const fakePlane = async (options: {
       }
       if (path.endsWith('/token')) return send(200, { token: `ghs_${seen.length}` });
       if (path.includes('/blobs/')) return send(201, { ref: 'ok' });
+      if (path.endsWith('/cost')) return send(options.costStatus ?? 204);
       if (path.endsWith('/finished')) return send(204);
       return send(404, { error: 'no such route' });
     });
@@ -265,6 +268,54 @@ describe('the daemon survives the things that happen to laptops', () => {
 
     expect(plane.seen.filter((s) => s.path === '/runner/jobs').length).toBeGreaterThan(1);
     expect(logs.join('\n')).not.toContain('nothing should have been executed');
+  });
+});
+
+describe('what a run spent goes beside the log, and never into it', () => {
+  const bill = { usage: [{ phase: 'agent', turns: 3 }], compute: [{ sandbox_id: 'sbx-1', phase: 'base' }] };
+
+  test('the bill is posted, as its own call, and never as an event', async () => {
+    const plane = await fakePlane();
+    await oneJob(plane, async (_job, io) => {
+      await io.append(event(1));
+      await io.cost(bill);
+    });
+    const posted = plane.seen.filter((one) => one.path.endsWith('/cost'));
+    expect(posted).toHaveLength(1);
+    expect(JSON.parse(posted[0]!.body)).toEqual(bill);
+    // THE CONTROL on the design, not on the plumbing: `readmodel.ts` says a fact about
+    // our own spending must not enter a log about the user's bug. Nothing the engine
+    // appended may carry it.
+    const appended = plane.seen.filter((one) => one.path.endsWith('/events'));
+    expect(appended).toHaveLength(1);
+    expect(appended[0]!.body).not.toContain('sbx-1');
+    expect(appended[0]!.body).not.toContain('turns');
+  });
+
+  test('an empty bill is not a request', async () => {
+    // A Docker run spends no sandboxes and a run that died before an agent spends no
+    // tokens. Posting `{}` would be a round trip per job to say nothing.
+    const plane = await fakePlane();
+    await oneJob(plane, async (_job, io) => {
+      await io.cost({ usage: [], compute: [] });
+      await io.cost({});
+    });
+    expect(plane.seen.filter((one) => one.path.endsWith('/cost'))).toHaveLength(0);
+  });
+
+  test('a plane that refuses the bill costs a log line, never the job', async () => {
+    // Unlike `append`, which retries: the evidence is already shipped by the time this is
+    // called. A runner that retried bookkeeping would hold a slot open over it, and one
+    // that threw would lose a finished run over a number.
+    const plane = await fakePlane({ costStatus: 500 });
+    const { logs } = await oneJob(plane, async (_job, io) => {
+      await io.append(event(1));
+      await io.cost(bill);
+    });
+    expect(plane.seen.filter((one) => one.path.endsWith('/cost'))).toHaveLength(1); // not retried
+    expect(logs.join('\n')).toMatch(/HTTP 500 to the bill/);
+    // And the job still finished, which is the property that matters.
+    expect(plane.seen.some((one) => one.path.endsWith('/finished'))).toBe(true);
   });
 });
 

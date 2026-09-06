@@ -5,11 +5,15 @@
 // is the most interesting thing this milestone produces, because it is what makes the
 // README's first architectural claim checkable rather than merely stated.
 //
-// `run_usage` is the exception that proves the rule: it is NOT derivable from the log,
-// deliberately. Inventing an event class to describe our own spending would put a fact
-// about us into a log about the user's bug (ADR-0006), so what a run cost lives beside
-// the log and never inside it. That means it cannot be rebuilt by replay, and losing it
-// loses real information — which is the price of keeping the log clean, paid knowingly.
+// `run_usage` and `run_compute` are the exception that proves the rule: they are NOT
+// derivable from the log, deliberately. Inventing an event class to describe our own
+// spending would put a fact about us into a log about the user's bug (ADR-0006), so what
+// a run cost lives beside the log and never inside it. That means it cannot be rebuilt by
+// replay, and losing it loses real information — which is the price of keeping the log
+// clean, paid knowingly.
+//
+// Two halves of one bill: `run_usage` is the model, `run_compute` is the machines. Before
+// 10e the second was always zero, because the machines were the operator's own laptop.
 
 import { projectRun, type RunRow } from './projection.js';
 import { readRun, type Db } from './store.js';
@@ -137,6 +141,47 @@ export async function saveUsage(client: Db, row: UsageRow): Promise<void> {
       row.cache_read_input_tokens, row.cache_creation_input_tokens, row.provider, row.model,
     ],
   );
+}
+
+/** What one sandbox cost, as the platform reported it when the session was stopped. */
+export type ComputeRow = {
+  run_id: string;
+  sandbox_id: string;
+  phase: string;
+  active_cpu_ms: number | null;
+  duration_ms: number | null;
+  ingress_bytes: number | null;
+  egress_bytes: number | null;
+};
+
+export async function saveCompute(client: Db, row: ComputeRow): Promise<void> {
+  await client.query(
+    `insert into run_compute (run_id, sandbox_id, phase, active_cpu_ms, duration_ms, ingress_bytes, egress_bytes)
+       values ($1, $2, $3, $4, $5, $6, $7)
+       on conflict (run_id, sandbox_id) do update set
+         phase = $3, active_cpu_ms = $4, duration_ms = $5, ingress_bytes = $6, egress_bytes = $7`,
+    [row.run_id, row.sandbox_id, row.phase, row.active_cpu_ms, row.duration_ms, row.ingress_bytes, row.egress_bytes],
+  );
+}
+
+/** Null stays null. `Number(null)` is 0, and a zero here would be a measurement. */
+const measure = (value: unknown): number | null => (value === null || value === undefined ? null : Number(value));
+
+export async function readCompute(client: Db, runId: string): Promise<ComputeRow[]> {
+  const { rows } = await client.query(
+    `select run_id, sandbox_id, phase, active_cpu_ms, duration_ms, ingress_bytes, egress_bytes
+       from run_compute where run_id = $1 order by observed_at, sandbox_id`,
+    [runId],
+  );
+  return rows.map((row) => ({
+    run_id: String(row.run_id),
+    sandbox_id: String(row.sandbox_id),
+    phase: String(row.phase),
+    active_cpu_ms: measure(row.active_cpu_ms),
+    duration_ms: measure(row.duration_ms),
+    ingress_bytes: measure(row.ingress_bytes),
+    egress_bytes: measure(row.egress_bytes),
+  }));
 }
 
 export async function readUsage(client: Db, runId: string): Promise<UsageRow[]> {

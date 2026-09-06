@@ -17,7 +17,7 @@ import { clearDraft, loadDraft } from './drafts.js';
 import { fold } from './fold.js';
 import { intake, listOpenIssues, readIssue, type Fetcher } from './github.js';
 import { listInstallations, loadInstallation } from './installations.js';
-import { listRuns, readRunRow, readUsage } from './readmodel.js';
+import { listRuns, readCompute, readRunRow, readUsage } from './readmodel.js';
 import { ENV_NAME, loadStored, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
 import { PROVIDERS } from './loop.js';
 import {
@@ -286,6 +286,7 @@ export function dashboardRoutes(options: {
           state,
           score: confidence(state),
           usage: await readUsage(client, runId),
+          compute: await readCompute(client, runId),
           forgotten: await tombstoneFor(client, runId),
         }),
       );

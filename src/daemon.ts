@@ -32,6 +32,19 @@ export type DaemonIo = {
   append: (event: RunEvent) => Promise<void>;
   /** A GitHub token for this run, minted by the plane, never held longer than needed. */
   token: () => Promise<string>;
+  /**
+   * What this run spent — the model, and the machines (M10, 10f).
+   *
+   * Not `append`: a fact about our spending is not an observation about the user's bug,
+   * and putting one in the log is what `readmodel.ts` explains at length that this
+   * project does not do.
+   *
+   * Best-effort, and unlike `append` it is NOT retried. The evidence is already shipped
+   * by the time this is called; a bill that could not be written is worth a log line and
+   * nothing more, and a runner that retried it would be holding a slot open over
+   * bookkeeping.
+   */
+  cost: (spent: { usage?: unknown[]; compute?: unknown[] }) => Promise<void>;
 };
 
 export type Daemon = {
@@ -213,6 +226,20 @@ export async function runDaemon(options: {
             });
             if (!response.ok) throw new Error(`the plane would not mint a token: HTTP ${response.status}`);
             return ((await response.json()) as { token: string }).token;
+          },
+          cost: async (spent) => {
+            if ((spent.usage?.length ?? 0) === 0 && (spent.compute?.length ?? 0) === 0) return;
+            const response = await call(`${base}/runner/runs/${job!.runId}/cost`, {
+              method: 'POST',
+              headers: { ...auth, 'content-type': 'application/json' },
+              body: JSON.stringify(spent),
+            }).catch((error: unknown) => {
+              log(`${job!.runId}: could not report what it spent — ${String(error)}`);
+              return null;
+            });
+            if (response && !response.ok) {
+              log(`${job!.runId}: the plane answered HTTP ${response.status} to the bill`);
+            }
           },
         });
       } catch (error) {
