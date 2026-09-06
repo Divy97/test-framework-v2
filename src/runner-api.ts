@@ -213,9 +213,21 @@ export function runnerRoutes(options: {
         return json({ error: authorized.refused }, authorized.refused.includes('no such run') ? 404 : 403);
       }
       if (!options.mintToken) return json({ error: 'this plane cannot mint installation tokens' }, 501);
-      // The runner's OWN installation, never one it names. A run it is authorized for
-      // belongs to its installation by construction, so there is nothing to pass in.
-      const token = await options.mintToken(runner.installationId);
+      // THE JOB'S installation, never the runner's and never one it names (M10, 10e).
+      //
+      // It used to be the runner's, on the reasoning that "a run it is authorized for
+      // belongs to its installation by construction" — true while every runner named an
+      // installation, and false the moment a global worker exists, whose own field is
+      // null. Reading the `jobs` row is correct for both: for a confined runner the two
+      // are the same value by construction, so nothing changes for it, and for a global
+      // one it is the only answer that is not "mint for nobody".
+      //
+      // The authorization is unchanged and is above this line: `appendFromRunner` admits
+      // exactly the runner the job was dispatched to. This decides WHICH token, not
+      // whether one is owed.
+      const facts = await jobFacts(client, runId);
+      if (!facts) return json({ error: 'no such run' }, 404);
+      const token = await options.mintToken(facts.installationId);
       return json({ token });
     }
 

@@ -134,6 +134,16 @@ export type RunRequest = {
    * of injection, into a sandbox that has no route out (ADR-0017).
    */
   secretNames?: readonly string[];
+  /**
+   * Where the phases run (M10, 10e). Absent, Docker on this machine — the shape every
+   * run had before there was a second substrate.
+   *
+   * Threaded rather than read from the environment here, because `run.ts` is called by
+   * the local CLI, by `serve.ts` and by the worker, and only the last of those has any
+   * business deciding to use somebody else's machines. `runner-main.ts` reads
+   * `ENGINE_EXECUTOR` and passes the result in.
+   */
+  executor?: RunPlan['executor'];
 };
 
 export type RunResult = {
@@ -337,6 +347,7 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
 
     const outcome = await orchestrate({
       runId,
+      ...(request.executor ? { executor: request.executor } : {}),
       // `afterSeq` is not a field: `orchestrate` owns its own numbering from 1, and
       // RUN_REQUESTED above is seq 1 — so the plan continues from there.
       repoPath: source,

@@ -63,7 +63,7 @@ afterAll(async () => {
 /** A fresh installation id per test, so nothing here can claim another test's work. */
 const installation = () => Math.floor(Math.random() * 1_000_000_000) + 1;
 
-const pair = async (installationId: number, name = 'laptop') => {
+const pair = async (installationId: number | null, name = 'laptop') => {
   const { runner, token } = await pairRunner(client!, { installationId, name });
   madeRunners.push(runner.id);
   return { runner, token };
@@ -142,7 +142,7 @@ describe('a machine has to be paired to say anything', () => {
     const { runner, token } = await pair(id);
     expect((await call(token, 'GET', '/runner/jobs')).status).toBe(204);
 
-    expect(await revokeRunner(client!, runner.id, runner.installationId)).toBe(true);
+    expect(await revokeRunner(client!, runner.id, id)).toBe(true);
     expect((await call(token, 'GET', '/runner/jobs')).status).toBe(401);
 
     // The row survives: the events it wrote are in the log forever, and a reader
@@ -203,6 +203,63 @@ describe('work goes to the machine it was dispatched to', () => {
     // And that is all there was for it. The other installation's job is still queued,
     // which is the assertion that matters: a claim is scoped, not first-come.
     expect((await call(token, 'GET', '/runner/jobs')).status).toBe(204);
+  });
+
+  test('a runner belonging to NO installation takes anyone s job (M10, 10e)', async () => {
+    if (skipped()) return;
+    // The worker this project operates is one process serving everyone who installs the
+    // App, so it cannot name an installation. `null` means any — and the test above,
+    // which this must not weaken, is the other half: a runner that DOES name one is
+    // still confined to it.
+    const mine = installation();
+    const theirs = installation();
+    const first = await queue(mine);
+    const second = await queue(theirs);
+
+    const { token } = await pair(null, 'the worker');
+    const a = await call(token, 'GET', '/runner/jobs');
+    const b = await call(token, 'GET', '/runner/jobs');
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    // Both, in the order they were queued — a global runner is not a licence to reorder.
+    expect([a.body['runId'], b.body['runId']]).toEqual([first, second]);
+    // And then nothing, because it took everything rather than looping on one job.
+    expect((await call(token, 'GET', '/runner/jobs')).status).toBe(204);
+  });
+
+  test('the token is minted for the JOB s installation, never the runner s', async () => {
+    if (skipped()) return;
+    // The rule this replaces read "the runner's OWN installation, never one it names",
+    // which was right while every runner named one and is unanswerable for a worker whose
+    // own field is null. Reading the `jobs` row is correct for both — and for a confined
+    // runner the two values are equal by construction, so nothing changed for it.
+    const owner = installation();
+    const runId = await queue(owner);
+    const { token } = await pair(null, 'the worker');
+    expect((await call(token, 'GET', '/runner/jobs')).body['runId']).toBe(runId);
+
+    const minted: (number | null)[] = [];
+    const route = runnerRoutes({
+      client: client!,
+      blobRoot: blobRoot(),
+      mintToken: async (id) => {
+        minted.push(id);
+        return 'an-installation-token';
+      },
+    });
+    const response = await route({
+      method: 'POST',
+      path: `/runner/runs/${runId}/token`,
+      query: new URLSearchParams(),
+      headers: { authorization: `Bearer ${token}` },
+      body: async () => '',
+      raw: async () => Buffer.alloc(0),
+    });
+
+    expect(response?.status).toBe(200);
+    // The job's installation, not `null` — which is what the runner's own field holds and
+    // what a token minted "for the runner" would have been.
+    expect(minted).toEqual([owner]);
   });
 
   test('two runners on one installation never take the same job', async () => {

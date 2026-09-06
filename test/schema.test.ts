@@ -23,12 +23,32 @@ const statements = [...schema.matchAll(/^(create|alter|drop)\b[^;]*/gim)].map((m
   match[0].replace(/\s+/g, ' ').trim(),
 );
 
+/**
+ * Forms that are safe to re-run without saying `if not exists`, and why each one is.
+ *
+ * A deliberately short list. The temptation when this test fails is to widen it until the
+ * new statement passes, which turns the check into a record of what has been written
+ * rather than a rule about what may be. So an entry earns its place only if re-running the
+ * statement is a no-op *by the semantics of the statement itself*, not because of what
+ * happens to be in the database today.
+ */
+const IDEMPOTENT_BY_NATURE = [
+  // Postgres treats a nullability change to the state a column is already in as a no-op
+  // rather than an error, so both directions can be re-run. (`set not null` still fails
+  // if the column contains nulls — but that is a failure about the DATA, on the first
+  // run as much as the second, and not a re-run hazard.)
+  /^alter table \S+ alter column \S+ (drop|set) not null$/i,
+];
+
 describe('db/schema.sql can be applied twice', () => {
   test('every statement in it is idempotent', () => {
     // Enumerated rather than counted: a failure has to say WHICH line is not safe to
     // re-run, or the person reading it has to diff twenty statements by eye.
     const notIdempotent = statements.filter(
-      (statement) => !/\bif not exists\b/i.test(statement) && !/\bif exists\b/i.test(statement),
+      (statement) =>
+        !/\bif not exists\b/i.test(statement) &&
+        !/\bif exists\b/i.test(statement) &&
+        !IDEMPOTENT_BY_NATURE.some((form) => form.test(statement)),
     );
     expect(notIdempotent).toEqual([]);
   });

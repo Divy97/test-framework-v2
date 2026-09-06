@@ -1,0 +1,36 @@
+# The worker (milestone 10, 10e). One machine, no inbound port, always on.
+#
+# `iad` rather than the plane's `sin`, and it is a latency decision rather than a
+# preference: every phase is a Vercel sandbox in `iad1`, and the worker talks to it
+# constantly — a tool call is a round trip, and an agent session is hundreds of them.
+# Sitting in Singapore while the sandboxes are in Virginia would put ~250ms on each one.
+# The plane stays in `sin` because it talks to a person and to GitHub, not to a sandbox.
+app = 'test-framework-worker'
+primary_region = 'iad'
+
+[build]
+  dockerfile = 'Dockerfile.worker'
+
+[env]
+  ENGINE_EXECUTOR = 'vercel'
+  ENGINE_VERCEL_REGION = 'iad1'
+  ENGINE_BLOB_ROOT = '/var/lib/worker/blobs'
+
+[[mounts]]
+  source = 'worker_state'
+  destination = '/var/lib/worker'
+
+# NO `[http_service]`, and that is the whole shape of this machine. It accepts nothing:
+# it long-polls the plane for work and calls Vercel. Adding one would give the process
+# holding the model key a way in, and there is nothing on the other side to serve.
+#
+# Which also means Fly cannot wake it on traffic — there is no traffic. `auto_stop` is
+# off and one machine runs continuously, and that is the honest cost of a design where
+# the agent loop lives outside the sandbox (ADR-0011).
+[[vm]]
+  size = 'shared-cpu-1x'
+  # 1GB rather than the plane's 512MB: this process holds an agent transcript, a git
+  # bundle of the repository in memory on its way to a sandbox, and the blobs it reads
+  # back out. Measured before lowering it.
+  memory = '1gb'
+  cpus = 1
