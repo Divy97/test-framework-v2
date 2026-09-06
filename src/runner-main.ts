@@ -12,12 +12,31 @@
 //
 // `npx tsx src/runner-main.ts`, with ENGINE_PLANE_URL and ENGINE_RUNNER_TOKEN set.
 
+import { join } from 'node:path';
 import { ensureBlobRoot } from './blobs.js';
 import { runDaemon, type DaemonIo, type DaemonJob } from './daemon.js';
 import type { IssueIntake } from './github.js';
 import { providerName } from './loop.js';
+import type { RunPlan } from './orchestrate.js';
 import { runFromIssue } from './run.js';
 import { loadEnv } from './store.js';
+
+/** Which substrate the phases run on. `docker` is this machine; `vercel` is a microVM. */
+export type ExecutorKind = 'docker' | 'vercel';
+
+/**
+ * What a Vercel-backed runner needs beyond the rest.
+ *
+ * Credentials are optional as a group: the SDK reads a `vercel login` from disk when none
+ * are given, which is how the spike ran. A machine with no CLI session — the worker —
+ * needs all three, and `readRunnerConfig` refuses a partial set rather than falling back
+ * to a login that is not there, because that failure surfaces as an authentication error
+ * on the first sandbox rather than at boot.
+ */
+export type VercelConfig = {
+  region: string;
+  credentials: { token?: string; teamId?: string; projectId?: string };
+};
 
 export type RunnerConfig = {
   planeUrl: string;
@@ -25,6 +44,9 @@ export type RunnerConfig = {
   image: string;
   agentImage: string;
   blobRoot: string;
+  executor: ExecutorKind;
+  /** Present only when `executor` is `vercel`. */
+  vercel?: VercelConfig;
   loop: { provider?: string; apiKey?: string; model?: string; effort?: string };
 };
 
@@ -52,8 +74,48 @@ export const DEFAULT_AGENT_IMAGE = 'test-framework-v2-agent:latest';
 /** Inside the checkout, which is a directory this process certainly owns. */
 export const DEFAULT_BLOB_ROOT = './.evidence-store';
 
+/** The default region. One, because a snapshot is not portable across them (ADR-0021). */
+export const DEFAULT_VERCEL_REGION = 'iad1';
+
 export function readRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const missing = Object.keys(REQUIRED).filter((key) => !env[key]);
+
+  // WHICH SUBSTRATE, validated only for the one actually chosen (M10, 10e).
+  //
+  // A Docker runner must not be asked for a Vercel token it will never use, and a Vercel
+  // worker must not start without one and discover it at the first sandbox — twenty
+  // minutes into a run, as an authentication error that reads like an outage. So the
+  // check is inside the branch rather than in `REQUIRED`.
+  const wanted = env.ENGINE_EXECUTOR ?? 'docker';
+  if (wanted !== 'docker' && wanted !== 'vercel') {
+    throw new Error(`ENGINE_EXECUTOR must be docker or vercel, not ${wanted}`);
+  }
+  const executor: ExecutorKind = wanted;
+  let vercel: VercelConfig | undefined;
+  if (executor === 'vercel') {
+    const token = env.VERCEL_TOKEN;
+    const teamId = env.VERCEL_TEAM_ID;
+    const projectId = env.VERCEL_PROJECT_ID;
+    const given = [token, teamId, projectId].filter(Boolean).length;
+    // All three or none. A partial set is the shape that silently falls back to a CLI
+    // login the machine does not have, so it is refused where an operator is looking.
+    if (given !== 0 && given !== 3) {
+      missing.push('VERCEL_TOKEN, VERCEL_TEAM_ID and VERCEL_PROJECT_ID together (or none, to use a `vercel login`)');
+    }
+    // The images are references the platform can pull, not tags on this machine — so the
+    // defaults `npm run images` gives are wrong here and there is nothing to fall back to.
+    if (!env.ENGINE_IMAGE || !env.ENGINE_AGENT_IMAGE) {
+      missing.push('ENGINE_IMAGE and ENGINE_AGENT_IMAGE (registry references, not local tags)');
+    }
+    vercel = {
+      region: env.ENGINE_VERCEL_REGION ?? DEFAULT_VERCEL_REGION,
+      credentials: {
+        ...(token === undefined ? {} : { token }),
+        ...(teamId === undefined ? {} : { teamId }),
+        ...(projectId === undefined ? {} : { projectId }),
+      },
+    };
+  }
 
   // The model credential, for the provider actually selected — the same check
   // `serve.ts` makes, and for the same reason: a runner that starts without one reaches
@@ -84,6 +146,8 @@ export function readRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
     image: env.ENGINE_IMAGE ?? DEFAULT_IMAGE,
     agentImage: env.ENGINE_AGENT_IMAGE ?? DEFAULT_AGENT_IMAGE,
     blobRoot: env.ENGINE_BLOB_ROOT ?? DEFAULT_BLOB_ROOT,
+    executor,
+    ...(vercel ? { vercel } : {}),
     loop: {
       ...(env.ENGINE_PROVIDER === undefined ? {} : { provider: env.ENGINE_PROVIDER }),
       apiKey: key,
@@ -100,9 +164,51 @@ export function readRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
  * boundary first: `runFromIssue` takes an `append` and a run id, and this supplies the
  * ones the plane is expecting.
  */
-export function engineExecute(config: RunnerConfig) {
+/**
+ * The executor this runner uses, built ONCE.
+ *
+ * Once, not per job, because the Vercel one holds a ledger of the sandboxes this worker
+ * created and a `sweep()` over them — per-job instances would each have their own idea of
+ * what is outstanding, which is exactly the bookkeeping the sweep exists to provide.
+ *
+ * A dynamic import, so a Docker runner never resolves `@vercel/sandbox` at all. Returns
+ * `undefined` for Docker rather than building `dockerExecutor()` here: absent is what
+ * every caller below already treats as "the default", and naming it twice invites the two
+ * to disagree.
+ */
+export async function executorFor(
+  config: RunnerConfig,
+): Promise<(RunPlan['executor'] & { sweep?: () => Promise<number> }) | undefined> {
+  if (config.executor !== 'vercel') return undefined;
+  const { vercelClient } = await import('./vercel-client.js');
+  const { vercelExecutor } = await import('./executor-vercel.js');
+  return vercelExecutor({
+    client: await vercelClient({ credentials: config.vercel!.credentials, region: config.vercel!.region }),
+    ledger: { path: join(config.blobRoot, '..', 'sandboxes.jsonl') },
+    // THE MACHINE, not the token and not the app.
+    //
+    // This was `config.token.slice(-12)`, which is wrong twice. `ENGINE_RUNNER_TOKEN` is a
+    // Fly APP secret, so every machine in the app holds the same value — two machines
+    // during a rolling deploy would share a tag, and `sweep()` stops everything the tag
+    // matches, which is precisely the outage the tag exists to prevent. And it exported
+    // ~72 bits of a 256-bit bearer credential into sandbox metadata, where it shows in
+    // listings and logs.
+    //
+    // `FLY_MACHINE_ID` is injected by the platform, is per-machine, is stable across
+    // restarts, and is not a secret — exactly what this needs. The fallback is for a
+    // developer running the worker outside Fly, where the pid is per-process and the
+    // sweep's ledger half carries the rest.
+    tags: {
+      engine: 'test-framework-v2',
+      worker: process.env.FLY_MACHINE_ID ?? `local-${process.pid}`,
+    },
+  });
+}
+
+export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor']) {
   return async (job: DaemonJob, io: DaemonIo): Promise<void> => {
     await runFromIssue({
+      ...(executor ? { executor } : {}),
       intake: job.intake as IssueIntake,
       // No App key on this machine. `installationToken` asks the plane instead, every
       // time it needs one, which is what keeps a run longer than an hour honest.
@@ -126,13 +232,30 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   // message about a mount it does not have.
   await ensureBlobRoot(config.blobRoot);
   const log = (line: string) => console.log(line);
-  log(`runner up: taking work from ${config.planeUrl}`);
+  const executor = await executorFor(config);
+
+  // BEFORE taking any work. A worker that died mid-run left machines the platform will
+  // end at their own session timeout — up to an hour of compute per phase that nobody is
+  // watching and everybody is paying for. Swept rather than trusted to expire.
+  //
+  // Never fatal. A sweep that cannot reach the platform is a worker that should still
+  // take work; refusing to start over unfinished bookkeeping would turn a billing
+  // annoyance into an outage.
+  if (executor?.sweep) {
+    const stopped = await executor.sweep().catch((error: unknown) => {
+      log(`could not sweep sandboxes left by an earlier worker: ${String((error as Error).message ?? error)}`);
+      return 0;
+    });
+    if (stopped > 0) log(`stopped ${stopped} sandbox(es) left behind by an earlier worker`);
+  }
+
+  log(`runner up on ${config.executor}: taking work from ${config.planeUrl}`);
   await runDaemon({
     planeUrl: config.planeUrl,
     token: config.token,
     blobRoot: config.blobRoot,
     log,
-    execute: engineExecute(config),
+    execute: engineExecute(config, executor),
   });
 }
 

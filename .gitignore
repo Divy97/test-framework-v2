@@ -18,6 +18,12 @@ dist/
 # and unignored after the first real run, 672K and one `git add -A` from a commit. It is
 # a run's evidence, not source, and `ENGINE_BLOB_ROOT` can point anywhere.
 .blobs/
+# The sandbox ledger, which a developer running `ENGINE_EXECUTOR=vercel` locally gets in
+# the repository root: `join(blobRoot, '..', 'sandboxes.jsonl')` with the default blob
+# root normalises to here. It names live machines and is bookkeeping, not source — the
+# same accident this file already records twice above.
+sandboxes.jsonl
+.evidence-store/
 # The same thing, for the two programs milestone 9 added: a plane holds what runners
 # upload, and a runner holds what its containers produce before they are shipped.
 .plane-blobs/

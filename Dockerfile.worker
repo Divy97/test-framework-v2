@@ -1,0 +1,72 @@
+# The worker (milestone 10, 10e). The machine that drives runs and runs none of them.
+#
+# What is NOT in this image is again the point, and the list is longer than the plane's.
+#
+# **No Docker client, and no Docker daemon.** Until M10 a runner needed both: it built an
+# environment image and started a container per phase on its own hardware. It does not any
+# more. Every phase runs in a Firecracker microVM this process talks to over HTTPS
+# (ADR-0021), so the worker's whole job is to hold the agent loop, decide what runs next,
+# and fold what comes back. That is a Node process with outbound network — nothing else.
+#
+# **No App private key.** It asks the plane for an installation token per call and never
+# holds one (ADR-0012), which is what keeps a run longer than an hour honest.
+#
+# **No user code, ever.** A recipe's commands, a reproduction, an agent's shell — all of
+# it executes inside a sandbox that is destroyed afterwards. This container executes only
+# what is in this repository.
+#
+# What it DOES hold is the model key and the Vercel credential. That is the trade
+# ADR-0011 makes: the loop lives outside the sandbox so the sandbox needs no credential,
+# which means the machine holding the loop needs both.
+
+# ---- build ----------------------------------------------------------------
+# Compiled for the same reason `Dockerfile.plane` compiles, minus the cold-start argument:
+# this machine does not auto-stop, so it starts once. It is here so the image ships the
+# exact source it was built from rather than a `tsx` reading files at run time.
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json tsconfig.build.json ./
+COPY src ./src
+RUN npx tsc -p tsconfig.build.json
+
+# ---- runtime --------------------------------------------------------------
+FROM node:22-alpine
+
+# `git` because the worker prepares what a sandbox clones from: it mirrors the repository,
+# strips the agent's source to the base commit, and bundles both (`git bundle create`).
+# That is real work this process does, unlike the plane's precautionary copy.
+RUN apk add --no-cache git
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=build /app/dist ./dist
+# THE PROMPTS, which are not code and are not optional.
+#
+# `prompts.ts` resolves `PROMPT_DIR` as `../prompts` from its own directory, and
+# `tsconfig.build.json` emits a flat `dist/`, so in this image that is `/app/prompts`.
+# Without this the worker boots, claims a job, and dies on ENOENT at the first
+# `renderPrompt` — after the claim, so the job sits dispatched-and-unfinished and
+# `openJobFor` blocks that issue for two hours. The failure is as far from the cause as
+# it is possible to get.
+COPY prompts ./prompts
+
+# The evidence store and the sandbox ledger, made here and owned by the user that writes
+# them — the same `/var/lib` ownership trap the plane's comment records, and the same fix.
+#
+# The ledger sits BESIDE the blob root rather than inside it: `blobs.ts` refuses a store
+# whose contents it did not write, and a bookkeeping file in there is exactly that.
+RUN mkdir -p /var/lib/worker/blobs && chown -R node:node /var/lib/worker
+ENV ENGINE_BLOB_ROOT=/var/lib/worker/blobs
+
+# No `EXPOSE`. The worker takes no inbound connection at all — it long-polls the plane for
+# work and calls out to Vercel. ADR-0011 removed the last listening port and nothing here
+# reintroduces one; a port on this machine would be a way in to the process holding the
+# model key.
+
+USER node
+ENV NODE_ENV=production
+ENV ENGINE_EXECUTOR=vercel
+CMD ["node", "dist/runner-main.js"]

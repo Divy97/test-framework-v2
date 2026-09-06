@@ -179,6 +179,22 @@ create table if not exists runners (
 
 create index if not exists runners_installation on runners (installation_id);
 
+-- A runner that belongs to no installation is one WE operate (M10, 10e).
+--
+-- Until M10 every runner was somebody's laptop and belonged to exactly one installation;
+-- the filter in `claimJob` was the whole of the boundary between one person's work and
+-- another's. A hosted worker cannot be per-installation — it is one process serving
+-- everyone who installs the App — so `null` is added to the domain to mean "any".
+--
+-- Nullable rather than a sentinel id like 0: a sentinel is a number that compares equal
+-- to something, and the day an installation id collides with it the boundary is gone
+-- silently. `null` compares equal to nothing, so the widening has to be written out in
+-- SQL (`$1 is null or installation_id = $1`) where a reader can see it.
+--
+-- Only the operator script writes it. `pairRunner` is reachable from the dashboard with
+-- an installation the caller can see; nothing a user can reach passes null.
+alter table runners alter column installation_id drop not null;
+
 -- One unit of work: a delivery the plane accepted and a runner has to execute.
 --
 -- The `run_id` is minted HERE, before any runner sees it, and that is what makes

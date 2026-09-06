@@ -21,7 +21,22 @@ import type { Db } from './store.js';
 import type { RunEvent } from './events.js';
 
 /** A paired machine. The token is not here — only its hash ever is. */
-export type Runner = { id: string; installationId: number; name: string };
+/**
+ * A machine allowed to take work, and which work it may take.
+ *
+ * `installationId: null` means ANY installation — the worker this project operates
+ * itself (M10, 10e). Until M10 every runner belonged to one installation because every
+ * runner was somebody's laptop, and the filter in `claimJob` was the whole of the
+ * boundary. A hosted worker cannot be per-installation: it is one process serving
+ * everyone who installs the App.
+ *
+ * The widening is deliberately narrow. `null` is only ever written by the operator
+ * script, never by anything a user can reach; a runner that names an installation is
+ * still confined to it exactly as before; and no route anywhere reads this field to
+ * decide what a run may touch — that comes from the `jobs` row, so a global runner gets
+ * what the job it holds is entitled to and nothing else.
+ */
+export type Runner = { id: string; installationId: number | null; name: string };
 
 /** One unit of work: a delivery the plane accepted, waiting for a machine. */
 export type Job = { runId: string; installationId: number; repo: string; intake: unknown };
@@ -49,7 +64,7 @@ const wait = (ms: number) => new Promise((done) => setTimeout(done, ms));
  */
 export async function pairRunner(
   client: Db,
-  options: { installationId: number; name: string },
+  options: { installationId: number | null; name: string },
 ): Promise<{ runner: Runner; token: string }> {
   const id = randomUUID();
   const token = `${TOKEN_PREFIX}${randomBytes(TOKEN_BYTES).toString('base64url')}`;
@@ -76,14 +91,22 @@ export async function verifyRunner(client: Db, token: string | undefined): Promi
     'select id, installation_id, name, token_hash from runners where token_hash = $1 and revoked_at is null',
     [wanted],
   );
-  const row = rows[0] as { id: string; installation_id: string; name: string; token_hash: string } | undefined;
+  const row = rows[0] as
+    | { id: string; installation_id: string | null; name: string; token_hash: string }
+    | undefined;
   if (!row) return null;
   const a = Buffer.from(row.token_hash, 'utf8');
   const b = Buffer.from(wanted, 'utf8');
   if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
   // `bigint` arrives as a string from pg, and an installation id compared as a string
   // in one place and a number in another is a comparison that silently never matches.
-  return { id: row.id, installationId: Number(row.installation_id), name: row.name };
+  // `null` stays null — `Number(null)` is 0, which is a valid-looking installation id
+  // and would confine the global worker to an installation nobody has.
+  return {
+    id: row.id,
+    installationId: row.installation_id === null ? null : Number(row.installation_id),
+    name: row.name,
+  };
 }
 
 /** Every machine paired to an installation, revoked ones included — the row is the record. */
@@ -126,11 +149,21 @@ export async function listRunners(
 export async function revokeRunner(
   client: Db,
   runnerId: string,
-  installationId: number,
+  installationId: number | null,
 ): Promise<boolean> {
   const { rowCount } = await client.query(
+    // `is not distinct from`, not `=`. A global runner's `installation_id` is null, and
+    // `null = null` is null — so with `=` the row matched nothing and the most valuable
+    // credential in the system could not be revoked by any value at all, including null.
+    // One `tfr_` string claims any installation's job and then mints that installation's
+    // GitHub token; the only remedy was hand-written SQL.
+    //
+    // This does NOT widen who may revoke what. The caller supplies the installation, and
+    // the only caller that can supply null is the operator script — the dashboard route
+    // passes an installation the signed-in person can see, exactly as before, and a
+    // confined runner still cannot be revoked by naming the wrong one.
     `update runners set revoked_at = now()
-       where id = $1 and installation_id = $2 and revoked_at is null`,
+       where id = $1 and installation_id is not distinct from $2::bigint and revoked_at is null`,
     [runnerId, installationId],
   );
   return (rowCount ?? 0) > 0;
@@ -226,10 +259,21 @@ export async function claimJob(
   const deadline = Date.now() + (options.waitMs ?? 0);
   for (;;) {
     const { rows } = await client.query(
+      // `$1 is null or installation_id = $1` — one predicate, two runners.
+      //
+      // A runner that names an installation is filtered to it, exactly as before: this
+      // is the boundary that stops one person's laptop taking another person's work, and
+      // widening it by accident would be the worst bug in this file. A runner that names
+      // none takes the oldest job of anyone's, which is what a worker we operate has to
+      // do to serve every installation from one process.
+      //
+      // Cast, because pg cannot infer a type for a parameter that is only ever compared
+      // to null — without it the driver sends an untyped null and the comparison against
+      // `bigint` fails at plan time.
       `update jobs set runner_id = $2, dispatched_at = now()
          where run_id = (
            select run_id from jobs
-             where installation_id = $1 and runner_id is null
+             where ($1::bigint is null or installation_id = $1::bigint) and runner_id is null
              order by queued_at
              limit 1
              for update skip locked

@@ -218,3 +218,60 @@ describe('a runner defaults everything this repository already decides', () => {
     expect(config.blobRoot).toBe('/mnt/evidence');
   });
 });
+
+describe('which substrate a runner uses, and what that costs it to say', () => {
+  const base = {
+    ENGINE_PLANE_URL: 'https://plane.test',
+    ENGINE_RUNNER_TOKEN: 'tfr_x',
+    OPENROUTER_API_KEY: 'sk-x',
+  };
+  const read = async (env: Record<string, string>) =>
+    (await import('../src/runner-main.js')).readRunnerConfig({ ...base, ...env } as NodeJS.ProcessEnv);
+
+  it('is Docker unless told otherwise, and asks a Docker runner for nothing extra', async () => {
+    const config = await read({});
+    expect(config.executor).toBe('docker');
+    // The point of validating inside the branch: a laptop must never be asked for a
+    // Vercel token it will never use.
+    expect(config.vercel).toBeUndefined();
+  });
+
+  it('refuses a substrate it does not have, rather than defaulting to one', async () => {
+    // A typo must not silently pick a substrate — in either direction. `fly` reads as a
+    // reasonable guess and would otherwise have run every phase on this laptop.
+    await expect(read({ ENGINE_EXECUTOR: 'fly' })).rejects.toThrow(/docker or vercel/);
+  });
+
+  it('a Vercel runner needs image REFERENCES, because local tags mean nothing there', async () => {
+    // `npm run images` builds `test-framework-v2-sandbox:latest` on this machine. The
+    // platform cannot pull that, and the failure without this check is a sandbox that
+    // will not create — twenty minutes into a run, reading like an outage.
+    await expect(read({ ENGINE_EXECUTOR: 'vercel' })).rejects.toThrow(/registry references/);
+  });
+
+  it('and all three credentials or none, never a partial set', async () => {
+    const images = { ENGINE_IMAGE: 'vcr.example/sandbox@sha256:aa', ENGINE_AGENT_IMAGE: 'vcr.example/agent@sha256:bb' };
+    // A partial set is the shape that silently falls back to a `vercel login` the machine
+    // does not have. Refused where an operator is looking.
+    await expect(read({ ENGINE_EXECUTOR: 'vercel', ...images, VERCEL_TOKEN: 't' })).rejects.toThrow(/together/);
+
+    // None is legitimate: that is the spike's shape, a developer with a CLI session.
+    const cli = await read({ ENGINE_EXECUTOR: 'vercel', ...images });
+    expect(cli.vercel?.credentials).toEqual({});
+    expect(cli.vercel?.region).toBe('iad1');
+
+    // And all three is the worker's shape.
+    const worker = await read({
+      ENGINE_EXECUTOR: 'vercel',
+      ...images,
+      VERCEL_TOKEN: 't',
+      VERCEL_TEAM_ID: 'team',
+      VERCEL_PROJECT_ID: 'proj',
+      ENGINE_VERCEL_REGION: 'sin1',
+    });
+    expect(worker.vercel).toEqual({
+      region: 'sin1',
+      credentials: { token: 't', teamId: 'team', projectId: 'proj' },
+    });
+  });
+});

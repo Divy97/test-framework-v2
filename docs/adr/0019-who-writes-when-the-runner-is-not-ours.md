@@ -101,3 +101,37 @@ itself.
   user waiting on a run deserves the right one.
 - **A revoked runner keeps its row.** Its events are in the log forever, and a reader
   asking who wrote them deserves an answer after the laptop has been sold.
+
+
+---
+
+## Amendment (M10, 10e): the blast radius this ADR described is no longer the one we have
+
+§1 argues the runner's dishonesty is survivable because *"a user can make their runner
+report anything; what they get for it is a lie told to themselves about their own
+repository."* That held while every runner was one user's laptop, confined to one
+installation.
+
+10e adds a runner that belongs to **no** installation — the worker we operate — and it is
+one process that claims everyone's jobs, holds the agent loop and the model key
+(ADR-0011), and is handed each job's installation token per call (ADR-0012). A compromise
+of that process is not a lie a user tells themselves. It is every tenant's GitHub access
+and every stored secret.
+
+**What this does not change.** The plane still refuses what it always refused: a runner
+may only write to a run dispatched to it (`appendFromRunner`), and `claimJob` still
+confines a runner that names an installation. Nothing here widens what a *user's* runner
+can reach, and no route reads a runner's installation to decide what a run may touch — the
+job's row decides. The rule "the plane trusts no runner's word about which run it holds"
+is intact and is what makes a global runner safe to add at all.
+
+**What it does change** is who the operator is protecting, and from what. Concretely:
+
+- The worker's token is the highest-value credential this system issues, and it must be
+  revocable. It was not: `revokeRunner` compared `installation_id = $2`, which matches
+  nothing for a null row, so no value revoked it. Fixed in 10e with
+  `is not distinct from`, plus `scripts/unpair-worker.mts`.
+- A global worker **competes** with a user's own paired runner for that installation's
+  jobs. `claimJob` is plain FIFO — whoever polls first wins, and there is no way to
+  express a preference. Nobody has decided whether that is right; it is written down here
+  so the first person surprised by it finds the reason rather than a bug.
