@@ -193,11 +193,13 @@ Two costs this adds, named rather than left to be discovered:
   `VERIFICATION_ABORTED{cause:'ceiling'}` puts ours in the log — where the fold
   disqualifies the attempt, because a comparison cut short mid-observation is half a
   comparison and must not be credited with a reproduction.
-- **The host cannot write the spool, and that is the point.** `writeFiles` runs as uid
-  1000 — the uid the repro drops to — so there is no ownership that lets the host write a
-  spool the agent cannot. Tool calls therefore go in base64 inside a `sudo tee`, one round
-  trip, the same cost the file write would have been. The spool stays root-owned 0700, so
-  the agent cannot forge `{done: true}` and choose its own ending.
+- **The host cannot always write the spool, so it never uses `writeFiles` for it.** On the
+  managed image `writeFiles` runs as uid 1000 — the uid the repro drops to — so there is no
+  ownership that lets the host write a spool the agent cannot. Tool calls therefore go in
+  base64 inside a `tee`, one round trip, the same cost the file write would have been. The
+  spool stays root-owned 0700, so the agent cannot forge `{done: true}` and choose its own
+  ending. See the 10e amendment below for what `tee` is prefixed with, which is not the
+  same on every image.
 - **The in-container agent is not available here, and is refused rather than degraded.**
   `agentPrompt` runs the loop inside the sandbox — a model credential in there, and a route
   to the model API for the whole session, which is what [ADR-0011](0011-the-agent-loop-runs-outside-the-sandbox.md)
@@ -213,3 +215,39 @@ Two costs this adds, named rather than left to be discovered:
 - **`sweep()` is scoped to one worker.** It reads this worker's ledger and a tag carrying
   this worker's identity. A tag shared across a deployment would turn one booting worker
   into an outage for every other one.
+
+
+## Amendment (10e): the image is not the managed one
+
+Everything above was measured against Vercel's **managed** image — `vercel/sandbox/node:22`,
+Ubuntu, default user uid 1000, passwordless sudo. Our own are `node:22-alpine` with no
+`USER`: a command runs as **root**, and there is no `sudo` binary at all.
+
+Three live runs died on that difference, one per round trip, before anything ran:
+
+| | what it said | what it was |
+|---|---|---|
+| 1 | `400: timeout restricted to <= 45m on Hobby plans` | the engine's own hour, asked of a plan that refuses it |
+| 2 | `sh: sudo: not found` | every privileged command hardcoded `sudo -n ` |
+| 3 | *(never reached)* | the entrypoint named `/engine/src/runner-vm.ts`, a path no Dockerfile creates |
+
+**The precondition was never `sudo`.** It is that the Runner and the repro are different
+users, because what keeps an untrusted agent away from the event channel is the kernel
+refusing one user another's file descriptors. `runner.ts` sets the repro's uid to 1000
+unconditionally — it never inherits the image's — so the Runner must be anything else, and
+root is the only thing it can reliably be. How it *gets* there is a property of the image:
+already root on ours, one `sudo -n ` away on the managed one. `elevationFor()` asks once,
+at open, and an image that is neither — uid ≠ 0 with no sudo — is refused there with a
+reason rather than allowed to fail as a `chown` several minutes later.
+
+Our images are in fact the stricter of the two. `PREPARE` chowns `/work`, `/opt/env`,
+`/blobs` and `/out` to the user commands run as, so on alpine that is `0:0` rather than
+`1000:1000` — the repro can read its Job and its bundle but owns neither.
+
+**And the substrate now has a live smoke test.** `scripts/live-smoke-vercel.mts` runs the
+whole engine against real microVMs with no plane, no queue and no worker in the way; the
+first run reproduced, fixed, judged clean and opened a PR in 299s, with all four sandboxes
+sealed and every probe returning `{dns:false, route:false}`. `scripts/spike-vercel/14-our-image.ts`
+asks our images the questions the first thirteen items only asked the managed one.
+
+The numbers in the sections above remain the spike's, and remain about the managed image.

@@ -12,11 +12,15 @@
 //   - **Tool calls are files.** `writeFiles('/work/rpc/in/<n>.json')` in, the JSON channel
 //     out on the detached command's stdout. `runner-vm.ts` turns the directory back into
 //     the `AsyncIterable<string>` `runJob` already takes.
-//   - **The Runner runs as root, via sudo.** The managed image's default user is uid 1000,
-//     which is the uid the repro drops to — and what keeps an untrusted agent away from
-//     the event channel is the kernel refusing one user another's file descriptors, not
-//     any trick with fd 1. `runner-vm.ts` refuses to start as uid 1000 for exactly this,
-//     so a `sudo` forgotten here is a loud failure rather than a silent hole.
+//   - **The Runner runs as root; HOW is a property of the image.** The repro always drops
+//     to uid 1000 (`runner.ts` decides that, and never inherits it), and what keeps an
+//     untrusted agent away from the event channel is the kernel refusing one user
+//     another's file descriptors, not any trick with fd 1. So the Runner must be some
+//     other user. The managed image's default is uid 1000 with passwordless sudo, so it
+//     gets `sudo -n `; ours are alpine with no `USER` and no sudo binary, so a command is
+//     already root and gets nothing. `elevationFor` asks, once, at open — and
+//     `runner-vm.ts` refuses to start as uid 1000 regardless, so a missed elevation is a
+//     loud failure rather than a silent hole.
 //   - **The store is copied out.** `/blobs` is an ordinary directory in a machine about to
 //     be destroyed, so it is tarred, read back, and `put()` into the host's evidence store
 //     — re-digested on the way in, which is stricter than the `cp` Docker does.
@@ -61,10 +65,10 @@ const MAX_STDERR_CHARS = 8 * 1024;
 /**
  * The most a phase may leave in its store.
  *
- * `/blobs` is handed to uid 1000 so the repro can write its own captures, which means the
- * size is the agent's to choose. Generous — a transcript and a few screenshots are orders
- * of magnitude under it — and finite, because everything under it crosses a network into
- * this process's memory.
+ * The repro writes its own captures into the store, so the size is the agent's to choose
+ * — through `flush()` rather than directly, but the bytes are still its bytes. Generous —
+ * a transcript and a few screenshots are orders of magnitude under it — and finite,
+ * because everything under it crosses a network into this process's memory.
  */
 const MAX_STORE_BYTES = 256 * 1024 * 1024;
 /** The wall clock one phase gets from this process. The platform enforces its own beside it. */
@@ -104,14 +108,6 @@ const BUNDLE = `${WORK}/src.bundle`;
 const JOB = `${WORK}/job.json`;
 
 /**
- * Make the paths the Runner needs, and hand them to the user `writeFiles` writes as.
- *
- * The managed image runs as uid 1000 with passwordless sudo, and `/`, `/opt` and `/blobs`
- * are root's. Without this every `writeFiles` fails with a permission error that reads
- * like a transport fault. `/blobs` gets the sentinel here rather than in the image,
- * because the Runner refuses a store it cannot prove pre-existed.
- */
-/**
  * How this executor becomes root, which depends on the image and is DETECTED.
  *
  * The spike measured the root model on Vercel's MANAGED image: `ubuntu`, uid 1000, with
@@ -124,6 +120,15 @@ const JOB = `${WORK}/job.json`;
  */
 type Elevate = string;
 
+/**
+ * Make the paths the Runner needs, and hand them to the user `writeFiles` writes as.
+ *
+ * `/`, `/opt` and `/blobs` are root's on both images. On the managed one that is the
+ * difference between working and every `writeFiles` failing with a permission error that
+ * reads like a transport fault; on ours the commands are already root and the chown is a
+ * no-op that keeps one code path instead of two. `/blobs` gets the sentinel here rather
+ * than in the image, because the Runner refuses a store it cannot prove pre-existed.
+ */
 const prepareWith = (elevate: Elevate): string =>
   [
     `${elevate}mkdir -p ${WORK} ${SPOOL}/in ${SPOOL}/out /opt/env ${BLOBS} ${HANDOVER}`,
@@ -151,7 +156,18 @@ const prepareWith = (elevate: Elevate): string =>
 async function elevationFor(sandbox: SandboxHandle): Promise<Elevate> {
   const probe = await sandbox.run('id -u; command -v sudo >/dev/null 2>&1 && echo HAVE_SUDO || echo NO_SUDO');
   const said = probe.output.trim();
-  const uid = said.split('\n')[0]?.trim();
+  if (probe.exitCode !== 0) {
+    // The probe not RUNNING is a different fact from the image not being root, and
+    // reporting the second when the first happened is what this function exists to
+    // prevent one layer down. `output` is all we have, so it goes in whole.
+    throw new Error(`could not ask this image what user it runs commands as (exit ${probe.exitCode}): ${said || '(nothing)'}`);
+  }
+  // `output` is stdout and stderr interleaved, as the SDK gives it, so line 0 is only the
+  // uid on an image that prints nothing else — a motd, a shell banner or one line on
+  // stderr would make it something else entirely, and the executor would refuse a
+  // perfectly good root image while naming the banner as its uid. The uid is the first
+  // line that is only digits.
+  const uid = said.split('\n').map((one) => one.trim()).find((one) => /^\d+$/.test(one));
   if (uid === '0') return '';
   if (said.includes('HAVE_SUDO')) return 'sudo -n ';
   throw new Error(
@@ -446,7 +462,14 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
         // The Job, the bundle and the spool are OURS, not the repository's, and a snapshot
         // carrying them would put this run's inputs into every phase that judges — where a
         // reproduction could read the symptom pattern it is supposed to be tested against.
-        await sandbox.run(`${elevate}rm -rf ${WORK} ${BLOBS}`);
+        const scrubbed = await sandbox.run(`${elevate}rm -rf ${WORK} ${BLOBS}`);
+        if (scrubbed.exitCode !== 0) {
+          // Reported, not ignored. A snapshot taken over a failed scrub carries this run's
+          // Job and bundle into every phase that judges from it — where a reproduction can
+          // read the symptom pattern it is supposed to be tested against — and nothing
+          // downstream would ever notice.
+          return { failed: redact(`could not remove this run's inputs before the snapshot: ${scrubbed.output.trim()}`).slice(0, MAX_REASON_CHARS) };
+        }
         const snapshot = await sandbox.snapshot();
         // `snapshot()` stops the sandbox, and the SDK reports what a session cost only
         // from `stop()` — so the environment build, the longest-lived sandbox in a run,
@@ -960,8 +983,8 @@ async function collect(sandbox: SandboxHandle, blobRoot: string, staging: string
     }
     const bytes = await sandbox.readFile(`${WORK}/blobs.tar`);
     if (!bytes) return "this sandbox's artifacts could not be read back";
-    // A CEILING, because `/blobs` is handed to uid 1000 and the agent's own commands run
-    // as that user. The event stream has had one since M4 and this did not: a phase that
+    // A CEILING, because what lands in `/blobs` is what the agent's own commands produced.
+    // The event stream has had one since M4 and this did not: a phase that
     // filled its store would have had every byte read into host memory and written into
     // the evidence store. Reported rather than thrown, like every other collection
     // failure — the events are the record and they are worth keeping.

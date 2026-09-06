@@ -156,47 +156,68 @@ describe('the world the Runner needs, and the one thing the host may not write',
     expect([...fake.sandboxes[0]!.prepared]).toEqual(expect.arrayContaining(['/work', '/blobs', '/out']));
   });
 
-  test('a tool call goes in as root, because the host writes as the user the repro is', async () => {
-    // The uid the SDK writes files as and the uid the repro drops to are the same one, so
-    // a spool the host can write is a spool the agent can forge `{done: true}` into. The
-    // fake refuses a `writeFiles` under `/work/rpc`, which is what a real sandbox would do
-    // with a root-owned 0700 directory — so an executor that went back to writing tool
-    // calls that way fails here instead of on the first live agent phase.
-    const fake = fakeSandboxes({
-      runner: async function* ({ awaitSpool }: RunnerContext) {
-        yield line({ env: { ready: true, steps: [], services: [] } });
-        yield line({ ready: true });
-        const call = await awaitSpool((written) => written.includes('"call"'));
-        yield line({ result: { id: (JSON.parse(call) as { call: { id: string } }).call.id, ok: true, output: 'ok' } });
-        await awaitSpool((written) => written.includes('"done":true'));
-        yield line({ finished: { handover: null } });
-      },
+  // A tool call, on BOTH image families, because the transport and the privilege it needs
+  // are two different questions and only one of them has an answer that is the same on
+  // both. Run against the same driver and the same Runner; only the image differs.
+  for (const image of [
+    { name: 'ours: commands are already root', runsAs: { uid: 0, sudo: false } },
+    { name: 'the managed one: uid 1000, and root is a `sudo` away', runsAs: { uid: 1000, sudo: true } },
+  ]) {
+    test(`a tool call goes in as root — ${image.name}`, async () => {
+      // The uid the SDK writes files as and the uid the repro drops to are the same one on
+      // the managed image, so a spool the host can write is a spool the agent can forge
+      // `{done: true}` into. The fake refuses a `writeFiles` under `/work/rpc` there, which
+      // is what a real sandbox would do with a root-owned 0700 directory — so an executor
+      // that went back to writing tool calls that way fails here instead of on the first
+      // live agent phase.
+      //
+      // And it refuses an UNELEVATED command into the same directory, which is the control
+      // that went missing when `deliver` stopped hardcoding `sudo`: dropping `${elevate}`
+      // from either half of `deliver` left every test in this file green, and would have
+      // failed EACCES on the managed image's first live tool call.
+      const fake = fakeSandboxes({
+        runsAs: image.runsAs,
+        runner: async function* ({ awaitSpool }: RunnerContext) {
+          yield line({ env: { ready: true, steps: [], services: [] } });
+          yield line({ ready: true });
+          const call = await awaitSpool((written) => written.includes('"call"'));
+          yield line({ result: { id: (JSON.parse(call) as { call: { id: string } }).call.id, ok: true, output: 'ok' } });
+          await awaitSpool((written) => written.includes('"done":true'));
+          yield line({ finished: { handover: null } });
+        },
+      });
+      const result = await vercelExecutor({ client: fake.client }).runPhase({
+        plan: plan({ recipe: { install: 'npm ci', services: [] } }),
+        source: repo(),
+        afterSeq: 0,
+        phase: 'agent',
+        overrides: { serveTools: true },
+        driver: async ({ invoke }) => void (await invoke('read', { path: 'README' })),
+      });
+      expect(result.exitCode).toBe(0);
+      // Delivered through a COMMAND rather than `writeFiles`, and verified afterwards:
+      // `sh -c` reports the last command's status, so without the `test -s` a failing
+      // `base64` would leave an empty spool file, which the Runner skips forever while the
+      // host waits for a reply.
+      const delivered = fake.sandboxes[0]!.commands.filter((one) => one.includes('/rpc/in/'));
+      expect(delivered).toHaveLength(2); // the call, and `{done:true}`
+      for (const command of delivered) {
+        expect(command).toMatch(/\btee\b/);
+        expect(command).toMatch(/\btest -s\b/);
+      }
+      // The privilege, asserted only where the image needs it. Both halves: `sh -c`
+      // reports the last command's status, so an unelevated `test -s` would be the half
+      // that decides whether the delivery is believed.
+      if (image.runsAs.uid !== 0) {
+        for (const command of delivered) {
+          expect(command).toMatch(/sudo -n tee/);
+          expect(command).toMatch(/sudo -n test -s/);
+        }
+      } else {
+        expect(delivered.some((one) => one.includes('sudo -n '))).toBe(false);
+      }
     });
-    const result = await vercelExecutor({ client: fake.client }).runPhase({
-      plan: plan({ recipe: { install: 'npm ci', services: [] } }),
-      source: repo(),
-      afterSeq: 0,
-      phase: 'agent',
-      overrides: { serveTools: true },
-      driver: async ({ invoke }) => void (await invoke('read', { path: 'README' })),
-    });
-    expect(result.exitCode).toBe(0);
-    // Delivered through a COMMAND rather than `writeFiles`, and verified afterwards:
-    // `sh -c` reports the last command's status, so without the `test -s` a failing
-    // `base64` would leave an empty spool file, which the Runner skips forever while the
-    // host waits for a reply.
-    //
-    // Not asserted as `sudo`, because whether that is needed is a property of the image:
-    // ours run as root, the managed one is uid 1000 with sudo, and `elevationFor` decides.
-    // The invariant here is the transport — a `tee` into the root-owned spool, checked —
-    // and the sudo half is pinned by its own tests above.
-    const delivered = fake.sandboxes[0]!.commands.filter((one) => one.includes('/rpc/in/'));
-    expect(delivered).toHaveLength(2); // the call, and `{done:true}`
-    for (const command of delivered) {
-      expect(command).toMatch(/\btee\b/);
-      expect(command).toMatch(/\btest -s\b/);
-    }
-  });
+  }
 
   test('the in-container agent is refused, because there is no moment to seal it', async () => {
     // `agentPrompt` runs the loop inside the sandbox: a model credential in there, and a

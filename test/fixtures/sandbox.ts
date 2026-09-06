@@ -133,6 +133,39 @@ export function tarOf(files: Record<string, string>): Buffer {
  */
 export const SANDBOX_UID = 1000;
 
+/** The root-owned 0700 directory tool calls travel through. */
+const SPOOL = '/work/rpc';
+
+/**
+ * Whether one command in a shell line would need root, on an image where commands are not
+ * already root.
+ *
+ * Three things do. Anything under the spool, which `PREPARE` makes `root:root 0700`
+ * precisely so the repro cannot reach it. Any `chown`, because only root gives a file
+ * away. And an `rm -rf` of `/work`, which recurses into that spool — the scrub before the
+ * snapshot, whose whole job is keeping this run's Job and bundle out of a phase that
+ * judges.
+ */
+const needsRoot = (segment: string): boolean =>
+  segment.includes(SPOOL) || /\bchown\b/.test(segment) || /\brm -rf\b[^|]*\/work\b/.test(segment);
+
+/**
+ * The first command in a shell line that needs root and did not ask for it, or null.
+ *
+ * PER SEGMENT, which is the whole reason this exists: `PREPARE` is five commands joined
+ * with `&&`, and asking whether the LINE contains `sudo -n ` would be answered `true` by
+ * any one of them — so dropping the elevation from the spool `chown` alone would pass.
+ * Splitting on `&&`, `;` and `|` is safe here because the only guest-influenced text in
+ * any of these lines is base64, whose alphabet contains none of the three.
+ */
+const unelevated = (command: string): string | null => {
+  for (const segment of command.split(/&&|;|\|/)) {
+    const one = segment.trim();
+    if (one !== '' && needsRoot(one) && !one.startsWith('sudo -n ')) return one;
+  }
+  return null;
+};
+
 /** One JSON line, as the Runner would write it. */
 export const line = (value: unknown): string => `${JSON.stringify(value)}\n`;
 
@@ -160,6 +193,8 @@ export function fakeSandboxes(options: FakeOptions = {}): {
   const snapshots: string[] = [];
   const dropped: string[] = [];
   const reachable = options.reachable ?? ((sandbox: FakeSandbox) => sandbox.policy === 'allow-all');
+  /** The image family, defaulting to ours: root, and no sudo binary to reach it with. */
+  const asUser = () => options.runsAs ?? { uid: 0, sudo: false };
 
   const handleFor = (fake: FakeSandbox): SandboxHandle => {
     const spool: string[] = [];
@@ -179,15 +214,22 @@ export function fakeSandboxes(options: FakeOptions = {}): {
       id: fake.id,
       writeFiles: async (files) => {
         for (const file of files) {
-          // THE ONE PERMISSION THIS FAKE MODELS, because one uid difference is the whole
-          // of the transport's design. `writeFiles` runs as uid 1000 — the uid the repro
-          // drops to — and `PREPARE` makes the spool root-owned 0700 so that user cannot
-          // forge `{done: true}`. Which means the host cannot write it either. Without
-          // this refusal the executor could go back to writing tool calls with
-          // `writeFiles`, every call would fail EACCES on the first live agent phase, and
-          // the suite would stay green.
-          if (file.path.startsWith('/work/rpc/')) {
-            throw new Error(`EACCES: the spool is root-owned 0700 and writeFiles runs as uid ${SANDBOX_UID}`);
+          // A PERMISSION, and it depends on the image — which is the point. `writeFiles`
+          // writes as the image's default user, so on the managed one it is uid 1000, the
+          // same user the repro drops to, and `PREPARE` makes the spool root-owned 0700
+          // exactly so that user cannot forge `{done: true}`. Which means the host cannot
+          // write it either, there.
+          //
+          // Without this refusal the executor could go back to writing tool calls with
+          // `writeFiles`, every call would fail EACCES on the first live agent phase
+          // against the managed image, and the suite would stay green.
+          //
+          // On an image whose commands are root there is no such refusal, and modelling
+          // one would be the fake disagreeing with reality in the direction that hides
+          // nothing — but also proves nothing. The control lives on the image where the
+          // difference exists.
+          if (file.path.startsWith('/work/rpc/') && asUser().uid !== 0) {
+            throw new Error(`EACCES: the spool is root-owned 0700 and writeFiles runs as uid ${asUser().uid}`);
           }
           fake.files.set(file.path, file.content);
         }
@@ -199,6 +241,27 @@ export function fakeSandboxes(options: FakeOptions = {}): {
       },
       run: async (command) => {
         fake.commands.push(command);
+        // FIRST, before any branch that could answer it by accident: the elevation probe.
+        // Its own text contains the word `sudo` (`command -v sudo`), so it has to be
+        // recognised before the no-sudo branch below, and it must not be swallowed by the
+        // `mkdir -p` branch either.
+        if (command.startsWith('id -u;')) {
+          const as = asUser();
+          return { exitCode: 0, output: `${as.uid}\n${as.sudo ? 'HAVE_SUDO' : 'NO_SUDO'}` };
+        }
+        // THE PERMISSION THIS FAKE MODELS FOR COMMANDS, and the reason it exists: every
+        // `${elevate}` in the executor was, until this rule, a string no test could be
+        // wrong about. Removing any one of them left the suite green — including the one
+        // in `deliver`, which is the whole transport.
+        //
+        // The rule is the kernel's: on an image whose commands run as a non-root user, a
+        // command that touches the root-owned 0700 spool, or changes ownership of
+        // anything, fails unless it is elevated. `sudo -n ` is how the executor elevates;
+        // a command without it is uid 1000 asking for root's things.
+        const denied = asUser().uid === 0 ? null : unelevated(command);
+        if (denied !== null) {
+          return { exitCode: 1, output: `${denied}: Permission denied (uid ${asUser().uid}, and nothing elevated)` };
+        }
         // The probes, answered from the policy the platform is modelled as holding — not
         // from the field the executor set. Exit 0 means REACHED.
         if (command.includes("require('dns')")) {
@@ -218,13 +281,9 @@ export function fakeSandboxes(options: FakeOptions = {}): {
           }
           return { exitCode: 0, output: '' };
         }
-        if (command.startsWith('id -u;')) {
-          const as = options.runsAs ?? { uid: 0, sudo: false };
-          return { exitCode: 0, output: `${as.uid}\n${as.sudo ? 'HAVE_SUDO' : 'NO_SUDO'}` };
-        }
         // A command needing privilege on an image that has no sudo binary fails the way
-        // a shell fails, which is how the first live run reported it.
-        if (command.includes('sudo ') && !(options.runsAs?.sudo ?? false)) {
+        // a shell fails, which is how the second live run reported it.
+        if (command.includes('sudo ') && !asUser().sudo) {
           return { exitCode: 127, output: 'sh: sudo: not found' };
         }
         if (command.includes('tar -cf')) {
