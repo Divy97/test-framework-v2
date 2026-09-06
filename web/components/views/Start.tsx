@@ -71,6 +71,19 @@ export function Start({
     );
   }, [issues.data, filter]);
 
+  /**
+   * Turning a page forgets what was chosen on the last one.
+   *
+   * `chosen` survived `setPage`, so selecting #5 on page one and clicking Next left the
+   * radio gone, the Start button enabled, and Start running an issue that was no longer on
+   * screen. The number is what the button sends; the radio is only how it was picked.
+   */
+  const turn = (to: number) => {
+    setChosen(null);
+    setSaid(null);
+    setPage(to);
+  };
+
   const start = () => {
     if (chosen === null) return;
     setBusy(true);
@@ -90,7 +103,10 @@ export function Start({
   return (
     <>
       {blocker ? (
-        <div className="warning" role="status">
+        // `id`, so the disabled button can point at it, and NO `role="status"`: this is a
+        // static explanation, not an update, and announcing the whole heading-and-paragraph
+        // every time `detail` reloads is an interruption nobody asked for.
+        <div className="warning" id="why-not">
           <h2>Not yet.</h2>
           <p>{blocker.text}</p>
           {blocker.fix ? (
@@ -112,9 +128,30 @@ export function Start({
       ) : issues.error ? (
         <Failed error={issues.error} retry={issues.reload} />
       ) : (issues.data ?? []).length === 0 ? (
+        // TWO different empty states, because they were one and the wrong one stranded
+        // people. "Next page" is offered whenever a page is full, so paging past the end
+        // returned `[]` — and this branch replaced the whole control block INCLUDING
+        // "Previous page", leaving somebody on page 2 reading "no open issues" about a
+        // repository with thirty of them, and no way back.
         <div className="nothing">
-          <p>No open issues on {repo}.</p>
-          <p>Open one on GitHub and it will appear here — this list is asked of GitHub on every load, never cached.</p>
+          {page > 1 ? (
+            <>
+              <p>There is nothing on page {page}.</p>
+              <p>
+                <button type="button" className="quiet small" onClick={() => turn(page - 1)}>
+                  Back to page {page - 1}
+                </button>
+              </p>
+            </>
+          ) : (
+            <>
+              <p>No open issues on {repo}.</p>
+              <p>
+                Open one on GitHub and it will appear here — this list is asked of GitHub on
+                every load, never cached.
+              </p>
+            </>
+          )}
         </div>
       ) : (
         <>
@@ -155,23 +192,32 @@ export function Start({
               ))}
             </ul>
           </fieldset>
-          {shown.length === 0 ? (
-            <p className="muted small" role="status">
-              Nothing on this page matches &ldquo;{filter}&rdquo;.
-            </p>
-          ) : null}
+          {/* Always in the tree, text toggled — a live region mounted together with its
+              content announces nothing, which is the rule `bits.tsx` states and this was
+              breaking on every keystroke that filtered everything out. */}
+          <p className="muted small" role="status" aria-live="polite">
+            {shown.length === 0 ? `Nothing on this page matches “${filter}”.` : ''}
+          </p>
 
           <div className="row">
-            <button type="button" disabled={chosen === null || blocker !== null || busy} onClick={start}>
+            {/* `aria-describedby`, because `disabled` removes the button from the tab order
+                and announces only "unavailable". The four reasons are computed above and
+                rendered beside it — visually. This is what associates them. */}
+            <button
+              type="button"
+              disabled={chosen === null || blocker !== null || busy}
+              {...(blocker ? { 'aria-describedby': 'why-not' } : {})}
+              onClick={start}
+            >
               {busy ? 'Starting…' : 'Start a run'}
             </button>
             {page > 1 ? (
-              <button type="button" className="quiet small" onClick={() => setPage(page - 1)}>
+              <button type="button" className="quiet small" onClick={() => turn(page - 1)}>
                 Previous page
               </button>
             ) : null}
             {(issues.data ?? []).length >= 30 ? (
-              <button type="button" className="quiet small" onClick={() => setPage(page + 1)}>
+              <button type="button" className="quiet small" onClick={() => turn(page + 1)}>
                 Next page
               </button>
             ) : null}
@@ -209,7 +255,16 @@ export function Start({
                       <When iso={run.started_at} />
                     </td>
                     <td>
-                      {isOver(run.status, run.ended_at) ? run.status.replace(/_/g, ' ') : <span className="pending">running</span>}
+                      {isOver(run.status, run.ended_at) ? (
+                        run.status.replace(/_/g, ' ')
+                      ) : (
+                        <span className="pending">
+                          <span className="mark" aria-hidden="true">
+                            ●
+                          </span>
+                          running
+                        </span>
+                      )}
                     </td>
                     <td>{isOver(run.status, run.ended_at) ? run.tier : '—'}</td>
                   </tr>

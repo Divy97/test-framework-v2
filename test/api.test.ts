@@ -570,3 +570,55 @@ describe('a JSON answer says not to sniff it', () => {
     }
   });
 });
+
+describe('a run that has been started but not yet claimed', () => {
+  // Where every use of the Start button lands FIRST. `enqueueJob` writes to `jobs` and
+  // nothing else — the log's first event comes from the worker that claims it (ADR-0019) —
+  // so for a few seconds `run_projection` has no row. Answering 404 there sent people
+  // straight to "No such run", with no retry, for a run that was about to start normally.
+  const QUEUED = '7c1d3e9a-4b25-4f80-9a3d-6e2b1c8f0417';
+
+  /** A database where the job exists and the projection does not. */
+  const queuedSurface = (repo = 'mine/repo') =>
+    dashboardRoutes({
+      client: {
+        query: vi.fn(async (sql: string, params: unknown[] = []) => {
+          const rows = sql.includes('from installations')
+            ? [{ repo: 'mine/repo', installation_id: 1, account: 'me', connected_at: new Date(0), removed_at: null },
+               { repo: 'theirs/repo', installation_id: 2, account: 'them', connected_at: new Date(0), removed_at: null }]
+            : sql.includes('from run_projection')
+              ? []
+              : sql.includes('from jobs where run_id')
+                ? [{ repo, issue_number: 41 }]
+                : [];
+          return { rows, rowCount: rows.length };
+        }),
+      } as unknown as Db,
+      installUrl: 'https://example.invalid',
+      auth: { session: async () => SESSION, installations: async () => [1] },
+    });
+
+  it('is 202 and says so, rather than 404', async () => {
+    const { status, json } = await bodyOf(queuedSurface(), 'GET', `/api/runs/${QUEUED}/evidence`);
+    expect(status).toBe(202);
+    expect(json.queued).toBe(true);
+    expect(json.repo).toBe('mine/repo');
+    expect(json.issue_number).toBe(41);
+  });
+
+  it('but only for a job you may see — everyone else still gets no such run', async () => {
+    const { status, json } = await bodyOf(queuedSurface('theirs/repo'), 'GET', `/api/runs/${QUEUED}/evidence`);
+    expect(status).toBe(404);
+    expect(json).toEqual({ error: 'no such run' });
+  });
+
+  it('and a run id belonging to no job at all is still 404', async () => {
+    const nothing = dashboardRoutes({
+      client: { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as unknown as Db,
+      installUrl: 'https://example.invalid',
+      auth: { session: async () => SESSION, installations: async () => [1] },
+    });
+    const { status } = await bodyOf(nothing, 'GET', `/api/runs/${QUEUED}/evidence`);
+    expect(status).toBe(404);
+  });
+});

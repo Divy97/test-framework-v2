@@ -20,13 +20,14 @@ const TIER_MEANING: Record<number, string> = {
  */
 export function Runs({ repo, go }: { repo: string | null; go: (to: string) => void }) {
   const runs = useJson<RunRow[]>(repo ? `/api/runs?repo=${encodeURIComponent(repo)}` : '/api/runs');
-  if (runs.loading) return <Loading what="runs" />;
-  if (!runs.data) return <Failed error={runs.error ?? 'unknown'} retry={runs.reload} />;
+  const heading = <h1>{repo ? `Runs on ${repo}` : 'Runs'}</h1>;
+  if (runs.loading) return <>{heading}<Loading what="runs" /></>;
+  if (!runs.data) return <>{heading}<Failed error={runs.error ?? 'unknown'} retry={runs.reload} /></>;
 
   const rows = runs.data;
   return (
     <>
-      <h1>{repo ? `Runs on ${repo}` : 'Runs'}</h1>
+      {heading}
       {rows.length === 0 ? (
         <div className="nothing">
           <p>{repo ? `No run has been started on ${repo}.` : 'No run has been started yet.'}</p>
@@ -35,7 +36,11 @@ export function Runs({ repo, go }: { repo: string | null; go: (to: string) => vo
       ) : (
         <div className="scroll">
           <table>
-            <caption>{rows.length} run{rows.length === 1 ? '' : 's'}, newest first</caption>
+            <caption>
+              {rows.length} run{rows.length === 1 ? '' : 's'}, newest first. Tier 1 is
+              reproduced with an independent test, Tier 2 reproduced, Tier 3 not reproduced —
+              so no fix was attempted.
+            </caption>
             <thead>
               <tr>
                 <th scope="col">run</th>
@@ -80,7 +85,18 @@ export function Runs({ repo, go }: { repo: string | null; go: (to: string) => vo
                       run.status.replace(/_/g, ' ')
                     )}
                   </td>
-                  <td title={TIER_MEANING[run.tier] ?? ''}>{isOver(run.status, run.ended_at) ? run.tier : '—'}</td>
+                  <td>
+                    {isOver(run.status, run.ended_at) ? (
+                      <>
+                        {run.tier}
+                        {/* The meaning was in a `title` only — unreachable by keyboard,
+                            unreliable in a screen reader, invisible on touch. */}
+                        <span className="sr">: {TIER_MEANING[run.tier] ?? 'unknown'}</span>
+                      </>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
                   <td className="num">
                     {isOver(run.status, run.ended_at) ? `${run.confidence}/${run.ceiling}` : '—'}
                   </td>

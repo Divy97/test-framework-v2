@@ -32,6 +32,10 @@
   --panel:#f3f1eb; --code:#eeebe3; --link:#1f4b8f;
   --ok:#256040; --bad:#8f2727; --pending:#7a5a12;
   --warn-bg:#fdf5ed; --warn-line:#b4553a; --warn-fg:#6f3320;
+  /* The boundary of a CONTROL, as distinct from a decorative hairline. 3.02:1 against
+   * --paper, which is what WCAG 1.4.11 asks of the thing that identifies an input or a
+   * button; --rule-strong is 1.48:1 and is for structure, not for controls. */
+  --control:#8b8578;
   --serif:ui-serif,Georgia,Cambria,"Times New Roman",serif;
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   /* One place, so a header height change cannot desynchronise from the scroll offset
@@ -43,6 +47,7 @@
   --panel:#1a1815; --code:#1e1c18; --link:#b3ccff;
   --ok:#7fc79b; --bad:#e89b94; --pending:#d9b46a;
   --warn-bg:#231a14; --warn-line:#c4693f; --warn-fg:#f0c3a8;
+  --control:#6f6a60;
 }}
 
 *{box-sizing:border-box}
@@ -175,7 +180,7 @@ b.fail,b.pass{font-weight:600}
   transition:transform .12s ease,opacity .12s ease}
 .cta:hover{opacity:.88;transform:translateY(-1px)}
 .cta.secondary{background:transparent;color:var(--ink);
-  box-shadow:inset 0 0 0 1px var(--rule-strong)}
+  box-shadow:inset 0 0 0 1px var(--control)}
 .calls .cta{margin:0}
 button{margin-top:1rem;padding:.68rem 1.4rem;border-radius:4px;border:0;cursor:pointer;
   background:var(--ink);color:var(--paper);font-size:.775rem;font-weight:500;
@@ -184,9 +189,15 @@ button:hover:not(:disabled){opacity:.88}
 /* DISABLED IS VISIBLE. A control that looks live and does nothing is worse than one that
  * says it cannot act, and the pages here disable Start for real reasons — no key, no
  * recipe, a run already under way — each of which is explained beside it. */
-button:disabled{opacity:.42;cursor:not-allowed}
+/* 0.6, not 0.42. At 0.42 a `button.quiet` label composites to 1.85:1 — WCAG exempts
+ * inactive controls, so this was not a failure, but the comment above claims disabled is
+ * VISIBLE and at 1.85:1 it is not. This holds the claim. */
+button:disabled{opacity:.6;cursor:not-allowed}
+/* `--control`, and this is the set of buttons it matters most for: Delete a secret,
+ * Revoke a runner, Delete the model key, Destroy the artifacts. The four most destructive
+ * controls in the product were the four with the least perceivable boundary. */
 button.quiet{background:transparent;color:var(--muted);
-  box-shadow:inset 0 0 0 1px var(--rule-strong);margin-top:0}
+  box-shadow:inset 0 0 0 1px var(--control);margin-top:0}
 button.quiet:hover:not(:disabled){color:var(--bad);box-shadow:inset 0 0 0 1px var(--bad);opacity:1}
 button.small{padding:.42rem .9rem;font-size:.68rem;margin-top:0}
 
@@ -201,8 +212,15 @@ textarea{display:block;width:100%;background:var(--code);color:var(--ink);
 textarea:focus{border-color:var(--link)}
 input[type=text],input[type=password],input[type=search],input:not([type]),select{
   background:var(--code);color:var(--ink);
-  border:1px solid var(--rule-strong);border-radius:4px;padding:.6rem .75rem;
-  font-size:.8125rem;min-width:18rem;max-width:100%}
+  /* `--control` rather than `--rule-strong`: a hairline is 1.48:1 against the page, and a
+   * text field whose only boundary is a hairline is a control you cannot see until you
+   * focus it. WCAG 1.4.11 wants 3:1 for the thing that identifies a control. */
+  border:1px solid var(--control);border-radius:4px;padding:.6rem .75rem;
+  /* `min(18rem,100%)`, because `min-width` BEATS `max-width` in the used-value algorithm —
+   * so the `max-width:100%` that was here did nothing, and at 320px a 288px control sat in
+   * 283.2px of content box and pushed the page sideways. Every screen with an input
+   * failed WCAG 1.4.10 Reflow. */
+  font-size:.8125rem;min-width:min(18rem,100%);max-width:100%}
 input:focus,select:focus{border-color:var(--link)}
 [aria-invalid=true]{border-color:var(--bad)}
 .error{color:var(--bad);font-size:.855rem;margin:.45rem 0 0;max-width:42rem}
@@ -235,7 +253,10 @@ details[open] summary{margin-bottom:.5rem}
  * Home and End to the ends, `aria-selected` and `aria-controls` wired.
  */
 .tabs{display:flex;gap:0;border-bottom:1px solid var(--rule-strong);margin:1.75rem 0 0;
-  overflow-x:auto}
+  /* `overflow-x:auto` clips the focus ring of the first tab, which has `padding-left:0`
+   * below — so the one indicator a keyboard user has was cut off on the left. The padding
+   * and the negative margin give the outline room without moving anything. */
+  overflow-x:auto;padding-left:3px;margin-left:-3px}
 .tabs button{margin:0;background:transparent;color:var(--muted);border-radius:0;
   padding:.85rem 1.15rem;font-size:.7rem;letter-spacing:.14em;white-space:nowrap;
   border-bottom:2px solid transparent;margin-bottom:-1px}
@@ -255,6 +276,12 @@ details[open] summary{margin-bottom:.5rem}
  * events as they arrive and re-reads the fold for anything that is a judgement, because a
  * timeline that decided for itself whether a run had reproduced would be a second opinion
  * about what happened (ADR-0009), racing the pull request to the answer.
+ *
+ * Three states, not four. An earlier draft of this comment described rows for phases that
+ * have NOT happened yet — "waiting" — and the styling for it existed while the component
+ * never emitted it. That design is not a small addition: a list of phases to come is a
+ * model of what a run is, which is `fold.ts`'s job and not this file's, and it would be
+ * wrong the first time a run took a path the list did not predict.
  */
 .timeline{list-style:none;padding:0;margin:1.25rem 0}
 .timeline li{display:grid;grid-template-columns:1.6rem 1fr auto;gap:.9rem;
@@ -265,8 +292,6 @@ details[open] summary{margin-bottom:.5rem}
 .timeline .what .detail{display:block;font-family:var(--mono);font-size:.75rem;
   color:var(--muted);margin-top:.2rem;white-space:pre-wrap;overflow-wrap:anywhere}
 .timeline .at{font-family:var(--mono);font-size:.7rem;color:var(--muted);white-space:nowrap}
-.timeline li[data-state=waiting]{opacity:.5}
-.timeline li[data-state=waiting] .dot{color:var(--muted)}
 .timeline li[data-state=doing] .dot{color:var(--pending)}
 .timeline li[data-state=done] .dot{color:var(--ok)}
 .timeline li[data-state=failed] .dot{color:var(--bad)}
@@ -347,8 +372,11 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .lede b{color:var(--ink);font-weight:600}
 .band{padding:4.5rem 2rem;border-bottom:1px solid var(--rule)}
 .band:last-of-type{border-bottom:0}
-.band-head{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
-  letter-spacing:.2em;color:var(--muted);margin:0 0 2rem}
+/* An `h2` wearing the eyebrow's clothes. It was a `<p>`, which left the eight `h3`s
+ * inside the steps and cards following `h1.display` with nothing between them — the whole
+ * section structure of the only public page absent from a heading list. */
+.band-head{font-family:var(--mono);font-size:.68rem;font-weight:400;text-transform:uppercase;
+  letter-spacing:.2em;color:var(--muted);margin:0 0 2rem;padding:0;border:0}
 .specimen{border:1px solid var(--rule-strong);border-radius:8px;overflow:hidden;
   background:var(--panel);max-width:52rem}
 .specimen-bar{display:flex;gap:.9rem;align-items:baseline;padding:.8rem 1.2rem;

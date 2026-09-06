@@ -29,6 +29,17 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, test } from 'vitest';
 import type { Evidence as EvidenceData, Me, RepoDetail } from '../web/lib/api';
 import type { Frame } from '../web/lib/hooks';
+import { EVENT_TYPES } from '../src/events.js';
+import type {
+  AttemptStartedV1,
+  FixDiffObservedV1,
+  RunEndedV1,
+  RunRequestedV1,
+  SandboxCreatedV1,
+  SandboxSealedV1,
+  VerificationAbortedV1,
+} from '../src/events.js';
+import { EVENT_TYPES as CLIENT_EVENT_TYPES } from '../web/lib/hooks';
 import { Chrome } from '../web/components/Chrome';
 import { Evidence } from '../web/components/views/Evidence';
 import { Environment } from '../web/components/views/Environment';
@@ -153,7 +164,7 @@ describe('attacker-influenced text arrives as text', () => {
 
   test('an event payload reaching the timeline is escaped', () => {
     const frames: Frame[] = [
-      { seq: 1, ts: '2026-09-06T10:00:00.000Z', type: 'REPRO_REGISTERED', payload: { command: XSS } },
+      { run_id: 'r', seq: 1, ts: '2026-09-06T10:00:00.000Z', type: 'REPRO_REGISTERED', payload: { command: XSS } },
     ];
     const html = render(<Timeline frames={frames} ended={false} />);
     expect(html).not.toContain('<script>');
@@ -277,26 +288,18 @@ describe('a run that has not finished does not report a verdict', () => {
 
 describe('the timeline reports events and decides nothing', () => {
   const frame = (seq: number, type: string, payload: unknown): Frame => ({
+    run_id: 'r',
     seq,
     ts: '2026-09-06T10:00:00.000Z',
     type,
     payload,
   });
 
-  test('a sealed sandbox says what the probe INSIDE it found', () => {
-    const html = render(
-      <Timeline frames={[frame(1, 'SANDBOX_SEALED', { policy: 'deny-all', dns: false, route: false })]} ended />,
-    );
-    expect(html).toMatch(/probe inside it found no DNS and no route out/);
-  });
-
-  test('a seal that did not hold is marked failed, and names what got through', () => {
-    const html = render(
-      <Timeline frames={[frame(1, 'SANDBOX_SEALED', { policy: 'deny-all', dns: true, route: false })]} ended />,
-    );
-    expect(html).toContain('data-state="failed"');
-    expect(html).toContain('DNS');
-  });
+  // The seal's own assertions live in "the timeline reads the payloads the engine actually
+  // writes" below, built from `SandboxSealedV1` rather than from a hand-typed object. The
+  // two that stood here were written against the same guess the component made — a flat
+  // `dns`/`route` — so they passed while every sealed sandbox in the product rendered as a
+  // failure. A fixture invented alongside the code it checks is not a check.
 
   test('hundreds of agent turns collapse into one row that calls them testimony', () => {
     const frames = Array.from({ length: 40 }, (_, i) => frame(i + 1, 'AGENT_MESSAGE', {}));
@@ -559,5 +562,146 @@ describe('the environment screen says what approving did', () => {
       <Environment repo={'acme/<script>alert(1)</script>'} detail={detail()} me={me} onChanged={() => {}} />,
     );
     expect(html).not.toContain('<script>alert(1)</script>');
+  });
+});
+
+/**
+ * The two places this repository writes down what an event is.
+ *
+ * `web/` is a separate bundle with a separate toolchain, so it cannot import `src/events.ts`
+ * — sixteen strings are not worth dragging the engine into a browser build for. What makes
+ * the duplication safe is this file, and until it existed the comments on both copies
+ * claimed it did.
+ */
+describe('the dashboard and the engine agree on what an event is', () => {
+  test('the two lists of event types are identical', () => {
+    // Not "the client is a subset". An extra name is as wrong as a missing one: it can never
+    // match, so it sits in a list looking like coverage — which is exactly what
+    // `OBSERVATION_ABORTED` and `RUN_BLOCKED` did while the real `VERIFICATION_ABORTED` was
+    // absent and an abort never refreshed the verdict.
+    expect([...CLIENT_EVENT_TYPES].sort()).toEqual([...EVENT_TYPES].sort());
+  });
+
+  test('every type the log can carry is one the timeline was asked about', () => {
+    // A weaker claim than "renders something", deliberately: the timeline SKIPS what it has
+    // no sentence for, and that is the right behaviour. What this catches is a type nobody
+    // considered — it will be skipped silently, and this says so by name.
+    const unhandled = EVENT_TYPES.filter((type) => {
+      const html = render(
+        <Timeline frames={[{ run_id: 'r', seq: 1, ts: '2026-09-06T10:00:00.000Z', type, payload: {} }]} ended />,
+      );
+      return !html.includes('<li');
+    });
+    // `AGENT_MESSAGE` is deliberately absent from the list: it is collapsed into a count,
+    // and one on its own is a row. Everything else must produce a row.
+    expect(unhandled).toEqual([]);
+  });
+});
+
+/**
+ * THE test the timeline needed and did not have.
+ *
+ * Its `describe()` reads payload fields by name, and getting a name wrong is silent: the
+ * read is `undefined`, the sentence still renders, and it is plausible. Five were wrong at
+ * once — including `SANDBOX_SEALED`, whose `dns` and `route` are nested under `probe`, so
+ * every correctly sealed sandbox of every run rendered with a red ✗ and the words *"a probe
+ * inside it still found: DNS, a route"*. The seal is this product's central claim.
+ *
+ * The fixtures below are built from `src/events.ts`'s own payload TYPES, so a field that
+ * moves is a compile error here before it is a wrong sentence in a browser.
+ */
+describe('the timeline reads the payloads the engine actually writes', () => {
+  const frame = (type: string, payload: unknown): Frame => ({
+    run_id: 'r',
+    seq: 1,
+    ts: '2026-09-06T10:00:00.000Z',
+    type,
+    payload,
+  });
+
+  test('a sealed sandbox is not reported as a leaking one', () => {
+    const payload: SandboxSealedV1 = {
+      v: 1,
+      sandbox_id: 'sbx-1',
+      phase: 'base',
+      policy: 'deny-all',
+      probe: { dns: false, route: false },
+    };
+    const html = render(<Timeline frames={[frame('SANDBOX_SEALED', payload)]} ended />);
+    expect(html).toMatch(/no DNS and no route out/);
+    expect(html).not.toContain('data-state="failed"');
+    expect(html).not.toMatch(/still found/);
+  });
+
+  test('and one that leaked is', () => {
+    const payload: SandboxSealedV1 = {
+      v: 1,
+      sandbox_id: 'sbx-1',
+      phase: 'agent',
+      policy: 'deny-all',
+      probe: { dns: true, route: false },
+    };
+    const html = render(<Timeline frames={[frame('SANDBOX_SEALED', payload)]} ended />);
+    expect(html).toContain('data-state="failed"');
+    expect(html).toMatch(/still found: DNS/);
+  });
+
+  test('a payload with no probe at all says so, rather than claiming a seal', () => {
+    // A log written before the probe existed. "Not recorded" and "it held" are different
+    // facts and this page may not conflate them.
+    const html = render(<Timeline frames={[frame('SANDBOX_SEALED', { v: 1, policy: 'deny-all' })]} ended />);
+    expect(html).toMatch(/No probe was recorded/);
+    expect(html).not.toMatch(/no DNS and no route out/);
+  });
+
+  test('a run ends with its reason, not with the word "ended"', () => {
+    const payload: RunEndedV1 = { v: 1, reason: 'not_reproduced' };
+    const html = render(<Timeline frames={[frame('RUN_ENDED', payload)]} ended />);
+    // And the refusal is stated as the refusal, not as a failure: the gate holding is the
+    // deliverable everywhere else in this product, and the timeline may not be the one
+    // place that presents it as something going wrong.
+    expect(html).toMatch(/the bug was not reproduced, so no fix was attempted/);
+    expect(html).not.toContain('data-state="failed"');
+  });
+
+  test('an errored run is marked failed, which the wrong field name made unreachable', () => {
+    const html = render(<Timeline frames={[frame('RUN_ENDED', { v: 1, reason: 'error' } as RunEndedV1)]} ended />);
+    expect(html).toContain('data-state="failed"');
+  });
+
+  test('an attempt is numbered', () => {
+    const payload: AttemptStartedV1 = { v: 1, n: 2 };
+    expect(render(<Timeline frames={[frame('ATTEMPT_STARTED', payload)]} ended />)).toMatch(/Attempt 2/);
+  });
+
+  test('a sandbox names itself, and a request quotes the report', () => {
+    const created: SandboxCreatedV1 = { v: 1, sandbox_id: 'sbx-9', image_ref: 'sha256:img' };
+    expect(render(<Timeline frames={[frame('SANDBOX_CREATED', created)]} ended />)).toContain('sbx-9');
+
+    const requested: RunRequestedV1 = {
+      v: 1,
+      source: 'github',
+      thread_ref: 'acme/widgets#41',
+      raw_text: 'the cart total is wrong for shipped orders',
+    };
+    expect(render(<Timeline frames={[frame('RUN_REQUESTED', requested)]} ended />)).toContain('the cart total is wrong');
+  });
+
+  test('a fix is measured in files, and an abort quotes its reason', () => {
+    const diff: FixDiffObservedV1 = {
+      v: 1,
+      base_sha: 'a',
+      fix_sha: 'b',
+      changed_files: ['src/cart.mjs', 'package-lock.json'],
+      diff_hash: 'sha256:d',
+    };
+    const measured = render(<Timeline frames={[frame('FIX_DIFF_OBSERVED', diff)]} ended />);
+    expect(measured).toMatch(/2<\/b> files changed/);
+    expect(measured).toContain('src/cart.mjs');
+
+    const abort: VerificationAbortedV1 = { v: 1, phase: 'base', reason: 'the repro command never exited' };
+    const stopped = render(<Timeline frames={[frame('VERIFICATION_ABORTED', abort)]} ended />);
+    expect(stopped).toContain('the repro command never exited');
+    expect(stopped).toContain('data-state="failed"');
   });
 });

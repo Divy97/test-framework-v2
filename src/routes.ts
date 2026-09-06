@@ -385,9 +385,29 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, runId);
+      if (!row) {
+        // QUEUED, not missing — and the difference is the first thing a person sees after
+        // pressing Start. `enqueueJob` writes a row to `jobs` and nothing else; the log's
+        // first event, and therefore the projection, comes from the worker that claims it
+        // (ADR-0019). For the seconds between, `run_projection` has nothing, and answering
+        // 404 sent everybody who used the button straight to "No such run" — a dead end,
+        // with no retry, for a run that was about to start perfectly normally.
+        //
+        // Authorized the way everything else here is: the job carries the repository, and a
+        // caller who may not see it gets the ordinary 404.
+        const { rows } = await client.query(
+          'select repo, issue_number from jobs where run_id = $1',
+          [runId],
+        );
+        const job = rows[0] as { repo: string; issue_number: number | null } | undefined;
+        if (!job || (who !== null && !who.repos.has(job.repo))) return json({ error: 'no such run' }, 404);
+        // 202: the request is fine and the thing is not ready yet. The page polls this and
+        // says a worker has not claimed it, which is true and is what is happening.
+        return json({ queued: true, repo: job.repo, issue_number: job.issue_number }, 202);
+      }
       // The same answer for "no such run" and "not yours". A run id is a uuid, so this
       // costs a legitimate user nothing and tells a stranger nothing about what exists.
-      if (!row || (who !== null && !who.repos.has(row.repo))) return json({ error: 'no such run' }, 404);
+      if (who !== null && !who.repos.has(row.repo)) return json({ error: 'no such run' }, 404);
       // The view is built from the LOG, not from the row. The row is a cache and says so;
       // an evidence view built from a cache would be evidence at one remove, which is the
       // one thing this screen cannot be.

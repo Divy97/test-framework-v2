@@ -281,6 +281,7 @@ export function Evidence({ data, ended }: { data: EvidenceData; ended: boolean }
           <h2>Where observation stopped</h2>
           <div className="scroll">
             <table>
+              <caption>Where the engine stopped observing, and why</caption>
               <thead>
                 <tr>
                   <th scope="col">attempt</th>
@@ -315,6 +316,7 @@ export function Evidence({ data, ended }: { data: EvidenceData; ended: boolean }
           <summary>The transcript&rsquo;s index — {state.transcript.length} messages, by hash</summary>
           <div className="scroll">
             <table>
+              <caption>The agent&rsquo;s messages, by hash — stored, and an input to no verdict</caption>
               <thead>
                 <tr>
                   <th scope="col">n</th>
@@ -358,6 +360,7 @@ function Cost({ usage, compute }: { usage: EvidenceData['usage']; compute: Evide
           <h3>The model</h3>
           <div className="scroll">
             <table>
+              <caption>What the model was asked and answered, per phase</caption>
               <thead>
                 <tr>
                   <th scope="col">phase</th>
@@ -385,6 +388,7 @@ function Cost({ usage, compute }: { usage: EvidenceData['usage']; compute: Evide
           <h3>The machines</h3>
           <div className="scroll">
             <table>
+              <caption>One row per sandbox this run created</caption>
               <thead>
                 <tr>
                   <th scope="col">phase</th>

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { send, type Runner } from '../../lib/api';
 import { useJson } from '../../lib/hooks';
 import { Failed, Loading, Said, When } from '../bits';
@@ -23,6 +23,8 @@ export function Runners({ repo }: { repo: string }) {
     `/api/repos/${encodeURIComponent(repo)}/runners`,
   );
   const [name, setName] = useState('');
+  const [revoking, setRevoking] = useState<string | null>(null);
+  const heading = useRef<HTMLParagraphElement>(null);
   const [busy, setBusy] = useState(false);
   const [minted, setMinted] = useState<{ token: string; name: string; planeUrl: string } | null>(null);
   const [said, setSaid] = useState<{ ok: boolean; text: string } | null>(null);
@@ -34,7 +36,7 @@ export function Runners({ repo }: { repo: string }) {
 
   return (
     <>
-      <p className="hero">
+      <p className="hero" ref={heading} tabIndex={-1}>
         A runner dials out to this service, receives no inbound connection, and asks for a
         short-lived token per run. Pairing one hands over a credential once.
       </p>
@@ -51,7 +53,11 @@ export function Runners({ repo }: { repo: string }) {
                 <th scope="col">paired</th>
                 <th scope="col">last seen</th>
                 <th scope="col">state</th>
-                <th scope="col"></th>
+                {/* Not empty. An unlabelled column header announces as nothing while
+                    navigating the table, on the column that holds the destructive control. */}
+                <th scope="col">
+                  <span className="sr">Actions</span>
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -84,21 +90,29 @@ export function Runners({ repo }: { repo: string }) {
                       <button
                         type="button"
                         className="quiet small"
+                        disabled={revoking !== null}
                         onClick={() => {
+                          setRevoking(runner.id);
                           void send(
                             'POST',
                             `/api/repos/${encodeURIComponent(repo)}/runners/${encodeURIComponent(runner.id)}/revoke`,
                           ).then((answer) => {
+                            setRevoking(null);
                             setSaid(
                               answer.ok
-                                ? { ok: true, text: `${runner.name} revoked.` }
+                                ? { ok: true, text: `${runner.name} revoked. It can take no more work.` }
                                 : { ok: false, text: answer.error ?? 'that failed' },
                             );
-                            if (answer.ok) listing.reload();
+                            // The button survives a revoke (the row stays, marked revoked),
+                            // but it stops existing — so focus would fall to `<body>`.
+                            if (answer.ok) {
+                              listing.reload();
+                              heading.current?.focus();
+                            }
                           });
                         }}
                       >
-                        Revoke <span className="sr">{runner.name}</span>
+                        {revoking === runner.id ? 'Revoking…' : 'Revoke'} <span className="sr">{runner.name}</span>
                       </button>
                     )}
                   </td>
@@ -127,8 +141,9 @@ export function Runners({ repo }: { repo: string }) {
           onChange={(event) => setName(event.target.value)}
           placeholder="build-box"
           autoComplete="off"
+          aria-describedby="runner-name-hint"
         />
-        <p className="hint">
+        <p className="hint" id="runner-name-hint">
           It will dial <code>{planeUrl}</code>.
         </p>
       </div>

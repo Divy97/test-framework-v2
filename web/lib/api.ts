@@ -123,20 +123,29 @@ export type RepoRow = {
   runs: number;
 };
 
+/**
+ * `run_projection`, as `readmodel.ts`'s `toRow` actually builds it.
+ *
+ * Checked field by field against `src/readmodel.ts:23` and `src/projection.ts`. It carried
+ * `reproduced` and `pr_number`, neither of which is a column — both were always `undefined`
+ * — and omitted `regression` and `last_seq`, which are returned. Nothing failed, because a
+ * field that is always undefined renders as nothing and reads as "this run did not have
+ * one".
+ */
 export type RunRow = {
   run_id: string;
   repo: string;
   issue_number: number;
   status: string;
-  started_at: string;
-  ended_at: string | null;
   tier: number;
   confidence: number;
   ceiling: number;
   scoring: number;
-  reproduced: boolean;
-  pr_url?: string | null;
-  pr_number?: number | null;
+  regression: string;
+  pr_url: string | null;
+  started_at: string;
+  ended_at: string | null;
+  last_seq: number;
 };
 
 export type Recipe = {
@@ -179,6 +188,7 @@ export type Evidence = {
     registeredRepro: { command: string; files: Record<string, string>; applied: string[]; attempt: number } | null;
     registrations: { command: string; files: Record<string, string>; applied: string[]; attempt: number }[];
     testRuns: {
+      attempt: number;
       phase: string;
       repeat?: number;
       commit_sha: string;
@@ -186,10 +196,18 @@ export type Evidence = {
       signal?: string | null;
       symptom_matched?: boolean;
       stdout_hash: string;
+      duration_ms?: number;
     }[];
-    suiteRuns: { phase: string; attempt?: number; command: string; exit_code: number; signal?: string | null; stdout_hash: string }[];
+    suiteRuns: {
+      attempt: number;
+      phase: string;
+      command: string;
+      exit_code: number;
+      signal?: string | null;
+      stdout_hash: string;
+    }[];
     fixDiff: { changed_files: string[]; diff_hash: string } | null;
-    aborts: { attempt: number; phase: string; cause: string | null; reason: string }[];
+    aborts: { attempt: number; phase: string; cause?: string; reason: string }[];
     transcript: { n: number; claimed_type: string | null; raw_hash: string; bytes: number }[];
     environment?: { executor: string; imageRef: string; snapshot: string } | null;
     pr: { repo: string; pr_number: number; head_sha: string } | null;

@@ -26,7 +26,7 @@ export function Timeline({ frames, ended }: { frames: Frame[]; ended: boolean })
   const rows = group(frames);
   if (rows.length === 0) {
     return (
-      <p className="loading" role="status">
+      <p className="loading" role="status" aria-live="polite">
         Waiting for the first event. A worker has to claim this run before anything is
         written to its log.
       </p>
@@ -40,10 +40,14 @@ export function Timeline({ frames, ended }: { frames: Frame[]; ended: boolean })
         // about it that is actually true.
         const state = row.failed ? 'failed' : !ended && index === rows.length - 1 ? 'doing' : 'done';
         return (
-          <li key={row.seq} data-state={state}>
+          <li key={row.seq} data-state={state} {...(state === 'doing' ? { 'aria-current': 'step' as const } : {})}>
             <span className="dot" aria-hidden="true">
               {state === 'failed' ? '✗' : state === 'doing' ? '●' : '✓'}
             </span>
+            {/* The word behind the dot. `doing` was a hue and an animation and nothing
+                else — the one place in this product where a STATE, rather than a verdict,
+                was carried by colour alone. */}
+            <span className="sr">{state === 'failed' ? 'failed: ' : state === 'doing' ? 'in progress: ' : 'done: '}</span>
             <span className="what">
               {row.what}
               {row.detail ? <span className="detail">{row.detail}</span> : null}

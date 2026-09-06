@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { send, type Me } from '../../lib/api';
 import { Said } from '../bits';
 
@@ -31,6 +31,7 @@ export function Settings({ me, onChanged }: { me: Me | null; onChanged: () => vo
   const [key, setKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [said, setSaid] = useState<{ ok: boolean; text: string } | null>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
 
   if (me && !me.accounts) {
     return (
@@ -51,7 +52,9 @@ export function Settings({ me, onChanged }: { me: Me | null; onChanged: () => vo
   return (
     <>
       <h1>Settings</h1>
-      <h2>Your model key</h2>
+      <h2 ref={heading} tabIndex={-1}>
+        Your model key
+      </h2>
       <p className="hero">
         A run spends the key of whoever starts it. Without one, Start is refused before any
         machine is created — a failure about our configuration wearing the shape of a finding
@@ -134,18 +137,27 @@ export function Settings({ me, onChanged }: { me: Me | null; onChanged: () => vo
           <button
             type="button"
             className="quiet"
+            disabled={busy}
             onClick={() => {
+              setBusy(true);
               void send('DELETE', '/api/settings/model-key').then((answer) => {
+                setBusy(false);
                 setSaid(
                   answer.ok
                     ? { ok: true, text: 'Deleted. Start will be refused until a key is stored.' }
                     : { ok: false, text: answer.error ?? 'that failed' },
                 );
-                if (answer.ok) onChanged();
+                // This button disappears on success — `me.modelKey` becomes null — so focus
+                // would fall to `<body>` and a keyboard user would be at the top of the
+                // document with no idea the deletion happened.
+                if (answer.ok) {
+                  onChanged();
+                  heading.current?.focus();
+                }
               });
             }}
           >
-            Delete it
+            {busy ? 'Deleting…' : 'Delete it'}
           </button>
         ) : null}
       </div>

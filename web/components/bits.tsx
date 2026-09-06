@@ -46,7 +46,10 @@ export function Yes({ value, yes = 'yes', no = 'no', unknown = 'not observed' }:
  * than leaving a screen-reader user on a page that silently became something else.
  */
 export const Loading = ({ what }: { what: string }) => (
-  <p className="loading" role="status">
+  // `aria-live` on a node that is already in the tree. `role="status"` alone, on an element
+  // mounted together with its text, announces nothing — which is the rule this file states
+  // twelve lines below and this function was breaking.
+  <p className="loading" role="status" aria-live="polite">
     Loading {what}…
   </p>
 );
@@ -58,6 +61,9 @@ export const Loading = ({ what }: { what: string }) => (
  * of message on these screens that should not wait to be discovered.
  */
 export const Failed = ({ error, retry }: { error: string; retry?: () => void }) => (
+  // `h2`, because every caller renders its own `h1` FIRST — a failure state whose only
+  // heading is an `h2` is a page that starts at level two, which is what happened when this
+  // was returned in place of the view rather than beneath its title.
   <div className="warning" role="alert">
     <h2>That did not load.</h2>
     <p>{error}</p>
@@ -126,7 +132,11 @@ export function Tabs<T extends string>({
             type="button"
             role="tab"
             id={`${base}-${tab.id}`}
-            aria-controls={`${base}-${tab.id}-panel`}
+            // ONLY on the selected tab, because only its panel is rendered. Setting it on
+            // all three left two dangling IDREFs at all times — and the docblock above
+            // claims this is the pattern "in full", which a wrong `aria-controls` is not.
+            // The attribute is optional in the APG; a broken one is worse than none.
+            {...(tab.id === current ? { 'aria-controls': `${base}-${tab.id}-panel` } : {})}
             aria-selected={tab.id === current}
             tabIndex={tab.id === current ? 0 : -1}
             ref={(node) => {

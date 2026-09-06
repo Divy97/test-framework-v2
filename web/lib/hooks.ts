@@ -17,7 +17,17 @@ import { get, type Answer } from './api';
  * indication that it did.
  */
 export function useJson<T>(url: string | null): Answer<T> & { loading: boolean; reload: () => void } {
-  const [answer, setAnswer] = useState<Answer<T> | null>(null);
+  // The URL the answer BELONGS TO, carried with it. Two different things want the old data
+  // kept and they are not the same thing:
+  //
+  //   - A RELOAD of the same URL should keep it. A live run re-reads its fold every couple
+  //     of seconds, and blanking to "loading" each time makes a four-minute watch flicker.
+  //   - A CHANGE of URL must not. `page.tsx` keeps the same `<Run>` element position across
+  //     `/runs/A` → `/runs/B`, so the component is reconciled rather than remounted, and
+  //     without this the new run's page renders the OLD run's repository, issue number, run
+  //     id, tier, confidence and whole event log for a full round trip — with `loading`
+  //     false the entire time, so nothing on screen says it is looking at the wrong run.
+  const [answer, setAnswer] = useState<{ url: string; answer: Answer<T> } | null>(null);
   const [nonce, setNonce] = useState(0);
   const reload = useCallback(() => setNonce((n) => n + 1), []);
 
@@ -25,12 +35,9 @@ export function useJson<T>(url: string | null): Answer<T> & { loading: boolean; 
     if (url === null) return;
     const controller = new AbortController();
     let live = true;
-    // NOT cleared to null first. Blanking the previous answer on every reload makes a
-    // live run's four-minute watch flash "loading" every few seconds; the old data is
-    // right until the new data arrives.
     void get<T>(url, controller.signal)
       .then((next) => {
-        if (live) setAnswer(next);
+        if (live) setAnswer({ url, answer: next });
       })
       .catch(() => {
         /* aborted: the caller moved on, and painting an error over a screen they have
@@ -42,12 +49,13 @@ export function useJson<T>(url: string | null): Answer<T> & { loading: boolean; 
     };
   }, [url, nonce]);
 
+  const current = answer !== null && answer.url === url ? answer.answer : null;
   return {
-    status: answer?.status ?? 0,
-    ok: answer?.ok ?? false,
-    data: answer?.data ?? null,
-    error: answer?.error ?? null,
-    loading: answer === null && url !== null,
+    status: current?.status ?? 0,
+    ok: current?.ok ?? false,
+    data: current?.data ?? null,
+    error: current?.error ?? null,
+    loading: current === null && url !== null,
     reload,
   };
 }
@@ -80,29 +88,38 @@ export function useJson<T>(url: string | null): Answer<T> & { loading: boolean; 
  */
 const useBeforePaint = typeof window === 'undefined' ? useEffect : useLayoutEffect;
 
-export function usePath(): { path: string | null; go: (to: string) => void } {
-  const [path, setPath] = useState<string | null>(null);
+export function usePath(): { path: string | null; search: string; go: (to: string) => void } {
+  // PATHNAME PLUS SEARCH, because `?repo=` selects what a page shows and dropping it made
+  // two bugs at once. `go('/runs')` from `/runs?repo=acme%2Fwidgets` compared equal and
+  // returned early, so the Runs tab in the header did nothing — the filtered list stayed and
+  // `aria-current` was already on it, so there was not even feedback. And Back between two
+  // `?repo=` URLs stored the same pathname twice, React bailed out of the re-render, and the
+  // list kept the previous repository.
+  const [here, setHere] = useState<string | null>(null);
+  const at = () => `${window.location.pathname}${window.location.search}`;
 
   useBeforePaint(() => {
-    setPath(window.location.pathname);
-    const onPop = () => setPath(window.location.pathname);
+    setHere(at());
+    const onPop = () => setHere(at());
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
   const go = useCallback((to: string) => {
-    if (to === window.location.pathname) return;
+    if (to === at()) return;
     window.history.pushState(null, '', to);
-    setPath(to);
+    setHere(to);
     // To the top, because a `pushState` navigation keeps the scroll position of the page
     // being left — which lands a reader halfway down a screen they have not seen.
     window.scrollTo(0, 0);
   }, []);
 
-  return { path, go };
+  const [path = '', search = ''] = here === null ? [] : here.split(/(?=\?)/);
+  return { path: here === null ? null : path, search, go };
 }
 
-export type Frame = { seq: number; type: string; payload: unknown; ts: string };
+/** One row of the log, as `store.ts` reads it. `run_id` is on the wire and unused here. */
+export type Frame = { run_id: string; seq: number; type: string; payload: unknown; ts: string };
 
 /**
  * The run's event stream (ADR-0005), as the browser's own `EventSource`.
@@ -122,9 +139,15 @@ export function useTail(
   options: { onMeaningful?: (final: boolean) => void; stop?: boolean } = {},
 ) {
   const [frames, setFrames] = useState<Frame[]>([]);
-  const [state, setState] = useState<'idle' | 'open' | 'retrying'>('idle');
+  const [state, setState] = useState<'idle' | 'open' | 'retrying' | 'lost'>('idle');
+  // The latest callback, kept in a ref so the effect below does not tear the stream down
+  // and rebuild it every time the caller re-renders. Written in an EFFECT rather than
+  // during render: a ref write in a render body is a side effect in a function React is
+  // free to call and discard, which is the shape that breaks first under concurrency.
   const meaningful = useRef(options.onMeaningful);
-  meaningful.current = options.onMeaningful;
+  useEffect(() => {
+    meaningful.current = options.onMeaningful;
+  });
   const stop = options.stop === true;
 
   useEffect(() => {
@@ -143,9 +166,12 @@ export function useTail(
     setFrames([]);
     const source = new EventSource(`/runs/${encodeURIComponent(runId)}/events`);
     source.onopen = () => setState('open');
-    // EventSource reconnects on its own; this only reports that it is between attempts,
-    // so a stalled screen says so rather than looking like a run that stopped.
-    source.onerror = () => setState('retrying');
+    // `readyState`, because `error` fires for BOTH a reconnect and a permanent close, and
+    // the two need opposite words. The tail is authorized (10g) and answers 401 when a
+    // session expires; the browser does not retry a non-2xx, so a page that reported every
+    // error as "reconnecting" sat there saying so forever over a frozen timeline, with no
+    // hint that the fix was to sign in again.
+    source.onerror = () => setState(source.readyState === EventSource.CLOSED ? 'lost' : 'retrying');
 
     // ONE LISTENER PER TYPE, and `onmessage` is not among them.
     //

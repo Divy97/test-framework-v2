@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Me, RepoDetail } from '../../lib/api';
 import { useJson } from '../../lib/hooks';
 import { Failed, Loading, Tabs, When } from '../bits';
@@ -24,7 +24,11 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
   const detail = useJson<RepoDetail>(`/api/repos/${encodeURIComponent(repo)}`);
   const [tab, setTab] = useState<Tab>('start');
 
-  useEffect(() => {
+  // BEFORE THE PAINT. Read in an ordinary effect, `/repos/x#environment` rendered the Start
+  // tab first — mounting it and firing its `GET …/issues` — and then switched. A layout
+  // effect runs before the browser draws, so the tab in the URL is the first one seen.
+  const useBeforePaint = typeof window === 'undefined' ? useEffect : useLayoutEffect;
+  useBeforePaint(() => {
     const fromHash = () => {
       const hash = window.location.hash.replace('#', '');
       setTab(hash === 'environment' || hash === 'runners' ? hash : 'start');
@@ -34,16 +38,23 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
     return () => window.removeEventListener('hashchange', fromHash);
   }, [repo]);
 
+  const tabs = useRef<HTMLDivElement>(null);
   const choose = (next: Tab) => {
     setTab(next);
+    // A tab changed from somewhere OTHER than the tablist — the "Write its recipe" link in
+    // Start's blocker — unmounts the thing that was just activated, and focus falls to
+    // `<body>`. Moving it to the now-selected tab is where a reader would expect to be.
+    requestAnimationFrame(() => tabs.current?.querySelector<HTMLElement>('[aria-selected=true]')?.focus());
     // `replaceState`, not `pushState`: a tab is a view of the same page, and pushing one
     // entry per tab makes Back walk the tabs instead of leaving the repository.
     window.history.replaceState(null, '', `${window.location.pathname}#${next}`);
   };
 
-  if (detail.loading) return <Loading what={repo} />;
+  if (detail.loading) return <><h1>{repo}</h1><Loading what={repo} /></>;
   if (detail.status === 404) {
     return (
+      <>
+        <h1>Not connected</h1>
       <div className="nothing">
         <p>{repo} is not connected.</p>
         <p>
@@ -52,9 +63,10 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
           repositories this service knows.
         </p>
       </div>
+      </>
     );
   }
-  if (!detail.data) return <Failed error={detail.error ?? 'unknown'} retry={detail.reload} />;
+  if (!detail.data) return <><h1>{repo}</h1><Failed error={detail.error ?? 'unknown'} retry={detail.reload} /></>;
 
   const data = detail.data;
 
@@ -93,6 +105,7 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
         )}
       </p>
 
+      <div ref={tabs}>
       <Tabs<Tab>
         label={`What to do with ${repo}`}
         current={tab}
@@ -109,6 +122,7 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
         ) : null}
         {tab === 'runners' ? <Runners repo={repo} /> : null}
       </Tabs>
+      </div>
     </>
   );
 }

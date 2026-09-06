@@ -47,12 +47,12 @@ export function Landing({ installUrl, signIn }: { installUrl: string; signIn: bo
 
       <section className="band">
         <div>
-          <p className="band-head">What comes back</p>
+          <h2 className="band-head">What comes back</h2>
           <div className="specimen">
             <div className="specimen-bar">
               <span>run 7f3a91c4</span>
               <span>acme/checkout#41</span>
-              <span className="pass">Tier 2</span>
+              <span className="pass">Tier 2 — reproduced</span>
             </div>
             <div className="specimen-body">
               <p className="verdict">
@@ -78,7 +78,7 @@ export function Landing({ installUrl, signIn }: { installUrl: string; signIn: bo
 
       <section className="band">
         <div>
-          <p className="band-head">How it works</p>
+          <h2 className="band-head">How it works</h2>
           <div className="steps">
             <div className="step">
               <div>
@@ -123,7 +123,7 @@ export function Landing({ installUrl, signIn }: { installUrl: string; signIn: bo
 
       <section className="band">
         <div>
-          <p className="band-head">The rules it will not bend</p>
+          <h2 className="band-head">The rules it will not bend</h2>
           <div className="cards">
             <div className="card">
               <h3>Reproduce first, or do not fix</h3>
@@ -159,7 +159,7 @@ export function Landing({ installUrl, signIn }: { installUrl: string; signIn: bo
 
       <section className="band">
         <div>
-          <p className="band-head">What it costs you to find out</p>
+          <h2 className="band-head">What it costs you to find out</h2>
           <p>
             Installing grants the App access to the repositories you pick, and nothing else.
             The sandbox that runs an agent holds neither our model key nor your GitHub token —
@@ -174,12 +174,25 @@ export function Landing({ installUrl, signIn }: { installUrl: string; signIn: bo
         </div>
       </section>
 
-      <footer className="foot">
-        <div>
-          <p>Test Framework v2 — an event-sourced execution and verification platform.</p>
-          <p>Evidence over testimony. Reproduce first. Nothing merged.</p>
-        </div>
-      </footer>
     </>
+  );
+}
+
+/**
+ * The footer, exported separately so `page.tsx` can render it OUTSIDE `<main>`.
+ *
+ * A `contentinfo` landmark nested inside `main` is either flagged by every audit tool or
+ * dropped entirely, depending on which mapping the browser applies — so the site-wide
+ * footer of the only public page was either an error or absent, and neither is what was
+ * intended.
+ */
+export function LandingFooter() {
+  return (
+    <footer className="foot">
+      <div>
+        <p>Test Framework v2 — an event-sourced execution and verification platform.</p>
+        <p>Evidence over testimony. Reproduce first. Nothing merged.</p>
+      </div>
+    </footer>
   );
 }

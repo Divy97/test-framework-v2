@@ -20,8 +20,11 @@ import { plain } from '../Chrome';
  */
 export function Repos({ me, go }: { me: Me | null; go: (to: string) => void }) {
   const repos = useJson<RepoRow[]>('/api/repos');
-  if (repos.loading) return <Loading what="your repositories" />;
-  if (!repos.data) return <Failed error={repos.error ?? 'unknown'} retry={repos.reload} />;
+  // The heading FIRST, on every state. A loading or failed view that returns in place of
+  // the page leaves the document with no `h1` — and on the failure path the first heading
+  // becomes `Failed`'s `h2`, so the page starts at level two.
+  if (repos.loading) return <><h1>Repositories</h1><Loading what="your repositories" /></>;
+  if (!repos.data) return <><h1>Repositories</h1><Failed error={repos.error ?? 'unknown'} retry={repos.reload} /></>;
 
   const rows = repos.data;
   const ready = rows.filter((row) => row.onboarded);

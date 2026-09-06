@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { send, type Me, type RepoDetail } from '../../lib/api';
 import { Said, When } from '../bits';
 
@@ -255,7 +255,17 @@ function Proof({ proof }: { proof: unknown }) {
           </>
         )}
       </p>
-      {it.environment?.built === false ? <p className="fail">{String(it.environment.failed ?? '')}</p> : null}
+      {/* Only when there is something to say. `failed` absent rendered an EMPTY red
+          paragraph — a colour with no content, which is the purest form of meaning carried
+          by colour alone. */}
+      {it.environment?.built === false && it.environment.failed ? (
+        <p className="fail">
+          <span className="mark" aria-hidden="true">
+            ✗
+          </span>
+          {String(it.environment.failed)}
+        </p>
+      ) : null}
       {it.suite ? (
         <p>
           The project&rsquo;s own test command, run in the sealed container:{' '}
@@ -308,6 +318,8 @@ function Proof({ proof }: { proof: unknown }) {
  * Replacing a value means storing it again.
  */
 function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail; onChanged: () => void }) {
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
   const [name, setName] = useState('');
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
@@ -333,7 +345,9 @@ function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail
 
   return (
     <>
-      <h2>Stored secrets</h2>
+      <h2 ref={heading} tabIndex={-1}>
+        Stored secrets
+      </h2>
       {detail.secrets.names.length > 0 ? (
         <ul className="names">
           {detail.secrets.names.map((stored) => (
@@ -342,20 +356,31 @@ function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail
               <button
                 type="button"
                 className="quiet small"
+                disabled={deleting !== null}
                 onClick={() => {
+                  // `deleting`, so a double click does not send two requests — and so the
+                  // control says it is working rather than looking inert for a round trip.
+                  setDeleting(stored);
                   void send('DELETE', `/api/repos/${encodeURIComponent(repo)}/secrets/${encodeURIComponent(stored)}`).then(
                     (answer) => {
+                      setDeleting(null);
                       setSaid(
                         answer.ok
-                          ? { ok: true, text: `${stored} deleted.` }
+                          ? { ok: true, text: `${stored} deleted. Storing it again is the only way back.` }
                           : { ok: false, text: answer.error ?? 'that failed' },
                       );
-                      if (answer.ok) onChanged();
+                      // FOCUS, because this button is about to stop existing: the row
+                      // disappears and focus falls to `<body>`, dumping a keyboard user at
+                      // the top of the document with no idea where they are.
+                      if (answer.ok) {
+                        onChanged();
+                        heading.current?.focus();
+                      }
                     },
                   );
                 }}
               >
-                Delete <span className="sr">{stored}</span>
+                {deleting === stored ? 'Deleting…' : 'Delete'} <span className="sr">{stored}</span>
               </button>
             </li>
           ))}
@@ -398,7 +423,9 @@ function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail
             aria-describedby="secret-name-hint"
             placeholder="STRIPE_API_KEY"
           />
-          <p className="hint" id="secret-name-hint">
+          {/* `aria-live`, because a description is not re-read when it changes: the name
+              goes invalid, the Store button silently disables, and nothing says why. */}
+          <p className="hint" id="secret-name-hint" aria-live="polite">
             {badName
               ? `"${name}" is not an environment variable name — capitals, digits and underscores, not starting with a digit.`
               : 'The name is public and appears in this list. Match it to the recipe’s required.'}

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { isOver, send, type Evidence as EvidenceData, type Me } from '../../lib/api';
 import { useJson, useTail, type Frame } from '../../lib/hooks';
 import { Failed, Loading, Said, When } from '../bits';
@@ -50,23 +50,37 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
     [reload],
   );
 
-  const over = evidence.data ? isOver(evidence.data.state.status, evidence.data.row.ended_at) : false;
-  // STREAM A LIVE RUN, READ A FINISHED ONE, and the difference is the whole reason both
-  // exist. The tail resumes by `seq`, so a live run's stream from zero carries the history
-  // as well as what happens next — one connection, no gap to stitch. A finished run has no
-  // "next", and holding a socket open to discover that costs the plane four queries a
-  // second per open tab.
+  // THE LOG, ALWAYS READ ONCE, and streamed on top of it only while the run is going.
   //
-  // `null` for the URL until the evidence has said which this is: opening a stream and then
-  // closing it a moment later is worse than waiting, and `useJson`/`useTail` both treat null
-  // as "not yet".
-  const tail = useTail(over || !evidence.data ? null : runId, { onMeaningful });
-  const stored = useJson<Frame[]>(over ? `/api/runs/${encodeURIComponent(runId)}/events` : null);
-  const frames = over ? (stored.data ?? []) : tail.frames;
+  // The first shape of this was "stream a live run, read a finished one", switching on the
+  // fold's status, and it was wrong in three ways at once:
+  //
+  //   1. `fold.ts` sets `pr_opened` on the `PR_OPENED` event, which comes BEFORE
+  //      `RUN_ENDED`. So the stream closed one event early on every successful run and the
+  //      snapshot that replaced it could be taken before the ending landed — the timeline
+  //      permanently missing the run's last rows.
+  //   2. At the moment of the switch there was nothing to show: the stream's frames were
+  //      dropped and the read had not answered, so a run that had just finished with
+  //      hundreds of events rendered "waiting for the first event".
+  //   3. If that read failed, `frames` stayed empty forever with no error and no retry —
+  //      exactly what `lib/api.ts` says must never happen.
+  //
+  // So the read is unconditional and the two are MERGED by `seq`. The snapshot is the
+  // history, the stream is what comes next, and duplicates are free because the log is
+  // append-only and a seq identifies a row.
+  const stored = useJson<Frame[]>(`/api/runs/${encodeURIComponent(runId)}/events`);
+  const live = useTail(overFrom(stored.data, evidence.data) ? null : runId, { onMeaningful });
+  const frames = merge(stored.data ?? [], live.frames);
+  // The run is over when the LOG says so. `RUN_ENDED` in hand, or a projection that recorded
+  // an end — never a status that is merely terminal, which arrives an event too early.
+  const over = frames.some((frame) => frame.type === 'RUN_ENDED') || evidence.data?.row.ended_at !== null;
 
-  if (evidence.loading) return <Loading what="this run" />;
+  if (evidence.loading) return <><h1>Run</h1><Loading what="this run" /></>;
+  if (evidence.status === 202) return <Queued runId={runId} reload={evidence.reload} />;
   if (evidence.status === 404) {
     return (
+      <>
+        <h1>No such run</h1>
       <div className="nothing">
         <p>No such run.</p>
         <p>
@@ -75,12 +89,16 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
           nothing about which runs exist.
         </p>
       </div>
+      </>
     );
   }
-  if (!evidence.data) return <Failed error={evidence.error ?? 'unknown'} retry={reload} />;
+  if (!evidence.data) return <><h1>Run</h1><Failed error={evidence.error ?? 'unknown'} retry={reload} /></>;
 
   const { row, state, score, usage, compute, forgotten } = evidence.data;
   const ended = over;
+  // The most recent thing that happened, for the live region — one short sentence rather
+  // than a list. `SANDBOX_SEALED` and `TEST_RUN` are the two a person actually waits for.
+  const latest = SAID[frames.at(-1)?.type ?? ''];
   const refused = score.tier === 3;
   const attempt = state.reproducedAttempt;
   const repro = state.registrations.filter((r) => r.attempt === attempt).at(-1) ?? state.registeredRepro;
@@ -106,22 +124,40 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
         ) : null}
       </p>
 
-      {!ended ? (
-        <p className="live">
-          <span className="dot" aria-hidden="true">
-            ●
-          </span>
-          {tail.state === 'retrying' ? (
-            <span className="disconnected">Reconnecting to the log…</span>
-          ) : (
-            <span>Live — {frames.length} events</span>
-          )}
-        </p>
-      ) : null}
+      {/* One live region for the whole run, and only a SUMMARY inside it. The timeline
+          itself must not be one: a run emits hundreds of frames and announcing each is
+          worse than announcing none. This changes a handful of times and says the thing a
+          reader who cannot see the list actually needs — how far along it is, and what just
+          happened. */}
+      <p className="live" role="status" aria-live="polite">
+        {!ended ? (
+          <>
+            <span className="dot" aria-hidden="true">
+              ●
+            </span>
+            {live.state === 'lost' ? (
+              <span className="disconnected">
+                The connection to the log closed. <a href="/auth/github">Signing in again</a> may
+                be what this needs; reloading will say for certain.
+              </span>
+            ) : live.state === 'retrying' ? (
+              <span className="disconnected">Reconnecting to the log…</span>
+            ) : (
+              <span>
+                Live — {frames.length} event{frames.length === 1 ? '' : 's'}
+                {latest ? `. Latest: ${latest}` : ''}
+              </span>
+            )}
+          </>
+        ) : null}
+      </p>
 
       <div className="strip">
+        {/* `state.status`, not `row.status`. The row is a cache; the fold is current. Both
+            were on this page at once, so a projection that had not caught up printed
+            "status attempting" beside the tier and confidence of a finished run. */}
         <span className="chip">
-          <b>status</b> {row.status.replace(/_/g, ' ')}
+          <b>status</b> {state.status.replace(/_/g, ' ')}
         </span>
         {ended ? (
           <>
@@ -168,8 +204,14 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
       ) : null}
 
       <h2>What happened</h2>
-      <Timeline frames={frames} ended={ended} />
-      <RawLog frames={frames} />
+      {stored.error && frames.length === 0 ? (
+        <Failed error={stored.error} retry={stored.reload} />
+      ) : (
+        <>
+          <Timeline frames={frames} ended={ended} />
+          <RawLog frames={frames} />
+        </>
+      )}
 
       <Evidence data={evidence.data} ended={ended} />
 
@@ -177,6 +219,90 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
     </>
   );
 }
+
+/**
+ * Between pressing Start and a worker picking the job up.
+ *
+ * `enqueueJob` writes to `jobs`; the log's first event comes from the worker that claims it
+ * (ADR-0019), so for a few seconds there is a run id with nothing behind it. The page used
+ * to render "No such run" here — the same answer somebody else's run gets — with no retry,
+ * which is where every single use of the Start button landed first.
+ *
+ * A poll rather than a tail, because there is no stream to open yet: the tail is per run and
+ * the run has no events. Two seconds is slower than a worker's long-poll and far cheaper
+ * than a socket held open on the chance that one exists.
+ */
+function Queued({ runId, reload }: { runId: string; reload: () => void }) {
+  useEffect(() => {
+    const timer = setInterval(reload, 2000);
+    return () => clearInterval(timer);
+  }, [reload]);
+  return (
+    <>
+      <h1>Waiting for a worker</h1>
+      <p className="live" role="status" aria-live="polite">
+        <span className="dot" aria-hidden="true">
+          ●
+        </span>
+        <span>Queued — no machine has claimed this run yet</span>
+      </p>
+      <p className="hero">
+        The run exists and is on the queue. Nothing is written to its log until a worker takes
+        it, which is why there is nothing to show here yet — the plane dispatches work and
+        never produces events itself.
+      </p>
+      <p className="muted small">
+        This page is checking every couple of seconds and will fill in on its own.{' '}
+        <code className="hash">{runId}</code>
+      </p>
+    </>
+  );
+}
+
+/**
+ * Two views of one append-only log, as one list.
+ *
+ * `seq` identifies a row, so a duplicate is free to drop and order is total. Neither source
+ * is authoritative on its own: the snapshot is everything up to the moment it was taken, and
+ * the stream is everything from whenever it connected.
+ */
+/**
+ * What to say, out loud, about the newest event.
+ *
+ * Only the ones worth interrupting for. `AGENT_MESSAGE` is most of a run by volume and
+ * saying "the agent said something" three hundred times is the failure mode a live region
+ * has, not a feature.
+ */
+const SAID: Record<string, string> = {
+  RUN_REQUESTED: 'the run was requested',
+  ENV_BUILT: 'the environment was built',
+  SANDBOX_SEALED: 'a sandbox was sealed',
+  ATTEMPT_STARTED: 'a new attempt started',
+  REPRO_REGISTERED: 'a reproduction was registered',
+  TEST_RUN: 'the reproduction ran',
+  SUITE_RUN: "the project's own suite ran",
+  FIX_DIFF_OBSERVED: 'the fix was measured',
+  VERIFICATION_ABORTED: 'observation stopped',
+  PR_OPENED: 'a pull request was opened',
+  RUN_ENDED: 'the run ended',
+};
+
+const merge = (stored: Frame[], live: Frame[]): Frame[] => {
+  const bySeq = new Map<number, Frame>();
+  for (const frame of stored) bySeq.set(frame.seq, frame);
+  for (const frame of live) bySeq.set(frame.seq, frame);
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+};
+
+/**
+ * Whether to open a stream at all, decided before either source has been merged.
+ *
+ * Deliberately conservative: anything short of proof that the run has ended opens the
+ * stream. A stream opened on a finished run costs one connection that closes on the next
+ * render; a stream NOT opened on a live one is a page that never updates.
+ */
+const overFrom = (stored: Frame[] | null, evidence: EvidenceData | null): boolean =>
+  (stored ?? []).some((frame) => frame.type === 'RUN_ENDED') || evidence?.row.ended_at != null;
 
 /**
  * Destroying this run's artifacts (9e).
