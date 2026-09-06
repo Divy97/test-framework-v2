@@ -161,13 +161,55 @@ same words the missing-Chromium one uses, because "not built" and "broken" produ
 blank page and only one of them is a bug.
 
 What shipped: `web/` as a Next.js static export, seven screens, and the plane serving them
-from its own port (`src/static.ts`). `src/web.ts` — 1,390 lines — is deleted, and every
-route on the surface is now `/api/`. Two defects the work found in code that was already
-merged: `run_projection.ended_at` is not always written, so keying "is this run over" on it
-put a live indicator and a *verdict not yet* chip on a run that had opened a pull request —
-the fold's `status` is the authority and is what the screens now ask; and this repository's
-`.dockerignore` matched `node_modules` at the root only, so a second npm project would have
-shipped its whole dependency tree into the build context.
+from its own port (`src/static.ts`). `src/web.ts` — 1,390 lines — is deleted, and every route
+on the surface is now `/api/`.
+
+**Two defects it found in code that was already merged**: `run_projection.ended_at` is not
+always written, so keying "is this run over" on it put a live indicator and a *verdict not
+yet* chip on a run that had opened a pull request — the fold's `status` is the authority and
+is what the screens now ask; and this repository's `.dockerignore` matched `node_modules` at
+the root only, so a second npm project would have shipped its whole dependency tree into the
+build context.
+
+**And nine it found in its own, of which two are the interesting ones.**
+
+*The live view was dead.* `sse.ts` writes `event: <type>` on every frame — deliberately, so a
+consumer can subscribe per type — and `EventSource.onmessage` handles only the default
+`message` type. So the first version delivered nothing: an open connection, a clean console,
+and **0 events** for the whole of a run. Nothing here could have caught it. `sse.test.ts`
+proves the server's frames are right and they were; `screens.test.tsx` proves the timeline
+renders frames handed to it and it does; the defect lived in the two lines between, and only
+a browser with a log growing underneath it can see those. `test/dashboard.browser.test.ts`
+now has one.
+
+*Every sealed sandbox rendered as a security failure.* `SANDBOX_SEALED` carries
+`probe: { dns, route }`; the timeline read them at the top level, so `undefined === false`
+was false and the row said **"a probe inside it still found: DNS, a route"** — with a red ✗ —
+on every run of every repository. Four more payloads were read by the wrong field name.
+*Both tests covering that component passed*, because their fixtures were hand-written objects
+carrying the same guess the code made. **A fixture invented alongside the code it checks is
+not a check; it is the same guess written twice.** Every payload fixture is now typed as its
+real type from `src/events.ts`, which also gained a runtime `EVENT_TYPES` with two
+`Assert<>`s making it exhaustive against `EventPayload` in both directions — the dashboard
+keeps its own copy, and `test/screens.test.tsx` asserts the two are identical.
+
+The rest, briefly: the throttle on re-reading the fold could swallow the *final* refetch, so a
+finished run said "still going" for ever; pressing Start landed on "No such run", because the
+projection does not exist until a worker claims the job (`/api/runs/:id/evidence` now answers
+**202 queued** and the page polls); `/api/me` called GitHub on every page load to read one
+bit; a non-uuid run id was a 500 echoing the caller's own path back at them; `useJson`
+rendered the previous run's data under the new run's URL for a full round trip; one bad field
+blanked the entire application; and the 320px reflow, a dangling `aria-controls`, four
+destructive controls with no busy state and nowhere for focus to land, and a live view that
+announced nothing at all.
+
+**Two things about the suite are worth recording as process rather than as defects.** A slice
+taken to end-of-file deleted seven `readRunnerConfig` tests that have nothing to do with this
+milestone — the only coverage the two image defaults, the blob root and the substrate
+validation had. And `test/authz.test.ts`, 27 authorization tests and the largest such body in
+the repository, was left pointing at deleted routes rather than ported. Both were found by
+review, not by the suite: a deleted test file is silent by construction, and a red one is
+easy to read as somebody else's problem.
 
 Rough order: week 1 — 10a and 10g; weeks 2–3 — 10b, 10c, 10j, 10k; weeks 4–5 — 10d, 10i;
 week 6 — 10e, 10h; week 7 — 10f, 10l, 10m; week 8 — 10n and real runs on repositories the
