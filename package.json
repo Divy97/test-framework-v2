@@ -20,7 +20,8 @@
     "worker:pair": "tsx --env-file=.env scripts/pair-worker.mts",
     "worker:unpair": "tsx --env-file=.env scripts/unpair-worker.mts",
     "web:build": "npm --prefix web ci && tsc --noEmit -p web/tsconfig.json && npm --prefix web run build",
-    "web:dev": "npm --prefix web run dev"
+    "web:dev": "npm --prefix web run dev",
+    "test:full": "npm run web:build && vitest run"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.116.0",

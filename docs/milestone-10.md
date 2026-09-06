@@ -153,6 +153,13 @@ deployed — and `curl` as its only client. `POST /api/runs` is milestone 10's e
 and nothing in the product called it; the SSE tail has been streaming since milestone 5 and
 nothing consumed it.
 
+**Two tests skip without a built bundle, and they hold the checks that only real Next output
+can give** — the landing page pre-rendered into `index.html`, and the CSP hashing against the
+flight data Next actually emits. `npm test` does not build; `npm run test:full` does, and is
+what a full-signal run means from 10i on. Both skips print what is missing by name, in the
+same words the missing-Chromium one uses, because "not built" and "broken" produce the same
+blank page and only one of them is a bug.
+
 What shipped: `web/` as a Next.js static export, seven screens, and the plane serving them
 from its own port (`src/static.ts`). `src/web.ts` — 1,390 lines — is deleted, and every
 route on the surface is now `/api/`. Two defects the work found in code that was already
