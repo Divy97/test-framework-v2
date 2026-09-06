@@ -117,7 +117,10 @@ export type Frame = { seq: number; type: string; payload: unknown; ts: string };
  * folded for itself would be a second implementation of what happened, free to disagree
  * with the pull request, and this codebase has made that mistake twice (ADR-0009).
  */
-export function useTail(runId: string | null, options: { onMeaningful?: () => void; stop?: boolean } = {}) {
+export function useTail(
+  runId: string | null,
+  options: { onMeaningful?: (final: boolean) => void; stop?: boolean } = {},
+) {
   const [frames, setFrames] = useState<Frame[]>([]);
   const [state, setState] = useState<'idle' | 'open' | 'retrying'>('idle');
   const meaningful = useRef(options.onMeaningful);
@@ -143,7 +146,20 @@ export function useTail(runId: string | null, options: { onMeaningful?: () => vo
     // EventSource reconnects on its own; this only reports that it is between attempts,
     // so a stalled screen says so rather than looking like a run that stopped.
     source.onerror = () => setState('retrying');
-    source.onmessage = (message: MessageEvent<string>) => {
+
+    // ONE LISTENER PER TYPE, and `onmessage` is not among them.
+    //
+    // `sse.ts` writes `event: <type>` on every frame, deliberately, so that a consumer can
+    // subscribe per type. The consequence is the part that is easy to miss: `onmessage`
+    // handles the DEFAULT `message` type only, so a page that assigns it receives nothing
+    // at all — no error, no console output, an open connection and an empty list. That is
+    // how this shipped the first time, showing "0 events" for the whole of a run.
+    //
+    // `EventSource` has no wildcard, so the list has to be enumerated. `EVENT_TYPES` below
+    // is the dashboard's copy of `src/events.ts`'s, and `test/screens.test.tsx` asserts the
+    // two are identical — a type added on one side and not the other would otherwise be an
+    // event this page silently never shows.
+    const onFrame = (message: MessageEvent<string>) => {
       let frame: Frame;
       try {
         frame = JSON.parse(message.data) as Frame;
@@ -151,13 +167,47 @@ export function useTail(runId: string | null, options: { onMeaningful?: () => vo
         return;
       }
       setFrames((have) => (have.some((f) => f.seq === frame.seq) ? have : [...have, frame]));
-      if (CHANGES_THE_VERDICT.has(frame.type)) meaningful.current?.();
+      // `final` is passed through so the consumer can refuse to throttle the LAST one.
+      if (CHANGES_THE_VERDICT.has(frame.type)) meaningful.current?.(FINAL.has(frame.type));
     };
-    return () => source.close();
+    for (const type of EVENT_TYPES) source.addEventListener(type, onFrame as EventListener);
+    return () => {
+      for (const type of EVENT_TYPES) source.removeEventListener(type, onFrame as EventListener);
+      source.close();
+    };
   }, [runId, stop]);
 
   return { frames, state };
 }
+
+/**
+ * Every event type the log can carry — the dashboard's copy of `src/events.ts`'s
+ * `EVENT_TYPES`, which `test/screens.test.tsx` asserts is identical to it.
+ *
+ * Duplicated rather than imported, because this bundle is built by a different toolchain
+ * into a different artifact and importing the engine's event module would drag the engine
+ * into a browser build to obtain sixteen strings.
+ */
+export const EVENT_TYPES = [
+  'RUN_REQUESTED',
+  'REPRO_REGISTERED',
+  'SANDBOX_CREATED',
+  'ENV_BUILT',
+  'SANDBOX_SEALED',
+  'ATTEMPT_STARTED',
+  'ENV_READY',
+  'AGENT_MESSAGE',
+  'AGENT_FINISHED',
+  'AGENT_HANDED_OVER',
+  'TEST_RUN',
+  'SUITE_RUN',
+  'FIX_DIFF_OBSERVED',
+  'VERIFICATION_ABORTED',
+  'PR_OPENED',
+  'RUN_ENDED',
+] as const;
+
+export type EventType = (typeof EVENT_TYPES)[number];
 
 /**
  * Which events mean the FOLD has moved, and therefore that the verdict is worth re-reading.
@@ -166,7 +216,24 @@ export function useTail(runId: string | null, options: { onMeaningful?: () => vo
  * changes the timeline and changes no judgement. Re-reading the evidence on each of those
  * would be a few hundred needless round trips per run for an answer that had not changed.
  */
-const CHANGES_THE_VERDICT = new Set([
+/**
+ * The events after which there is nothing else coming.
+ *
+ * Split out because the consumer THROTTLES its re-reads of the fold — bursts of `TEST_RUN`
+ * arrive within a second of each other and three identical folds is two wasted round trips
+ * — and a throttle that swallows the last one is the worst bug this page can have: the run
+ * finishes, the verdict never arrives, and the screen says *still going* forever.
+ *
+ * It is not hypothetical. `PR_OPENED` and `RUN_ENDED` are appended microseconds apart by a
+ * real worker; the first refetch read a fold that did not yet contain the second, and the
+ * second refetch was dropped as too soon.
+ */
+// `RUN_ENDED` and nothing else. `blocked` is one of its REASONS, not an event type of its
+// own — a `RUN_BLOCKED` here was a string that could never match.
+const ENDS_IT: readonly EventType[] = ['RUN_ENDED'];
+const FINAL = new Set<string>(ENDS_IT);
+
+const VERDICT_MOVING: readonly EventType[] = [
   'RUN_REQUESTED',
   'ENV_BUILT',
   'SANDBOX_SEALED',
@@ -177,8 +244,17 @@ const CHANGES_THE_VERDICT = new Set([
   'FIX_DIFF_OBSERVED',
   'AGENT_FINISHED',
   'AGENT_HANDED_OVER',
-  'OBSERVATION_ABORTED',
+  // The real name. This list carried `OBSERVATION_ABORTED` — an event that does not
+  // exist — and omitted this one, so an abort moved `state.aborts`, `reproducedAttempt`
+  // and therefore the tier, and the page went on showing the verdict from before it for
+  // the rest of the run. Typed against `EVENT_TYPES` now, so an invented name is a
+  // compile error rather than a `Set` entry nothing ever matches.
+  'VERIFICATION_ABORTED',
   'PR_OPENED',
-  'RUN_BLOCKED',
   'RUN_ENDED',
-]);
+];
+// Declared as a typed array and then widened, so the NAMES are checked against
+// `EVENT_TYPES` while the `Set` still accepts the plain `string` a frame carries. A
+// `Set<string>` built from string literals checks nothing, which is how an event type that
+// does not exist sat in this list unnoticed.
+const CHANGES_THE_VERDICT = new Set<string>(VERDICT_MOVING);

@@ -59,6 +59,11 @@ const json = (body: unknown, status = 200) => ({
   status,
   type: 'application/json',
   body: JSON.stringify(body, null, 2),
+  // `nosniff`, and it is the one header this surface and `src/static.ts` disagreed about —
+  // on the surface that carries secret NAMES and repository data, which is the wrong way
+  // round. Not exploitable against a modern browser; it costs nothing and the alternative
+  // is two answers to "does this service set it" depending on which route you asked.
+  headers: { 'x-content-type-options': 'nosniff' } as Record<string, string>,
 });
 
 /**
@@ -154,6 +159,20 @@ export function dashboardRoutes(options: {
     const proto = first(headers['x-forwarded-proto']) ?? (host.startsWith('127.0.0.1') || host.startsWith('localhost') ? 'http' : 'https');
     return `${proto}://${host}`;
   };
+
+/**
+ * A run id, or nothing.
+ *
+ * `run_projection.run_id` is a `uuid` column, and Postgres refuses to compare one with
+ * anything else — so `/api/runs/zzz/evidence` threw, and `sse.ts` turned the throw into a
+ * **500 carrying the raw Postgres message**, which quotes the caller's own path segment
+ * back at them. `tailAuthorizer` has guarded exactly this since 10g, eight lines away in a
+ * sibling module; these routes did not.
+ *
+ * 404 is the right answer and the one every other "no such run" gives, so a stranger
+ * probing ids learns the same nothing either way.
+ */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   const visible = async (
     headers: Record<string, string | string[] | undefined>,
@@ -351,6 +370,7 @@ export function dashboardRoutes(options: {
     const log = /^\/api\/runs\/([^/]+)\/events$/.exec(path);
     if (method === 'GET' && log) {
       const runId = decodeURIComponent(log[1]!);
+      if (!UUID.test(runId)) return json({ error: 'no such run' }, 404);
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, runId);
@@ -361,6 +381,7 @@ export function dashboardRoutes(options: {
     const run = /^\/api\/runs\/([^/]+)\/evidence$/.exec(path);
     if (method === 'GET' && run) {
       const runId = decodeURIComponent(run[1]!);
+      if (!UUID.test(runId)) return json({ error: 'no such run' }, 404);
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, runId);
@@ -394,6 +415,7 @@ export function dashboardRoutes(options: {
     const forgetting = /^\/api\/runs\/([^/]+)\/forget$/.exec(path);
     if (method === 'POST' && forgetting) {
       const runId = decodeURIComponent(forgetting[1]!);
+      if (!UUID.test(runId)) return json({ error: 'no such run' }, 404);
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, runId);
@@ -781,7 +803,9 @@ export function dashboardRoutes(options: {
     if (method === 'GET' && api) {
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
-      const row = await readRunRow(client, decodeURIComponent(api[1]!));
+      const runId = decodeURIComponent(api[1]!);
+      if (!UUID.test(runId)) return json({ error: 'no such run' }, 404);
+      const row = await readRunRow(client, runId);
       return row && (who === null || who.repos.has(row.repo))
         ? json(row)
         : json({ error: 'no such run' }, 404);

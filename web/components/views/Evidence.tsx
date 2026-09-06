@@ -9,10 +9,23 @@ export const TIER_MEANING: Record<number, string> = {
   3: 'not reproduced — no fix was attempted',
 };
 
+/**
+ * The FOUR values `fold.ts` can produce, not the three that were guessed.
+ *
+ * `Regression` is `'clean' | 'broken' | 'already_red' | 'unmeasured'`. This map had
+ * `unknown` — a value the fold cannot emit — and was missing the two most common non-clean
+ * ones, which then fell through to `?? state.regression` and printed the raw token: the
+ * page read *"already_red — the project's own test command, executed by the engine on both
+ * commits."* The wrong key was there because a test fixture used it, which is the shape of
+ * a map written to satisfy a fixture rather than the code it describes.
+ */
 export const REGRESSION_LABEL: Record<string, string> = {
   clean: 'the suite passed on both commits',
   broken: "the fix breaks the project's own suite",
-  unknown: 'the suite was not run on both commits',
+  // The suite was already failing on the base commit, so it can say nothing about the fix.
+  // Not a finding about this change, and the wording has to keep those apart.
+  already_red: "the project's own suite was already failing before this change",
+  unmeasured: 'the suite was not run on both commits, so nothing stands behind this',
 };
 
 /**
@@ -91,13 +104,19 @@ export function Evidence({ data, ended }: { data: EvidenceData; ended: boolean }
           <p className="small">
             Registered command: <code>{repro.command}</code>
           </p>
-          {Object.keys(repro.files).length > 0 ? (
+          {/* `?? {}` and `?? []`, because this renders a LOG rather than a value we built.
+              The fold copies these straight out of the event payload, so a run recorded by
+              an older engine — or by anything that wrote a `REPRO_REGISTERED` without them
+              — arrives here with `files` undefined. `Object.entries(undefined)` throws, and
+              in a bundle a throw during render is not a 500 on one section: it is a blank
+              page reading "Application error", for a run whose evidence is entirely intact. */}
+          {Object.keys(repro.files ?? {}).length > 0 ? (
             <ul className="plain small">
-              {Object.entries(repro.files).map(([path, ref]) => (
+              {Object.entries(repro.files ?? {}).map(([path, ref]) => (
                 <li key={path}>
                   <code>{path}</code> — <code>{ref}</code>{' '}
                   <span className="muted">
-                    {repro.applied.includes(path)
+                    {(repro.applied ?? []).includes(path)
                       ? 'written by the engine over both checkouts'
                       : 'a committed path, hashed rather than applied'}
                   </span>

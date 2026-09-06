@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Me } from '../lib/api';
 import { useJson, usePath } from '../lib/hooks';
+import { Boundary } from '../components/Boundary';
 import { Chrome } from '../components/Chrome';
 import { Landing } from '../components/views/Landing';
 import { Repos } from '../components/views/Repos';
@@ -182,7 +183,10 @@ function Shell({
         {announced}
       </p>
       <main id="main" ref={main} tabIndex={-1}>
-        {children}
+        {/* INSIDE the shell, not around it. A screen that throws should leave the header,
+            the navigation and the way out standing — a boundary around the whole document
+            would replace the one thing that lets somebody go somewhere else. */}
+        <Boundary>{children}</Boundary>
       </main>
     </>
   );

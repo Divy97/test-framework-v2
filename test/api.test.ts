@@ -45,6 +45,17 @@ const SESSION: Session = { id: 's', githubId: 1, login: 'divy97', avatarUrl: '',
 const RECIPE = { install: 'npm ci', services: [], test: 'npm test' };
 
 /**
+ * REAL uuids, because `run_projection.run_id` is a `uuid` column.
+ *
+ * These were `r-mine` and `r-theirs`, which no query in production can be handed: Postgres
+ * refuses to compare a `uuid` with anything else and throws — so every route below was
+ * asserted against ids that would have produced a 500 rather than the answer being tested.
+ * A fixture the database would reject describes nothing.
+ */
+const MINE_RUN = '3f1c9a52-7b0e-4d2f-9c41-8a6e5d0b21c7';
+const THEIRS_RUN = '9b2e7c14-5d38-4a6f-8e10-2c9f4b7a3d55';
+
+/**
  * A database with two installations, one run on each, and a recipe on `mine/repo`.
  *
  * Parameterised the way `authz.test.ts`'s is, and for the reason recorded there: a fake
@@ -61,7 +72,7 @@ const fakeClient = (writes: { sql: string; params: unknown[] }[] = [], options: 
         ? // The demo log, re-addressed to whichever run was asked for. A hand-built event
           // stream here would be a second opinion about what a run looks like; this is the
           // fixture `fold`, `confidence` and the browser test are all already built on.
-          demoRunEvents.map((event, index) => ({ ...event, run_id: runId ?? 'r-mine', seq: index + 1 }))
+          demoRunEvents.map((event, index) => ({ ...event, run_id: runId ?? MINE_RUN, seq: index + 1 }))
         : sql.includes('from installations')
         ? [
             { repo: 'mine/repo', installation_id: 1, account: 'me', connected_at: new Date(0), removed_at: null },
@@ -77,8 +88,8 @@ const fakeClient = (writes: { sql: string; params: unknown[] }[] = [], options: 
               ? [{ name: 'STRIPE_KEY' }]
               : sql.includes('from run_projection')
                 ? [
-                    { run_id: 'r-mine', repo: 'mine/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(0), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 7, thread_ref: 'mine/repo#1' },
-                    { run_id: 'r-theirs', repo: 'theirs/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(0), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 8, thread_ref: 'theirs/repo#1' },
+                    { run_id: MINE_RUN, repo: 'mine/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(0), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 7, thread_ref: 'mine/repo#1' },
+                    { run_id: THEIRS_RUN, repo: 'theirs/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(0), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 8, thread_ref: 'theirs/repo#1' },
                   ].filter((row) => (runId === null || row.run_id === runId) && (repo === null || row.repo === repo))
                 : sql.includes('from user_model_keys')
                   ? [{ provider: 'openrouter' }]
@@ -238,7 +249,7 @@ describe('one repository, in one answer', () => {
     expect(json.recipe).toEqual(RECIPE);
     expect(json.secrets.names).toEqual(['STRIPE_KEY']);
     expect(json.runs).toHaveLength(1);
-    expect(json.runs[0].run_id).toBe('r-mine');
+    expect(json.runs[0].run_id).toBe(MINE_RUN);
   });
 
   it("somebody else's repository is unknown, in the same words an unknown one gets", async () => {
@@ -384,9 +395,9 @@ describe('the evidence view, as JSON, is the same view the page is', () => {
     // which is the one thing this screen cannot be — so the JSON carries the fold, and the
     // read that produces it is the same one the HTML page performs.
     const writes: { sql: string; params: unknown[] }[] = [];
-    const { status, json } = await bodyOf(surface({ writes }), 'GET', '/api/runs/r-mine/evidence');
+    const { status, json } = await bodyOf(surface({ writes }), 'GET', `/api/runs/${MINE_RUN}/evidence`);
     expect(status).toBe(200);
-    expect(json.row.run_id).toBe('r-mine');
+    expect(json.row.run_id).toBe(MINE_RUN);
     expect(json.state.runId).toBeDefined();
     expect(json.score.scoring).toBe(2);
     expect(writes.some((write) => /from events/.test(write.sql))).toBe(true);
@@ -396,7 +407,7 @@ describe('the evidence view, as JSON, is the same view the page is', () => {
     // ADR-0009. A page that re-derived "did this reproduce" from the raw events would be a
     // second implementation of what happened, free to disagree with the pull request — the
     // mistake this codebase has already made twice.
-    const { json } = await bodyOf(surface(), 'GET', '/api/runs/r-mine/evidence');
+    const { json } = await bodyOf(surface(), 'GET', `/api/runs/${MINE_RUN}/evidence`);
     for (const field of ['tier', 'score', 'ceiling', 'grounds', 'unmeasured']) {
       expect(json.score, field).toHaveProperty(field);
     }
@@ -405,7 +416,7 @@ describe('the evidence view, as JSON, is the same view the page is', () => {
   });
 
   it("somebody else's run is no such run, and says nothing more", async () => {
-    const { status, json } = await bodyOf(surface(), 'GET', '/api/runs/r-theirs/evidence');
+    const { status, json } = await bodyOf(surface(), 'GET', `/api/runs/${THEIRS_RUN}/evidence`);
     expect(status).toBe(404);
     expect(json).toEqual({ error: 'no such run' });
   });
@@ -414,7 +425,7 @@ describe('the evidence view, as JSON, is the same view the page is', () => {
     // `/runs/:id` was a rendered document until 10i deleted `src/web.ts`. It is now a path
     // this route declines, so the static bundle answers it — which is what makes "every
     // route here is `/api/`" a checkable statement rather than a claim in a comment.
-    expect(await call(surface(), 'GET', '/runs/r-mine')).toBeNull();
+    expect(await call(surface(), 'GET', `/runs/${MINE_RUN}`)).toBeNull();
     expect(await call(surface(), 'GET', '/repos')).toBeNull();
     expect(await call(surface(), 'GET', `/repos/${MINE}/onboard`)).toBeNull();
     expect(await call(surface(), 'GET', `/repos/${MINE}/runners`)).toBeNull();
@@ -426,7 +437,7 @@ describe('destroying a run says so in the envelope it was asked in', () => {
   // document down as the side effect of a delete. What is asserted here is the ENVELOPE
   // and the gate — `test/forget.test.ts` owns whether the bytes actually go.
   it('answers JSON, not a redirect to a page', async () => {
-    const { status, json } = await bodyOf(surface(), 'POST', '/api/runs/r-mine/forget');
+    const { status, json } = await bodyOf(surface(), 'POST', `/api/runs/${MINE_RUN}/forget`);
     // 501: this surface holds no artifacts, which is the honest answer rather than a
     // pretended deletion. The shape is the point — a 303 here would be the bug.
     expect(status).toBe(501);
@@ -434,13 +445,13 @@ describe('destroying a run says so in the envelope it was asked in', () => {
   });
 
   it("somebody else's run cannot be destroyed, and the refusal is JSON too", async () => {
-    const { status, json } = await bodyOf(surface(), 'POST', '/api/runs/r-theirs/forget');
+    const { status, json } = await bodyOf(surface(), 'POST', `/api/runs/${THEIRS_RUN}/forget`);
     expect(status).toBe(404);
     expect(json).toEqual({ error: 'no such run' });
   });
 
   it('the form route is gone with the form', async () => {
-    expect(await call(surface(), 'POST', '/runs/r-theirs/forget')).toBeNull();
+    expect(await call(surface(), 'POST', `/runs/${THEIRS_RUN}/forget`)).toBeNull();
   });
 });
 
@@ -503,7 +514,7 @@ describe('pairing a runner hands over the token exactly once', () => {
 
 describe('a finished run is read, not tailed', () => {
   it('answers the log as JSON, with the same authorization the evidence view has', async () => {
-    const { status, json } = await bodyOf(surface(), 'GET', '/api/runs/r-mine/events');
+    const { status, json } = await bodyOf(surface(), 'GET', `/api/runs/${MINE_RUN}/events`);
     expect(status).toBe(200);
     expect(Array.isArray(json)).toBe(true);
     expect(json[0]).toHaveProperty('seq');
@@ -511,7 +522,7 @@ describe('a finished run is read, not tailed', () => {
   });
 
   it("somebody else's log is no such run", async () => {
-    const { status, json } = await bodyOf(surface(), 'GET', '/api/runs/r-theirs/events');
+    const { status, json } = await bodyOf(surface(), 'GET', `/api/runs/${THEIRS_RUN}/events`);
     expect(status).toBe(404);
     expect(json).toEqual({ error: 'no such run' });
   });
@@ -520,10 +531,42 @@ describe('a finished run is read, not tailed', () => {
     // The two share authorization and nothing else. If `/events` fell through to the
     // evidence pattern the page would render a fold where it expects a list, and the
     // timeline would silently show nothing.
-    const events = await bodyOf(surface(), 'GET', '/api/runs/r-mine/events');
-    const evidence = await bodyOf(surface(), 'GET', '/api/runs/r-mine/evidence');
+    const events = await bodyOf(surface(), 'GET', `/api/runs/${MINE_RUN}/events`);
+    const evidence = await bodyOf(surface(), 'GET', `/api/runs/${MINE_RUN}/evidence`);
     expect(Array.isArray(events.json)).toBe(true);
     expect(Array.isArray(evidence.json)).toBe(false);
     expect(evidence.json).toHaveProperty('score');
+  });
+});
+
+describe('a run id that cannot be one is not a database error', () => {
+  // `run_projection.run_id` is a `uuid`, so a non-uuid threw inside `readRunRow` and
+  // `sse.ts` turned the throw into a 500 carrying the raw Postgres message — which quotes
+  // the caller's own path segment back at them. `tailAuthorizer` has guarded this since
+  // 10g, eight lines away in a sibling module; these routes had not.
+  it.each([
+    ['/api/runs/zzz'],
+    ['/api/runs/zzz/evidence'],
+    ['/api/runs/zzz/events'],
+    ["/api/runs/'; drop table events; --/evidence"],
+  ])('%s is 404, the same answer a real id nobody owns gets', async (path) => {
+    const { status, json } = await bodyOf(surface(), 'GET', path);
+    expect(status).toBe(404);
+    expect(JSON.stringify(json)).not.toContain('zzz');
+    expect(JSON.stringify(json)).not.toContain('drop table');
+  });
+
+  it('and the same for the write', async () => {
+    const { status } = await bodyOf(surface(), 'POST', '/api/runs/zzz/forget');
+    expect(status).toBe(404);
+  });
+});
+
+describe('a JSON answer says not to sniff it', () => {
+  it('is set on every JSON route, the way the static surface sets it on every asset', async () => {
+    for (const path of ['/api/me', '/api/repos', `/api/runs/${MINE_RUN}/evidence`]) {
+      const answer = await call(surface(), 'GET', path);
+      expect(answer?.headers?.['x-content-type-options'], path).toBe('nosniff');
+    }
   });
 });

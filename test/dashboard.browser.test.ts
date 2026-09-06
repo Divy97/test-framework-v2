@@ -651,3 +651,112 @@ describe.sequential('the floor, in the browser that renders it', () => {
     expect(await browser!.text('[aria-live=polite]')).not.toBe(MISSING);
   });
 });
+
+/**
+ * A run, WHILE IT HAPPENS.
+ *
+ * The rest of this file drives runs that are already over, which read their log over
+ * `GET /api/runs/:id/events` — and that path works perfectly well with the live one
+ * completely broken. It was: the first version of `useTail` assigned `onmessage`, and
+ * `sse.ts` writes `event: <type>` on every frame, so nothing was ever delivered. An open
+ * connection, a clean console, and a page that said **0 events** for the whole of a run.
+ *
+ * Nothing already in this repository could have caught it. `test/sse.test.ts` asserts the
+ * server's frames are correct — they were. `test/screens.test.tsx` renders the timeline from
+ * frames handed to it — they arrived. The defect lived in the two lines between, and the
+ * only thing that can see those is a browser with a log growing underneath it.
+ */
+describe.sequential('a run, while it happens', () => {
+  const RUN = '11111111-2222-3333-4444-555555555555';
+  let live: StatusServer | null = null;
+  let liveBase = '';
+  /** The log this fixture is appending to, in order, as a worker would. */
+  let log: { run_id: string; seq: number; type: string; payload: unknown; ts: string }[] = [];
+  let status = 'attempting';
+
+  const append = (type: string, payload: unknown) => {
+    log.push({ run_id: RUN, seq: log.length + 1, type, payload, ts: new Date().toISOString() });
+    if (type === 'RUN_ENDED') status = 'pr_opened';
+  };
+
+  beforeAll(async () => {
+    if (why) return;
+    log = [];
+    status = 'attempting';
+    append('RUN_REQUESTED', { title: 'cart total is wrong' });
+    const row = () => ({
+      run_id: RUN,
+      repo: REPO,
+      issue_number: 41,
+      status,
+      started_at: new Date(Date.now() - 60_000),
+      ended_at: null,
+      tier: 2,
+      confidence: 90,
+      ceiling: 103,
+      scoring: 2,
+      regression: 'clean',
+      pr_url: null,
+      last_seq: log.length,
+    });
+    const client = {
+      query: async (sql: string, params: unknown[] = []) => {
+        const rows = sql.includes('from run_projection')
+          ? [row()]
+          : sql.includes('from events')
+            ? log.filter((event) => event.seq > Number(params[1] ?? 0))
+            : [];
+        return { rows, rowCount: rows.length };
+      },
+    } as unknown as Db;
+    live = await startStatusServer({
+      // The real tail, over a log that is still being written.
+      read: async (_runId, after) => log.filter((event) => event.seq > after) as never,
+      routes: chain(dashboardRoutes({ client, installUrl: INSTALL_URL }), staticRoutes()),
+    });
+    liveBase = `http://127.0.0.1:${live.port}`;
+  });
+
+  afterAll(async () => {
+    await live?.close();
+    live = null;
+  });
+
+  test('fills in as the events land, and becomes a verdict when they stop', async () => {
+    if (skipped('the live run')) return;
+    await browser!.navigate(`${liveBase}/runs/${RUN}`);
+    visited.push(`/runs/${RUN} (live)`);
+
+    // Connected, and saying so. Not "0 events" — the first frame is already in the log, so
+    // a stream that delivers nothing is visible right here.
+    await settle(/the run was requested/i, 'the live run');
+    expect(await browser!.text()).toMatch(/live/i);
+
+    // The seal, reported from the probe INSIDE the sandbox, which is the only thing that
+    // answers the question at all.
+    append('SANDBOX_SEALED', { policy: 'deny-all', dns: false, route: false });
+    expect(await settle(/no DNS and no route out/i, 'the seal')).toMatch(/sandbox was sealed/i);
+
+    // Hundreds of these arrive in a real run. One row, with a count, and the word that says
+    // what it is worth.
+    for (let n = 0; n < 5; n += 1) append('AGENT_MESSAGE', {});
+    expect(await settle(/agent worked for/i, 'the turns')).toMatch(/input to no verdict/i);
+
+    // Base red for the reported symptom.
+    append('TEST_RUN', { phase: 'base', exit_code: 1, symptom_matched: true, commit_sha: 'aaaa1111bbbb', stdout_hash: 'sha256:b0' });
+    expect(await settle(/symptom present/i, 'base red')).toMatch(/exit 1/);
+
+    // And the transition. `RUN_ENDED` is what tells the page to re-read the fold; the fold
+    // is what turns "verdict not yet" into a tier. Nothing here computes that in the browser.
+    append('PR_OPENED', { pr_number: 12 });
+    append('RUN_ENDED', { status: 'pr_opened' });
+    const done = await settle(/tier/i, 'the verdict');
+    expect(done).toMatch(/a pull request was opened/i);
+    expect(done).not.toMatch(/verdict.{0,20}not yet/i);
+    // The live indicator is gone, which is also the tail being closed: a finished run polled
+    // forever would be four queries a second per open tab.
+    expect(done).not.toMatch(/●\s*live/i);
+
+    expect(browser!.console(), 'the live view logged something').not.toMatch(/^\[(error|warning)\]/im);
+  });
+});

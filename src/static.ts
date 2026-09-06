@@ -67,7 +67,7 @@ const TYPES: Record<string, string> = {
  */
 const RESERVED = ['/api/', '/auth/', '/runner/', '/webhook', '/healthz'];
 
-type Bundle = { files: Map<string, Buffer>; index: Buffer; csp: string };
+type Bundle = { files: Map<string, Buffer>; index: Buffer; csp: Map<string, string> };
 
 /**
  * Read the whole bundle into memory once.
@@ -97,7 +97,15 @@ function load(root: string): Bundle | null {
   }
   const index = files.get('/index.html');
   if (!index) return null;
-  return { files, index, csp: policy(index.toString('utf8')) };
+  // PER DOCUMENT, not per bundle. `404.html` is a different document with different inline
+  // blocks, and serving it under `index.html`'s policy blocked five of its six scripts —
+  // fail-closed, so a blank page rather than a hole, but a blank page whose only
+  // explanation is in a console. One entry per HTML file, computed once at boot.
+  const csp = new Map<string, string>();
+  for (const [path, bytes] of files) {
+    if (path.endsWith('.html')) csp.set(path, policy(bytes.toString('utf8')));
+  }
+  return { files, index, csp };
 }
 
 /**
@@ -180,10 +188,11 @@ export function staticRoutes(options: { root?: string } = {}): Route {
       };
     }
 
-    const file = bundle.files.get(path === '/' ? '/index.html' : path);
+    const key = path === '/' ? '/index.html' : path;
+    const file = bundle.files.get(key);
     if (file) {
-      const ext = extname(path === '/' ? '/index.html' : path);
-      if (ext === '.html') return page(file, bundle.csp);
+      const ext = extname(key);
+      if (ext === '.html') return page(file, bundle.csp.get(key) ?? bundle.csp.get('/index.html')!);
       return {
         status: 200,
         type: TYPES[ext] ?? 'application/octet-stream',
@@ -208,6 +217,6 @@ export function staticRoutes(options: { root?: string } = {}): Route {
     }
 
     // Everything else is a page path, and the bundle decides which page.
-    return page(bundle.index, bundle.csp);
+    return page(bundle.index, bundle.csp.get('/index.html')!);
   };
 }

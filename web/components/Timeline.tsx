@@ -60,6 +60,15 @@ export function Timeline({ frames, ended }: { frames: Frame[]; ended: boolean })
 
 type Row = { seq: number; ts: string; what: React.ReactNode; detail?: string; failed?: boolean };
 
+/**
+ * One field of a payload, defensively.
+ *
+ * Every read here goes through this rather than `payload.x`, and it is not ceremony: this
+ * renders a LOG, whose rows were written by earlier versions of this engine and are kept
+ * forever by design (ADR-0001). A field that moved, or that a `v: 1` payload gained later,
+ * must render as absent — not throw, because in a bundle a throw during render blanks the
+ * page rather than failing one section.
+ */
 const at = (payload: unknown, key: string): unknown =>
   payload !== null && typeof payload === 'object' ? (payload as Record<string, unknown>)[key] : undefined;
 
@@ -111,73 +120,129 @@ function group(frames: Frame[]): Row[] {
 /**
  * One event, in English.
  *
+ * EVERY FIELD NAME HERE IS FROM `src/events.ts`, and that sentence is the whole comment
+ * because getting it wrong is silent. The first version of this file guessed five of them
+ * and each guess produced a plausible sentence:
+ *
+ *   - `SANDBOX_SEALED` carries `probe: { dns, route }`, NOT `dns` and `route` at the top
+ *     level. Read flat, both are `undefined`, `undefined === false` is false, and every
+ *     correctly sealed sandbox rendered with a red ✗ and the words *"a probe inside it
+ *     still found: DNS, a route"*. The seal is this product's central claim, and the
+ *     timeline was calling it a failure on every run of every repository.
+ *   - `RUN_ENDED` carries `reason`, not `status`, so every run "ended — ended" and the
+ *     branch marking an errored or blocked run as failed was unreachable.
+ *   - `ATTEMPT_STARTED` carries `n`, not `attempt` — "Attempt ? started".
+ *   - `SANDBOX_CREATED` has no `phase`, and `RUN_REQUESTED` has no `title`.
+ *
+ * None of it threw, nothing appeared in the console, and `test/screens.test.tsx` passed
+ * because its fixtures were written from the same guesses. What catches it now is
+ * `payloadsMatchEvents` in that file, which builds these rows from `src/events.ts`'s own
+ * payload types rather than from a hand-typed object.
+ *
  * Anything not named here is skipped rather than rendered as its type. A timeline that
- * falls back to printing `VERIFICATION_ABORTED` has stopped being for a person, and the
- * raw log below is where an unrecognised event is legible anyway.
+ * falls back to printing `VERIFICATION_ABORTED` has stopped being for a person, and the raw
+ * log below is where an unrecognised event is legible anyway.
  */
 function describe(frame: Frame): Row | null {
   const base = { seq: frame.seq, ts: frame.ts };
   const p = frame.payload;
   switch (frame.type) {
-    case 'RUN_REQUESTED':
-      return { ...base, what: 'The run was requested', detail: str(p, 'title') };
+    case 'RUN_REQUESTED': {
+      // `raw_text` is the report as it arrived — an issue body, a Slack message. Bounded,
+      // because it is whatever a stranger wrote.
+      const text = str(p, 'raw_text');
+      return {
+        ...base,
+        what: 'The run was requested',
+        ...(text ? { detail: text.length > 160 ? `${text.slice(0, 160)}…` : text } : {}),
+      };
+    }
     case 'SANDBOX_CREATED':
       return {
         ...base,
-        what: (
-          <>
-            A sandbox was created for <b>{str(p, 'phase') ?? 'a phase'}</b>
-          </>
-        ),
-        detail: str(p, 'sandbox_id'),
+        what: 'A sandbox was created',
+        detail: [str(p, 'sandbox_id'), str(p, 'image_ref')].filter(Boolean).join(' · '),
       };
-    case 'ENV_BUILT':
+    case 'ENV_BUILT': {
+      const failed = (at(p, 'steps') as { step: string; exit_code: number }[] | undefined)?.filter(
+        (step) => step.exit_code !== 0,
+      );
       return {
         ...base,
         what: 'The environment was built and snapshotted',
         detail: str(p, 'snapshot') ?? str(p, 'image_ref'),
+        ...(failed && failed.length > 0 ? { failed: true } : {}),
       };
+    }
     case 'SANDBOX_SEALED': {
-      // The probe result, from INSIDE the sandbox, which is the whole reason this event
-      // exists rather than a claim about the firewall's configuration.
-      const dns = at(p, 'dns');
-      const route = at(p, 'route');
+      // `probe`, from INSIDE the sandbox, which is the whole reason this event exists
+      // rather than a claim about the firewall's configuration.
+      const probe = at(p, 'probe');
+      const dns = at(probe, 'dns');
+      const route = at(probe, 'route');
+      // `=== false` in both directions, so a payload that carries neither reads as
+      // "not recorded" rather than as a seal that held.
       const sealed = dns === false && route === false;
+      const leaked = [dns !== false ? 'DNS' : null, route !== false ? 'a route' : null].filter(Boolean);
       return {
         ...base,
         what: (
           <>
-            The sandbox was sealed — <b>{str(p, 'policy') ?? 'deny-all'}</b>
+            The <b>{str(p, 'phase') ?? 'sandbox'}</b> sandbox was sealed — {str(p, 'policy') ?? 'deny-all'}
           </>
         ),
         detail: sealed
           ? 'A probe inside it found no DNS and no route out.'
-          : `A probe inside it still found: ${[dns !== false ? 'DNS' : null, route !== false ? 'a route' : null].filter(Boolean).join(', ')}.`,
+          : probe === undefined
+            ? 'No probe was recorded for this sandbox.'
+            : `A probe inside it still found: ${leaked.join(', ')}.`,
         ...(sealed ? {} : { failed: true }),
       };
     }
     case 'ATTEMPT_STARTED':
-      return { ...base, what: <>Attempt {num(p, 'attempt') ?? '?'} started</> };
-    case 'ENV_READY':
-      return { ...base, what: 'The recipe replayed and the services answered' };
-    case 'REPRO_REGISTERED':
+      return { ...base, what: <>Attempt {num(p, 'n') ?? '?'} started</> };
+    case 'ENV_READY': {
+      const services = (at(p, 'services') as { name: string }[] | undefined) ?? [];
       return {
         ...base,
-        what: 'A reproduction was registered',
-        detail: str(p, 'command'),
+        what: 'The recipe replayed and the services answered',
+        ...(services.length > 0 ? { detail: services.map((service) => service.name).join(', ') } : {}),
       };
-    case 'AGENT_FINISHED':
-      return { ...base, what: 'The agent finished' };
-    case 'AGENT_HANDED_OVER':
-      return { ...base, what: 'The agent handed over its commit', detail: str(p, 'commit')?.slice(0, 12) };
-    case 'TEST_RUN': {
-      const exit = num(p, 'exit_code') ?? 0;
-      const matched = at(p, 'symptom_matched');
+    }
+    case 'REPRO_REGISTERED':
+      return { ...base, what: 'A reproduction was registered', detail: str(p, 'command') };
+    case 'AGENT_FINISHED': {
+      const exit = num(p, 'exit_code');
       return {
         ...base,
         what: (
           <>
-            The reproduction ran on <b>{str(p, 'phase') ?? '?'}</b> — <Exit code={exit} signal={str(p, 'signal')} />
+            The agent finished after <b>{num(p, 'messages') ?? 0}</b> message
+            {num(p, 'messages') === 1 ? '' : 's'}
+          </>
+        ),
+        ...(exit !== undefined && exit !== 0 ? { detail: `exit ${exit}`, failed: true } : {}),
+      };
+    }
+    case 'AGENT_HANDED_OVER':
+      return {
+        ...base,
+        what: (
+          <>
+            The agent handed over its <b>{str(p, 'kind') ?? 'work'}</b> commit
+          </>
+        ),
+        detail: str(p, 'commit')?.slice(0, 12),
+      };
+    case 'TEST_RUN': {
+      const exit = num(p, 'exit_code') ?? 0;
+      const matched = at(p, 'symptom_matched');
+      const phase = str(p, 'phase') ?? '?';
+      return {
+        ...base,
+        what: (
+          <>
+            The reproduction ran on <b>{phase}</b> — <Exit code={exit} signal={str(p, 'signal')} />
             {matched === undefined ? null : matched === true ? ', symptom present' : ', symptom gone'}
           </>
         ),
@@ -197,33 +262,67 @@ function describe(frame: Frame): Row | null {
         detail: str(p, 'command'),
       };
     }
-    case 'FIX_DIFF_OBSERVED':
-      return { ...base, what: 'The fix was measured', detail: str(p, 'diff_hash') };
+    case 'FIX_DIFF_OBSERVED': {
+      const files = (at(p, 'changed_files') as string[] | undefined) ?? [];
+      return {
+        ...base,
+        what: (
+          <>
+            The fix was measured — <b>{files.length}</b> file{files.length === 1 ? '' : 's'} changed
+          </>
+        ),
+        detail: files.length > 0 ? files.join(', ') : str(p, 'diff_hash'),
+      };
+    }
     case 'VERIFICATION_ABORTED':
       return {
         ...base,
-        what: 'Observation stopped',
-        detail: `${str(p, 'cause') ?? 'unstated'}: ${str(p, 'reason') ?? ''}`,
+        what: (
+          <>
+            Observation stopped in <b>{str(p, 'phase') ?? 'a phase'}</b>
+          </>
+        ),
+        // Prose the agent's own repro command can appear in. Displayed, never parsed —
+        // `events.ts` is explicit that this field must not be read by machine.
+        detail: str(p, 'reason'),
         failed: true,
       };
     case 'PR_OPENED':
       return { ...base, what: <>A pull request was opened — #{num(p, 'pr_number') ?? '?'}</> };
     case 'RUN_ENDED': {
-      const status = str(p, 'status') ?? 'ended';
+      // `reason`, not `status`. The two words mean the same thing here and only one of them
+      // is in the payload.
+      const reason = str(p, 'reason') ?? 'ended';
       return {
         ...base,
         what: (
           <>
-            The run ended — <b>{status.replace(/_/g, ' ')}</b>
+            The run ended — <b>{ENDING[reason] ?? reason.replace(/_/g, ' ')}</b>
           </>
         ),
-        ...(status === 'errored' || status === 'blocked' ? { failed: true } : {}),
+        ...(reason === 'error' || reason === 'blocked' ? { failed: true } : {}),
       };
     }
     default:
       return null;
   }
 }
+
+/**
+ * What each ending means, in the words the rest of the product uses for it.
+ *
+ * `not_reproduced` is the one that matters: it is a refusal, not a failure, and the
+ * evidence page states it as the deliverable. A timeline that ended a run with the bare
+ * token would be the only place in the product that presented the gate holding as
+ * something having gone wrong.
+ */
+const ENDING: Record<string, string> = {
+  pr_opened: 'a pull request was opened',
+  not_reproduced: 'the bug was not reproduced, so no fix was attempted',
+  attempts_exhausted: 'the attempts were exhausted',
+  error: 'an error',
+  blocked: 'blocked — a required variable had no value',
+};
 
 /** The log itself, folded away: it is the product, and it is also three hundred lines. */
 export function RawLog({ frames }: { frames: Frame[] }) {

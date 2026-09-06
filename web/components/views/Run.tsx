@@ -36,12 +36,19 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
   // arrives rather than from a closure, so two events in one tick cannot both see the old
   // value and both refetch — which is exactly the burst this exists to collapse.
   const last = useRef(0);
-  const onMeaningful = useCallback(() => {
-    const now = Date.now();
-    if (now - last.current < 1200) return;
-    last.current = now;
-    reload();
-  }, [reload]);
+  const onMeaningful = useCallback(
+    (final: boolean) => {
+      const now = Date.now();
+      // NEVER the last one. Everything else can wait 1.2 seconds for the next fold; the
+      // event that says the run is over cannot, because nothing arrives after it to carry
+      // the deferred read — the page would sit on "the run is still going" until somebody
+      // reloaded it, for a run that had already opened a pull request.
+      if (!final && now - last.current < 1200) return;
+      last.current = now;
+      reload();
+    },
+    [reload],
+  );
 
   const over = evidence.data ? isOver(evidence.data.state.status, evidence.data.row.ended_at) : false;
   // STREAM A LIVE RUN, READ A FINISHED ONE, and the difference is the whole reason both
@@ -88,7 +95,10 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
       </h1>
       <p className="muted small">
         <code className="hash">{row.run_id}</code> · started <When iso={row.started_at} />
-        {ended ? (
+        {/* `row.ended_at`, not `ended`. The two differ: `ended` is the fold's answer and is
+            true for a `pr_opened` run whose projection never recorded a timestamp, and
+            printing "· ended —" for one says less than saying nothing. */}
+        {row.ended_at ? (
           <>
             {' '}
             · ended <When iso={row.ended_at} />

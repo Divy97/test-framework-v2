@@ -216,3 +216,27 @@ describe('the front end never writes markup it did not build', () => {
     }
   });
 });
+
+describe('a policy belongs to the document it is served with', () => {
+  it("404.html is not served under index.html's hashes", async () => {
+    // It was. `404.html` is a different document with different inline blocks, and five of
+    // its six scripts were blocked by a policy computed from a page it is not — fail-closed,
+    // so a blank page rather than a hole, and a blank page whose only explanation is in a
+    // console nobody opens.
+    const root = mkdtempSync(join(tmpdir(), 'bundle-'));
+    writeFileSync(join(root, 'index.html'), '<!doctype html><script>INDEX</script>');
+    writeFileSync(join(root, '404.html'), '<!doctype html><script>NOTFOUND</script>');
+    const route = staticRoutes({ root });
+
+    const index = await call(route, '/');
+    const missing = await call(route, '/404.html');
+    const hash = (body: string) => createHash('sha256').update(body, 'utf8').digest('base64');
+
+    expect(index?.headers?.['content-security-policy']).toContain(hash('INDEX'));
+    expect(missing?.headers?.['content-security-policy']).toContain(hash('NOTFOUND'));
+    // And neither carries the other's, which is what makes the first two assertions mean
+    // something rather than passing on a policy that allowed everything.
+    expect(index?.headers?.['content-security-policy']).not.toContain(hash('NOTFOUND'));
+    expect(missing?.headers?.['content-security-policy']).not.toContain(hash('INDEX'));
+  });
+});
