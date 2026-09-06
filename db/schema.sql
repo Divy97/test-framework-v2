@@ -99,6 +99,49 @@ create table if not exists run_usage (
   primary key (run_id, phase)
 );
 
+-- WHICH agent phase, because a run has two and `(run_id, phase)` cannot tell them apart.
+--
+-- The repro agent and the fix agent both report `phase: 'agent'` (`orchestrate.ts`), so
+-- the second row's `on conflict do update` landed on the first and the repro agent's spend
+-- was silently replaced. Half the model bill, wrong since M6d, and invisible while the
+-- only runs anyone read closely were local ones — 10f is what starts writing this for
+-- hosted runs, and what puts it on a page beside two agent SANDBOXES.
+--
+-- Migrated in three idempotent steps rather than by re-declaring the key: a `create table
+-- if not exists` cannot change a table that already exists, and `add primary key` is not
+-- re-runnable. A unique index does the same work and says `if not exists`.
+alter table run_usage add column if not exists n integer not null default 0;
+create unique index if not exists run_usage_key on run_usage (run_id, phase, n);
+alter table run_usage drop constraint if exists run_usage_pkey;
+
+-- What the SANDBOXES cost (M10, 10f), beside the log for the same reason `run_usage` is.
+--
+-- One row per sandbox, not per phase: a run creates five — the environment build, two
+-- agents, base and fix — and `agent` appears twice, so `(run_id, phase)` is not unique
+-- and would silently keep only the second one.
+--
+-- Every measure is nullable because the platform does not always report one — a sandbox
+-- abandoned before it was usable, or one whose session ended in a way that answered
+-- nothing. A zero there would be a measurement; null is the absence of one, and the
+-- difference matters when the question is what a run cost.
+--
+-- `bigint` and not `integer` (the reason `run_usage` above gives for its own choice is
+-- real: node-postgres returns bigint as a STRING). Milliseconds and bytes over a session
+-- outgrow `integer` where token counts do not, so the width is right and `readCompute`
+-- carries the `Number()` that makes the string a number. Any future `sum()` in SQL has to
+-- do the same.
+create table if not exists run_compute (
+  run_id        uuid        not null,
+  sandbox_id    text        not null,
+  phase         text        not null,
+  active_cpu_ms bigint,
+  duration_ms   bigint,
+  ingress_bytes bigint,
+  egress_bytes  bigint,
+  observed_at   timestamptz not null default now(),
+  primary key (run_id, sandbox_id)
+);
+
 -- The read model. A DISPOSABLE CACHE, and the README's first architectural claim
 -- depends on it staying one (M6c).
 --

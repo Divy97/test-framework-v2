@@ -47,10 +47,15 @@ const fakePlane = async (options: {
   appendStatus?: (attempt: number) => number;
   /** What the poll answers. 401/403 is the plane refusing this runner's credential. */
   pollStatus?: number;
+  /** What the bill route answers, so a plane that refuses one can be exercised. */
+  costStatus?: number;
+  /** What a blob PUT answers, per attempt — the retry policy is the point of two cases. */
+  blobStatus?: (attempt: number) => number;
 } = {}) => {
   const seen: Seen[] = [];
   let handed = false;
   let appends = 0;
+  let blobs = 0;
 
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -76,7 +81,11 @@ const fakePlane = async (options: {
         return send(status, status === 200 ? { appended: 1 } : { error: 'no' });
       }
       if (path.endsWith('/token')) return send(200, { token: `ghs_${seen.length}` });
-      if (path.includes('/blobs/')) return send(201, { ref: 'ok' });
+      if (path.includes('/blobs/')) {
+        const status = options.blobStatus?.(blobs++) ?? 201;
+        return send(status, status < 400 ? { ref: 'ok' } : { error: 'no' });
+      }
+      if (path.endsWith('/cost')) return send(options.costStatus ?? 204);
       if (path.endsWith('/finished')) return send(204);
       return send(404, { error: 'no such route' });
     });
@@ -265,6 +274,120 @@ describe('the daemon survives the things that happen to laptops', () => {
 
     expect(plane.seen.filter((s) => s.path === '/runner/jobs').length).toBeGreaterThan(1);
     expect(logs.join('\n')).not.toContain('nothing should have been executed');
+  });
+});
+
+describe('what a run spent goes beside the log, and never into it', () => {
+  const bill = { usage: [{ phase: 'agent', turns: 3 }], compute: [{ sandbox_id: 'sbx-1', phase: 'base' }] };
+
+  test('the bill is posted, as its own call, and never as an event', async () => {
+    const plane = await fakePlane();
+    await oneJob(plane, async (_job, io) => {
+      await io.append(event(1));
+      await io.cost(bill);
+    });
+    const posted = plane.seen.filter((one) => one.path.endsWith('/cost'));
+    expect(posted).toHaveLength(1);
+    expect(JSON.parse(posted[0]!.body)).toEqual(bill);
+    // THE CONTROL on the design, not on the plumbing: `readmodel.ts` says a fact about
+    // our own spending must not enter a log about the user's bug. Nothing the engine
+    // appended may carry it.
+    const appended = plane.seen.filter((one) => one.path.endsWith('/events'));
+    expect(appended).toHaveLength(1);
+    expect(appended[0]!.body).not.toContain('sbx-1');
+    expect(appended[0]!.body).not.toContain('turns');
+  });
+
+  test('an empty bill is not a request', async () => {
+    // A Docker run spends no sandboxes and a run that died before an agent spends no
+    // tokens. Posting `{}` would be a round trip per job to say nothing.
+    const plane = await fakePlane();
+    await oneJob(plane, async (_job, io) => {
+      await io.cost({ usage: [], compute: [] });
+      await io.cost({});
+    });
+    expect(plane.seen.filter((one) => one.path.endsWith('/cost'))).toHaveLength(0);
+  });
+
+  test('a plane that refuses the bill costs a log line, never the job', async () => {
+    // Unlike `append`, which retries: the evidence is already shipped by the time this is
+    // called. A runner that retried bookkeeping would hold a slot open over it, and one
+    // that threw would lose a finished run over a number.
+    const plane = await fakePlane({ costStatus: 500 });
+    let threw = false;
+    const { logs } = await oneJob(plane, async (_job, io) => {
+      await io.append(event(1));
+      await io.cost(bill).catch(() => void (threw = true));
+    });
+    // THE assertion, and it has to be this one: a `cost` that throws still ends with the
+    // job finished, because the daemon catches everything `execute` throws. Asserting on
+    // `/finished` therefore proves nothing, and asserting on the log matches either way —
+    // `ended badly — Error: the plane answered HTTP 500 to the bill` contains the same
+    // words. What is actually being claimed is that this call does not throw at all.
+    expect(threw).toBe(false);
+    expect(plane.seen.filter((one) => one.path.endsWith('/cost'))).toHaveLength(1); // not retried
+    expect(logs.join('\n')).toMatch(/HTTP 500 to the bill/);
+    expect(logs.join('\n')).not.toMatch(/ended badly/);
+    expect(plane.seen.some((one) => one.path.endsWith('/finished'))).toBe(true);
+  });
+});
+
+describe('an artifact is a file of ours, and is not given up on once', () => {
+  /** A `sha256:` in an event, with a blob on disk to match. */
+  const artifact = async (root: string, body: string) => {
+    const { put } = await import('../src/blobs.js');
+    return put(root, Buffer.from(body));
+  };
+
+  test('an IMAGE digest is not an artifact, and is never asked for', async () => {
+    // `ENV_BUILT` records the image a phase was created from, and a pinned reference ends
+    // `…/test-framework-v2-sandbox@sha256:abc…` — the same 64 hex digits naming a
+    // container image in somebody else's registry. Every hosted run uploaded its own
+    // image digest and logged `ENOENT` for it, once per run, forever.
+    const root = blobRoot();
+    const ref = await artifact(root, 'a real artifact');
+    const plane = await fakePlane();
+    const { logs } = await oneJob(
+      plane,
+      async (_job, io) => {
+        await io.append(
+          event(1, {
+            image: `vcr.vercel.com/x/test-framework-v2-sandbox@sha256:${'a'.repeat(64)}`,
+            stdout_hash: ref,
+          }),
+        );
+      },
+      root,
+    );
+    const asked = plane.seen.filter((one) => one.path.includes('/blobs/'));
+    // THE control: the real one still goes. A regex that excluded everything would pass a
+    // test that only checked the image was skipped.
+    expect(asked.map((one) => one.path.split('/blobs/')[1])).toEqual([ref]);
+    expect(logs.join('\n')).not.toMatch(/could not upload/);
+  });
+
+  test('a blob the plane drops once is sent again, because a lost ref is an ENOENT for a reader', async () => {
+    // The first hosted run lost one to a single `TypeError: fetch failed`. `append` had
+    // four attempts and this had one, so the log ended up citing a ref the evidence store
+    // does not hold — the shape `collect()` says it exists to prevent, one layer out.
+    const root = blobRoot();
+    const ref = await artifact(root, 'worth keeping');
+    const plane = await fakePlane({ blobStatus: (attempt) => (attempt === 0 ? 503 : 201) });
+    const { logs } = await oneJob(plane, async (_job, io) => void (await io.append(event(1, { stdout_hash: ref }))), root);
+    expect(plane.seen.filter((one) => one.path.includes('/blobs/'))).toHaveLength(2);
+    expect(logs.join('\n')).toMatch(/1 artifact/);
+    expect(logs.join('\n')).not.toMatch(/was refused/);
+  });
+
+  test('but a 4xx is an ANSWER, and is not asked again', async () => {
+    // Same lesson the append path learned in M9. A blob the plane refuses will be refused
+    // again, and a ref it already holds answers 409 — retrying either is noise.
+    const root = blobRoot();
+    const ref = await artifact(root, 'refused');
+    const plane = await fakePlane({ blobStatus: () => 409 });
+    const { logs } = await oneJob(plane, async (_job, io) => void (await io.append(event(1, { stdout_hash: ref }))), root);
+    expect(plane.seen.filter((one) => one.path.includes('/blobs/'))).toHaveLength(1);
+    expect(logs.join('\n')).toMatch(/HTTP 409/);
   });
 });
 

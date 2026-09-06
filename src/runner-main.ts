@@ -20,6 +20,7 @@ import { providerName } from './loop.js';
 import type { RunPlan } from './orchestrate.js';
 import { runFromIssue } from './run.js';
 import { loadEnv } from './store.js';
+import type { ComputeRow } from './readmodel.js';
 
 /** Which substrate the phases run on. `docker` is this machine; `vercel` is a microVM. */
 export type ExecutorKind = 'docker' | 'vercel';
@@ -183,8 +184,29 @@ export function readRunnerConfig(env: NodeJS.ProcessEnv = process.env): RunnerCo
  * every caller below already treats as "the default", and naming it twice invites the two
  * to disagree.
  */
+/**
+ * What the sandboxes of one run cost, held until the job that made them is over.
+ *
+ * The executor is built ONCE per worker — it owns the ledger of machines this process
+ * created — but `onCompute` fires per sandbox, mid-run, and the plane will only take a
+ * bill for a run this runner still holds. So the numbers are kept here, keyed by run,
+ * and `engineExecute` drains them at the end of the job that produced them.
+ *
+ * Drained rather than accumulated: a worker takes jobs forever, and a map that only ever
+ * grows is a leak with a very slow fuse.
+ *
+ * TYPED WITH THE ROW THE DATABASE TAKES, not `unknown[]`. As `unknown[]` the shape written
+ * here and the shape `saveCompute` inserts were two claims nobody compared: renaming this
+ * end's `sandbox_id` to `sandboxId` typechecks, passes every test, and in production every
+ * insert fails a NOT NULL constraint — which the route swallows, the daemon does not log,
+ * and the page reports as an empty table forever. The same shape of defect as the
+ * `sandboxId` the SDK never had, and the same one-line fix: let the compiler compare them.
+ */
+export type ComputeLog = Map<string, Omit<ComputeRow, 'run_id'>[]>;
+
 export async function executorFor(
   config: RunnerConfig,
+  spent?: ComputeLog,
 ): Promise<(RunPlan['executor'] & { sweep?: () => Promise<number> }) | undefined> {
   if (config.executor !== 'vercel') return undefined;
   const { vercelClient } = await import('./vercel-client.js');
@@ -210,25 +232,82 @@ export async function executorFor(
       engine: 'test-framework-v2',
       worker: process.env.FLY_MACHINE_ID ?? `local-${process.pid}`,
     },
+    ...(spent === undefined
+      ? {}
+      : {
+          onCompute: (compute) => {
+            const { runId, phase, sandboxId, ...measured } = compute;
+            // `sandbox_id` and not `phase` is what makes a row unique: a run creates two
+            // agent sandboxes, and keying on the phase would keep the second and lose the
+            // first without saying so.
+            spent.set(runId, [
+              ...(spent.get(runId) ?? []),
+              {
+                sandbox_id: sandboxId,
+                phase,
+                active_cpu_ms: measured.activeCpuMs ?? null,
+                duration_ms: measured.durationMs ?? null,
+                ingress_bytes: measured.ingressBytes ?? null,
+                egress_bytes: measured.egressBytes ?? null,
+              },
+            ]);
+          },
+        }),
   });
 }
 
-export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor']) {
+export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor'], spent?: ComputeLog) {
   return async (job: DaemonJob, io: DaemonIo): Promise<void> => {
-    await runFromIssue({
-      ...(executor ? { executor } : {}),
-      intake: job.intake as IssueIntake,
-      // No App key on this machine. `installationToken` asks the plane instead, every
-      // time it needs one, which is what keeps a run longer than an hour honest.
-      app: { mint: () => io.token() },
-      recipe: job.recipe,
-      image: config.image,
-      agentImage: config.agentImage,
-      blobRoot: config.blobRoot,
-      runId: job.runId,
-      append: io.append,
-      loop: config.loop,
-    });
+    // `try/finally` so a run that ended badly still reports what it burned getting there.
+    // A failed run is the one whose cost is most worth knowing.
+    let result: Awaited<ReturnType<typeof runFromIssue>> | undefined;
+    try {
+      result = await runFromIssue({
+        ...(executor ? { executor } : {}),
+        intake: job.intake as IssueIntake,
+        // No App key on this machine. `installationToken` asks the plane instead, every
+        // time it needs one, which is what keeps a run longer than an hour honest.
+        app: { mint: () => io.token() },
+        recipe: job.recipe,
+        image: config.image,
+        agentImage: config.agentImage,
+        blobRoot: config.blobRoot,
+        runId: job.runId,
+        append: io.append,
+        loop: config.loop,
+      });
+    } finally {
+      // The model and the machines, in one call, whatever happened above.
+      //
+      // Until 10f this return value was discarded: `saveUsage` had exactly one caller,
+      // `serve.ts`, so every run a WORKER drove lost what it spent. The dashboard's usage
+      // table was empty for hosted runs and nobody had noticed, because the only runs
+      // anyone read closely were local ones.
+      const compute = spent?.get(job.runId) ?? [];
+      // CLEARED, not just deleted. A worker runs one job at a time — `runDaemon` awaits
+      // `execute` before claiming again — so anything left under another key was written
+      // when `plan.runId` and `job.runId` disagreed. They cannot today, because
+      // `engineExecute` passes `job.runId` in and `run.ts` uses what it is given; if that
+      // ever changed, `delete` alone would leak those rows forever under a uuid nobody
+      // holds. Dropping them loses a number; keeping them grows without bound.
+      spent?.clear();
+      await io.cost({
+        // `n` counts phases of the same NAME, so the repro agent and the fix agent get 0
+        // and 1 rather than one row overwriting the other.
+        usage: (result?.usage ?? []).map(({ phase, usage }, index, all) => ({
+          phase,
+          n: all.slice(0, index).filter((one) => one.phase === phase).length,
+          turns: usage.turns,
+          input_tokens: usage.input_tokens,
+          output_tokens: usage.output_tokens,
+          cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+          cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+          provider: config.loop.provider ?? 'openrouter',
+          model: config.loop.model ?? '',
+        })),
+        compute,
+      });
+    }
   };
 }
 
@@ -240,7 +319,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   // message about a mount it does not have.
   await ensureBlobRoot(config.blobRoot);
   const log = (line: string) => console.log(line);
-  const executor = await executorFor(config);
+  const spent: ComputeLog = new Map();
+  const executor = await executorFor(config, spent);
 
   // BEFORE taking any work. A worker that died mid-run left machines the platform will
   // end at their own session timeout — up to an hour of compute per phase that nobody is
@@ -263,7 +343,7 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     token: config.token,
     blobRoot: config.blobRoot,
     log,
-    execute: engineExecute(config, executor),
+    execute: engineExecute(config, executor, spent),
   });
 }
 

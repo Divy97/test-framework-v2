@@ -1103,6 +1103,14 @@ export function evidencePage(input: {
   state: RunState;
   score: Confidence;
   usage: { phase: string; turns: number; input_tokens: number; output_tokens: number }[];
+  /** What the sandboxes cost (M10, 10f). Empty on a run that used this machine's Docker. */
+  compute?: {
+    sandbox_id: string;
+    phase: string;
+    active_cpu_ms: number | null;
+    duration_ms: number | null;
+    egress_bytes: number | null;
+  }[];
   /**
    * Present when this run's artifacts were destroyed on request (9e).
    *
@@ -1113,6 +1121,7 @@ export function evidencePage(input: {
   forgotten?: { requestedBy: string; forgottenAt: string; removed: number } | null;
 }): string {
   const { row, state, score, usage } = input;
+  const compute = input.compute ?? [];
   const refused = score.tier === 3;
   // The credited attempt, taken from the fold and never re-derived — a second definition of
   // "which attempt" is free to disagree with the first, and in this codebase it did.
@@ -1330,18 +1339,43 @@ said, not what the engine saw.</p>` +
         : ''),
   );
 
-  if (usage.length > 0) {
+  if (usage.length > 0 || compute.length > 0) {
+    // A dash, not a zero, for a measure the platform did not report — a sandbox abandoned
+    // before it was usable, or one whose session ended answering nothing. Printing `0ms`
+    // there would be inventing a measurement.
+    const ms = (value: number | null) => (value === null ? '—' : `${Math.round(value)}ms`);
+    const kb = (value: number | null) => (value === null ? '—' : `${Math.round(value / 1024)}KB`);
     sections.push(
       `<h2>What this run cost</h2>` +
-        table(
-          ['phase', 'turns', 'input tokens', 'output tokens'],
-          usage.map((entry) => [
-            cell(entry.phase),
-            String(entry.turns),
-            String(entry.input_tokens),
-            String(entry.output_tokens),
-          ]),
-        ) +
+        (usage.length > 0
+          ? `<h3>The model</h3>` +
+            table(
+              ['phase', 'turns', 'input tokens', 'output tokens'],
+              usage.map((entry) => [
+                cell(entry.phase),
+                String(entry.turns),
+                String(entry.input_tokens),
+                String(entry.output_tokens),
+              ]),
+            )
+          : '') +
+        (compute.length > 0
+          ? `<h3>The machines</h3>` +
+            table(
+              ['phase', 'sandbox', 'active cpu', 'wall clock', 'egress'],
+              compute.map((entry) => [
+                cell(entry.phase),
+                cell(entry.sandbox_id),
+                ms(entry.active_cpu_ms),
+                ms(entry.duration_ms),
+                kb(entry.egress_bytes),
+              ]),
+            ) +
+            `<p class="small muted">One row per sandbox, because a run creates two agents
+and keying on the phase would keep the second and lose the first. Egress is the number
+worth reading twice: a phase that judges is created <code>deny-all</code>, so anything
+other than a handful of bytes there is a seal that did not take.</p>`
+          : '') +
         `<p class="small muted">Recorded beside the log rather than inside it: an event
 class describing our own spending would put a fact about us into a log about your bug
 (ADR-0006).</p>`,

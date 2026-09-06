@@ -77,7 +77,7 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10b** | the `Executor` seam; Docker behind it; `orchestrate.ts` names no docker | | merged; #67 |
 | **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | merged; #69 |
 | **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | merged; #72 |
-| **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | in review; #75 (plane half) |
+| **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | merged; #75, #77, #78, #79 |
 | **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | |
 | **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | merged; #66 |
 | **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
@@ -88,11 +88,36 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10m** | orientation, plan, critic — off by default, proven inert, then measured | | |
 | **10n** | every line of the record that this milestone made false | all | |
 
-Half of Track A and half of Track B are in. What is left is the half that touches a real
-machine: **10e** puts the worker on Fly and takes the first live run, which is also the
-first time any of 10d's executor runs against a sandbox rather than a fake. Until it does,
-ADR-0021's numbers are the spike's and the executor is unexercised — two review rounds
-found four defects in it that only reading caught, and a fifth would probably find more.
+**10e is done, and it took four defects to get there — three of one kind and one of another.**
+
+Three were this executor assuming Vercel's *managed* image — ubuntu, uid 1000, passwordless
+sudo, code wherever the spike put it — where ours are alpine, root, no sudo, code at
+`/app`: `sh: sudo: not found`, an entrypoint at a path no Dockerfile creates, and #78's
+session length, which is a Hobby plan ceiling rather than an image difference and was named
+in the plan's own risk list.
+
+The fourth is a different animal. `sweep()` had **never stopped a single sandbox**, and it
+never failed either — it silently returned 0, and was caught by the live smoke test's own
+cleanup check rather than by anything failing. Two independent causes in the same adapter:
+a structural type this repository wrote itself claimed a `sandboxId` the SDK has never had,
+and `Sandbox.list` returns a Paginator that `.map` throws on, which `sweep` swallows by
+design so a failed listing cannot stop a worker taking work.
+
+None was findable against the fake, and the fourth is why: **a fake cannot disagree with
+the SDK about the SDK.** What replaced finding them one live run at a time is
+`scripts/live-smoke-vercel.mts` — the whole engine on real microVMs with no plane, no queue
+and no worker in the way — plus spike items 14 and 15, which ask *our* images and *our*
+sweep the questions the first thirteen only ever asked the managed one.
+
+The first hosted run to open a real pull request was `f8d10681` on 2026-09-06: five
+sandboxes, the four that judge or run an agent each sealed `deny-all` with a probe from
+inside (the fifth is the environment build, which is `allow-all` by design because
+`install` needs a registry), base red twice, fix green three times, Tier 2 at 98/103.
+
+What is left of the worker's own deploy is a Vercel account token, which the CLI refuses to
+mint (`403 cannot create tokens for this app`). Until it exists the worker runs on the
+author's laptop against the production plane, which is the same process with a different
+`FLY_MACHINE_ID`.
 
 **10k has two deploy prerequisites, and the next deploy fails without them.**
 `PLANE_SECRETS_KEY` is now in the plane's `REQUIRED` set, so a deployment that does not

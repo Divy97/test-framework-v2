@@ -331,11 +331,20 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
     const timeoutMs = Math.min(plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS, options.maxSessionMs ?? MAX_SESSION_MS);
     const sandbox = await client.create({ from, policy, timeoutMs, tags });
     await remember(options.ledger, { sandboxId: sandbox.id, runId: plan.runId });
+    // A sandbox that dies before it is usable still ran, and still cost. This path is not
+    // hypothetical: `could not prepare the sandbox` is what `sh: sudo: not found` was, and
+    // it is the failure class that dominated the first live runs — the one whose cost is
+    // most worth knowing, and the one that reported none because it stops the sandbox
+    // directly and never reaches `close()`.
+    const abandon = async (): Promise<void> => {
+      const ended = await sandbox.stop().catch(() => null);
+      options.onCompute?.({ ...(ended ?? { sandboxId: sandbox.id }), runId: plan.runId, phase: 'open' });
+    };
     let elevate: Elevate;
     try {
       elevate = await elevationFor(sandbox);
     } catch (error) {
-      await sandbox.stop().catch(() => {});
+      await abandon();
       throw error;
     }
     const prepared = await sandbox.run(prepareWith(elevate));
@@ -343,7 +352,7 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
       // Not recoverable and not the repository's fault: the image is ours. Stopping here
       // rather than proceeding means the failure names the step instead of arriving three
       // calls later as a permission error on a file write.
-      await sandbox.stop().catch(() => {});
+      await abandon();
       throw new Error(`could not prepare the sandbox: ${prepared.output.trim().slice(-500)}`);
     }
     return { sandbox, elevate };
@@ -476,16 +485,22 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
           return { failed: redact(`could not remove this run's inputs before the snapshot: ${scrubbed.output.trim()}`).slice(0, MAX_REASON_CHARS) };
         }
         const snapshot = await sandbox.snapshot();
-        // `snapshot()` stops the sandbox, and the SDK reports what a session cost only
-        // from `stop()` — so the environment build, the longest-lived sandbox in a run,
-        // reports no compute. Asked for anyway, in case a later SDK answers; a throw here
-        // is the expected outcome and is not an error worth reporting.
-        await sandbox
-          .stop()
-          .then((compute) => {
-            if (compute && options.onCompute) options.onCompute({ ...compute, runId: plan.runId, phase: 'env' });
-          })
-          .catch(() => {});
+        // `snapshot()` stops the sandbox, so `stop()` here may throw or answer nothing.
+        // The SDK exposes the same numbers as getters ON the sandbox — `activeCpuUsageMs`
+        // and `networkTransfer`, both documented as "only reported once the VM is
+        // stopped" — so `usage()` reads them off a machine this process did not stop.
+        //
+        // Reported EITHER WAY, with nulls if neither answers, because the environment
+        // build is the longest-lived sandbox in a run and a bill that silently omits it is
+        // a bill about four machines out of five.
+        const ended = await sandbox.stop().catch(() => null);
+        if (options.onCompute) {
+          options.onCompute({
+            ...(ended ?? sandbox.usage?.() ?? { sandboxId: sandbox.id }),
+            runId: plan.runId,
+            phase: 'env',
+          });
+        }
         sandbox = undefined;
         return { snapshot, steps: (env?.steps ?? []).map(({ step, exit_code }) => ({ step, exit_code })) };
       } catch (error) {

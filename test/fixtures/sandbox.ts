@@ -399,6 +399,8 @@ export function fakeSandboxes(options: FakeOptions = {}): {
       snapshot: async () => {
         const ref = `snap-${snapshots.length + 1}`;
         snapshots.push(ref);
+        // The platform ENDS the sandbox here, which is the whole reason the environment
+        // build's cost has to be read off the getters rather than out of `stop()`.
         fake.stopped = true;
         return { ref };
       },
@@ -406,10 +408,15 @@ export function fakeSandboxes(options: FakeOptions = {}): {
         // A session that has already ended cannot be ended again, and the executor's
         // sweep counts what it actually stopped — so a fake that answered twice would
         // make the sweep's number a lie.
+        //
+        // Which is also the environment build's situation, every time: `snapshot()` ends
+        // that sandbox, so the `stop()` after it throws HERE the way it does live. The
+        // getters below are how its cost is read anyway.
         if (fake.stopped) throw new Error('this sandbox is not running');
         fake.stopped = true;
         return { sandboxId: fake.id, activeCpuMs: 1234, durationMs: 5678 };
       },
+      usage: (): Compute => ({ sandboxId: fake.id, activeCpuMs: 99, ingressBytes: 7, egressBytes: 8 }),
     };
   };
 

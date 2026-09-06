@@ -856,3 +856,49 @@ describe('nothing is left running, and nothing is left uncollected', () => {
     expect(fake.sandboxes[0]!.stopped).toBe(true);
   });
 });
+
+
+describe('every sandbox a run created appears on its bill', () => {
+  const spent = (fake: ReturnType<typeof fakeSandboxes>) => {
+    const rows: { runId: string; phase: string; sandboxId: string; activeCpuMs?: number }[] = [];
+    return {
+      rows,
+      executor: vercelExecutor({ client: fake.client, onCompute: (one) => rows.push(one) }),
+    };
+  };
+
+  test('the environment build too, whose session `snapshot()` ended before we could stop it', async () => {
+    // The one machine in a run that `stop()` cannot report on, and the longest-lived.
+    // The SDK exposes the same numbers as getters ON the sandbox, so its cost is read
+    // rather than lost — and the fake ends the session in `snapshot()` exactly as the
+    // platform does, so the `stop()` here throws the way it throws live.
+    const fake = fakeSandboxes({
+      runner: async function* () {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+      },
+    });
+    const { rows, executor } = spent(fake);
+    expect(await executor.buildSnapshot(plan(), repo(), 'main', { install: 'npm ci', services: [] }))
+      .toMatchObject({ snapshot: { ref: 'snap-1' } });
+
+    // THE assertion. Before this the `.catch(() => {})` swallowed the throw and the env
+    // sandbox produced no row at all — a bill about four machines out of five, with
+    // nothing anywhere to say a fifth had existed.
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ phase: 'env', activeCpuMs: 99 });
+  });
+
+  test('and a sandbox abandoned before it was ever usable, which is what a bad image is', async () => {
+    // `could not prepare the sandbox` is what `sh: sudo: not found` was. That path stops
+    // the machine directly and never reaches `close()`, so the failure class that
+    // dominated the first live runs was the one reporting no cost — the opposite of
+    // "a failed run is the one whose cost is most worth knowing".
+    const fake = fakeSandboxes({ runsAs: { uid: 1000, sudo: false } });
+    const { rows, executor } = spent(fake);
+    await expect(
+      executor.runPhase({ plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' } }),
+    ).rejects.toThrow(/no sudo/);
+    expect(rows).toMatchObject([{ phase: 'open' }]);
+    expect(fake.sandboxes[0]!.stopped).toBe(true);
+  });
+});

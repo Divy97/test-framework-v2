@@ -1,4 +1,8 @@
 node_modules/
+# ... and as a SYMLINK, which the trailing slash above does not match. A worktree that
+# links to the main checkout's modules is the normal way to work here, and `git add -A`
+# committed one — a dangling absolute path in anyone else's clone.
+node_modules
 dist/
 .env
 .env.*

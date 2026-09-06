@@ -20,6 +20,7 @@ import { digest, get } from '../src/blobs.js';
 import type { ArtifactRef } from '../src/events.js';
 import { enqueueJob, pairRunner, revokeRunner, type Runner } from '../src/plane.js';
 import { runnerRoutes } from '../src/runner-api.js';
+import { readCompute, readUsage } from '../src/readmodel.js';
 import type pg from 'pg';
 import { connect } from '../src/store.js';
 
@@ -622,5 +623,104 @@ describe('blobs cross the boundary, or do not land at all (9b)', () => {
       raw: Buffer.from('x'),
     });
     expect(response.status).toBe(404);
+  });
+});
+
+describe('the bill is written by the runner that holds the run, and nobody else', () => {
+  test('usage and compute land beside the log, keyed by sandbox and not by phase', async () => {
+    if (skipped()) return;
+    const id = installation();
+    const runId = await queue(id);
+    const { token } = await pair(id);
+    await call(token, 'GET', '/runner/jobs');
+
+    const response = await call(token, 'POST', `/runner/runs/${runId}/cost`, {
+      body: {
+        usage: [{ phase: 'agent', turns: 4, input_tokens: 100, output_tokens: 20,
+                  cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+                  provider: 'openrouter', model: 'x/y' }],
+        // TWO AGENT SANDBOXES, which is what every run actually creates. Keyed on
+        // `phase` the second would overwrite the first and the loss would be silent.
+        compute: [
+          { sandbox_id: 'sbx-a', phase: 'agent', active_cpu_ms: 10, duration_ms: 100, ingress_bytes: 5, egress_bytes: 6 },
+          { sandbox_id: 'sbx-b', phase: 'agent', active_cpu_ms: 20, duration_ms: 200, ingress_bytes: 7, egress_bytes: 8 },
+          // The environment build, whose session cost the platform never reports:
+          // `snapshot()` stops it and only `stop()` answers. Null is the absence of a
+          // measurement, and `Number(null)` being 0 would turn it into one.
+          { sandbox_id: 'sbx-env', phase: 'env', active_cpu_ms: null, duration_ms: null, ingress_bytes: null, egress_bytes: null },
+        ],
+      },
+    });
+    expect(response.status).toBe(204);
+
+    const rows = await readCompute(client!, runId);
+    expect(rows.map((r) => r.sandbox_id).sort()).toEqual(['sbx-a', 'sbx-b', 'sbx-env']);
+    expect(rows.find((r) => r.sandbox_id === 'sbx-env')).toMatchObject({ active_cpu_ms: null, duration_ms: null });
+    expect(rows.find((r) => r.sandbox_id === 'sbx-b')).toMatchObject({ active_cpu_ms: 20, egress_bytes: 8 });
+    expect(await readUsage(client!, runId)).toMatchObject([{ phase: 'agent', turns: 4 }]);
+
+    // BOTH AGENT PHASES SURVIVE. A run has two — the repro agent and the fix agent — and
+    // both report `phase: 'agent'`. Keyed `(run_id, phase)` the second overwrote the
+    // first and half the model bill vanished, wrong since M6d and invisible until 10f put
+    // it on a page beside two agent SANDBOXES.
+    const second = await call(token, 'POST', `/runner/runs/${runId}/cost`, {
+      body: {
+        usage: [{ phase: 'agent', n: 1, turns: 9, input_tokens: 700, output_tokens: 60,
+                  cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+                  provider: 'openrouter', model: 'x/y' }],
+      },
+    });
+    expect(second.status).toBe(204);
+    expect(await readUsage(client!, runId)).toMatchObject([
+      { phase: 'agent', n: 0, turns: 4 },
+      { phase: 'agent', n: 1, turns: 9 },
+    ]);
+
+    // And a REPEAT of a row already written updates it rather than duplicating — the
+    // idempotency the `on conflict` is there for, which a runner retrying would need.
+    await call(token, 'POST', `/runner/runs/${runId}/cost`, {
+      body: {
+        compute: [{ sandbox_id: 'sbx-a', phase: 'agent', active_cpu_ms: 11, duration_ms: 100, ingress_bytes: 5, egress_bytes: 6 }],
+      },
+    });
+    const again = await readCompute(client!, runId);
+    expect(again).toHaveLength(3);
+    expect(again.find((r) => r.sandbox_id === 'sbx-a')).toMatchObject({ active_cpu_ms: 11 });
+
+    // And none of it reached the log, which is the whole reason it is a route.
+    const { rows: events } = await client!.query('select count(*)::int as n from events where run_id = $1', [runId]);
+    expect(events[0].n).toBe(0);
+  });
+
+  test('ANOTHER runner cannot write a bill against this run', async () => {
+    if (skipped()) return;
+    const id = installation();
+    const runId = await queue(id);
+    const mine = await pair(id, 'mine');
+    const theirs = await pair(id, 'theirs');
+    await call(mine.token, 'GET', '/runner/jobs');
+
+    const response = await call(theirs.token, 'POST', `/runner/runs/${runId}/cost`, {
+      body: { compute: [{ sandbox_id: 'forged', phase: 'agent', active_cpu_ms: 1, duration_ms: 1, ingress_bytes: 1, egress_bytes: 1 }] },
+    });
+    expect(response.status).toBe(403);
+    expect(await readCompute(client!, runId)).toEqual([]);
+  });
+
+  test('the run a row belongs to comes from the PATH, never from the body', async () => {
+    if (skipped()) return;
+    // A runner authorized for one run must not be able to write against another by
+    // naming it in the payload — the same rule the append path applies to `run_id`.
+    const id = installation();
+    const mineRun = await queue(id);
+    const otherRun = await queue(id);
+    const { token } = await pair(id);
+    await call(token, 'GET', '/runner/jobs');
+
+    await call(token, 'POST', `/runner/runs/${mineRun}/cost`, {
+      body: { compute: [{ run_id: otherRun, sandbox_id: 'sbx-1', phase: 'base', active_cpu_ms: 1, duration_ms: 1, ingress_bytes: 1, egress_bytes: 1 }] },
+    });
+    expect((await readCompute(client!, mineRun)).map((r) => r.sandbox_id)).toEqual(['sbx-1']);
+    expect(await readCompute(client!, otherRun)).toEqual([]);
   });
 });

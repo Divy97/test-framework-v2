@@ -98,17 +98,32 @@ GitHub had **never delivered anything**, and the empty repository list on the da
 entirely correct — a process behind a home router cannot receive an inbound webhook, and every
 tunnel that stands in for one dies overnight.
 
-The engine needs Docker and a machine. A product needs an address GitHub can always reach.
+The engine needs somewhere to execute. A product needs an address GitHub can always reach.
 Those are different requirements, so they are different processes:
 
 ```
- ┌─ CONTROL PLANE ─ one address, forever ──────────┐        ┌─ RUNNER ─ your machine ─────┐
- │  the GitHub App key · the event log · the UI    │        │  Docker · the model key     │
- │  GitHub OAuth · a queue of jobs                 │◄───────┤  dials OUT, never listens   │
- │  mints run ids · authorizes every append        │  poll  │  writes every event         │
- │  NO Docker · NO model key · executes nothing    │  ship  │  holds NO GitHub key        │
- └─────────────────────────────────────────────────┘        └─────────────────────────────┘
+ ┌─ CONTROL PLANE ─ one address, forever ──────────┐    ┌─ RUNNER ────────────────────┐
+ │  the GitHub App key · the event log · the UI    │    │  the model key              │
+ │  GitHub OAuth · a queue of jobs                 │◄───┤  dials OUT, never listens   │
+ │  mints run ids · authorizes every append        │poll│  writes every event         │
+ │  executes nothing · NO Docker                   │ship│  holds NO GitHub key        │
+ └─────────────────────────────────────────────────┘    └──────────────┬──────────────┘
+                                                                       │ one per phase
+                                                      ┌────────────────┴─────────────┐
+                                                      │  Docker here, OR a microVM   │
+                                                      │  on a substrate we operate   │
+                                                      │  no part of  (ADR-0021)      │
+                                                      └──────────────────────────────┘
 ```
+
+The plane holds no key it can *spend*: it stores a user's model credential encrypted and
+hands it to the runner that holds their run, and it never consults a model itself.
+
+**Where a phase runs is a seam, not a fact about the runner.** `ENGINE_EXECUTOR=docker` is
+the laptop, and `vercel` is a Firecracker microVM per phase — created `deny-all`, then
+*probed from inside* to check the platform actually applied it, because a policy read back
+from the SDK is a read of our own cache. Nothing in the engine knows which it got
+([ADR-0021](docs/adr/0021-the-sandbox-is-a-microvm-we-do-not-operate.md)).
 
 The rule that survives the split is the one this whole system rests on: **the plane mints the
 run id and writes no events.** It decides that a run exists and who may write it; the runner

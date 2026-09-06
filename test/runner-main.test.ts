@@ -11,6 +11,9 @@
 // mocks it, which is why it is its own file.
 
 import { beforeEach, describe, expect, test, vi } from 'vitest';
+import type { ComputeRow } from '../src/readmodel.js';
+import type { ComputeLog } from '../src/runner-main.js';
+type ComputeRow2 = Omit<ComputeRow, 'run_id'>;
 
 /** Typed with its one argument, so `mock.calls[0][0]` is a value and not `never`. */
 const runFromIssue = vi.fn(async (_request: Record<string, unknown>) => {});
@@ -31,12 +34,17 @@ const job = {
   recipe: null,
 } as unknown as Parameters<ReturnType<typeof engineExecute>>[0];
 
+const bills: { usage?: unknown[]; compute?: unknown[] }[] = [];
 const io = {
   append: async () => {},
   token: async () => 'an-installation-token',
+  cost: async (spent: { usage?: unknown[]; compute?: unknown[] }) => void bills.push(spent),
 } as unknown as Parameters<ReturnType<typeof engineExecute>>[1];
 
-beforeEach(() => runFromIssue.mockClear());
+beforeEach(() => {
+  runFromIssue.mockClear();
+  bills.splice(0);
+});
 
 describe('what the runner chose is what the engine is handed', () => {
   test('a Docker runner builds no executor, and hands none over', async () => {
@@ -80,5 +88,70 @@ describe('what a Vercel runner builds, without building one', () => {
     // the SDK and reach the network.
     const { join } = await import('node:path');
     expect(join(config.blobRoot, '..', 'sandboxes.jsonl')).toBe('/var/lib/worker/sandboxes.jsonl');
+  });
+});
+
+
+describe('what the run spent is reported, and never dropped on the floor', () => {
+  /**
+   * One sandbox's row, in the shape the database takes.
+   *
+   * Whole rather than partial, because `ComputeLog` is typed against `ComputeRow` now —
+   * that typing is the control on the write end agreeing with the read end, and a fixture
+   * that opted out of it with a cast would be the test disabling the check it exists for.
+   */
+  const row = (sandbox_id: string, phase: string): ComputeRow2 => ({
+    sandbox_id,
+    phase,
+    active_cpu_ms: 1,
+    duration_ms: 2,
+    ingress_bytes: 3,
+    egress_bytes: 4,
+  });
+  const spent = (rows: ComputeRow2[]): ComputeLog => new Map([[job.runId, rows]]);
+
+  test('the model AND the machines go out in one bill, and the buffer is drained', async () => {
+    // Before 10f this return value was discarded outright: `saveUsage` had one caller,
+    // `serve.ts`, so every run a WORKER drove lost what it spent — and the sandboxes were
+    // never recorded anywhere at all.
+    runFromIssue.mockResolvedValueOnce({
+      usage: [{ phase: 'agent', usage: { turns: 7, input_tokens: 90, output_tokens: 8 } }],
+    } as never);
+    const machines = spent([row('sbx-1', 'base')]);
+    await engineExecute(readRunnerConfig(BASE), undefined, machines)(job, io);
+
+    expect(bills).toHaveLength(1);
+    expect(bills[0]!.usage).toMatchObject([{ phase: 'agent', turns: 7, input_tokens: 90 }]);
+    expect(bills[0]!.compute).toEqual([row('sbx-1', 'base')]);
+    // DRAINED. A worker takes jobs forever, and a map that only ever grows is a leak
+    // with a very slow fuse.
+    expect(machines.has(job.runId)).toBe(false);
+  });
+
+  test('a run that ENDED BADLY still reports what it burned getting there', async () => {
+    // The control on the `finally`. A failed run is the one whose cost is most worth
+    // knowing — it is the shape that spends an hour of sandbox and produces nothing —
+    // and reporting only on success would hide exactly those.
+    runFromIssue.mockRejectedValueOnce(new Error('the environment build could not be run'));
+    const machines = spent([row('sbx-env', 'env')]);
+    await expect(engineExecute(readRunnerConfig(BASE), undefined, machines)(job, io)).rejects.toThrow(
+      /environment build/,
+    );
+    expect(bills).toHaveLength(1);
+    expect(bills[0]!.compute).toEqual([row('sbx-env', 'env')]);
+    expect(machines.has(job.runId)).toBe(false);
+  });
+
+  test(`and one run never carries another run's machines`, async () => {
+    // The buffer is keyed by run because the executor is built once per WORKER and
+    // `onCompute` fires mid-run: a worker with two jobs in flight must not put one's
+    // sandboxes on the other's bill.
+    const machines = spent([row('sbx-mine', 'base')]);
+    machines.set('99999999-2222-4333-8444-555555555555', [row('sbx-theirs', 'base')]);
+    await engineExecute(readRunnerConfig(BASE), undefined, machines)(job, io);
+    expect(bills[0]!.compute).toEqual([row('sbx-mine', 'base')]);
+    // CLEARED rather than left: one job at a time means an entry under another key is an
+    // orphan, and `delete` alone would keep it forever under a uuid nobody holds.
+    expect(machines.size).toBe(0);
   });
 });

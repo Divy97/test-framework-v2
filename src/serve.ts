@@ -451,10 +451,14 @@ export async function serve(options: ServeOptions): Promise<Service> {
 
         // WHAT IT COST, banked rather than logged and dropped (M6d). Not an event: our
         // spending is a fact about us, and the log is about the user's bug (ADR-0006).
-        for (const entry of result.usage ?? []) {
+        const banked = result.usage ?? [];
+        for (const [index, entry] of banked.entries()) {
           await saveUsage(client, {
             run_id: result.runId,
             phase: entry.phase,
+            // Which phase of this name it is. Two `agent` phases per run, and before this
+            // the fix agent's row landed on the repro agent's and half the bill vanished.
+            n: banked.slice(0, index).filter((one) => one.phase === entry.phase).length,
             turns: entry.usage.turns,
             input_tokens: entry.usage.input_tokens,
             output_tokens: entry.usage.output_tokens,
