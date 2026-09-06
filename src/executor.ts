@@ -48,20 +48,25 @@ export type PhaseResult = {
   /** Host directory the agent container left its commits in, when it had one. */
   handover?: string;
   /**
-   * The phase was stopped by this engine's wall clock rather than finishing (M10).
+   * Which ceiling stopped this phase, when one did (M10).
    *
    * Beside the `VERIFICATION_ABORTED{cause:'ceiling'}` the executor also emits, not
    * instead of it: the event is what the fold reads and what disqualifies the attempt.
-   * This field is for a caller that wants the fact without re-reading the events, and
-   * nothing reads it today.
    *
-   * `'wall'` only. The substrate's own session timeout — enforced with our process dead —
-   * is the other ceiling a microVM adds, and it is not reported here because a process
-   * that is dead reports nothing; what surfaces then is a stream that ends and a sandbox
-   * the boot sweep finds. A `'session'` value would be a name for an observation this
-   * design cannot make.
+   * - `'wall'` is OURS — `containerTimeoutMs`, enforced by the process driving the phase.
+   * - `'session'` is the SUBSTRATE'S, and it is observable, which an earlier version of
+   *   this comment denied. It argued a dead process reports nothing — true of a worker
+   *   that has died, and not the case here: a microVM's session ceiling fires while this
+   *   process is alive and using it, and the SDK then says so (10a item 11 measured
+   *   `StreamError` on the stream and `APIError 410` on the wait). On the Hobby tier that
+   *   ceiling is 45 minutes, BELOW this engine's own hour, so it is the one that fires
+   *   first on a long run — and the spike doc already described the executor mapping it.
+   *
+   * Reported rather than thrown, for the reason `runPhase` must never throw for an
+   * outcome the design has a name for: everything the phase observed before the session
+   * ended is still evidence.
    */
-  ceiling?: 'wall';
+  ceiling?: 'wall' | 'session';
   /**
    * What the container said on stderr, bounded.
    *

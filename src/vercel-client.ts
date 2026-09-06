@@ -29,6 +29,69 @@ export type NetworkPolicy = 'allow-all' | 'deny-all';
 export type Finished = { exitCode: number; output: string };
 
 /**
+ * The PLATFORM ended the session while we were still using it.
+ *
+ * Its own class because it is not a transport fault and must not be handled as one. A
+ * sandbox has a session ceiling enforced outside the guest, and when it fires the SDK
+ * stops answering about that machine: the spike measured `logs()` throwing
+ * `StreamError: Sandbox stream was closed…` and `wait()` throwing `APIError 410: Sandbox
+ * has stopped execution…`, neither of which hangs (10a item 11). On the Hobby tier that
+ * ceiling is 45 minutes, which is BELOW this engine's own hour, so it is the one that
+ * fires first on a long run.
+ *
+ * Distinguished here rather than in the executor because the SDK's error shapes are this
+ * file's business. What the executor does with it is report `ceiling: 'session'` and keep
+ * every event observed up to that point — the alternative is an exception that unwinds
+ * the run and takes the evidence with it.
+ */
+export class SessionEnded extends Error {}
+
+/**
+ * Whether an error from the SDK means the session is over.
+ *
+ * Matched on the two shapes the spike actually observed, plus the status code, rather
+ * than on a message alone: a string match is a guess about somebody else's wording, and
+ * a 410 is the platform saying the resource is gone in the way HTTP has a word for.
+ */
+const isSessionEnded = (error: unknown): boolean => {
+  const detail = error as { name?: string; status?: number; statusCode?: number; message?: string };
+  if (detail?.status === 410 || detail?.statusCode === 410) return true;
+  if (detail?.name === 'StreamError') return true;
+  return /sandbox (stream was closed|has stopped execution)/i.test(detail?.message ?? '');
+};
+
+/**
+ * The same translation for a stream, because `for await` throws from inside the loop.
+ *
+ * A generator rather than a `.catch`: the error arrives on the Nth `next()`, after some
+ * chunks have already been yielded, and those chunks are evidence the caller keeps.
+ */
+async function* throughSessionIterable<T>(source: AsyncIterable<T>): AsyncIterable<T> {
+  const iterator = source[Symbol.asyncIterator]();
+  for (;;) {
+    let step: IteratorResult<T>;
+    try {
+      step = await iterator.next();
+    } catch (error) {
+      if (isSessionEnded(error)) throw new SessionEnded(String((error as Error).message ?? error));
+      throw error;
+    }
+    if (step.done) return;
+    yield step.value;
+  }
+}
+
+/** Run something against a sandbox, turning a session end into `SessionEnded`. */
+const throughSession = async <T>(work: () => Promise<T>): Promise<T> => {
+  try {
+    return await work();
+  } catch (error) {
+    if (isSessionEnded(error)) throw new SessionEnded(String((error as Error).message ?? error));
+    throw error;
+  }
+};
+
+/**
  * A command started and left running, whose stdout is the event channel.
  *
  * ONE stream, carrying both descriptors labelled, rather than a method per descriptor.
@@ -187,16 +250,17 @@ const wrap = (sandbox: SdkSandbox): SandboxHandle => ({
       return null;
     }
   },
-  run: async (command, options = {}) => {
-    const finished = await sandbox.runCommand({
-      cmd: 'sh',
-      args: ['-c', command],
-      ...(options.sudo ? { sudo: true } : {}),
-      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-    });
-    await finished.wait();
-    return { exitCode: finished.exitCode, output: await finished.output('both') };
-  },
+  run: async (command, options = {}) =>
+    await throughSession(async () => {
+      const finished = await sandbox.runCommand({
+        cmd: 'sh',
+        args: ['-c', command],
+        ...(options.sudo ? { sudo: true } : {}),
+        ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+      });
+      await finished.wait();
+      return { exitCode: finished.exitCode, output: await finished.output('both') };
+    }),
   start: async (command, options = {}) => {
     const started = await sandbox.runCommand({
       cmd: 'sh',
@@ -210,7 +274,9 @@ const wrap = (sandbox: SdkSandbox): SandboxHandle => ({
         (async function* () {
           const logs = started.logs();
           try {
-            for await (const chunk of logs) {
+            // The iteration itself, not just the setup: the stream is where a session end
+            // shows up first, mid-phase, while this process is very much alive.
+            for await (const chunk of throughSessionIterable(logs)) {
               yield { stream: chunk.stream === 'stderr' ? ('stderr' as const) : ('stdout' as const), data: chunk.data };
             }
           } finally {
@@ -221,7 +287,7 @@ const wrap = (sandbox: SdkSandbox): SandboxHandle => ({
             logs.close();
           }
         })(),
-      wait: async () => (await started.wait()).exitCode,
+      wait: async () => await throughSession(async () => (await started.wait()).exitCode),
       kill: () => started.kill(),
     };
   },

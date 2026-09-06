@@ -15,6 +15,7 @@
 // the policy field instead of the probe, would see a different answer here than a correct
 // one does.
 
+import { SessionEnded } from '../../src/vercel-client.js';
 import type {
   Compute,
   NetworkPolicy,
@@ -71,6 +72,14 @@ export type FakeOptions = {
   refuseCreate?: boolean;
   /** What `tar` says when it fails, so the collection path can be exercised. */
   tarFails?: string;
+  /**
+   * End the session after this many stdout chunks, the way the platform does.
+   *
+   * Modelled as a throw from the STREAM rather than a clean end, because that is what
+   * 10a item 11 measured: `logs()` throws `StreamError` and `wait()` throws a 410. A fake
+   * that simply stopped yielding would exercise the happy path and prove nothing.
+   */
+  endSessionAfter?: number;
 };
 
 /**
@@ -247,6 +256,7 @@ export function fakeSandboxes(options: FakeOptions = {}): {
           id: 'cmd-1',
           chunks: () =>
             (async function* () {
+              let yielded = 0;
               try {
                 for await (const chunk of script({
                   sandbox: fake,
@@ -258,6 +268,10 @@ export function fakeSandboxes(options: FakeOptions = {}): {
                   },
                 })) {
                   yield { stream: 'stdout' as const, data: chunk };
+                  yielded += 1;
+                  if (options.endSessionAfter !== undefined && yielded >= options.endSessionAfter) {
+                    throw new SessionEnded('Sandbox stream was closed before the command finished');
+                  }
                 }
               } finally {
                 done();
@@ -265,6 +279,9 @@ export function fakeSandboxes(options: FakeOptions = {}): {
             })(),
           wait: async () => {
             await finished;
+            if (options.endSessionAfter !== undefined) {
+              throw new SessionEnded('Sandbox has stopped execution');
+            }
             return 0;
           },
           kill: async () => {

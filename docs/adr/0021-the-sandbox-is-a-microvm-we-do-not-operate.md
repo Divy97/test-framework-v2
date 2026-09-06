@@ -180,10 +180,16 @@ Two costs this adds, named rather than left to be discovered:
   a window and then closes (spike item 5), so a stream dropped mid-phase cannot be picked
   up where it left off. `runner-vm.ts` mirrors every reply to `<spool>/out/<id>.json` for
   that reason; the events themselves are durable in the plane once appended.
-- **A phase now has two ceilings.** Ours, enforced by the process driving it, and the
-  platform's session timeout, enforced with that process dead. `PhaseResult.ceiling`
-  reports the first; the second cannot be reported by a process that is dead, and what
-  surfaces then is a stream that ends and a sandbox the boot sweep finds.
+- **A phase now has two ceilings, and BOTH are observable.** Ours, enforced by the process
+  driving the phase, and the platform's session timeout — which an earlier draft of this
+  paragraph said could not be reported "by a process that is dead". That confused two
+  different failures. A worker that has died reports nothing, true; but the session
+  ceiling fires while the worker is alive and using the sandbox, and the SDK says so —
+  item 11 measured `StreamError` on the stream and `APIError 410` on the wait. On the
+  Hobby tier that ceiling is 45 minutes, below this engine's own hour, so it is the one
+  that fires FIRST on a long run. `PhaseResult.ceiling` distinguishes them, and both are
+  reported rather than thrown, because a phase cut off after forty minutes has forty
+  minutes of evidence in it.
   `VERIFICATION_ABORTED{cause:'ceiling'}` puts ours in the log — where the fold
   disqualifies the attempt, because a comparison cut short mid-observation is half a
   comparison and must not be credited with a reproduction.
