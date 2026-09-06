@@ -7,7 +7,8 @@
 // everyone's work. So it lives here, needs `DATABASE_URL`, and is run by whoever operates
 // the deployment.
 //
-//   npx tsx --env-file=.env scripts/pair-worker.mts "the worker"
+//   npm run worker:pair -- "the worker"          # asks first
+//   npm run worker:pair -- "the worker" --yes    # for a deploy script
 //
 // The token is shown ONCE. Only its hash is stored, so a lost token is re-paired rather
 // than recovered — the same rule the dashboard's pairing page follows.
@@ -16,7 +17,10 @@ import { createInterface } from 'node:readline';
 import { pairRunner } from '../src/plane.js';
 import { close, connect, ready } from '../src/store.js';
 
-const name = process.argv[2] ?? 'the hosted worker';
+/** `--yes` anywhere in the arguments; the rest is the name. */
+const args = process.argv.slice(2);
+const assumeYes = args.includes('--yes');
+const name = args.find((arg) => arg !== '--yes') ?? 'the hosted worker';
 
 /** Which database, without the password. Same reason `cli.ts schema` prints it. */
 const where = (): string => {
@@ -47,7 +51,10 @@ await ready(client);
 try {
   console.log(`This mints a runner token that can claim ANY installation's jobs.`);
   console.log(`Name: ${name}`);
-  if (!(await confirm(`Pair a global worker against ${where()}?`))) {
+  // `--yes` for a deploy script, which has no terminal to answer a prompt with — the
+  // same escape `cli.ts schema` carries, and for the same reason: without it the guard
+  // below refuses a piped answer, correctly, and the script cannot be automated at all.
+  if (!assumeYes && !(await confirm(`Pair a global worker against ${where()}?`))) {
     console.error('Not paired.');
     process.exit(1);
   }
