@@ -107,7 +107,11 @@ const COMPUTE = [
   { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-env', phase: 'env', active_cpu_ms: null, duration_ms: null, ingress_bytes: null, egress_bytes: null },
   { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-repro', phase: 'agent', active_cpu_ms: 4_120, duration_ms: 186_400, ingress_bytes: 25_769, egress_bytes: 14_956 },
   { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-fix', phase: 'agent', active_cpu_ms: 3_048, duration_ms: 141_200, ingress_bytes: 21_310, egress_bytes: 9_882 },
-  { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-base', phase: 'base', active_cpu_ms: 1_902, duration_ms: 26_187, ingress_bytes: 0, egress_bytes: 0 },
+  // Non-zero egress on a SEALED phase, which is what the first hosted run actually
+  // measured (8KB, 11KB, 15KB across three `deny-all` sandboxes). A fixture with zeroes
+  // here would model a world where egress answers the question about the network, and it
+  // does not — `SANDBOX_SEALED` does.
+  { run_id: DEMO_RUN_ID, sandbox_id: 'sbx-base', phase: 'base', active_cpu_ms: 1_902, duration_ms: 26_187, ingress_bytes: 19_004, egress_bytes: 11_735 },
 ];
 
 /**

@@ -137,6 +137,10 @@ create table if not exists run_compute (
   active_cpu_ms bigint,
   duration_ms   bigint,
   ingress_bytes bigint,
+  -- NOT a seal check. Measured non-zero on every `deny-all` phase of the first hosted
+  -- run (8KB, 11KB, 15KB): it counts bytes leaving the machine at all, most of them this
+  -- engine reading back its own transcript, evidence tarball and handover bundle.
+  -- `SANDBOX_SEALED` is what answers the question about the network.
   egress_bytes  bigint,
   observed_at   timestamptz not null default now(),
   primary key (run_id, sandbox_id)

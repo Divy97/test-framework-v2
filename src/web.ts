@@ -1372,9 +1372,13 @@ said, not what the engine saw.</p>` +
               ]),
             ) +
             `<p class="small muted">One row per sandbox, because a run creates two agents
-and keying on the phase would keep the second and lose the first. Egress is the number
-worth reading twice: a phase that judges is created <code>deny-all</code>, so anything
-other than a handful of bytes there is a seal that did not take.</p>`
+and keying on the phase would keep the second and lose the first. <strong>Egress is not a
+seal check</strong> — every phase above was sealed <code>deny-all</code> and every one of
+them shows kilobytes, because the number counts bytes leaving the machine at all: this
+engine's own reads of the transcript, the evidence tarball and the handover bundle, and
+whatever a blocked connection managed to send to the proxy that terminates it. Whether a
+sandbox could reach the internet is answered by <code>SANDBOX_SEALED</code>, which records
+what a probe <em>inside</em> it found.</p>`
           : '') +
         `<p class="small muted">Recorded beside the log rather than inside it: an event
 class describing our own spending would put a fact about us into a log about your bug
