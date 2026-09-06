@@ -362,8 +362,13 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
      *
      * On boot, because the failure it repairs is a worker that died mid-run: the platform
      * will end those sessions at their own timeout, but that is up to an hour of compute
-     * per phase nobody is watching. Returns how many it stopped so a caller can log a
-     * number rather than a shrug.
+     * per phase nobody is watching.
+     *
+     * Returns how many the platform ACCEPTED a stop for, which is not quite the same as
+     * how many were still running: a sandbox `close()` already ended answers the same way
+     * as one this call ended, and telling them apart would cost a status round trip per id
+     * to make a log line more precise. The number that matters is zero-vs-not on a boot
+     * sweep, and that one is exact.
      */
     sweep: async () => {
       // THIS WORKER'S sandboxes, from two sources that agree. The ledger is the record a
