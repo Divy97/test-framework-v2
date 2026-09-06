@@ -517,7 +517,8 @@ describe('what a run cost, against a real database', () => {
       // token", and cached input is billed at a different rate — a row without these two
       // columns cannot be reconciled against a bill, which is the only thing this table
       // is for. They are also the columns most likely to be dropped as noise.
-      expect(await readUsage(client, runId)).toEqual([row]);
+      // `n` defaults to 0 — see below for what it is for.
+      expect(await readUsage(client, runId)).toEqual([{ ...row, n: 0 }]);
 
       // Re-saving the same phase replaces it. A run whose usage was written twice would
       // double the reported spend, and this table has no event log to reconcile against.
@@ -525,6 +526,20 @@ describe('what a run cost, against a real database', () => {
       const after = await readUsage(client, runId);
       expect(after).toHaveLength(1);
       expect(after[0]!.output_tokens).toBe(3_200);
+
+      // AND THE SECOND AGENT PHASE IS A DIFFERENT ROW (M10, 10f). A run has two — the
+      // repro agent and the fix agent — and both report `phase: 'agent'`. Keyed
+      // `(run_id, phase)` the second landed on the first with a `do update`, so the repro
+      // agent's spend was replaced rather than added and half the model bill vanished.
+      // Wrong since this table was written, and invisible for as long as the only runs
+      // anybody read closely were local ones.
+      await saveUsage(client, { ...row, n: 1, turns: 5, output_tokens: 900 });
+      const both = await readUsage(client, runId);
+      expect(both).toHaveLength(2);
+      expect(both.map((one) => [one.n, one.output_tokens])).toEqual([
+        [0, 3_200],
+        [1, 900],
+      ]);
       // Numbers, not strings. `integer` is deliberate in the schema for exactly this:
       // node-postgres hands back `bigint` as text and every sum would silently concatenate.
       expect(typeof after[0]!.input_tokens).toBe('number');
