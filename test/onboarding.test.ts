@@ -10,7 +10,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Db } from '../src/store.js';
 import { dashboardRoutes } from '../src/routes.js';
-import { onboardPage } from '../src/web.js';
 import { startStatusServer, type StatusServer } from '../src/sse.js';
 
 const servers: StatusServer[] = [];
@@ -40,11 +39,21 @@ const serve = async (onApproved: (repo: string) => void, writes: string[] = []) 
   return `http://127.0.0.1:${server.port}`;
 };
 
+/**
+ * A `PUT` with a JSON body, since 10i.
+ *
+ * It was a form post to `/repos/o/r/onboard`, and the change is the envelope and nothing
+ * else: the same `parseRecipe`, the same `saveRecipe`, the same `onApproved`, behind the
+ * same origin check. What is asserted below — that proving fires after the write, not
+ * before, and not at all on a refusal or a forgery — is a property of the ORDER of those
+ * calls, which is why this test kept driving them over a real socket rather than moving
+ * into `test/api.test.ts` with the rest of the JSON surface.
+ */
 const approve = (base: string, recipe: string, headers: Record<string, string> = {}) =>
-  fetch(`${base}/repos/o/r/onboard`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
-    body: new URLSearchParams({ recipe }).toString(),
+  fetch(`${base}/api/repos/o%2Fr/recipe`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ recipe: JSON.parse(recipe) }),
     redirect: 'manual',
   });
 
@@ -57,7 +66,7 @@ describe('approving a recipe starts a proving run', () => {
     const base = await serve((repo) => approved.push(repo), writes);
 
     const response = await approve(base, GOOD);
-    expect(response.status).toBe(303);
+    expect(response.status).toBe(200);
     expect(approved).toEqual(['o/r']);
 
     // AFTER the write, and the order is the claim: proving is about the commands now
@@ -96,28 +105,7 @@ describe('approving a recipe starts a proving run', () => {
   });
 });
 
-/**
- * Approving is a write with no visible result, and that made a working button look broken.
- *
- * The form 303s back to a page that renders the recipe it already showed. A click that
- * stored something and a click that stored the same thing again are pixel-identical — so
- * the first person to use this pasted a recipe, clicked, saw no change, and reported that
- * nothing happened. The click had worked. The paste had not landed, and an empty recipe
- * was approved for real, with the page unable to say either way.
- */
-describe('the page says what approving did', () => {
-  it('names when the recipe in force took force', () => {
-    const html = onboardPage('acme/widgets', { install: 'npm ci', services: [], test: 'npm test' }, undefined, undefined, {
-      approvedAt: '2026-09-01T18:12:33.928Z',
-    });
-
-    expect(html).toContain('In force');
-    // The moving part: a second approval writes a new timestamp, so the page changes even
-    // when the recipe does not.
-    expect(html).toContain('01 Sept');
-  });
-
-  it('says nothing of the sort when no recipe has ever been approved', () => {
-    expect(onboardPage('acme/widgets', null)).not.toContain('In force');
-  });
-});
+// What the screen says about an approval that landed — the "In force since" line, which
+// exists because a click that stored something and a click that changed nothing were
+// pixel-identical — moved to `test/screens.test.tsx` when 10i deleted `src/web.ts`. The
+// route's own behaviour is above and did not move.

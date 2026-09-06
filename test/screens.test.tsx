@@ -27,9 +27,13 @@
 
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, test } from 'vitest';
-import type { Evidence as EvidenceData, Frame } from '../web/lib/api';
+import type { Evidence as EvidenceData, Me, RepoDetail } from '../web/lib/api';
+import type { Frame } from '../web/lib/hooks';
+import { Chrome } from '../web/components/Chrome';
 import { Evidence } from '../web/components/views/Evidence';
+import { Environment } from '../web/components/views/Environment';
 import { Landing } from '../web/components/views/Landing';
+import { Minted } from '../web/components/views/Runners';
 import { Timeline } from '../web/components/Timeline';
 
 const render = (node: React.ReactElement): string => renderToStaticMarkup(node);
@@ -348,5 +352,212 @@ describe('the landing page argues without manufacturing proof', () => {
     const html = render(<Landing installUrl="https://x.invalid" signIn />);
     expect(html).toContain('proves the bug existed');
     expect(html).toContain('Install on GitHub');
+  });
+});
+
+describe('the header offers the way out only where there is one', () => {
+  const me = (over: Partial<Me> = {}): Me => ({
+    accounts: true,
+    signedIn: true,
+    login: 'divy97',
+    mode: 'plane',
+    installUrl: 'https://example.invalid',
+    modelKey: { provider: 'openrouter' },
+    secrets: { enabled: false },
+    github: true,
+    forgetting: true,
+    ...over,
+  });
+
+  test('shows who you are and a sign out, when somebody is signed in', () => {
+    const html = render(<Chrome me={me()} path="/runs" go={() => {}} />);
+    expect(html).toContain('divy97');
+    expect(html).toContain('Sign out');
+    expect(html).toContain('action="/auth/logout"');
+    // A form, not an anchor, and a real one: `POST` because a link that logs somebody out
+    // is a link anybody's page can embed in an `<img>`.
+    expect(html).toContain('method="post"');
+  });
+
+  test('offers nothing when nobody is', () => {
+    // Anonymous on a hosted plane, and every page on a laptop, where there is no login to
+    // end. A sign-out button with no session behind it is a control that does nothing.
+    const html = render(<Chrome me={me({ signedIn: false, login: null })} path="/runs" go={() => {}} />);
+    expect(html).not.toContain('Sign out');
+    expect(html).not.toContain('/auth/logout');
+  });
+
+  test('a surface with no accounts offers no way out of one', () => {
+    const html = render(<Chrome me={me({ accounts: false, login: null })} path="/runs" go={() => {}} />);
+    expect(html).not.toContain('/auth/logout');
+  });
+
+  test('escapes the login, which came from GitHub rather than from us', () => {
+    const html = render(<Chrome me={me({ login: '<script>alert(1)</script>' })} path="/runs" go={() => {}} />);
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  test('the current section is marked, for a reader who cannot see the underline', () => {
+    const html = render(<Chrome me={me()} path="/runs" go={() => {}} />);
+    expect(html).toContain('aria-current="page"');
+    // One, not three.
+    expect(html.match(/aria-current="page"/g)?.length).toBe(1);
+  });
+});
+
+/**
+ * The command on the pairing page has to be the whole command.
+ *
+ * A new operator followed it exactly — clone, `npm ci`, run — and the runner refused,
+ * naming four variables it had no way to look up. The two image names and the blob root are
+ * things this repository already decides; only the model credential is genuinely the
+ * operator's. The answer to the other three lived in a document about setting up a GitHub
+ * App, which nothing in the pairing flow pointed at.
+ */
+describe('what the pairing page tells a stranger to run', () => {
+  const minted = { token: 'tfr_x', name: 'laptop', planeUrl: 'https://plane.test' };
+
+  test('builds the images, which a new machine does not have', () => {
+    expect(render(<Minted minted={minted} />)).toContain('npm run images');
+  });
+
+  test('names the model key, which is the one thing that cannot be defaulted', () => {
+    expect(render(<Minted minted={minted} />)).toContain('OPENROUTER_API_KEY');
+  });
+
+  test('says the token is on a command line, because that is where shell history comes from', () => {
+    expect(render(<Minted minted={minted} />)).toContain('shell history');
+  });
+
+  test('the token and the plane URL are in the command, not described', () => {
+    const html = render(<Minted minted={minted} />);
+    expect(html).toContain('tfr_x');
+    expect(html).toContain('https://plane.test');
+  });
+});
+
+/**
+ * Approving is a write with no visible result, and that made a working button look broken.
+ *
+ * A click that stored something and a click that stored the same thing again were
+ * pixel-identical — so the first person to use this pasted a recipe, clicked, saw no
+ * change, and reported that nothing happened. The click had worked. The paste had not
+ * landed, and an empty recipe was approved for real, with the page unable to say either
+ * way. The timestamp moves on every successful write, which is the difference made visible.
+ */
+describe('the environment screen says what approving did', () => {
+  const detail = (over: Partial<RepoDetail> = {}): RepoDetail => ({
+    repo: 'acme/widgets',
+    account: 'acme',
+    connectedAt: '2026-08-01T00:00:00.000Z',
+    onboarded: true,
+    recipe: { install: 'npm ci', services: [], test: 'npm test' },
+    approvedAt: '2026-09-01T18:12:33.928Z',
+    proof: null,
+    draft: null,
+    secrets: { names: [], enabled: false },
+    runs: [],
+    ...over,
+  });
+  const me: Me = {
+    accounts: true,
+    signedIn: true,
+    login: 'divy97',
+    mode: 'plane',
+    installUrl: 'https://x.invalid',
+    modelKey: null,
+    secrets: { enabled: false },
+    github: true,
+    forgetting: true,
+  };
+
+  test('names when the recipe in force took force', () => {
+    const html = render(<Environment repo="acme/widgets" detail={detail()} me={me} onChanged={() => {}} />);
+    expect(html).toContain('In force');
+    // The moving part: a second approval writes a new timestamp, so the screen changes even
+    // when the recipe does not. Rendered as the machine-readable value here because the
+    // human phrasing is computed against `Date.now()` in an effect — which is itself the
+    // point, since a relative time baked into a pre-rendered document would be a lie about
+    // when the image was built.
+    expect(html).toContain('2026-09-01T18:12:33.928Z');
+  });
+
+  test('says nothing of the sort when no recipe has ever been approved', () => {
+    const html = render(
+      <Environment
+        repo="acme/widgets"
+        detail={detail({ recipe: null, approvedAt: null, onboarded: false })}
+        me={me}
+        onChanged={() => {}}
+      />,
+    );
+    expect(html).not.toContain('In force');
+  });
+
+  test('the approval warning is above the box, on every state of the screen', () => {
+    // ADR-0013: the person approving IS the control, and a control that is told what it is
+    // controlling after it has acted is not one.
+    for (const state of [detail(), detail({ recipe: null, approvedAt: null })]) {
+      const html = render(<Environment repo="acme/widgets" detail={state} me={me} onChanged={() => {}} />);
+      expect(html).toMatch(/you are the control/i);
+      expect(html.indexOf('you are the control')).toBeLessThan(html.indexOf('<textarea'));
+    }
+  });
+
+  test('a draft says an agent wrote it, and an approved recipe wins outright', () => {
+    const drafted = render(
+      <Environment
+        repo="acme/widgets"
+        detail={detail({ recipe: null, approvedAt: null, draft: { install: 'pip install -e .', services: [] } })}
+        me={me}
+        onChanged={() => {}}
+      />,
+    );
+    expect(drafted).toMatch(/pre-filled by an agent, not by a person/);
+    expect(drafted).toContain('pip install -e .');
+
+    // Both present: the recipe in force is the one actually in force, and a draft beside it
+    // reads as a live second proposal nobody asked for.
+    const both = render(
+      <Environment
+        repo="acme/widgets"
+        detail={detail({ draft: { install: 'pip install -e .', services: [] } })}
+        me={me}
+        onChanged={() => {}}
+      />,
+    );
+    expect(both).not.toContain('pip install -e .');
+    expect(both).not.toMatch(/pre-filled by an agent/);
+  });
+
+  test('a stored secret is listed by name, and the screen says values do not come back', () => {
+    const html = render(
+      <Environment
+        repo="acme/widgets"
+        detail={detail({ secrets: { names: ['STRIPE_KEY'], enabled: false } })}
+        me={me}
+        onChanged={() => {}}
+      />,
+    );
+    expect(html).toContain('STRIPE_KEY');
+    expect(html).toMatch(/cannot show it to you again|can show it to you again/);
+    // No control that implies a value can be read back. Adding one is the first step
+    // towards writing the route that returns it.
+    expect(html).not.toMatch(/reveal|show value|copy value/i);
+  });
+
+  test('storing while injection is off says the value is held and not used', () => {
+    const html = render(
+      <Environment repo="acme/widgets" detail={detail({ secrets: { names: ['A'], enabled: false } })} me={me} onChanged={() => {}} />,
+    );
+    expect(html).toMatch(/not yet injected into any run/i);
+  });
+
+  test('a repository name reaches the screen as text', () => {
+    const html = render(
+      <Environment repo={'acme/<script>alert(1)</script>'} detail={detail()} me={me} onChanged={() => {}} />,
+    );
+    expect(html).not.toContain('<script>alert(1)</script>');
   });
 });

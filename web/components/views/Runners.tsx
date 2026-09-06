@@ -171,7 +171,7 @@ export function Runners({ repo }: { repo: string }) {
  * the pairing flow pointed at, and a stranger with a token and no instructions has a
  * credential for a machine they cannot start.
  */
-function Minted({ minted }: { minted: { token: string; name: string; planeUrl: string } }) {
+export function Minted({ minted }: { minted: { token: string; name: string; planeUrl: string } }) {
   return (
     <div className="panel">
       <h2>

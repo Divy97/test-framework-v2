@@ -1,6 +1,5 @@
 'use client';
 
-import { send } from '../lib/api';
 import type { Me } from '../lib/api';
 
 /**
@@ -54,19 +53,15 @@ export function Chrome({ me, path, go }: { me: Me | null; path: string; go: (to:
       </nav>
       <div className="out">
         {me?.login ? <span className="who">{me.login}</span> : null}
+        {/* A REAL FORM, and the one control in this application that needs no JavaScript.
+            POST rather than GET because a link that logs somebody out is a link anybody's
+            page can embed in an `<img>`; a form rather than a `fetch` because the plane
+            already answers this with a 303 that clears the cookie, and letting the browser
+            follow it costs nothing and works when nothing else here would. */}
         {me?.accounts && me.signedIn ? (
-          <button
-            type="button"
-            onClick={() => {
-              // A POST, because signing out is a state change and a GET that logs you out
-              // is a link anybody can put in an image tag. The plane clears the cookie and
-              // answers a redirect; the reload is what makes the whole app re-ask
-              // `/api/me` rather than keep a stale session in memory.
-              void send('POST', '/auth/logout').then(() => window.location.assign('/'));
-            }}
-          >
-            Sign out
-          </button>
+          <form method="post" action="/auth/logout">
+            <button type="submit">Sign out</button>
+          </form>
         ) : null}
       </div>
     </header>

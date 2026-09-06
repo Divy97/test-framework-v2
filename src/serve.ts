@@ -41,7 +41,8 @@ import { projectOne, saveUsage } from './readmodel.js';
 import { loadRecipe, saveProof } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runFromIssue } from './run.js';
-import { startStatusServer } from './sse.js';
+import { chain, startStatusServer } from './sse.js';
+import { staticRoutes } from './static.js';
 import { loadEnv, appendEvent, connect, readRunAfter, type Db, ready, close } from './store.js';
 
 export type Config = {
@@ -516,17 +517,24 @@ export async function serve(options: ServeOptions): Promise<Service> {
     read: (runId, afterSeq) => readRunAfter(client, runId, afterSeq),
     // The dashboard shares the tail's port rather than binding a third (M6f). One
     // surface, one thing to expose, and the live tail a run page needs is already here.
-    routes: dashboardRoutes({
-      client,
-      // The engine runs HERE: containers on this machine, and installing a repository
-      // starts a drafting run that fills the recipe box. The hosted plane can promise
-      // neither, so the pages say different things.
-      mode: 'local',
-      // Not awaited: proving is two containers and several minutes, and the human who
-      // just pressed approve is owed a page now. The result lands in the row and the
-      // next render of this page shows it.
-      onApproved: (repo) => void proveForRepo(repo),
-    }),
+    routes: chain(
+      dashboardRoutes({
+        client,
+        // The engine runs HERE: containers on this machine, and installing a repository
+        // starts a drafting run that fills the recipe box. The hosted plane can promise
+        // neither, so the pages say different things.
+        mode: 'local',
+        // Not awaited: proving is two containers and several minutes, and the human who
+        // just pressed approve is owed a page now. The result lands in the row and the
+        // next render of this page shows it.
+        onApproved: (repo) => void proveForRepo(repo),
+      }),
+      // The dashboard, from `web/`'s static export (10i). A checkout that has never run
+      // `npm run web:build` has no bundle, and `staticRoutes` answers that with a page
+      // naming the command rather than a 404 — the local product is a checkout somebody
+      // just cloned, and a blank screen there reads as a broken service.
+      staticRoutes(),
+    ),
   });
 
   return {

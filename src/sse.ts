@@ -195,6 +195,28 @@ export type Route = (request: {
   raw: (limit?: number) => Promise<Buffer | null>;
 }) => Promise<{ status: number; type: string; body: string | Buffer; headers?: Record<string, string> } | null>;
 
+/**
+ * Try each route in turn; the first that answers wins.
+ *
+ * `null` already means "not mine" in this contract, so composition is free and no route
+ * has to know what else is mounted.
+ *
+ * HERE, next to `Route` and `sameOrigin`, for the reason recorded on `sameOrigin`: more
+ * than one route module needs it and none of them owns the others. It lived in
+ * `plane-server.ts` until 10i gave `serve.ts` a second route to compose, at which point
+ * the local surface would have had to import the hosted plane to get a three-line
+ * combinator.
+ */
+export const chain =
+  (...routes: Route[]): Route =>
+  async (request) => {
+    for (const route of routes) {
+      const answer = await route(request);
+      if (answer) return answer;
+    }
+    return null;
+  };
+
 /** Ceiling on a request body. The only write takes a recipe, and a recipe is small. */
 const MAX_BODY_BYTES = 256 * 1024;
 
