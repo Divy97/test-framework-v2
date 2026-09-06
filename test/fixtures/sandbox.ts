@@ -75,6 +75,12 @@ export type FakeOptions = {
   /** What `tar` says when it fails, so the collection path can be exercised. */
   tarFails?: string;
   /**
+   * What `id -u` answers and whether sudo exists — the two image families this executor
+   * must work with. Default root-with-no-sudo, which is what OUR images are; the managed
+   * image is uid 1000 with passwordless sudo, and the spike only ever measured that one.
+   */
+  runsAs?: { uid: number; sudo: boolean };
+  /**
    * End the session after this many stdout chunks, the way the platform does.
    *
    * Modelled as a throw from the STREAM rather than a clean end, because that is what
@@ -211,6 +217,15 @@ export function fakeSandboxes(options: FakeOptions = {}): {
             if (command.includes(path)) fake.prepared.add(path);
           }
           return { exitCode: 0, output: '' };
+        }
+        if (command.startsWith('id -u;')) {
+          const as = options.runsAs ?? { uid: 0, sudo: false };
+          return { exitCode: 0, output: `${as.uid}\n${as.sudo ? 'HAVE_SUDO' : 'NO_SUDO'}` };
+        }
+        // A command needing privilege on an image that has no sudo binary fails the way
+        // a shell fails, which is how the first live run reported it.
+        if (command.includes('sudo ') && !(options.runsAs?.sudo ?? false)) {
+          return { exitCode: 127, output: 'sh: sudo: not found' };
         }
         if (command.includes('tar -cf')) {
           return options.tarFails

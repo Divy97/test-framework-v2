@@ -181,14 +181,20 @@ describe('the world the Runner needs, and the one thing the host may not write',
       driver: async ({ invoke }) => void (await invoke('read', { path: 'README' })),
     });
     expect(result.exitCode).toBe(0);
-    // Delivered through `sudo`, and verified afterwards: `sh -c` reports the last
-    // command's status, so without the `test -s` a failing `base64` would leave an empty
-    // spool file, which the Runner skips forever while the host waits for a reply.
+    // Delivered through a COMMAND rather than `writeFiles`, and verified afterwards:
+    // `sh -c` reports the last command's status, so without the `test -s` a failing
+    // `base64` would leave an empty spool file, which the Runner skips forever while the
+    // host waits for a reply.
+    //
+    // Not asserted as `sudo`, because whether that is needed is a property of the image:
+    // ours run as root, the managed one is uid 1000 with sudo, and `elevationFor` decides.
+    // The invariant here is the transport — a `tee` into the root-owned spool, checked —
+    // and the sudo half is pinned by its own tests above.
     const delivered = fake.sandboxes[0]!.commands.filter((one) => one.includes('/rpc/in/'));
     expect(delivered).toHaveLength(2); // the call, and `{done:true}`
     for (const command of delivered) {
-      expect(command).toMatch(/sudo -n tee/);
-      expect(command).toMatch(/sudo -n test -s/);
+      expect(command).toMatch(/\btee\b/);
+      expect(command).toMatch(/\btest -s\b/);
     }
   });
 
@@ -413,6 +419,53 @@ describe('the agent sandbox is sealed before it is asked anything', () => {
       { seq: 2, type: 'SANDBOX_SEALED', payload: { v: 1, sandbox_id: 's', phase: 'agent', policy: 'deny-all', probe: { dns: false, route: true } } },
     ].map((one) => ({ ...one, run_id: RUN, ts: '2026-09-06T00:00:00.000Z' })) as RunEvent[];
     expect(fold(events).sealedBeforeAgent).toBe(false);
+  });
+});
+
+describe('reaching root, on an image that may or may not have sudo', () => {
+  const runner = async function* ({ sandbox }: RunnerContext) {
+    yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
+  };
+
+  test('our images run as root, so nothing is prefixed with sudo', async () => {
+    // The second failure of the first live run: `sh: sudo: not found`. The spike measured
+    // the root model on Vercel's MANAGED image — `ubuntu`, uid 1000, passwordless sudo —
+    // and our own are alpine with no `USER` and no sudo binary. Probed live: uid 0, no
+    // sudo, can write `/`.
+    const fake = fakeSandboxes({ runsAs: { uid: 0, sudo: false }, runner });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(result.events.some((one) => one.type === 'TEST_RUN')).toBe(true);
+    // `sudo -n `, not `sudo` — the probe that decides this asks `command -v sudo`, and a
+    // bare substring match would be satisfied by the question rather than the answer.
+    expect(fake.sandboxes[0]!.commands.some((c) => c.includes('sudo -n '))).toBe(false);
+    // And it still starts the Runner and prepares the world.
+    expect(fake.sandboxes[0]!.commands.some((c) => c.includes('runner-vm'))).toBe(true);
+    expect([...fake.sandboxes[0]!.prepared]).toEqual(expect.arrayContaining(['/work', '/blobs', '/out']));
+  });
+
+  test('the managed image is uid 1000 with sudo, and gets it', async () => {
+    // THE control. Without it the executor could simply have dropped sudo everywhere and
+    // passed — correct for our images and broken for the one the spike measured.
+    const fake = fakeSandboxes({ runsAs: { uid: 1000, sudo: true }, runner });
+    await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(fake.sandboxes[0]!.commands.some((c) => c.includes('sudo -n mkdir'))).toBe(true);
+    expect(fake.sandboxes[0]!.commands.some((c) => c.includes('sudo -n ') && c.includes('runner-vm'))).toBe(true);
+  });
+
+  test('and an image that is neither is refused with a reason, not a shell error', async () => {
+    // uid 1000 and no sudo means the Runner would run as the same user the repro drops
+    // to, and `runner-vm.ts` refuses that outright. Better to say so at open than to let
+    // a `chown` fail and read as a transport fault.
+    const fake = fakeSandboxes({ runsAs: { uid: 1000, sudo: false }, runner });
+    const built = await vercelExecutor({ client: fake.client }).buildSnapshot(
+      plan(), repo(), 'main', { install: 'npm ci', services: [] },
+    );
+    expect(built).toMatchObject({ failed: expect.stringContaining('no sudo') });
+    expect(fake.sandboxes[0]!.stopped).toBe(true);
   });
 });
 
