@@ -6,7 +6,21 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
-    "noEmit": true
+    "noEmit": true,
+    // `test/screens.test.tsx` renders the dashboard's components. They need JSX, and
+    // React's automatic runtime is what `web/tsconfig.json` compiles them under — two
+    // settings that disagreed would mean the suite checked a file the bundle does not ship.
+    "jsx": "react-jsx"
   },
-  "include": ["src", "test"]
+  "include": ["src", "test"],
+  // `web/` is a SEPARATE PROGRAM with a separate tsconfig, and it has to be: its modules
+  // are resolved by a bundler, so they import without a file extension, which `NodeNext`
+  // above refuses by design. Typechecking them here would report an error in every import
+  // in the front end.
+  //
+  // They are not unchecked. `next build` runs `tsc` over all of `web/` with
+  // `moduleResolution: bundler` — the resolver those files are actually written for —
+  // and fails the build on an error, which is how the split stays honest rather than
+  // becoming a hole. `npm run web:build` is therefore part of the check, not just the ship.
+  "exclude": ["test/screens.test.tsx"]
 }

@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 // `.env` holds DATABASE_URL, and `test/store.test.ts` is the only coverage the SQL
@@ -34,6 +35,22 @@ for (const key of ['ENGINE_PROVIDER', 'ENGINE_MODEL', 'ENGINE_EFFORT', 'OPENROUT
 // slowest tests sit near vitest's 5s default and fail under load. Raise the
 // ceiling rather than let a green suite depend on how busy the machine is.
 export default defineConfig({
+  // The dashboard's screens are `.tsx` since 10i, and `test/screens.test.tsx` renders them
+  // with `renderToStaticMarkup`. `automatic` so the components need no React import, which
+  // is what `web/tsconfig.json` already compiles them under — two settings that disagree
+  // would mean the file the suite checks is not the file the bundle ships.
+  esbuild: { jsx: 'automatic' },
+  // ONE React, and this is not tidiness. `web/` has its own `node_modules` — deliberately,
+  // so Next never enters the worker or the sandbox images — so a component imported from
+  // there resolves `react` to `web/node_modules/react` while `react-dom/server` in the test
+  // file resolves to the root one. Two copies means two hook dispatchers, and every
+  // component that calls `useState` renders as `Cannot read properties of null`.
+  resolve: {
+    alias: {
+      react: fileURLToPath(new URL('./node_modules/react', import.meta.url)),
+      'react-dom': fileURLToPath(new URL('./node_modules/react-dom', import.meta.url)),
+    },
+  },
   test: {
     testTimeout: 30_000,
     // `.claude/worktrees/*` holds full checkouts of this repository, so the default

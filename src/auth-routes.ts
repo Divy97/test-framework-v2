@@ -17,7 +17,6 @@ import {
   type OAuthConfig,
 } from './auth.js';
 import { sameOrigin, type Route } from './sse.js';
-import { escapeHtml, layout } from './web.js';
 
 /** The state cookie lives exactly as long as a login takes. */
 const STATE_COOKIE = 'tf_oauth_state';
@@ -36,17 +35,41 @@ const seeOther = (location: string, cookie?: string) => {
  * Deliberately one page for every failure — a refused exchange, a state that did not
  * come back, a GitHub that would not answer. Telling somebody at a login screen WHICH
  * of those happened describes our configuration rather than their attempt.
+ *
+ * THE ONLY HTML THIS SERVICE STILL RENDERS, since 10i moved every screen into `web/`'s
+ * static bundle (ADR-0022). It cannot join them, and the reason is the shape of the
+ * failure: a person arrives here mid-redirect from GitHub, on a URL the bundle's router
+ * has no view for, with a query string carrying the reason. Answering with the
+ * application and letting it discover the problem would mean shipping a screen whose only
+ * job is to explain a state it cannot be given.
+ *
+ * So it is written out here, with its own two colours and no stylesheet. Self-contained
+ * rather than sharing a layout, because the one thing this page must survive is the rest
+ * of the front end being broken.
  */
+const escape = (s: string): string =>
+  s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+
 const refused = (why: string) =>
   ({
     status: 400,
     type: 'text/html; charset=utf-8',
-    body: layout(
-      'Sign-in did not complete',
-      `<h1>That sign-in did not complete</h1>
-<p>${escapeHtml(why)}</p>
-<p><a class="cta" href="/auth/github">Try again</a></p>`,
-    ),
+    body:
+      `<!doctype html><html lang="en"><meta charset="utf-8">` +
+      `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+      `<title>Sign-in did not complete</title>` +
+      `<style>:root{color-scheme:light dark;--paper:#faf9f6;--ink:#17161a;--muted:#65635c}` +
+      `@media(prefers-color-scheme:dark){:root{--paper:#121110;--ink:#eceae3;--muted:#9c978f}}` +
+      `body{margin:0;background:var(--paper);color:var(--ink);` +
+      `font:400 1.0625rem/1.62 ui-serif,Georgia,serif;padding:4rem 1.5rem;max-width:36rem}` +
+      `h1{font-weight:400;letter-spacing:-.02em}p{color:var(--muted)}` +
+      `a{display:inline-block;margin-top:1.5rem;padding:.7rem 1.4rem;background:var(--ink);` +
+      `color:var(--paper);text-decoration:none;border-radius:4px;` +
+      `font:500 .78rem/1 ui-monospace,Menlo,monospace;letter-spacing:.1em;text-transform:uppercase}` +
+      `</style>` +
+      `<h1>That sign-in did not complete</h1>` +
+      `<p>${escape(why)}</p>` +
+      `<a href="/auth/github">Try again</a>`,
     headers: { 'set-cookie': clearedCookie() },
   }) as const;
 

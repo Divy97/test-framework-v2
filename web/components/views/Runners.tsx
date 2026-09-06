@@ -39,26 +39,7 @@ export function Runners({ repo }: { repo: string }) {
         short-lived token per run. Pairing one hands over a credential once.
       </p>
 
-      {minted ? (
-        <div className="panel">
-          <h2>This is the only time this token is shown.</h2>
-          <p>
-            Nothing stores it in a form anything can read back — the database holds a hash.
-            Put it in the runner&rsquo;s environment now; if you lose it, revoke this machine
-            and pair another.
-          </p>
-          <div className="log">
-            <div>
-              <span className="seq">1</span>
-              <span>ENGINE_PLANE_URL={minted.planeUrl}</span>
-            </div>
-            <div>
-              <span className="seq">2</span>
-              <span>ENGINE_RUNNER_TOKEN={minted.token}</span>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      {minted ? <Minted minted={minted} /> : null}
 
       {runners.length > 0 ? (
         <div className="scroll">
@@ -177,5 +158,57 @@ export function Runners({ repo }: { repo: string }) {
       </button>
       <Said said={said} />
     </>
+  );
+}
+
+/**
+ * What to run on the machine, and the four things it will need.
+ *
+ * Ported from the page 10i deleted, because the list is not decoration: three of these
+ * four — the checkout, the images, the plane URL — are things this repository already
+ * decides, and only the model credential is genuinely the operator's. The answer to the
+ * other three used to live in a document about setting up a GitHub App, which nothing in
+ * the pairing flow pointed at, and a stranger with a token and no instructions has a
+ * credential for a machine they cannot start.
+ */
+function Minted({ minted }: { minted: { token: string; name: string; planeUrl: string } }) {
+  return (
+    <div className="panel">
+      <h2>
+        Pair <code>{minted.name}</code> — this token is shown once
+      </h2>
+      <p>Run this on the machine that will do the work:</p>
+      <pre className="scroll">
+        <code>{`git clone https://github.com/Divy97/test-framework-v2
+cd test-framework-v2 && npm ci
+npm run images   # builds the two sandbox images. Several minutes, once.
+
+export OPENROUTER_API_KEY=...   # your own; this machine spends it, we never see it
+ENGINE_PLANE_URL=${minted.planeUrl} \\
+ENGINE_RUNNER_TOKEN=${minted.token} \\
+npm run runner`}</code>
+      </pre>
+      <p className="muted small">
+        We store a hash of it, not the token, so it cannot be shown again — pair a new runner
+        if you lose it, and revoke the old one above.
+      </p>
+      <p className="muted small">
+        The runner is this repository, run from a checkout. There is no package to install:
+        an <code>npx &lt;name&gt;</code> here would fetch whatever the npm registry has under
+        that name and execute it on your machine, with the token above already in its
+        environment.
+      </p>
+      <p className="muted small">
+        It needs Docker running and a model key of your own. Everything else has a default —
+        the two image names are what <code>npm run images</code> builds, and evidence is
+        written to <code>./.evidence-store</code> in the checkout.
+      </p>
+      <p className="muted small">
+        <b>The token is on a command line.</b> That puts it in your shell history and, while
+        the runner is running, in the output of <code>ps</code>. If that matters where you are
+        running this, put it in an environment file the shell reads instead, and revoke this
+        one if it has been somewhere it should not.
+      </p>
+    </div>
   );
 }
