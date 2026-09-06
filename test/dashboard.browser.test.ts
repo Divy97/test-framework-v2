@@ -432,8 +432,8 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     // reads the bytes rather than watching a browser render past them.
     await browser!.navigate(`${base}/`);
     visited.push('/');
-    const page = await settle(/repositories/i, '/');
-    expect(page).toMatch(/acme.widgets/);
+    const page = await settle(/acme.widgets/, '/');
+    expect(page).toMatch(/repositories/i);
   });
 
   test('the scripts it serves are allowed by the policy it serves', async () => {
@@ -444,7 +444,10 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     // hash per inline block. Get one hash wrong — a Next upgrade that changes how the
     // flight data is emitted, a byte of whitespace — and every page is blank, with the
     // reason only in a console this is the only test that reads.
-    await visit('/repos', /repositories/i);
+    // `acme/widgets`, not the heading — every view renders its `h1` while it is still
+    // loading (so no state is headingless), which makes the title match before any data has
+    // arrived. Waiting for content is what proves the bundle ran and its fetch landed.
+    await visit('/repos', /acme.widgets/);
     expect(browser!.console()).not.toMatch(/Content Security Policy|refused to execute/i);
     // And the page really did run: this text exists nowhere in the shell.
     const page = await browser!.text();
@@ -521,7 +524,7 @@ describe.sequential('the dashboard, driven in a real browser', () => {
 
   test('the repository list shows both states, and only one of them carries the fix', async () => {
     if (skipped('the repository list')) return;
-    const page = await visit('/repos', /repositories/i);
+    const page = await visit('/repos', /acme.legacy/);
     expect(page).toContain('acme/widgets');
     expect(page).toContain('acme/legacy');
     expect(page).toMatch(/recipe approved/i);
@@ -676,14 +679,14 @@ describe.sequential('a run, while it happens', () => {
 
   const append = (type: string, payload: unknown) => {
     log.push({ run_id: RUN, seq: log.length + 1, type, payload, ts: new Date().toISOString() });
-    if (type === 'RUN_ENDED') status = 'pr_opened';
+    if (type === 'PR_OPENED' || type === 'RUN_ENDED') status = 'pr_opened';
   };
 
   beforeAll(async () => {
     if (why) return;
     log = [];
     status = 'attempting';
-    append('RUN_REQUESTED', { title: 'cart total is wrong' });
+    append('RUN_REQUESTED', { v: 1, source: 'github', thread_ref: `${REPO}#41`, raw_text: 'the cart total is wrong' });
     const row = () => ({
       run_id: RUN,
       repo: REPO,
@@ -724,6 +727,7 @@ describe.sequential('a run, while it happens', () => {
 
   test('fills in as the events land, and becomes a verdict when they stop', async () => {
     if (skipped('the live run')) return;
+    const before = browser!.console();
     await browser!.navigate(`${liveBase}/runs/${RUN}`);
     visited.push(`/runs/${RUN} (live)`);
 
@@ -734,7 +738,10 @@ describe.sequential('a run, while it happens', () => {
 
     // The seal, reported from the probe INSIDE the sandbox, which is the only thing that
     // answers the question at all.
-    append('SANDBOX_SEALED', { policy: 'deny-all', dns: false, route: false });
+    // `probe: { … }`, which is the shape `SandboxSealedV1` declares and
+    // `executor-vercel.ts` emits. A flat `dns`/`route` here would test the guess rather
+    // than the engine — which is exactly how the flat read shipped.
+    append('SANDBOX_SEALED', { v: 1, sandbox_id: 'sbx-1', phase: 'base', policy: 'deny-all', probe: { dns: false, route: false } });
     expect(await settle(/no DNS and no route out/i, 'the seal')).toMatch(/sandbox was sealed/i);
 
     // Hundreds of these arrive in a real run. One row, with a count, and the word that says
@@ -743,13 +750,14 @@ describe.sequential('a run, while it happens', () => {
     expect(await settle(/agent worked for/i, 'the turns')).toMatch(/input to no verdict/i);
 
     // Base red for the reported symptom.
-    append('TEST_RUN', { phase: 'base', exit_code: 1, symptom_matched: true, commit_sha: 'aaaa1111bbbb', stdout_hash: 'sha256:b0' });
+    append('TEST_RUN', { v: 1, phase: 'base', attempt: 1, exit_code: 1, symptom_matched: true, commit_sha: 'aaaa1111bbbb', stdout_hash: 'sha256:b0' });
     expect(await settle(/symptom present/i, 'base red')).toMatch(/exit 1/);
 
     // And the transition. `RUN_ENDED` is what tells the page to re-read the fold; the fold
     // is what turns "verdict not yet" into a tier. Nothing here computes that in the browser.
-    append('PR_OPENED', { pr_number: 12 });
-    append('RUN_ENDED', { status: 'pr_opened' });
+    append('PR_OPENED', { v: 1, repo: REPO, pr_number: 12, head_sha: 'bbbb2222cccc', diff_hash: 'sha256:d' });
+    // `reason`, not `status`. The payload has one of those names.
+    append('RUN_ENDED', { v: 1, reason: 'pr_opened' });
     const done = await settle(/tier/i, 'the verdict');
     expect(done).toMatch(/a pull request was opened/i);
     expect(done).not.toMatch(/verdict.{0,20}not yet/i);
@@ -757,6 +765,10 @@ describe.sequential('a run, while it happens', () => {
     // forever would be four queries a second per open tab.
     expect(done).not.toMatch(/●\s*live/i);
 
-    expect(browser!.console(), 'the live view logged something').not.toMatch(/^\[(error|warning)\]/im);
+    // Only what THIS test produced. `console()` accumulates for the whole file, and the
+    // throwing-page test above deliberately puts an error in it — so an assertion over the
+    // whole buffer here fails on somebody else's intentional throw.
+    const since = browser!.console().slice(before.length);
+    expect(since, 'the live view logged something').not.toMatch(/^\[(error|warning)\]/im);
   });
 });

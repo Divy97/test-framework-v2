@@ -69,11 +69,23 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
   // history, the stream is what comes next, and duplicates are free because the log is
   // append-only and a seq identifies a row.
   const stored = useJson<Frame[]>(`/api/runs/${encodeURIComponent(runId)}/events`);
-  const live = useTail(overFrom(stored.data, evidence.data) ? null : runId, { onMeaningful });
+  const live = useTail(logEnded(stored.data, evidence.data) ? null : runId, { onMeaningful });
   const frames = merge(stored.data ?? [], live.frames);
-  // The run is over when the LOG says so. `RUN_ENDED` in hand, or a projection that recorded
-  // an end — never a status that is merely terminal, which arrives an event too early.
-  const over = frames.some((frame) => frame.type === 'RUN_ENDED') || evidence.data?.row.ended_at !== null;
+  // TWO QUESTIONS, and collapsing them into one was wrong in both directions.
+  //
+  //   `ended`   — may this page show a verdict? The FOLD's answer. `fold.ts` reaches a
+  //               terminal status at `PR_OPENED`, and that is correct: the run has a tier
+  //               and a confidence from that moment, and a log that was truncated before
+  //               `RUN_ENDED` still has a verdict a reader is entitled to.
+  //   `closing` — may the stream be shut? Only once the LOG has ended. `RUN_ENDED` comes
+  //               after `PR_OPENED`, so closing on the fold's status drops the run's last
+  //               events on every successful run.
+  //
+  // One flag did both: keyed to the fold it lost the ending, keyed to the log it hid the
+  // verdict of every run whose log has no `RUN_ENDED` — which is every fixture in this
+  // repository and every run recorded before that event existed.
+  const ended = isOver(stateOf(evidence.data), evidence.data?.row.ended_at ?? null);
+  const closing = frames.some((frame) => frame.type === 'RUN_ENDED') || evidence.data?.row.ended_at != null;
 
   if (evidence.loading) return <><h1>Run</h1><Loading what="this run" /></>;
   if (evidence.status === 202) return <Queued runId={runId} reload={evidence.reload} />;
@@ -95,7 +107,6 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
   if (!evidence.data) return <><h1>Run</h1><Failed error={evidence.error ?? 'unknown'} retry={reload} /></>;
 
   const { row, state, score, usage, compute, forgotten } = evidence.data;
-  const ended = over;
   // The most recent thing that happened, for the live region — one short sentence rather
   // than a list. `SANDBOX_SEALED` and `TEST_RUN` are the two a person actually waits for.
   const latest = SAID[frames.at(-1)?.type ?? ''];
@@ -130,7 +141,7 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
           reader who cannot see the list actually needs — how far along it is, and what just
           happened. */}
       <p className="live" role="status" aria-live="polite">
-        {!ended ? (
+        {!closing ? (
           <>
             <span className="dot" aria-hidden="true">
               ●
@@ -208,7 +219,7 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
         <Failed error={stored.error} retry={stored.reload} />
       ) : (
         <>
-          <Timeline frames={frames} ended={ended} />
+          <Timeline frames={frames} ended={closing} />
           <RawLog frames={frames} />
         </>
       )}
@@ -301,7 +312,10 @@ const merge = (stored: Frame[], live: Frame[]): Frame[] => {
  * stream. A stream opened on a finished run costs one connection that closes on the next
  * render; a stream NOT opened on a live one is a page that never updates.
  */
-const overFrom = (stored: Frame[] | null, evidence: EvidenceData | null): boolean =>
+/** The fold's status, or a non-terminal placeholder while the fold has not arrived. */
+const stateOf = (evidence: EvidenceData | null): string => evidence?.state.status ?? 'requested';
+
+const logEnded = (stored: Frame[] | null, evidence: EvidenceData | null): boolean =>
   (stored ?? []).some((frame) => frame.type === 'RUN_ENDED') || evidence?.row.ended_at != null;
 
 /**

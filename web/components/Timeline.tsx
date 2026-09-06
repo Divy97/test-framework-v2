@@ -181,6 +181,7 @@ function describe(frame: Frame): Row | null {
     case 'SANDBOX_SEALED': {
       // `probe`, from INSIDE the sandbox, which is the whole reason this event exists
       // rather than a claim about the firewall's configuration.
+      const phase = str(p, 'phase');
       const probe = at(p, 'probe');
       const dns = at(probe, 'dns');
       const route = at(probe, 'route');
@@ -192,7 +193,7 @@ function describe(frame: Frame): Row | null {
         ...base,
         what: (
           <>
-            The <b>{str(p, 'phase') ?? 'sandbox'}</b> sandbox was sealed — {str(p, 'policy') ?? 'deny-all'}
+            The {phase ? <b>{phase}</b> : null} sandbox was sealed — {str(p, 'policy') ?? 'deny-all'}
           </>
         ),
         detail: sealed
