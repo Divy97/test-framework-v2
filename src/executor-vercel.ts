@@ -43,7 +43,14 @@ import type { Recipe, ReplayOutcome } from './recipe.js';
 import { redact } from './redact.js';
 import { isWorkerReply, type Job, type SuiteProbe, type WorkerRequest } from './runner.js';
 import { MAX_REASON_CHARS } from './verify.js';
-import { asLines, type Compute, type Finished, type SandboxClient, type SandboxHandle } from './vercel-client.js';
+import {
+  asLines,
+  SessionEnded,
+  type Compute,
+  type Finished,
+  type SandboxClient,
+  type SandboxHandle,
+} from './vercel-client.js';
 
 const execFile = promisify(execFileCb);
 
@@ -438,7 +445,7 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
   let stderr = '';
   let totalBytes = 0;
   let truncated = false;
-  let ceiling: 'wall' | undefined;
+  let ceiling: 'wall' | 'session' | undefined;
   let sandbox: SandboxHandle | undefined;
   /**
    * Events this executor writes BEFORE the container says anything, and after.
@@ -632,7 +639,14 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
     // await its reply while this keeps reading. The promise is awaited before the phase
     // returns, so nothing here outlives the function.
     const draining = (async () => {
-      for await (const line of asLines(stdout)) take(line);
+      try {
+        for await (const line of asLines(stdout)) take(line);
+      } catch (error) {
+        // THE SUBSTRATE'S CEILING, arriving mid-phase. Everything already taken stays
+        // taken — that is the whole reason this is caught rather than allowed to reject.
+        if (!(error instanceof SessionEnded)) throw error;
+        ceiling ??= 'session';
+      }
     })();
     // ABANDONED, not merely killed. A sandbox whose stream has stopped producing is the
     // wedge the ceiling exists for, and `kill()` is a request to the platform: waiting on
@@ -700,7 +714,16 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
           });
         }
       }
-      exitCode = ceiling ? 1 : await Promise.race([started.wait(), abandoned.then(() => 1)]);
+      exitCode = ceiling
+        ? 1
+        : await Promise.race([started.wait(), abandoned.then(() => 1)]).catch((error: unknown) => {
+            // `wait()` is the other place the platform says the session is over, and the
+            // spike saw it as a 410. Caught here as well as on the stream because either
+            // can arrive first, and a phase that got this far has a stream worth keeping.
+            if (!(error instanceof SessionEnded)) throw error;
+            ceiling ??= 'session';
+            return 1;
+          });
     } finally {
       clearTimeout(bell);
       await settled;
@@ -741,13 +764,23 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
     }
 
     if (ceiling) {
-      stderr = `${stderr}\nthe ${phase} sandbox was stopped after ${plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS}ms`.slice(
-        -MAX_STDERR_CHARS,
-      );
+      stderr = `${stderr}\n${
+        ceiling === 'session'
+          ? `the ${phase} sandbox's session was ended by the platform`
+          : `the ${phase} sandbox was stopped after ${plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS}ms`
+      }`.slice(-MAX_STDERR_CHARS);
       post.push(
         own(plan.runId, 0, {
           type: 'VERIFICATION_ABORTED',
-          payload: { v: 1, phase: 'setup', cause: 'ceiling', reason: `the ${phase} sandbox exceeded its wall clock` },
+          payload: {
+            v: 1,
+            phase: 'setup',
+            cause: 'ceiling',
+            reason:
+              ceiling === 'session'
+                ? `the ${phase} sandbox's session was ended by the platform before the phase finished`
+                : `the ${phase} sandbox exceeded this engine's wall clock`,
+          },
         }),
       );
     }

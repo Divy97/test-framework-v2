@@ -607,6 +607,37 @@ describe('nothing is left running, and nothing is left uncollected', () => {
     expect(fold(stream('collection')).shownOnBase).toBe(true);
   });
 
+  test('a session the PLATFORM ends is a ceiling, not a crash, and the evidence survives', async () => {
+    // The ceiling this engine does not control. A microVM's session is enforced outside
+    // the guest and, on the Hobby tier, is 45 minutes — BELOW this engine's own hour, so
+    // it is the one that fires first on a long run. 10a item 11 measured exactly how it
+    // arrives: `logs()` throws `StreamError`, `wait()` throws `APIError 410`.
+    //
+    // Before this, both propagated: `runPhase` threw, and because `orchestrate()` returns
+    // its events only at the end, the throw discarded every observation the run had made.
+    // A phase that ran for 45 minutes and was cut off has a great deal worth keeping.
+    const fake = fakeSandboxes({
+      endSessionAfter: 1,
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
+        yield event(afterSeqOf(sandbox) + 2, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true, repeat: 1 });
+      },
+    });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+
+    expect(result.ceiling).toBe('session');
+    // The observation it DID make, kept. This is the assertion the old behaviour could
+    // not satisfy, because there was no result at all.
+    expect(result.events.some((one) => one.type === 'TEST_RUN')).toBe(true);
+    // Named as the platform's, not as ours — an operator reading "exceeded this engine's
+    // wall clock" would go looking at `containerTimeoutMs`, which is not the cause.
+    const abort = result.events.find((one) => (one.payload as { cause?: string }).cause === 'ceiling')!;
+    expect((abort.payload as { reason: string }).reason).toMatch(/session was ended by the platform/);
+    expect(fake.sandboxes[0]!.stopped).toBe(true);
+  });
+
   test('a phase whose stream never ends is stopped, and says so in the log', async () => {
     const fake = fakeSandboxes({
       runner: async function* ({ sandbox }: RunnerContext) {
