@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.build.json",
     "images": "docker build -t test-framework-v2-sandbox:latest . && docker build -t test-framework-v2-agent:latest -f Dockerfile.agent .",
     "db:schema": "docker compose exec -T postgres psql -U postgres -d events -f - < db/schema.sql",
+    "db:apply": "tsx --env-file=.env src/cli.ts schema",
     "seed": "tsx --env-file=.env src/cli.ts seed",
     "replay": "tsx --env-file=.env src/cli.ts replay",
     "status": "tsx --env-file=.env src/status.ts",

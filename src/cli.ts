@@ -20,6 +20,14 @@ const [command, arg, arg2] = process.argv.slice(2);
 
 /** Print the draft, then ask. Anything but a literal `yes` refuses. */
 async function confirm(question: string): Promise<boolean> {
+  // Nothing to ask, so the answer is no. Without this the prompt is written to a stdin
+  // nobody is reading, the promise never settles, node warns about an unsettled top-level
+  // await, and the process exits **0** — a refusal that reports success, which is the one
+  // outcome a script wrapping this must not see.
+  if (!process.stdin.isTTY) {
+    console.error(`${question} — refusing: nothing to read an answer from. Pass --yes to skip the prompt.`);
+    return false;
+  }
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     const answer = await new Promise<string>((resolve) => rl.question(`${question} [yes/no] `, resolve));
@@ -101,10 +109,47 @@ try {
     }
     await saveRecipe(client, repo, draft);
     console.log(`Stored. ${repo} will replay this and never re-derive it.`);
+  } else if (command === 'schema') {
+    // THE SCHEMA, applied to whatever `DATABASE_URL` says — which is the whole point.
+    //
+    // `npm run db:schema` shells into the local `docker compose` container and can never
+    // reach anything else, so the only way to apply this to the hosted database was a
+    // hand-typed `psql`. An undocumented manual step against production is the kind of
+    // thing that is done wrong once and then nobody can say what state the database is in.
+    //
+    // No migration framework, and that is a property of the FILE rather than laziness:
+    // every statement in `db/schema.sql` is `if not exists`, so it is idempotent, order
+    // does not matter, and running it twice is running it once. Nothing to version. A
+    // migration that ever has to TRANSFORM data — rename a column, backfill, drop
+    // something — breaks that property and is the moment to build the versioned runner,
+    // not before.
+    //
+    // It says which database first. `recipe approve` above argues that an approval which
+    // does not show you what you are approving is not one; the same is true of a command
+    // that writes to a database without telling you which. `DATABASE_URL` carries a
+    // password, so only the host and the database name are printed.
+    const sql = await readFile(new URL('../db/schema.sql', import.meta.url), 'utf8');
+    const statements = sql.match(/^(create|alter|drop)\s/gim)?.length ?? 0;
+    let where = 'the configured database';
+    try {
+      const url = new URL(process.env.DATABASE_URL ?? '');
+      where = `${url.hostname}${url.pathname}`;
+    } catch {
+      // No URL to parse means `connect()` is about to fail with a better message than
+      // anything invented here.
+    }
+    console.log(`${statements} statements from db/schema.sql, all idempotent.`);
+    // `--yes` for a deploy script, which has no terminal to answer a prompt with.
+    if (arg !== '--yes' && !(await confirm(`Apply them to ${where}?`))) {
+      console.error('Not applied.');
+      process.exit(1);
+    }
+    await client.query(sql);
+    console.log(`Applied to ${where}.`);
   } else {
     console.error(
-      'usage: cli.ts seed | replay <run_id> | rebuild | recipe show <owner/repo> | ' +
-        'recipe approve <draft.json> <owner/repo>',
+      'usage: cli.ts seed | replay <run_id> | rebuild | schema [--yes] | ' +
+        'recipe show <owner/repo> | recipe approve <draft.json> <owner/repo>',
     );
     process.exit(1);
   }
