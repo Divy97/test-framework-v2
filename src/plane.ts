@@ -52,6 +52,20 @@ const TOKEN_BYTES = 32;
 /** How often the long poll looks again. Presence is worth more than a tight loop. */
 const POLL_INTERVAL_MS = 500;
 
+/**
+ * How long a dispatched job may produce nothing before another runner may take it.
+ *
+ * Sized against the ONE silent window a live runner has: between being handed a job and
+ * minting its installation token, which is a single HTTP round trip. Two minutes is about
+ * a hundred times that, and it is also five long-polls — a runner idle for two minutes has
+ * missed four heartbeats it makes for free.
+ *
+ * Not sized against how long a RUN takes, which is the tempting mistake. A run that has
+ * started has written seq 1, and the `not exists (events)` clause makes its duration
+ * irrelevant: an hour-long agent phase is never a candidate for reclaim.
+ */
+const STRANDED_AFTER_MS = 2 * 60_000;
+
 const digest = (token: string): string => createHash('sha256').update(token).digest('hex');
 const wait = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
@@ -270,16 +284,57 @@ export async function claimJob(
       // Cast, because pg cannot infer a type for a parameter that is only ever compared
       // to null — without it the driver sends an untyped null and the comparison against
       // `bigint` fails at plan time.
+      //
+      // AND A JOB ITS RUNNER NEVER TOOK, which was stranded forever.
+      //
+      // A runner that dies holding an open long-poll leaves the plane about to answer a
+      // socket nobody is reading. The next job to arrive is claimed FOR it — `runner_id`
+      // stamped, response written into the void — and since this predicate only ever took
+      // `runner_id is null`, no runner could take it again. Seen live on 2026-09-06:
+      // killing the laptop worker to hand over to the Fly one stranded the very next job,
+      // and every rolling deploy of the worker would have done the same.
+      //
+      // Reclaimed on three conditions, and each one is load-bearing:
+      //
+      //   - `not exists (events)`. THE guard on ADR-0009's single producer. Once seq 1 is
+      //     written the run has an author, and no lease may take that away. Also what
+      //     stops a job that finished with no events from being re-dispatched forever,
+      //     with `finished_at is null` beside it saying the same thing twice on purpose.
+      //   - the runner has not been seen SINCE the dispatch. Every `/runner/` request
+      //     heartbeats, and a live runner mints an installation token within a second of
+      //     claiming — `run.ts` mints it before the clone, "because a clone we cannot do
+      //     makes the rest moot". So `last_seen >= dispatched_at` is what a working runner
+      //     looks like, and its absence is one that never came back. `not exists` rather
+      //     than a comparison so a runner row that is gone entirely also reclaims.
+      //   - and a grace period on top, because the window between claiming and minting is
+      //     about one round trip and the interval below is a hundred times that.
+      //
+      // If the reclaim is ever wrong, it is wrong SAFELY: `appendFromRunner` authorizes on
+      // `job.runner_id = runner.id`, so the moment this row moves, the old runner's first
+      // append is refused with "this run was dispatched to another runner" — before it can
+      // write seq 1, because seq 1 is the append it would have been making.
       `update jobs set runner_id = $2, dispatched_at = now()
          where run_id = (
-           select run_id from jobs
-             where ($1::bigint is null or installation_id = $1::bigint) and runner_id is null
-             order by queued_at
+           select j.run_id from jobs j
+             where ($1::bigint is null or j.installation_id = $1::bigint)
+               and j.finished_at is null
+               and (
+                 j.runner_id is null
+                 or (
+                   j.dispatched_at < now() - ($3 || ' milliseconds')::interval
+                   and not exists (select 1 from events e where e.run_id = j.run_id)
+                   and not exists (
+                     select 1 from runners r
+                       where r.id = j.runner_id and r.last_seen >= j.dispatched_at
+                   )
+                 )
+               )
+             order by j.queued_at
              limit 1
              for update skip locked
          )
        returning run_id, installation_id, repo, intake`,
-      [runner.installationId, runner.id],
+      [runner.installationId, runner.id, STRANDED_AFTER_MS],
     );
     const row = rows[0] as { run_id: string; installation_id: string; repo: string; intake: unknown } | undefined;
     if (row) {

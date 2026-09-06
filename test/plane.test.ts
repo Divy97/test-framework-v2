@@ -18,7 +18,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import type { RunEvent } from '../src/events.js';
 import { digest, get } from '../src/blobs.js';
 import type { ArtifactRef } from '../src/events.js';
-import { enqueueJob, pairRunner, revokeRunner, type Runner } from '../src/plane.js';
+import { claimJob, enqueueJob, pairRunner, revokeRunner, type Runner } from '../src/plane.js';
 import { runnerRoutes } from '../src/runner-api.js';
 import { readCompute, readUsage } from '../src/readmodel.js';
 import type pg from 'pg';
@@ -722,5 +722,107 @@ describe('the bill is written by the runner that holds the run, and nobody else'
     });
     expect((await readCompute(client!, mineRun)).map((r) => r.sandbox_id)).toEqual(['sbx-1']);
     expect(await readCompute(client!, otherRun)).toEqual([]);
+  });
+});
+
+describe('a job its runner never took goes back on the queue', () => {
+  /**
+   * The incident, reproduced: a runner dies holding an open long-poll, the plane claims
+   * the next job FOR it and writes the answer to a socket nobody is reading.
+   *
+   * Staged rather than simulated, because the socket is not the point — the ROW is. What
+   * a dead claim leaves behind is a job with a `runner_id`, no events, and a runner whose
+   * last request predates the dispatch.
+   */
+  const stranded = async (installationId: number) => {
+    const runId = await queue(installationId);
+    const gone = await pair(installationId, 'the one that died');
+    await call(gone.token, 'GET', '/runner/jobs');
+    // Backdate both, which is what two minutes of wall clock would do.
+    await client!.query(
+      `update jobs set runner_id = $2, dispatched_at = now() - interval '5 minutes' where run_id = $1`,
+      [runId, gone.runner.id],
+    );
+    await client!.query(`update runners set last_seen = now() - interval '6 minutes' where id = $1`, [gone.runner.id]);
+    return { runId, gone };
+  };
+
+  test('another runner claims it, and the dead one can no longer write to it', async () => {
+    if (skipped()) return;
+    const id = installation();
+    const { runId, gone } = await stranded(id);
+
+    const alive = await pair(id, 'the one that took over');
+    const took = await claimJob(client!, alive.runner);
+    expect(took?.runId).toBe(runId);
+
+    // AND THE HANDOVER IS TOTAL. If the reclaim is ever wrong it must be wrong safely:
+    // the moment the row moves, the old runner's first append is refused — before it
+    // could write seq 1, because seq 1 is the append it would have been making.
+    const refused = await call(gone.token, 'POST', `/runner/runs/${runId}/events`, {
+      body: { events: [event(runId, 1)] },
+    });
+    expect(refused.status).toBe(403);
+    expect(String(refused.body['error'])).toContain('another runner');
+    const { rows } = await client!.query('select count(*)::int as n from events where run_id = $1', [runId]);
+    expect(rows[0].n).toBe(0);
+  });
+
+  test('THE control: a run that has started is never taken from its author', async () => {
+    if (skipped()) return;
+    // ADR-0009's single producer. Once seq 1 exists the run has an author, and no lease
+    // may take that away — an agent phase can think for an hour without a plane request,
+    // and reclaiming it would put two runners on one log.
+    const id = installation();
+    const { runId, gone } = await stranded(id);
+    await client!.query(
+      `insert into events (run_id, seq, ts, type, payload) values ($1, 1, now(), 'RUN_REQUESTED', $2)`,
+      [runId, JSON.stringify({ v: 1, source: 'github_issue', thread_ref: 'o/r#1', raw_text: 'x' })],
+    );
+    void gone;
+
+    const alive = await pair(id, 'must not take it');
+    expect(await claimJob(client!, alive.runner)).toBeNull();
+  });
+
+  test('and a runner that answered SINCE the dispatch keeps its job', async () => {
+    if (skipped()) return;
+    // The other half. A live runner mints an installation token within a second of
+    // claiming, which is a request, which is a heartbeat — so `last_seen >= dispatched_at`
+    // is what working looks like, and it is the whole difference from the case above.
+    const id = installation();
+    const { runId, gone } = await stranded(id);
+    await client!.query(`update runners set last_seen = now() where id = $1`, [gone.runner.id]);
+
+    const other = await pair(id, 'must not take it either');
+    expect(await claimJob(client!, other.runner)).toBeNull();
+    const { rows } = await client!.query('select runner_id from jobs where run_id = $1', [runId]);
+    expect(rows[0].runner_id).toBe(gone.runner.id);
+  });
+
+  test('and one still inside the grace period is left alone', async () => {
+    if (skipped()) return;
+    const id = installation();
+    const runId = await queue(id);
+    const gone = await pair(id, 'only just died');
+    await call(gone.token, 'GET', '/runner/jobs');
+    await client!.query(`update jobs set runner_id = $2, dispatched_at = now() where run_id = $1`, [runId, gone.runner.id]);
+    await client!.query(`update runners set last_seen = now() - interval '1 second' where id = $1`, [gone.runner.id]);
+
+    const other = await pair(id, 'too soon');
+    expect(await claimJob(client!, other.runner)).toBeNull();
+  });
+
+  test('and a FINISHED job is never re-dispatched, even having written nothing', async () => {
+    if (skipped()) return;
+    // A run that failed before seq 1 and was marked finished has no events at all, so the
+    // `not exists (events)` clause alone would hand it out forever.
+    const id = installation();
+    const { runId, gone } = await stranded(id);
+    await client!.query(`update jobs set finished_at = now() where run_id = $1`, [runId]);
+    void gone;
+
+    const other = await pair(id, 'must not take a finished job');
+    expect(await claimJob(client!, other.runner)).toBeNull();
   });
 });
