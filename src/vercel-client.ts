@@ -21,6 +21,8 @@
 //     inbound-under-`deny-all` as unverified. A method here would invite its use.
 
 import type { Readable } from 'node:stream';
+// Types only — erased, so nothing here loads the SDK. See the assertions below `Sdk`.
+import type { Sandbox as RealSandbox } from '@vercel/sandbox';
 
 /** What a sandbox may reach. `deny-all` is enforced outside the guest (ADR-0021). */
 export type NetworkPolicy = 'allow-all' | 'deny-all';
@@ -197,6 +199,11 @@ export async function* asLines(chunks: AsyncIterable<string>): AsyncIterable<str
  * Structural rather than imported: `@vercel/sandbox` is a dependency of the worker and
  * not of the tests, and typing against the shape means `npm test` does not need it
  * resolvable. The one place it IS imported is `vercelClient()`, behind a dynamic import.
+ *
+ * WHICH MADE THESE SHAPES UNCHECKED, and `as unknown as Sdk` at that import is where the
+ * checking stopped. `SdkSandbox` claimed a `sandboxId` the SDK has never had; the compiler
+ * compared our claim to our claim and agreed, and every id in this system was `undefined`
+ * for as long as the file existed. See the assertions below.
  */
 type Sdk = {
   Sandbox: {
@@ -207,6 +214,34 @@ type Sdk = {
   };
   Snapshot: { get(params: Record<string, unknown>): Promise<{ delete(): Promise<void> }> };
 };
+
+/**
+ * The three facts above that this file was WRONG about, checked against the real types.
+ *
+ * `import type` is erased at compile time — nothing here loads `@vercel/sandbox`, so a
+ * Docker-only runner still never resolves it and `npm test` still does not need it. What
+ * it buys back is what the cast threw away: rename a property, drop one, or change what
+ * `get` takes, and `npm run typecheck` says so instead of a live worker discovering it as
+ * a swallowed exception in the sweep.
+ *
+ * Deliberately NOT `RealSandbox extends SdkSandbox`. Ours declares
+ * `runCommand(params: Record<string, unknown>)` where the SDK's is fully typed, so whole
+ * assignability fails for a reason that is not a defect — and an assertion that fails for
+ * a reason nobody can fix is one somebody deletes.
+ */
+type Assert<T extends true> = T;
+/** What a sandbox is CALLED. This does not compile unless the property exists. */
+type _SandboxIsNamed = Assert<RealSandbox['name'] extends string ? true : false>;
+/** And what `get` takes to find one again — `{ sandboxId }` was not it. */
+type _GetTakesAName = Assert<Parameters<typeof RealSandbox.get>[0] extends { name: string } ? true : false>;
+/** And that a listed row carries the three fields the sweep reads off it. */
+type _ListedIsAsClaimed = Assert<
+  Awaited<ReturnType<typeof RealSandbox.list>> extends { sandboxes: (infer Row)[] }
+    ? Row extends SdkListed
+      ? true
+      : false
+    : false
+>;
 
 type SdkCommand = {
   cmdId: string;
