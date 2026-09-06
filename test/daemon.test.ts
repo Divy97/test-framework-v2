@@ -308,13 +308,20 @@ describe('what a run spent goes beside the log, and never into it', () => {
     // called. A runner that retried bookkeeping would hold a slot open over it, and one
     // that threw would lose a finished run over a number.
     const plane = await fakePlane({ costStatus: 500 });
+    let threw = false;
     const { logs } = await oneJob(plane, async (_job, io) => {
       await io.append(event(1));
-      await io.cost(bill);
+      await io.cost(bill).catch(() => void (threw = true));
     });
+    // THE assertion, and it has to be this one: a `cost` that throws still ends with the
+    // job finished, because the daemon catches everything `execute` throws. Asserting on
+    // `/finished` therefore proves nothing, and asserting on the log matches either way —
+    // `ended badly — Error: the plane answered HTTP 500 to the bill` contains the same
+    // words. What is actually being claimed is that this call does not throw at all.
+    expect(threw).toBe(false);
     expect(plane.seen.filter((one) => one.path.endsWith('/cost'))).toHaveLength(1); // not retried
     expect(logs.join('\n')).toMatch(/HTTP 500 to the bill/);
-    // And the job still finished, which is the property that matters.
+    expect(logs.join('\n')).not.toMatch(/ended badly/);
     expect(plane.seen.some((one) => one.path.endsWith('/finished'))).toBe(true);
   });
 });
