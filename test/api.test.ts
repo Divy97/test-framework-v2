@@ -93,7 +93,13 @@ const fakeClient = (writes: { sql: string; params: unknown[] }[] = [], options: 
                   ].filter((row) => (runId === null || row.run_id === runId) && (repo === null || row.repo === repo))
                 : sql.includes('from user_model_keys')
                   ? [{ provider: 'openrouter' }]
-                  : [];
+                  : // ONE PAIRED MACHINE. This answered `[]`, so "the listing never carries
+                    // a token" asserted the absence of a token in an empty list — adding
+                    // `token_hash` to what `listRunners` selects would not have failed it,
+                    // and the comment beside it said exactly why that would be wrong.
+                    sql.includes('from runners')
+                    ? [{ id: 'runner-1', installation_id: 1, name: 'build-box', paired_at: new Date(0), last_seen: new Date(0), revoked_at: null, token_hash: 'sha256:secret-hash' }]
+                    : [];
       return { rows, rowCount: rows.length };
     }),
   }) as unknown as Db;
@@ -478,14 +484,20 @@ describe('pairing a runner hands over the token exactly once', () => {
     }
   });
 
-  it('the listing never carries a token', async () => {
-    // Paired first, so this is a listing with something in it — an empty list cannot
-    // demonstrate the absence of a field.
+  it('the listing never carries a token, or the hash of one', async () => {
     const route = surface();
     const paired = await bodyOf(route, 'POST', `/api/repos/${MINE}/runners`, JSON.stringify({ name: 'laptop' }));
     const listed = await bodyOf(route, 'GET', `/api/repos/${MINE}/runners`);
     expect(listed.status).toBe(200);
+    // A LISTING WITH SOMETHING IN IT — an empty list cannot demonstrate the absence of a
+    // field, and this test asserted exactly that until the fake gained a row.
+    expect(listed.json.runners).toHaveLength(1);
+    expect(listed.json.runners[0].name).toBe('build-box');
     expect(JSON.stringify(listed.json)).not.toContain(paired.json.token);
+    // And not the hash either. `listRunners` selects its columns by name; adding
+    // `token_hash` to that list is the one-line change this is here to fail on.
+    expect(JSON.stringify(listed.json)).not.toContain('secret-hash');
+    expect(listed.json.runners[0]).not.toHaveProperty('token_hash');
   });
 
   it("a stranger cannot pair a machine against somebody else's repository", async () => {

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p web/tsconfig.json",
     "build": "tsc -p tsconfig.build.json",
     "images": "docker build -t test-framework-v2-sandbox:latest . && docker build -t test-framework-v2-agent:latest -f Dockerfile.agent .",
     "db:schema": "docker compose exec -T postgres psql -U postgres -d events -f - < db/schema.sql",
@@ -19,7 +19,7 @@
     "images:push": "sh scripts/push-images.sh",
     "worker:pair": "tsx --env-file=.env scripts/pair-worker.mts",
     "worker:unpair": "tsx --env-file=.env scripts/unpair-worker.mts",
-    "web:build": "npm --prefix web ci && npm --prefix web run build",
+    "web:build": "npm --prefix web ci && tsc --noEmit -p web/tsconfig.json && npm --prefix web run build",
     "web:dev": "npm --prefix web run dev"
   },
   "dependencies": {
@@ -35,6 +35,7 @@
     "vitest": "^2.1.8",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
-    "@types/react": "^19.1.9"
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7"
   }
 }

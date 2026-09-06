@@ -28,6 +28,30 @@ export function Runs({ repo, go }: { repo: string | null; go: (to: string) => vo
   return (
     <>
       {heading}
+      <Register rows={rows} repo={repo} go={go} />
+    </>
+  );
+}
+
+/**
+ * The register, as a pure function of its rows.
+ *
+ * Split out for the reason `Evidence` was split from `Run`: a component that fetches its own
+ * data can only be checked in a browser, and this repository's browser test skips whenever
+ * chromium or a built bundle is missing. This is the screen with a link to it on every page,
+ * and until this split it had no test of any kind.
+ */
+export function Register({
+  rows,
+  repo,
+  go,
+}: {
+  rows: RunRow[];
+  repo: string | null;
+  go: (to: string) => void;
+}) {
+  return (
+    <>
       {rows.length === 0 ? (
         <div className="nothing">
           <p>{repo ? `No run has been started on ${repo}.` : 'No run has been started yet.'}</p>
@@ -49,6 +73,10 @@ export function Runs({ repo, go }: { repo: string | null; go: (to: string) => vo
                 <th scope="col">started</th>
                 <th scope="col">status</th>
                 <th scope="col">tier</th>
+                {/* The regression arm, which the page this replaced showed and this one
+                    dropped — a run whose fix breaks the project's own suite looked exactly
+                    like one that does not, on the screen people scan. */}
+                <th scope="col">suite</th>
                 <th scope="col" className="num">confidence</th>
               </tr>
             </thead>
@@ -95,6 +123,27 @@ export function Runs({ repo, go }: { repo: string | null; go: (to: string) => vo
                       </>
                     ) : (
                       '—'
+                    )}
+                  </td>
+                  <td>
+                    {!isOver(run.status, run.ended_at) ? (
+                      '—'
+                    ) : run.regression === 'broken' ? (
+                      <span className="fail">
+                        <span className="mark" aria-hidden="true">
+                          ✗
+                        </span>
+                        broken by the fix
+                      </span>
+                    ) : run.regression === 'clean' ? (
+                      <span className="pass">
+                        <span className="mark" aria-hidden="true">
+                          ✓
+                        </span>
+                        clean
+                      </span>
+                    ) : (
+                      <span className="muted">{run.regression.replace(/_/g, ' ')}</span>
                     )}
                   </td>
                   <td className="num">

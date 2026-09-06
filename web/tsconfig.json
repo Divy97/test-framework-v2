@@ -17,6 +17,13 @@
     "plugins": [{ "name": "next" }],
     "paths": { "@/*": ["./*"] }
   },
-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  // `../test/screens.test.tsx` is HERE and not in the root program, and that is the whole of
+  // the split. It renders `web/`'s components, whose imports are resolved by a bundler and
+  // therefore carry no file extension — which the root's `NodeNext` refuses by design. The
+  // root excludes it for that reason; without this line it would be typechecked by nothing,
+  // and it had six real errors in the interval, three of them fixtures describing shapes the
+  // server does not return. `next build` runs `tsc` over this program, so `npm run
+  // web:build` is what checks it.
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts", "../test/screens.test.tsx"],
   "exclude": ["node_modules"]
 }

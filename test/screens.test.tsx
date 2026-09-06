@@ -27,7 +27,7 @@
 
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, test } from 'vitest';
-import type { Evidence as EvidenceData, Me, RepoDetail } from '../web/lib/api';
+import type { Evidence as EvidenceData, Me, RepoDetail, RepoRow, RunRow } from '../web/lib/api';
 import type { Frame } from '../web/lib/hooks';
 import { EVENT_TYPES } from '../src/events.js';
 import type {
@@ -45,6 +45,8 @@ import { Evidence } from '../web/components/views/Evidence';
 import { Environment } from '../web/components/views/Environment';
 import { Landing } from '../web/components/views/Landing';
 import { Minted } from '../web/components/views/Runners';
+import * as Repos from '../web/components/views/Repos';
+import * as Runs from '../web/components/views/Runs';
 import { Timeline } from '../web/components/Timeline';
 
 const render = (node: React.ReactElement): string => renderToStaticMarkup(node);
@@ -66,9 +68,13 @@ const base = (over: Partial<EvidenceData['state']> = {}): EvidenceData['state'] 
   regression: 'clean',
   registeredRepro: REPRO,
   registrations: [REPRO],
+  // `attempt` on every row, because `TestRunRecord` requires it — the fold judges each
+  // attempt against its own registration, and a fixture without it describes a shape the
+  // engine cannot produce. It was absent, and nothing checked, because this file was
+  // excluded from the only program that could have.
   testRuns: [
-    { phase: 'base', repeat: 0, commit_sha: '8d41c6b2a09f1234', exit_code: 1, symptom_matched: true, stdout_hash: 'sha256:b0' },
-    { phase: 'fix', repeat: 0, commit_sha: 'aa41c6b2a09f1234', exit_code: 0, symptom_matched: false, stdout_hash: 'sha256:f0' },
+    { attempt: 1, phase: 'base', repeat: 0, commit_sha: '8d41c6b2a09f1234', exit_code: 1, symptom_matched: true, stdout_hash: 'sha256:b0' },
+    { attempt: 1, phase: 'fix', repeat: 0, commit_sha: 'aa41c6b2a09f1234', exit_code: 0, symptom_matched: false, stdout_hash: 'sha256:f0' },
   ],
   suiteRuns: [
     { phase: 'base', attempt: 1, command: 'npm test', exit_code: 0, stdout_hash: 'sha256:s0' },
@@ -93,7 +99,11 @@ const evidence = (over: Partial<EvidenceData> = {}): EvidenceData => ({
     confidence: 90,
     ceiling: 103,
     scoring: 2,
-    reproduced: true,
+    // `regression` and `last_seq` are columns; `reproduced` and `pr_number` are not, and
+    // were in this fixture describing a row the projection has never returned.
+    regression: 'clean',
+    pr_url: null,
+    last_seq: 8,
   },
   state: base(),
   score: {
@@ -239,8 +249,13 @@ describe('the evidence page says what the engine can and cannot claim', () => {
     const html = render(
       <Evidence ended data={evidence({ compute: [{ sandbox_id: 'sbx-1', phase: 'base', active_cpu_ms: null, duration_ms: null, egress_bytes: null }] })} />,
     );
-    expect(html).toContain('—');
-    expect(html).not.toContain('0ms');
+    // IN THE CELL, not on the page. `toContain('—')` passed on the em dash in
+    // "{regression} — the project's own test command", so deleting the whole compute table
+    // would not have failed it.
+    const row = html.slice(html.indexOf('sbx-1'), html.indexOf('</tr>', html.indexOf('sbx-1')));
+    expect(row.match(/—/g)).toHaveLength(3);
+    expect(row).not.toContain('0ms');
+    expect(row).not.toContain('0KB');
   });
 
   test('confidence names the bytes a reviewer would open, and what was not measured', () => {
@@ -544,7 +559,10 @@ describe('the environment screen says what approving did', () => {
       />,
     );
     expect(html).toContain('STRIPE_KEY');
-    expect(html).toMatch(/cannot show it to you again|can show it to you again/);
+    // NOT an alternation over both polarities, which is what stood here — it accepted the
+    // copy promising a stored value COULD be shown again. The sentence was rewritten at the
+    // same time, because a claim this important should not need a lookahead to read.
+    expect(html).toMatch(/a value is\s+never returned/);
     // No control that implies a value can be read back. Adding one is the first step
     // towards writing the route that returns it.
     expect(html).not.toMatch(/reveal|show value|copy value/i);
@@ -703,5 +721,309 @@ describe('the timeline reads the payloads the engine actually writes', () => {
     const stopped = render(<Timeline frames={[frame('VERIFICATION_ABORTED', abort)]} ended />);
     expect(stopped).toContain('the repro command never exited');
     expect(stopped).toContain('data-state="failed"');
+  });
+});
+
+describe('the positive controls the negatives need', () => {
+  test('a reproduced run DOES show the diff', () => {
+    // The other half of "a Tier 3 shows no diff". Without it, `{false && …}` — never
+    // rendering the diff at all — passes every assertion in this file.
+    const html = render(<Evidence ended data={evidence()} />);
+    expect(html).toContain('The diff');
+    expect(html).toContain('src/cart.mjs');
+    expect(html).toContain('sha256:diff');
+  });
+
+  test('and the cost section is absent when there is nothing to bill', () => {
+    const html = render(<Evidence ended data={evidence({ usage: [], compute: [] })} />);
+    expect(html).not.toContain('What this run cost');
+    expect(html).not.toContain('Egress is not a seal check');
+  });
+
+  test('a broken suite quotes the run that broke, not a placeholder', () => {
+    // The fixture used to set `regression: 'broken'` while every suite run exited 0, so the
+    // page read "exits 0 on this one" and nothing noticed. The command, the exit code and
+    // the output hash all come from the fold's own row.
+    const html = render(
+      <Evidence
+        ended
+        data={evidence({
+          state: base({
+            regression: 'broken',
+            suiteRuns: [
+              { attempt: 1, phase: 'base', command: 'npm test', exit_code: 0, stdout_hash: 'sha256:s0' },
+              { attempt: 1, phase: 'fix', command: 'npm test', exit_code: 1, stdout_hash: 'sha256:broke' },
+            ],
+          }),
+        })}
+      />,
+    );
+    expect(html).toMatch(/exits 1 on this one/);
+    expect(html).toContain('sha256:broke');
+    expect(html).not.toMatch(/exits 0 on this one/);
+  });
+});
+
+describe('the run register, which had a link on every page and no test at all', () => {
+  const run = (over: Partial<RunRow> = {}): RunRow => ({
+    run_id: '3f1c9a52-7b0e-4d2f-9c41-8a6e5d0b21c7',
+    repo: 'acme/widgets',
+    issue_number: 41,
+    status: 'pr_opened',
+    tier: 2,
+    confidence: 90,
+    ceiling: 103,
+    scoring: 2,
+    regression: 'clean',
+    pr_url: null,
+    started_at: '2026-09-06T10:00:00.000Z',
+    ended_at: '2026-09-06T10:04:00.000Z',
+    last_seq: 8,
+    ...over,
+  });
+
+  test('a finished run shows its tier, its suite and its confidence', () => {
+    const html = render(<Runs.Register rows={[run()]} repo={null} go={() => {}} />);
+    expect(html).toContain('90/103');
+    expect(html).toMatch(/clean/);
+    expect(html).toMatch(/reproduced, but the reproduction/);
+  });
+
+  test('a fix that breaks the suite says so on the list, not only on the run', () => {
+    // This column existed on the page 10i replaced and was dropped by the replacement: a
+    // run whose fix breaks the project's own suite looked exactly like one that does not,
+    // on the screen people scan.
+    const html = render(<Runs.Register rows={[run({ regression: 'broken' })]} repo={null} go={() => {}} />);
+    expect(html).toMatch(/broken by the fix/);
+    expect(html).toContain('✗');
+  });
+
+  test('a run still going reports no verdict at all', () => {
+    const html = render(
+      <Runs.Register rows={[run({ status: 'attempting', ended_at: null })]} repo={null} go={() => {}} />,
+    );
+    expect(html).toMatch(/running/);
+    // No tier, no confidence, no suite — the fold has not reached any of them.
+    expect(html).not.toContain('90/103');
+    expect(html).not.toMatch(/clean/);
+  });
+
+  test('an empty list says which emptiness it is', () => {
+    expect(render(<Runs.Register rows={[]} repo={null} go={() => {}} />)).toMatch(/No run has been started yet/);
+    expect(render(<Runs.Register rows={[]} repo="acme/widgets" go={() => {}} />)).toMatch(
+      /No run has been started on acme\/widgets/,
+    );
+  });
+});
+
+describe('the repository register', () => {
+  const repo = (over: Partial<RepoRow> = {}): RepoRow => ({
+    repo: 'acme/widgets',
+    account: 'acme',
+    connectedAt: '2026-08-01T00:00:00.000Z',
+    onboarded: true,
+    runs: 3,
+    ...over,
+  });
+  const me: Me = {
+    accounts: true,
+    signedIn: true,
+    login: 'divy97',
+    mode: 'plane',
+    installUrl: 'https://example.invalid/install',
+    modelKey: null,
+    secrets: { enabled: false },
+    github: true,
+    forgetting: true,
+  };
+
+  test('the un-onboarded row is the one that carries the link that resolves it', () => {
+    // "Not onboarded yet" is the row's most important column: a run against a repository
+    // with no recipe boots nothing and reports a bug that was never shown.
+    const html = render(<Repos.Register rows={[repo({ onboarded: false, runs: 0 })]} me={me} go={() => {}} />);
+    expect(html).toMatch(/not onboarded yet/);
+    expect(html).toContain('/repos/acme/widgets');
+  });
+
+  test('the two states are split, not sorted', () => {
+    const html = render(
+      <Repos.Register rows={[repo(), repo({ repo: 'acme/legacy', onboarded: false })]} me={me} go={() => {}} />,
+    );
+    expect(html.indexOf('Onboarded')).toBeLessThan(html.indexOf('Connected, not onboarded'));
+    // The plural agrees with the total. "1 of 2 repository is onboarded" is what agreeing
+    // with the onboarded count produces, and that is what this said.
+    expect(html).toMatch(/1 of 2 repositories are onboarded/);
+    expect(html).toMatch(/The other is connected and waiting/);
+  });
+
+  test('an empty account is offered the install button, not an empty table', () => {
+    const html = render(<Repos.Register rows={[]} me={me} go={() => {}} />);
+    expect(html).toMatch(/No repositories are connected yet/);
+    expect(html).toContain('https://example.invalid/install');
+  });
+
+  test('a repository name with a fragment in it cannot truncate the link', () => {
+    // GitHub's string, not ours. A `#` ends the path at the fragment and links somewhere
+    // else entirely; the separator between owner and name has to survive, because the
+    // router matches on it.
+    const html = render(<Repos.Register rows={[repo({ repo: 'acme/wid#gets' })]} me={me} go={() => {}} />);
+    expect(html).toContain('/repos/acme/wid%23gets');
+    expect(html).not.toContain('/repos/acme/wid#gets');
+  });
+});
+
+/**
+ * The sentences that ARE the argument.
+ *
+ * Each of these has been wrong at least once, and none of them is decoration: ADR-0013's
+ * approval warning is the whole basis on which storing shell commands is acceptable, and
+ * ADR-0007's amendment forbids presenting a validation refusal as a finding about somebody's
+ * project. They were asserted on the rendered page before 10i and on nothing afterwards.
+ */
+describe('the copy that carries a decision', () => {
+  const detail = (over: Partial<RepoDetail> = {}): RepoDetail => ({
+    repo: 'acme/widgets',
+    account: 'acme',
+    connectedAt: '2026-08-01T00:00:00.000Z',
+    onboarded: true,
+    recipe: { install: 'npm ci', services: [], test: 'npm test' },
+    approvedAt: '2026-09-01T18:12:33.928Z',
+    proof: null,
+    draft: null,
+    secrets: { names: [], enabled: false },
+    runs: [],
+    ...over,
+  });
+  const me: Me = {
+    accounts: true, signedIn: true, login: 'divy97', mode: 'plane',
+    installUrl: 'https://x.invalid', modelKey: null,
+    secrets: { enabled: false }, github: true, forgetting: true,
+  };
+  const env = (over: Partial<RepoDetail> = {}) =>
+    render(<Environment repo="acme/widgets" detail={detail(over)} me={me} onChanged={() => {}} />);
+
+  test('ADR-0013: what approving actually authorises, in the words the CLI uses', () => {
+    const html = env();
+    expect(html).toContain('verbatim');
+    expect(html).toMatch(/with a package registry reachable/);
+    expect(html).toMatch(/Nothing sandboxes them from that sandbox/);
+    expect(html).toMatch(/you are the control/i);
+  });
+
+  test('ADR-0017: a secret that is stored and not injected says which', () => {
+    const html = env({ secrets: { names: ['STRIPE_KEY'], enabled: false } });
+    expect(html).toMatch(/nothing worth stealing lives in it/);
+    expect(html).toContain('ADR-0017');
+    expect(html).toMatch(/not yet injected into any run/i);
+  });
+
+  test('and one that IS injected says what that does and does not buy', () => {
+    // The other branch, which nothing rendered. A value in a sealed sandbox satisfies a
+    // startup check and cannot reach the service it authenticates to — somebody who is not
+    // told that stores a real key and files a bug about a timeout.
+    const html = env({ secrets: { names: ['STRIPE_KEY'], enabled: true } });
+    expect(html).toMatch(/no route out/);
+    expect(html).not.toMatch(/not yet injected/i);
+  });
+
+  test('10j: configuration goes in the recipe, a credential goes in required', () => {
+    const html = env();
+    expect(html).toMatch(/Environment variables: configuration here/);
+    expect(html).toContain('required');
+    expect(html).toMatch(/a <code>blocked<\/code> run/);
+    expect(html).toMatch(/not a finding about anybody/);
+  });
+
+  test('nothing stored yet says so, rather than showing an empty list', () => {
+    expect(env({ secrets: { names: [], enabled: false } })).toMatch(/Nothing is stored for acme\/widgets yet/);
+  });
+});
+
+describe('the proof of a repository, which is stored as opaque JSON', () => {
+  const detail = (proof: unknown): RepoDetail => ({
+    repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
+    onboarded: true, recipe: { install: 'npm ci', services: [], test: 'npm test' },
+    approvedAt: '2026-09-01T18:12:33.928Z', proof, draft: null,
+    secrets: { names: [], enabled: false }, runs: [],
+  });
+  const me: Me = {
+    accounts: true, signedIn: true, login: 'divy97', mode: 'plane',
+    installUrl: 'https://x.invalid', modelKey: null,
+    secrets: { enabled: false }, github: true, forgetting: true,
+  };
+  const proof = (it: unknown) =>
+    render(<Environment repo="acme/widgets" detail={detail(it)} me={me} onChanged={() => {}} />);
+
+  test('not proved yet says a proving run is what fills it', () => {
+    const html = proof(null);
+    expect(html).toMatch(/Not proved yet/);
+    expect(html).toMatch(/sealed container that judges a fix/);
+  });
+
+  test('ready says both halves: the environment built and the suite passed', () => {
+    const html = proof({ state: 'ready', provedAt: 'T', suite: { command: 'npm test', exitCode: 0 } });
+    expect(html).toMatch(/Ready\./);
+    expect(html).toContain('exit 0');
+  });
+
+  test('blocked says no run here can reproduce anything', () => {
+    const html = proof({ state: 'blocked', provedAt: 'T', environment: { built: false, failed: 'npm ci exited 127' } });
+    expect(html).toMatch(/Blocked\./);
+    expect(html).toContain('npm ci exited 127');
+    expect(html).toMatch(/no run here can reproduce anything/);
+  });
+
+  test('caveats and the things this engine did not check at all are kept apart', () => {
+    const html = proof({
+      state: 'caveats',
+      provedAt: 'T',
+      suite: { command: 'npm test', exitCode: 1 },
+      caveats: ['the test command `npm test` already fails at this commit (exit 1)'],
+      unproved: ['whether your production data shape matches the seed'],
+    });
+    expect(html).toMatch(/Ready, with caveats/);
+    expect(html).toContain('already fails at this commit');
+    expect(html).toMatch(/Not checked by this engine at all/);
+    expect(html).toContain('whether your production data shape matches the seed');
+  });
+
+  test('a proof written by an older engine renders rather than throwing', () => {
+    // Stored as opaque JSON and read back the same way. A field that did not exist yet must
+    // render as absent — in a bundle, a throw here is a blank page rather than one bad panel.
+    expect(() => proof({ state: 'ready' })).not.toThrow();
+    expect(() => proof({})).not.toThrow();
+    expect(() => proof({ state: 'ready', suite: null, caveats: 'not an array' })).not.toThrow();
+  });
+});
+
+describe('the skeleton in an empty recipe box', () => {
+  test('parses, and stores a recipe that runs nothing', () => {
+    // Two traps at once. A COMMENTED skeleton does not parse, so a reader who fills it in
+    // is met with a syntax error they were handed — on the one screen whose first act is to
+    // tell them they got it wrong. And a plausible `npm install` placeholder is a command
+    // this engine would execute verbatim against somebody's repository because it was
+    // pre-typed for them.
+    const html = render(
+      <Environment
+        repo="acme/widgets"
+        detail={{
+          repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
+          onboarded: false, recipe: null, approvedAt: null, proof: null, draft: null,
+          secrets: { names: [], enabled: false }, runs: [],
+        }}
+        me={{
+          accounts: true, signedIn: true, login: 'd', mode: 'plane', installUrl: 'https://x.invalid',
+          modelKey: null, secrets: { enabled: false }, github: true, forgetting: true,
+        }}
+        onChanged={() => {}}
+      />,
+    );
+    const box = html.slice(html.indexOf('<textarea'), html.indexOf('</textarea>'));
+    const skeleton = box.slice(box.indexOf('>') + 1).replace(/&quot;/g, '"');
+    const parsed = JSON.parse(skeleton) as Record<string, unknown>;
+    // Every command empty, `services` an empty list. `parseRecipe` reads `''` as absent, so
+    // approving this unchanged stores a recipe that runs nothing at all.
+    expect(parsed).toEqual({ install: '', migrate: '', seed: '', services: [], test: '' });
+    expect(skeleton).not.toMatch(/npm install|pip install|bundle install/);
   });
 });

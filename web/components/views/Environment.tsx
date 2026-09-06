@@ -442,8 +442,9 @@ function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail
             aria-describedby="secret-value-hint"
           />
           <p className="hint" id="secret-value-hint">
-            Sealed with AES-256-GCM and bound to this repository. Nothing here, and no other
-            page, can show it to you again.
+            Sealed with AES-256-GCM and bound to this repository. Once stored, a value is
+            never returned — not by this page, not by any other, and not by any route. To
+            replace one, store it again.
           </p>
         </div>
       </div>

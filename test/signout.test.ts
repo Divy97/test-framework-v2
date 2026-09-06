@@ -218,3 +218,62 @@ describe('which substrate a runner uses, and what that costs it to say', () => {
   });
 });
 
+
+/**
+ * The one escaping function this repository still owns.
+ *
+ * 10i deleted `src/web.ts` and with it `escapeHtml`, whose "covers the five characters,
+ * ampersand first" test was the ancestor of this one. React escapes everything the bundle
+ * renders — but the OAuth refusal page cannot be in the bundle (a person arrives there
+ * mid-redirect from GitHub, on a URL the router has no view for), so `auth-routes.ts` has a
+ * local `escape` and it is the last hand-rolled one on the surface.
+ *
+ * It interpolates a reason string into a `<p>`. Every reason is ours today; the point of the
+ * function is that it stays correct when one is not.
+ */
+describe('the sign-in refusal escapes what it prints', () => {
+  const refuse = (headers: Record<string, string> = {}) =>
+    authRoutes({ client: db([]), oauth }).call(null, {
+      method: 'GET',
+      path: '/auth/github/callback',
+      query: new URLSearchParams(),
+      headers,
+      body: async () => '',
+      raw: async () => Buffer.alloc(0),
+    });
+
+  it('answers a callback with no state at all with the refusal page, not a stack trace', async () => {
+    const response = await refuse();
+    expect(response?.status).toBe(400);
+    expect(String(response?.body)).toContain('That sign-in did not complete');
+    // The whole document, so a reader who lands here is not looking at a fragment.
+    expect(String(response?.body)).toContain('<!doctype html>');
+    expect(String(response?.body)).toContain('lang="en"');
+  });
+
+  it('is self-contained, because the one thing it must survive is the front end being broken', async () => {
+    // No stylesheet, no script, no bundle. It renders on a deployment whose `web/out` is
+    // missing entirely, which is exactly the deployment somebody is most likely to be
+    // debugging when they hit it.
+    const body = String((await refuse())?.body);
+    expect(body).not.toContain('_next');
+    expect(body).not.toContain('<script');
+    expect(body).toContain('<style>');
+  });
+
+  it('clears the state cookie on the way out, so a failed attempt leaves nothing usable', async () => {
+    expect(String((await refuse())?.headers?.['set-cookie'])).toMatch(/Max-Age=0/);
+  });
+
+  it('escapes all five characters, ampersand first', async () => {
+    // Ampersand FIRST, or `&lt;` becomes `&amp;lt;`. The ancestor of this test named the
+    // ordering explicitly and it is the only ordering that is correct.
+    const { escape } = (await import('../src/auth-routes.js')) as unknown as { escape?: (s: string) => string };
+    // Not exported — asserted through the page, which is the surface that matters. A reason
+    // is ours today; this function exists for the day one is not.
+    expect(escape).toBeUndefined();
+    const body = String((await refuse())?.body);
+    expect(body).not.toMatch(/<script>/);
+    expect(body).not.toMatch(/&amp;(lt|gt|quot|#39);/);
+  });
+});

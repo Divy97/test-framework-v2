@@ -522,6 +522,17 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     expect(panel).toContain('STRIPE_KEY');
   });
 
+  test('the run register renders, and links to the run', async () => {
+    // The one screen with a link to it on every page in the product, and the one the rest
+    // of this file never visited.
+    const page = await visit('/runs', /acme.widgets/);
+    expect(page).toMatch(/tier/i);
+    // And clicking through gets there, which is what makes the link a link rather than a
+    // string that happens to look like one.
+    const run = await clickThrough('tbody a', /the reproduction arm/i, `/runs/${DEMO_RUN_ID}`);
+    expect(run).toMatch(/acme.widgets#41/);
+  });
+
   test('the repository list shows both states, and only one of them carries the fix', async () => {
     if (skipped('the repository list')) return;
     const page = await visit('/repos', /acme.legacy/);

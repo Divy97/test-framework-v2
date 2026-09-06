@@ -24,6 +24,27 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { policy, staticRoutes, DEFAULT_BUNDLE } from '../src/static.js';
 
+/**
+ * The built bundle, or a skip that says so.
+ *
+ * `expect(true).toBe(true)` was here, twice, and it is the shape this repository refuses
+ * everywhere else: `store.test.ts`, `plane.test.ts` and `dashboard.browser.test.ts` all
+ * print what is missing. `npm test` does not run `web:build`, and these two tests hold the
+ * only checks against REAL Next output — the pre-rendered landing page, and the CSP hashing
+ * that a Next upgrade could silently break — so a silent pass here is the most expensive
+ * kind of green there is.
+ */
+let why = '';
+const built = (): string | null => {
+  try {
+    return readFileSync(join(DEFAULT_BUNDLE, 'index.html'), 'utf8');
+  } catch {
+    why = `the dashboard has not been built — no ${join(DEFAULT_BUNDLE, 'index.html')}. Run \`npm run web:build\``;
+    console.log(`SKIPPED: ${why}`);
+    return null;
+  }
+};
+
 const call = (route: ReturnType<typeof staticRoutes>, path: string, method = 'GET') =>
   route({
     method,
@@ -184,12 +205,8 @@ describe('the front end never writes markup it did not build', () => {
     // ship an empty shell and let React fill it — and the one URL anybody ever links to
     // would then have been blank to all three. `app/page.tsx` renders the landing page when
     // there is no `location`, which is the build, and this is what says so.
-    let html: string;
-    try {
-      html = readFileSync(join(DEFAULT_BUNDLE, 'index.html'), 'utf8');
-    } catch {
-      return void expect(true).toBe(true);
-    }
+    const html = built();
+    if (html === null) return void expect(why).toBe('SKIP');
     expect(html).toContain('proves the bug existed');
     expect(html).toContain('Install on GitHub');
     // And the shell around it, which is what makes it a page rather than a fragment.
@@ -202,12 +219,8 @@ describe('the front end never writes markup it did not build', () => {
     // is the assertion that the hashing works against the real Next output rather than
     // against the small fixture above — the two have differed before, and would again the
     // first time Next changes how it emits its flight data.
-    let html: string;
-    try {
-      html = readFileSync(join(DEFAULT_BUNDLE, 'index.html'), 'utf8');
-    } catch {
-      return void expect(true).toBe(true);
-    }
+    const html = built();
+    if (html === null) return void expect(why).toBe('SKIP');
     const inline = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)];
     expect(inline.length).toBeGreaterThan(0);
     const csp = policy(html);

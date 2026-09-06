@@ -26,7 +26,17 @@ export function Repos({ me, go }: { me: Me | null; go: (to: string) => void }) {
   if (repos.loading) return <><h1>Repositories</h1><Loading what="your repositories" /></>;
   if (!repos.data) return <><h1>Repositories</h1><Failed error={repos.error ?? 'unknown'} retry={repos.reload} /></>;
 
-  const rows = repos.data;
+  return <Register rows={repos.data} me={me} go={go} />;
+}
+
+/**
+ * The two registers, as a pure function of the rows.
+ *
+ * Split out for the reason `Evidence` was split from `Run` — a component that fetches its
+ * own data can only be checked in a browser, and the browser test skips without chromium or
+ * a built bundle.
+ */
+export function Register({ rows, me, go }: { rows: RepoRow[]; me: Me | null; go: (to: string) => void }) {
   const ready = rows.filter((row) => row.onboarded);
   const waiting = rows.filter((row) => !row.onboarded);
 
@@ -47,12 +57,17 @@ export function Repos({ me, go }: { me: Me | null; go: (to: string) => void }) {
           {of.map((row) => (
             <tr key={row.repo}>
               <td>
+                {/* ENCODED PER SEGMENT. `owner/name` keeps its separator — the router
+                    matches on it — but everything else is escaped, because a repository name
+                    is GitHub's string and not ours: a `#` truncates the path at the fragment
+                    and links somewhere else, and a quote used to be able to break out of the
+                    attribute entirely. React closes the second; this closes the first. */}
                 <a
-                  href={`/repos/${row.repo}`}
+                  href={href(row.repo)}
                   onClick={(event) => {
                     if (plain(event)) {
                       event.preventDefault();
-                      go(`/repos/${row.repo}`);
+                      go(href(row.repo));
                     }
                   }}
                 >
@@ -111,7 +126,12 @@ export function Repos({ me, go }: { me: Me | null; go: (to: string) => void }) {
           <p className="hero">
             {ready.length === 0
               ? 'Nothing here can run yet — a repository needs an approved recipe before an issue on it does anything.'
-              : `${ready.length} of ${rows.length} ${ready.length === 1 ? 'repository is' : 'repositories are'} onboarded and can take work. The rest are connected and waiting.`}
+              : // The plural agrees with the TOTAL, not with the onboarded count — "1 of 2
+                // repository is onboarded" is what the other way round produces, and it is
+                // the sentence at the top of the first screen anybody sees.
+                `${ready.length} of ${rows.length} ${rows.length === 1 ? 'repository is' : 'repositories are'} onboarded and can take work. ${
+                  rows.length - ready.length === 1 ? 'The other is' : 'The rest are'
+                } connected and waiting.`}
           </p>
           {ready.length > 0 ? (
             <>
@@ -140,3 +160,6 @@ export function Repos({ me, go }: { me: Me | null; go: (to: string) => void }) {
     </>
   );
 }
+
+/** `owner/repo` in a URL path: each segment encoded, the separator kept. */
+const href = (repo: string): string => `/repos/${repo.split('/').map(encodeURIComponent).join('/')}`;
