@@ -1,5 +1,17 @@
-node_modules
+# `**/` on every one of these, and it is not a flourish.
+#
+# A `.dockerignore` pattern is matched against the path from the context root, so a bare
+# `node_modules` excludes `/node_modules` and NOTHING ELSE. Since 10i there is a second npm
+# project at `web/`, and without the prefix its `node_modules` — a few hundred megabytes of
+# Next and its transitive dependencies — was copied into the build context, sent to the
+# daemon, and then copied over by `npm ci` in the stage that needs it.
+#
+# `web/.next` and `web/out` are the same hazard with a worse ending: a stale export from
+# somebody's laptop, copied in and then overwritten by the build, or not.
+**/node_modules
 .git
 test
 docs
 *.md
+web/.next
+web/out

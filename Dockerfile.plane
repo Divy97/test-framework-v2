@@ -31,6 +31,29 @@ COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 RUN npx tsc -p tsconfig.build.json
 
+# ---- the dashboard --------------------------------------------------------
+# A SECOND npm project, and the separation is the point (10i, ADR-0022).
+#
+# `web/` has its own `package.json` and its own lockfile so that Next, React and their
+# hundreds of transitive dependencies exist in exactly one image build and in no other.
+# The worker and both sandbox images install the ROOT `package.json`; had the dashboard's
+# dependencies gone there, every machine that runs untrusted code would carry a front-end
+# toolchain it can never use.
+#
+# Its own stage, and copied before the source, so a change to a component does not
+# reinstall it — and so this layer is shared with nothing above.
+#
+# `output: 'export'` means what comes out is HTML, CSS and JavaScript. There is no Next
+# server in the runtime image below, no second port and no second process: the plane holds
+# these bytes out itself, which is what "same origin, behind the plane" has to mean if it
+# is to be a fact rather than a promise.
+FROM node:22-alpine AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web ./
+RUN npm run build
+
 # ---- runtime --------------------------------------------------------------
 FROM node:22-alpine
 
@@ -48,6 +71,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
+# `../web/out` from the code's own directory, which is why `dist` sits where `src` did —
+# the same arrangement `db/` below relies on. `src/static.ts` resolves exactly this path.
+COPY --from=web /web/out ./web/out
 # The schema travels with the image, because the plane applies it on start. A deployment
 # that needs somebody to remember `db:schema` is a deployment that answers its first
 # request with a relation that does not exist.
