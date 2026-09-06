@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useState } from 'react';
-import { send, type Evidence as EvidenceData, type Me } from '../../lib/api';
+import { isOver, send, type Evidence as EvidenceData, type Me } from '../../lib/api';
 import { useJson, useTail } from '../../lib/hooks';
 import { Failed, Loading, Said, When } from '../bits';
 import { RawLog, Timeline } from '../Timeline';
@@ -56,7 +56,7 @@ export function Run({ runId, me }: { runId: string; me: Me | null }) {
   if (!evidence.data) return <Failed error={evidence.error ?? 'unknown'} retry={reload} />;
 
   const { row, state, score, usage, compute, forgotten } = evidence.data;
-  const ended = row.ended_at !== null;
+  const ended = isOver(state.status, row.ended_at);
   const refused = score.tier === 3;
   const attempt = state.reproducedAttempt;
   const repro = state.registrations.filter((r) => r.attempt === attempt).at(-1) ?? state.registeredRepro;

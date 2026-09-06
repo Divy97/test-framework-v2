@@ -85,6 +85,24 @@ export async function send<T>(method: 'POST' | 'PUT' | 'DELETE', path: string, b
 // engine into a browser build to describe six fields. They are checked against each other
 // by `test/api.test.ts`, which asserts the shape of every response below.
 
+/**
+ * Whether a run is over, asked of the FOLD rather than of the projection.
+ *
+ * `run_projection.ended_at` is a cache column and it is not always written — the demo log
+ * this repository has fixed since milestone 5 ends `pr_opened` with `ended_at` null, which
+ * is a true statement about that log and a contradiction on a screen. Reading it as "still
+ * running" put a live indicator, a "verdict not yet" chip and a pulsing timeline on a run
+ * that had opened a pull request.
+ *
+ * `fold.ts` owns what a run's status means (ADR-0009). These four are its terminal ones,
+ * and the projection's timestamp is kept only as a second witness — a run can be over
+ * without this list knowing about a status added later, but not without one of the two.
+ */
+const TERMINAL = new Set(['pr_opened', 'unresolved', 'blocked', 'errored']);
+
+export const isOver = (status: string, endedAt: string | null): boolean =>
+  TERMINAL.has(status) || endedAt !== null;
+
 export type Me = {
   accounts: boolean;
   signedIn: boolean;

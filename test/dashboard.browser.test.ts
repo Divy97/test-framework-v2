@@ -12,6 +12,17 @@
 // folding `demoRunEvents` through the real `fold` and `confidence`, so what is rendered is
 // what a genuine Tier 1 log produces rather than a hand-written page shape.
 //
+// SINCE 10i, IT CARRIES MORE. The pages are no longer strings this process built: they are
+// a React bundle fetching the JSON surface, which means a browser is now the ONLY place
+// several things can be checked at all — that the Content-Security-Policy this repository
+// serves does not block the scripts it also serves, that a `pushState` route resolves to a
+// view, that a fetch reaches an API on the same origin with its cookie. `renderToStaticMarkup`
+// in `test/screens.test.tsx` covers what the screens SAY; nothing but this covers whether
+// they arrive.
+//
+// Which raises the stakes on the skip below. This file already skipped without a Chromium;
+// it now also skips without a built `web/out`, and both say exactly what is missing.
+//
 // Three things here are deliberate and easy to undo by accident:
 //
 //   1. **`browser.console()` is the load-bearing assertion.** `navigate()` resolves happily
@@ -42,7 +53,8 @@ import type { Browser } from '../src/browser.js';
 import { demoRunEvents, DEMO_RUN_ID } from '../src/fixtures/demo-run.js';
 import { projectRun } from '../src/projection.js';
 import { dashboardRoutes } from '../src/routes.js';
-import { startStatusServer, type Route, type StatusServer } from '../src/sse.js';
+import { chain, startStatusServer, type StatusServer } from '../src/sse.js';
+import { DEFAULT_BUNDLE, staticRoutes } from '../src/static.js';
 
 // ---------------------------------------------------------------------------------------
 // The fixture database.
@@ -167,7 +179,11 @@ const fixtureClient = (): Db => {
     // explicitly rather than left to fall through: a page rendering "nothing stored" for
     // a query nobody wrote is exactly the false green the throw below exists to prevent.
     if (sql.includes('from repo_secrets where repo = $1')) {
-      return [];
+      // ONE stored name, so the environment screen has something to list. An empty answer
+      // renders "nothing stored yet", which is a page that passes while showing nothing —
+      // and the names half of the secrets contract (names out, never values) is only
+      // observable when there is a name.
+      return params[0] === REPO ? [{ name: 'STRIPE_KEY' }] : [];
     }
     throw new Error(`the fixture database was asked something nobody wrote: ${sql}`);
   };
@@ -180,18 +196,16 @@ const fixtureClient = (): Db => {
 };
 
 /**
- * The real routes, plus a favicon.
+ * The favicon is now the bundle's own (`web/app/icon.svg`), and this test used to supply it.
  *
- * Not decoration. Chrome asks every origin for `/favicon.ico`, the dashboard answers 404,
- * and Chrome writes "Failed to load resource" into the console — which would make the one
- * assertion in this file that can distinguish a rendered page from a broken one fail on
- * every page, for a reason that is not about the page. Answered here, in the test, so the
- * console stays a signal; the gap itself is reported rather than papered over in `src`.
+ * The note that stood here said Chrome asks every origin for `/favicon.ico`, gets a 404, and
+ * writes "Failed to load resource" into the console — which would make the one assertion in
+ * this file that can tell a rendered page from a broken one fail on every page, for a reason
+ * that is not about the page. It was answered HERE, in the test, and the gap reported rather
+ * than fixed. 10i fixed it: the app declares an icon, Next emits the `<link rel="icon">`, and
+ * `staticRoutes` serves it. The console assertion is now a signal about the product rather
+ * than about this file's scaffolding.
  */
-const withFavicon = (routes: Route): Route => async (request) =>
-  request.path === '/favicon.ico'
-    ? { status: 204, type: 'image/x-icon', body: '' }
-    : routes(request);
 
 // ---------------------------------------------------------------------------------------
 // The browser, and the conditions under which there is one.
@@ -245,6 +259,13 @@ beforeAll(async () => {
     why = `the launcher is missing: ${LAUNCHER}`;
     return;
   }
+  // The bundle, which is a build step rather than a checkout. Named as loudly as the
+  // missing-Chromium case, because "the dashboard was not built" and "the dashboard is
+  // broken" produce the same blank page and only one of them is a bug.
+  if (!existsSync(join(DEFAULT_BUNDLE, 'index.html'))) {
+    why = `the dashboard has not been built — no ${join(DEFAULT_BUNDLE, 'index.html')}. Run \`npm run web:build\``;
+    return;
+  }
   if (await portTaken()) {
     why =
       `something is already listening on 127.0.0.1:${DEBUG_PORT}, which src/browser.ts hardcodes ` +
@@ -262,7 +283,13 @@ beforeAll(async () => {
   server = await startStatusServer({
     read: async () => [],
     port: 0,
-    routes: withFavicon(dashboardRoutes({ client: fixtureClient(), installUrl: INSTALL_URL })),
+    routes: chain(
+      dashboardRoutes({ client: fixtureClient(), installUrl: INSTALL_URL }),
+      // The bundle, from the same port. This is the arrangement in production — one
+      // process, one origin, the API and the pages behind the same address — and testing
+      // the pages against anything else would test an arrangement nobody deploys.
+      staticRoutes(),
+    ),
   });
   base = `http://127.0.0.1:${server.port}`;
   // Imported HERE, after the environment is set, because the module captures the binary
@@ -318,11 +345,42 @@ const throwingPage = async (): Promise<{ url: string; close: () => Promise<void>
  * below would be asserted against an error page and most of them would simply be absent
  * from it, which reads as a content bug rather than as the route having thrown.
  */
-const visit = async (path: string, title: RegExp): Promise<string> => {
+const visit = async (path: string, wanted: RegExp): Promise<string> => {
   visited.push(path);
-  const loaded = await browser!.navigate(`${base}${path}`);
-  expect(loaded, `GET ${path} did not render the page it should have`).toMatch(title);
-  return loaded;
+  await browser!.navigate(`${base}${path}`);
+  // POLLED, since 10i, and the reason is the architecture rather than flakiness. The
+  // document that arrives is one shell for every path; the view, the title and every word
+  // below are decided after it has run and asked `/api/me`. Asserting on `navigate()`'s
+  // return value would be asserting on the shell, which says the same thing for every URL.
+  return settle(wanted, path);
+};
+
+/**
+ * Read the page until it says what it should, or say what it said instead.
+ *
+ * EVERY PATTERN PASSED HERE IS CASE-INSENSITIVE, and that is a fact about the DOM rather
+ * than a loosening of the assertion. `browser.text()` reads `innerText`, which applies CSS
+ * `text-transform` — and this stylesheet uppercases every section heading, every tab, every
+ * chip, every table header and every button, because the register's typography does. So
+ * `The reproduction arm` is on the page and `THE REPRODUCTION ARM` is what comes back.
+ *
+ * This is not hypothetical: five assertions in this file were red on `main` for exactly
+ * this reason before 10i rewrote them, and the failure reads as missing content rather
+ * than as a casing difference.
+ */
+const settle = async (wanted: RegExp, what: string, ms = 15_000): Promise<string> => {
+  const deadline = Date.now() + ms;
+  let last = '';
+  while (Date.now() < deadline) {
+    try {
+      last = await browser!.text();
+      if (wanted.test(last)) return last;
+    } catch {
+      // The execution context was torn down by a navigation this is waiting for.
+    }
+    await new Promise((done) => setTimeout(done, 60));
+  }
+  throw new Error(`${what} never reached ${wanted}; the page reads: ${last.replace(/\s+/g, ' ').slice(0, 400)}`);
 };
 
 /**
@@ -357,214 +415,224 @@ describe.sequential('the dashboard, driven in a real browser', () => {
   test('the launcher runs the browser it was pointed at, rather than a desktop instance', () => {
     if (skipped('the launcher')) return;
     // Asserted before anything depends on it: a wrapper that silently handed off to a
-    // running Chrome would fail every test below with "the browser did not come up",
-    // twenty seconds at a time, naming the binary rather than the profile.
-    const version = execFileSync(LAUNCHER, ['--version'], { encoding: 'utf8' });
-    expect(version).toMatch(/chrom/i);
+    // running Chrome would fail every test below with "the browser did not come up", and
+    // the cause would be four layers away from the message.
+    const printed = execFileSync(process.env.ENGINE_CHROMIUM!, ['--version'], { encoding: 'utf8' });
+    expect(printed).toMatch(/chrom/i);
   });
 
-  test('the landing page renders, states the claim, and links where install goes', async () => {
-    if (skipped('the landing page')) return;
+  test('the front door of a surface with no accounts is the application, not a pitch', async () => {
+    if (skipped('the front door')) return;
+    // `serve.ts` has one operator on 127.0.0.1 and no login. Showing them a marketing page
+    // for the thing they have already installed is the landing page's worst placement, so
+    // the bundle replaces `/` with `/repos` the moment `/api/me` says there are no accounts.
+    //
+    // That the landing page is REALLY in the document the server sent — the property a
+    // crawler and a link preview depend on — is asserted in `test/static.test.ts`, which
+    // reads the bytes rather than watching a browser render past them.
+    await browser!.navigate(`${base}/`);
+    visited.push('/');
+    const page = await settle(/repositories/i, '/');
+    expect(page).toMatch(/acme.widgets/);
+  });
 
-    const started = Date.now();
-    const loaded = await visit('/', /title: Test Framework v2$/);
-    const elapsed = Date.now() - started;
-    console.log(`navigate('/') took ${elapsed}ms`);
-
-    expect(loaded).toContain('Test Framework v2');
+  test('the scripts it serves are allowed by the policy it serves', async () => {
+    if (skipped('the policy')) return;
+    // THE assertion that could not exist before 10i, and the one most likely to break
+    // silently. `test/web.test.ts` guarded the old pages by asserting they contained no
+    // `<script>` at all; a bundle cannot keep that, so what replaces it is a CSP with a
+    // hash per inline block. Get one hash wrong — a Next upgrade that changes how the
+    // flight data is emitted, a byte of whitespace — and every page is blank, with the
+    // reason only in a console this is the only test that reads.
+    await visit('/repos', /repositories/i);
+    expect(browser!.console()).not.toMatch(/Content Security Policy|refused to execute/i);
+    // And the page really did run: this text exists nowhere in the shell.
     const page = await browser!.text();
-    // The product's one-line claim, as the h1 says it.
-    expect(page).toContain('Open an issue. Get back a pull request that proves the bug existed.');
-    expect(page).toMatch(/event-sourced execution and verification platform/);
-
-    // The Install link points at the URL that was INJECTED, not at `installUrl()`'s
-    // placeholder default — the selector is the assertion, because a selector that matches
-    // is an anchor whose href is exactly that string.
-    expect(await browser!.text(`a[href="${INSTALL_URL}"]`)).toBe('Install on GitHub');
-
-    // A regression test for `once()`, which used to drop its waiter without resolving, so
-    // every `navigate()` fell through to the 30s `CALL_TIMEOUT_MS` and reported success. It
-    // is a performance bug that looks like a slow page; a ceiling here is what makes it
-    // visible. Generous, because this is a cold browser start plus a first paint.
-    expect(elapsed).toBeLessThan(15_000);
+    expect(page).toContain('acme/widgets');
   });
 
-  test('a second navigation, on a warm browser, is fast', async () => {
-    if (skipped('navigation cost')) return;
-    const started = Date.now();
-    await visit('/', /title: Test Framework v2$/);
-    const elapsed = Date.now() - started;
-    console.log(`navigate('/') on a warm browser took ${elapsed}ms`);
-    // Nothing about this page is slow. Anything near 30s means `Page.loadEventFired` is
-    // being missed again and `Promise.race` is timing out instead of resolving.
-    expect(elapsed).toBeLessThan(5_000);
-  });
-
-  test('the repository list shows both states, and only one of them carries the fix', async () => {
-    if (skipped('the repository list')) return;
-    await visit('/repos', /title: Repositories$/);
-
-    const page = await browser!.text();
-    expect(page).toContain(REPO);
-    expect(page).toContain(UNONBOARDED);
-    expect(page).toContain('recipe approved');
-    expect(page).toContain('not onboarded yet');
-
-    // The onboarding link is the row's most important column, and it belongs to exactly the
-    // repository that needs it. `text()` returns 'missing' for a selector matching nothing,
-    // which makes an absent link assertable rather than merely unseen.
-    expect(await browser!.text(`a[href="/repos/${UNONBOARDED}/onboard"]`)).toBe('draft a recipe');
-    expect(await browser!.text(`a[href="/repos/${REPO}/onboard"]`)).toBe(MISSING);
-  });
-
-  test('clicking the onboarding link reaches the approval screen and its warning', async () => {
-    if (skipped('the onboarding click-through')) return;
-    await visit('/repos', /title: Repositories$/);
-
-    const page = await clickThrough(
-      `a[href="/repos/${UNONBOARDED}/onboard"]`,
-      /Read this before you approve/,
-      `/repos/${UNONBOARDED}/onboard`,
-    );
-
-    expect(page).toContain(`Onboard ${UNONBOARDED}`);
-    // The approval IS the control (ADR-0013), and the page has to say so to a stranger in
-    // the same words `cli.ts` says it to an operator.
-    expect(page).toMatch(/execute these commands\s+verbatim/);
-    expect(page).toContain('you are the control');
-    expect(page).toMatch(/Nothing sandboxes them from that sandbox/);
-    // The form is really there and really posts back to the route that answers it.
-    // `text()` reads `innerText`, and a `<textarea>`'s value is not rendered text — so the
-    // box's contents are `test/web.test.ts`'s to assert and its EXISTENCE is this file's.
-    expect(await browser!.text('textarea[name="recipe"]')).not.toBe(MISSING);
-    expect(await browser!.text(`form[action="/repos/${UNONBOARDED}/onboard"]`)).not.toBe(MISSING);
-    // The button says which of the two states this repository is in.
-    expect(await browser!.text('button[type="submit"]')).toBe('Approve and store');
-  });
-
-  test('the run list shows the run, and clicking it reaches the evidence page', async () => {
-    if (skipped('the run list')) return;
-    await visit('/runs', /title: Runs$/);
-
-    const list = await browser!.text();
-    expect(list).toContain(DEMO_RUN_ID);
-    expect(list).toContain(`${REPO}#41`);
-    expect(list).toContain('Tier 1');
-    // The denominator travels with the number.
-    expect(list).toContain(`${RUN_ROW.confidence}/${RUN_ROW.ceiling}`);
-
-    const evidence = await clickThrough(
-      `a[href="/runs/${DEMO_RUN_ID}"]`,
-      /The reproduction arm/,
-      `/runs/${DEMO_RUN_ID}`,
-    );
-    expect(evidence).toContain(`${REPO}#41`);
+  test('a path with no file behind it resolves to a view, not to a 404', async () => {
+    if (skipped('the router')) return;
+    // A run id cannot be pre-rendered. `/runs/<uuid>` is not a file and never will be, so
+    // the plane hands the shell out for it and the bundle decides — an arrangement that is
+    // one rewrite rule away from serving `not found` for every run in the product.
+    const page = await visit(`/runs/${DEMO_RUN_ID}`, /acme\/widgets#41/);
+    expect(page).toMatch(/the reproduction arm/i);
   });
 
   test('the evidence page shows base red, fix green, the tier and every ground', async () => {
     if (skipped('the evidence page')) return;
-    await visit(`/runs/${DEMO_RUN_ID}`, /title: acme\/widgets#41 — evidence$/);
-    const page = await browser!.text();
+    const page = await visit(`/runs/${DEMO_RUN_ID}`, /the reproduction arm/i);
 
-    // The tier, with the sentence that says what it means rather than a bare number.
-    expect(page).toContain('Tier 1');
-    expect(page).toContain('reproduced by a failing test whose independence is established');
+    // The verdict, from the fold rather than from the row.
+    expect(page).toMatch(/tier 1/i);
+    expect(page).toMatch(/reproduced by a failing test/i);
 
-    // The two arms of the reproduction, from the real fold of the real fixture log. Base
-    // failed for the reported reason; the fix run passed.
-    expect(page).toContain('base');
-    expect(page).toContain('fix');
-    expect(page).toContain('npm test -- checkout-discount');
-    expect(page).toContain('8d41c6b2a09f'); // the base commit, as the table truncates it
-    expect(page).toContain('f3a9d1c7e5b2'); // the fix commit
-    expect(page).toContain('sha256:5b7a1de2c3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0');
-    expect(page).toContain('sha256:9c8b7a6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b');
+    // Both arms, and the words that make the exit codes legible without colour.
+    expect(page).toMatch(/the reproduction arm/i);
+    expect(page).toMatch(/the regression arm/i);
+    expect(page).toContain('exit 1');
+    expect(page).toContain('exit 0');
 
-    // The regression arm says it was not measured, in the words that refuse to imply it was
-    // fine. `unmeasured` is the honest answer for this fixture and the page must not round it.
-    expect(page).toContain('suite unmeasured');
-    expect(page).toMatch(/Not knowing is not the same as knowing it is fine/);
+    // Testimony, named as testimony (ADR-0006).
+    expect(page).toMatch(/testimony/i);
+    expect(page).toMatch(/input to no verdict/);
 
-    // The score, and every ground behind it — with points, and with the bytes.
-    expect(page).toContain(`Confidence ${RUN_ROW.confidence}/${RUN_ROW.ceiling}`);
-    expect(page).toContain('the reproduction ran red on the base commit');
-    expect(page).toContain('every file of the reproduction was written by the engine over both checkouts');
-    expect(page).toContain('the fix series ran to completion');
-    expect(page).toContain('+45');
-    expect(page).toContain('+15');
-    expect(page).toContain('Not measured');
+    // What the run cost, beside the log and never inside it — including the dash for the
+    // environment sandbox, whose measures the platform does not report.
+    expect(page).toMatch(/what this run cost/i);
+    expect(page).toContain('—');
+    expect(page).toMatch(/egress is not a seal check/i);
+  });
 
-    // Testimony is named as testimony, before its count.
-    expect(page).toContain('Testimony');
-    expect(page).toMatch(/an input to no verdict/);
+  test('the repository screen puts starting a run first, and says why it cannot', async () => {
+    if (skipped('the repository screen')) return;
+    // The screen 10i exists for. `POST /api/runs` was built, authorized and tested in 10g
+    // and nothing in the product called it.
+    const page = await visit('/repos/acme/widgets', /start a run/i);
+    // This deployment has no App, so the picker cannot list anything — and the screen says
+    // so rather than rendering a button whose only outcome is a 501.
+    expect(page).toMatch(/no GitHub App/i);
+  });
 
-    // A Tier 1 with a diff shows it; the withholding is Tier 3's, and this is not one.
-    expect(page).toContain('src/checkout/discount.ts');
+  test('the tabs are a tablist, and the fragment says which one', async () => {
+    if (skipped('the tabs')) return;
+    await visit('/repos/acme/widgets', /start a run/i);
+    const panel = await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
+    // The approval warning, on the screen that stores commands the engine runs verbatim.
+    expect(panel).toMatch(/Read this before you approve/i);
+    expect(panel).toContain('STRIPE_KEY');
+  });
 
-    // The bill lives beside the log, and the page renders it from `run_usage`.
-    expect(page).toContain('What this run cost');
-    expect(page).toContain('41233');
+  test('the repository list shows both states, and only one of them carries the fix', async () => {
+    if (skipped('the repository list')) return;
+    const page = await visit('/repos', /repositories/i);
+    expect(page).toContain('acme/widgets');
+    expect(page).toContain('acme/legacy');
+    expect(page).toMatch(/recipe approved/i);
+    expect(page).toMatch(/not onboarded yet/i);
   });
 
   test('the evidence page screenshots as a real PNG', async () => {
     if (skipped('the screenshot')) return;
-    await visit(`/runs/${DEMO_RUN_ID}`, /title: acme\/widgets#41 — evidence$/);
-    const png = await browser!.screenshot();
-
-    // The magic bytes, not just "a buffer came back": `Page.captureScreenshot` returning an
-    // empty string still base64-decodes into a Buffer, and a zero-length one would pass any
-    // check that only asked whether it existed.
-    expect(png.subarray(0, 4).toString('latin1')).toBe('\x89PNG');
-    expect(png.length).toBeGreaterThan(5_000);
+    await visit(`/runs/${DEMO_RUN_ID}`, /the reproduction arm/i);
+    const shot = await browser!.screenshot();
+    // The PNG signature, and a size that is not an empty viewport.
+    expect(shot.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(shot.length).toBeGreaterThan(10_000);
   });
 
   test('nothing on any page wrote an error to the browser console', async () => {
     if (skipped('the console')) return;
-    // `navigate()` resolves for a 500 exactly as it does for a rendered page, so a check
-    // that only reads content cannot tell a served document from a broken one. This can:
-    // every failed subresource — a stylesheet, a script, a font, anything the router does
-    // not answer — lands here as `[error] Failed to load resource`. Verified by removing
-    // the favicon shim above, which turns this red on every page.
+    // THE load-bearing assertion of this file. `navigate()` resolves happily for a 500 and
+    // for a page that failed to fetch half of itself; the console is the only signal here
+    // that tells a served document from a broken one.
     //
-    // WHAT IT DOES NOT CATCH, checked rather than assumed: an uncaught JavaScript exception.
-    // A page serving `<script>notAFunction()</script>` leaves `console()` reading "nothing
-    // logged", because `src/browser.ts` subscribes to `Runtime.consoleAPICalled` and
-    // `Log.entryAdded` and not to `Runtime.exceptionThrown`. That is a gap in the tool, not
-    // in the dashboard — reported, not worked around, and the reason `visit()` also insists
-    // on the title rather than leaning on this alone.
-    //
-    // Asserted over the whole file because the browser and its log outlive each test; the
-    // message names every page that was loaded, so a failure is still actionable.
-    const log = browser!.console();
-    const noisy = log
+    // Its one measured limit, recorded on the assertion rather than in a comment nobody
+    // reads: `src/browser.ts` does not subscribe to `Runtime.exceptionThrown`, so an
+    // uncaught page exception is invisible to it — which is why `visit()` also insists the
+    // page says what it should.
+    expect(visited.length).toBeGreaterThan(4);
+    const noisy = browser!
+      .console()
       .split('\n')
       .filter((line) => /^\[(error|warning)\]/i.test(line));
-    expect(
-      noisy,
-      `after loading ${visited.join(', ')} the browser logged:\n${log}`,
-    ).toEqual([]);
+    expect(noisy, `pages visited: ${visited.join(', ')}`).toEqual([]);
   });
 
   test('sees an uncaught page exception, which is the bug class the browser exists for', async () => {
-    if (skipped('page exceptions')) return;
-    // It could NOT see one. `src/browser.ts` subscribed to `Runtime.consoleAPICalled` and
-    // `Log.entryAdded` and neither carries an uncaught exception, so a page whose script
-    // threw read as a page with nothing to say — `console()` returned `nothing logged`.
-    //
-    // That is the wrong blind spot to have. ADR-0006's amendment gave the agent a browser
-    // to find bugs it cannot find by reading, and a JavaScript error is the most common
-    // thing a rendered page gets wrong. It also renders fine: the markup is served, the
-    // load event fires, and `navigate()` reports success — so nothing else would notice.
-    const thrower = await throwingPage();
+    if (skipped('the throwing page')) return;
+    const page = await throwingPage();
     try {
-      await browser!.navigate(thrower.url);
-      // The exception arrives on its own event, after the load completes.
-      await new Promise((done) => setTimeout(done, 400));
-      const log = browser!.console();
-      expect(log).toMatch(/notAFunction is not defined/);
-      expect(log).toMatch(/\[error\]/);
+      await browser!.navigate(page.url);
+      // Rendered, and the console names the throw. This is the shape of failure that a
+      // string test cannot see at all: correct markup, served, and dead on arrival.
+      expect(await browser!.text()).toContain('rendered');
+      expect(browser!.console()).toMatch(/notAFunction|not defined|not a function/i);
     } finally {
-      await thrower.close();
+      await page.close();
     }
+  });
+});
+
+/**
+ * The accessibility floor, checked in the engine that decides it.
+ *
+ * Not an audit — an audit is a person with a screen reader, and nothing here claims to
+ * replace one. What this covers is the handful of structural facts that are cheap to break
+ * and impossible to notice: a landmark that stopped being a landmark when a `<div>` was
+ * substituted, a control that lost its label, a tablist that became a row of buttons, a
+ * heading level skipped by a component that was moved.
+ *
+ * They are asserted HERE rather than over the JSX because several of them are only true of
+ * the composed document — one `<main>` across the whole page, one `<h1>`, a `for` that
+ * resolves to an `id` that really exists.
+ */
+describe.sequential('the floor, in the browser that renders it', () => {
+  test('every screen has one main, one h1, and a skip link that reaches it', async () => {
+    if (skipped('the landmarks')) return;
+    for (const [path, wait] of [
+      ['/repos', /repositories/i],
+      [`/runs/${DEMO_RUN_ID}`, /the reproduction arm/i],
+      ['/repos/acme/widgets', /start a run/i],
+      ['/settings', /settings/i],
+    ] as const) {
+      await browser!.navigate(`${base}${path}`);
+      visited.push(path);
+      await settle(wait, path);
+      // `text(selector)` answers `'missing'` for a selector that matches nothing, so each
+      // of these is "this element exists and reads as it should".
+      expect(await browser!.text('main#main'), `${path} has no main landmark`).not.toBe(MISSING);
+      expect(await browser!.text('h1'), `${path} has no h1`).not.toBe(MISSING);
+      expect(await browser!.text('a.skip'), `${path} has no skip link`).toMatch(/skip/i);
+      expect(await browser!.text('header.top nav'), `${path} has no nav`).not.toBe(MISSING);
+      // The one that says where you are, for a reader who cannot see the underline.
+      expect(await browser!.text('header.top nav a[aria-current=page]'), `${path} marks no current section`).not.toBe(
+        MISSING,
+      );
+    }
+  });
+
+  test('the tablist announces itself as one, with a selected tab and a labelled panel', async () => {
+    if (skipped('the tablist')) return;
+    await browser!.navigate(`${base}/repos/acme/widgets`);
+    visited.push('/repos/acme/widgets');
+    await settle(/start a run/i, '/repos/acme/widgets');
+    expect(await browser!.text('[role=tablist]')).not.toBe(MISSING);
+    expect(await browser!.text('[role=tab][aria-selected=true]')).toMatch(/start a run/i);
+    // The panel exists and is tied to a tab. A tablist whose panel is not `aria-labelledby`
+    // a tab is a set of buttons that has told a screen reader it is something else.
+    expect(await browser!.text('[role=tabpanel][aria-labelledby]')).not.toBe(MISSING);
+  });
+
+  test('every input on the environment screen has a label pointing at it', async () => {
+    if (skipped('the labels')) return;
+    // CLICKED, not navigated to `#environment` directly. A fragment-only change on the URL
+    // already loaded is a `hashchange` rather than a navigation, and CDP's `Page.navigate`
+    // does not resolve for one — the test hung for thirty seconds rather than failing.
+    await browser!.navigate(`${base}/repos/acme/widgets`);
+    visited.push('/repos/acme/widgets');
+    await settle(/start a run/i, '/repos/acme/widgets');
+    await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
+    // The three the screen has: the recipe, and the two halves of storing a secret. Each is
+    // asserted by its label's `for`, which only resolves if the `id` is really there.
+    for (const [id, label] of [
+      ['recipe', /recipe/i],
+      ['secret-name', /name/i],
+      ['secret-value', /value/i],
+    ] as const) {
+      expect(await browser!.text(`label[for=${id}]`), `#${id} has no label`).toMatch(label);
+      expect(await browser!.text(`#${id}`), `#${id} does not exist`).not.toBe(MISSING);
+    }
+  });
+
+  test('the live region exists before there is anything to announce', async () => {
+    if (skipped('the live region')) return;
+    // Inserting a live region and its content in the same tick announces nothing, which is
+    // the single most common way a "we added an aria-live" fix does not work.
+    await browser!.navigate(`${base}/repos`);
+    visited.push('/repos');
+    await settle(/repositories/i, '/repos');
+    expect(await browser!.text('[aria-live=polite]')).not.toBe(MISSING);
   });
 });

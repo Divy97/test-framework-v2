@@ -178,6 +178,25 @@ describe('the front end never writes markup it did not build', () => {
     }
   });
 
+  it('the built document carries the landing page in its own bytes', () => {
+    // What a crawler, a link preview, or a reader with JavaScript disabled receives. This
+    // bundle is one document for every path, so it would have been entirely reasonable to
+    // ship an empty shell and let React fill it — and the one URL anybody ever links to
+    // would then have been blank to all three. `app/page.tsx` renders the landing page when
+    // there is no `location`, which is the build, and this is what says so.
+    let html: string;
+    try {
+      html = readFileSync(join(DEFAULT_BUNDLE, 'index.html'), 'utf8');
+    } catch {
+      return void expect(true).toBe(true);
+    }
+    expect(html).toContain('proves the bug existed');
+    expect(html).toContain('Install on GitHub');
+    // And the shell around it, which is what makes it a page rather than a fragment.
+    expect(html).toContain('<title>');
+    expect(html).toContain('lang="en"');
+  });
+
   it('the built document, if one has been built, is covered by its own policy', () => {
     // Only where a build exists, because the suite must not require one. When it does, this
     // is the assertion that the hashing works against the real Next output rather than

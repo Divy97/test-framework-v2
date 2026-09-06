@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { send, type Issue, type Me, type RepoDetail } from '../../lib/api';
+import { isOver, send, type Issue, type Me, type RepoDetail } from '../../lib/api';
 import { useJson } from '../../lib/hooks';
 import { Failed, Loading, Said, When } from '../bits';
 
@@ -35,7 +35,7 @@ export function Start({
   const [busy, setBusy] = useState(false);
   const [said, setSaid] = useState<{ ok: boolean; text: string } | null>(null);
 
-  const open = detail.runs.find((run) => run.ended_at === null);
+  const open = detail.runs.find((run) => !isOver(run.status, run.ended_at));
   // Every reason Start cannot happen, in the order the API checks them, so the sentence a
   // person reads here is the sentence they would have got back.
   const blocker =
@@ -208,8 +208,10 @@ export function Start({
                     <td>
                       <When iso={run.started_at} />
                     </td>
-                    <td>{run.ended_at === null ? <span className="pending">running</span> : run.status.replace(/_/g, ' ')}</td>
-                    <td>{run.ended_at === null ? '—' : run.tier}</td>
+                    <td>
+                      {isOver(run.status, run.ended_at) ? run.status.replace(/_/g, ' ') : <span className="pending">running</span>}
+                    </td>
+                    <td>{isOver(run.status, run.ended_at) ? run.tier : '—'}</td>
                   </tr>
                 ))}
               </tbody>

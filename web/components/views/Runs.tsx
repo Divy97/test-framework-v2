@@ -1,6 +1,6 @@
 'use client';
 
-import type { RunRow } from '../../lib/api';
+import { isOver, type RunRow } from '../../lib/api';
 import { useJson } from '../../lib/hooks';
 import { Failed, Loading, ShortId, When } from '../bits';
 import { plain } from '../Chrome';
@@ -69,7 +69,7 @@ export function Runs({ repo, go }: { repo: string | null; go: (to: string) => vo
                     <When iso={run.started_at} />
                   </td>
                   <td>
-                    {run.ended_at === null ? (
+                    {!isOver(run.status, run.ended_at) ? (
                       <span className="pending">
                         <span className="mark" aria-hidden="true">
                           ●
@@ -80,9 +80,9 @@ export function Runs({ repo, go }: { repo: string | null; go: (to: string) => vo
                       run.status.replace(/_/g, ' ')
                     )}
                   </td>
-                  <td title={TIER_MEANING[run.tier] ?? ''}>{run.ended_at === null ? '—' : run.tier}</td>
+                  <td title={TIER_MEANING[run.tier] ?? ''}>{isOver(run.status, run.ended_at) ? run.tier : '—'}</td>
                   <td className="num">
-                    {run.ended_at === null ? '—' : `${run.confidence}/${run.ceiling}`}
+                    {isOver(run.status, run.ended_at) ? `${run.confidence}/${run.ceiling}` : '—'}
                   </td>
                 </tr>
               ))}
