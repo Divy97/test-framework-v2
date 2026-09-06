@@ -505,6 +505,20 @@ describe('reaching root, on an image that may or may not have sudo', () => {
     expect(existsSync(join(process.cwd(), 'src/runner-vm.ts'))).toBe(true);
   });
 
+  test('a probe that did not RUN says so, rather than naming its output as a uid', async () => {
+    // `output` is stdout and stderr interleaved, and the exit code was not read at all —
+    // so a probe that failed produced `runs commands as uid  and has no sudo`, blaming
+    // the image for a transport fault. The same `??`-where-`||`-was-meant shape
+    // `runner.ts` already records as the mistake made twice.
+    const broken = fakeSandboxes({ failsCommand: /^id -u;/, runsAs: { uid: 0, sudo: false } });
+    await expect(
+      vercelExecutor({ client: broken.client }).runPhase({
+        plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+      }),
+    ).rejects.toThrow(/could not ask this image what user it runs commands as/);
+    expect(broken.sandboxes[0]!.stopped).toBe(true);
+  });
+
   test('and an image that is neither is refused with a reason, not a shell error', async () => {
     // uid 1000 and no sudo means the Runner would run as the same user the repro drops
     // to, and `runner-vm.ts` refuses that outright. Better to say so at open than to let
@@ -567,6 +581,38 @@ describe('the environment build keeps nothing of ours in the snapshot', () => {
     const ran = sandbox.commands.findIndex((command) => command.includes('runner-vm'));
     expect(ran).toBeGreaterThanOrEqual(0);
     expect(wiped).toBeGreaterThan(ran);
+  });
+
+  test('the scrub is elevated, and a scrub that failed is REPORTED rather than snapshotted', async () => {
+    // Two controls on one line, because a snapshot taken over a failed scrub is the worst
+    // shape here: it carries this run's Job and bundle into every phase that judges from
+    // it — where a reproduction could read the symptom pattern it is supposed to be
+    // tested against — and nothing downstream would ever notice.
+    //
+    // First that it CAN scrub on the managed image. `rm -rf /work` recurses into a
+    // root:root 0700 spool, so uid 1000 cannot do it; drop the elevation and the fake
+    // refuses exactly as the kernel would.
+    const managed = fakeSandboxes({
+      runsAs: { uid: 1000, sudo: true },
+      runner: async function* () {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+      },
+    });
+    expect(
+      await vercelExecutor({ client: managed.client }).buildSnapshot(plan(), repo(), 'main', { install: 'npm ci', services: [] }),
+    ).toMatchObject({ snapshot: { ref: 'snap-1' } });
+
+    // And then that a scrub which failed anyway is not silently snapshotted over.
+    const refused = fakeSandboxes({
+      failsCommand: /rm -rf \/work/,
+      runner: async function* () {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+      },
+    });
+    const built = await vercelExecutor({ client: refused.client }).buildSnapshot(plan(), repo(), 'main', { install: 'npm ci', services: [] });
+    expect(built).toMatchObject({ failed: expect.stringContaining("could not remove this run's inputs") });
+    expect(refused.snapshots).toEqual([]);
+    expect(refused.sandboxes[0]!.stopped).toBe(true);
   });
 
   test('a recipe that does not boot is REPORTED, not thrown', async () => {

@@ -81,6 +81,15 @@ export type FakeOptions = {
    */
   runsAs?: { uid: number; sudo: boolean };
   /**
+   * Make any command matching this fail, exit 1, with its own words on `output`.
+   *
+   * For the paths that READ an exit code. A `sandbox.run` whose status is discarded is
+   * indistinguishable from one that worked, and this file has shipped two of those — the
+   * elevation probe and the scrub before the snapshot — so the fake has to be able to
+   * produce the failure that separates them.
+   */
+  failsCommand?: RegExp;
+  /**
    * End the session after this many stdout chunks, the way the platform does.
    *
    * Modelled as a throw from the STREAM rather than a clean end, because that is what
@@ -241,7 +250,13 @@ export function fakeSandboxes(options: FakeOptions = {}): {
       },
       run: async (command) => {
         fake.commands.push(command);
-        // FIRST, before any branch that could answer it by accident: the elevation probe.
+        // BEFORE EVERYTHING, the probe included: a command this test wants to see fail.
+        // The paths that read an exit code are the ones worth a control, and the probe is
+        // one of them.
+        if (options.failsCommand?.test(command)) {
+          return { exitCode: 1, output: `${command.slice(0, 40)}: refused by the fixture` };
+        }
+        // Then, before any branch that could answer it by accident: the elevation probe.
         // Its own text contains the word `sudo` (`command -v sudo`), so it has to be
         // recognised before the no-sudo branch below, and it must not be swallowed by the
         // `mkdir -p` branch either.
