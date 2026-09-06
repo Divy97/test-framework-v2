@@ -173,7 +173,16 @@ describe('being signed in is not being allowed', () => {
     expect(response?.status).toBe(404);
     const revokes = writes.filter((sql) => sql.includes('set revoked_at'));
     expect(revokes).toHaveLength(1);
-    expect(revokes[0]).toContain('installation_id = $2');
+    // SCOPED — the update names the installation as well as the id. Matched loosely
+    // because this fake can only read SQL text, and the exact predicate has already
+    // changed once: 10e rewrote it to `is not distinct from` so a global worker, whose
+    // installation is null, could be revoked at all. A test that pins the operator pins
+    // the wrong thing.
+    //
+    // What the predicate DOES is proven behaviourally against a real database in
+    // `plane.test.ts` — that a confined runner cannot be revoked by naming the wrong
+    // installation, or none. This assertion's job is only that the clause is there.
+    expect(revokes[0]).toMatch(/where id = \$1 and installation_id\b.*\$2/);
   });
 
   it('a GitHub that will not answer denies rather than admits', async () => {
