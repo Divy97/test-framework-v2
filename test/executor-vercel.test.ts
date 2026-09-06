@@ -416,6 +416,33 @@ describe('the agent sandbox is sealed before it is asked anything', () => {
   });
 });
 
+describe('the session we ask for is one the plan will give', () => {
+  test('an hour is clamped to the Hobby ceiling, because the platform refuses more', async () => {
+    // From the first live run, which died eight seconds in: `400: timeout restricted to
+    // <= 45m on Hobby plans`. Not a clamp on their side — a refusal at create, so nothing
+    // ran at all and the run ended `errored` on our own configuration.
+    const fake = fakeSandboxes({
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
+      },
+    });
+    await vercelExecutor({ client: fake.client }).runPhase({
+      // An hour: the engine's own wall clock, which is about wedges and knows nothing
+      // about anybody's billing plan.
+      plan: plan({ containerTimeoutMs: 3_600_000 }), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(fake.sandboxes[0]!.timeoutMs).toBe(45 * 60_000);
+  });
+
+  test('and a shorter phase ceiling still wins, because the clamp is a maximum', async () => {
+    const fake = fakeSandboxes({ runner: async function* () {} });
+    await vercelExecutor({ client: fake.client, maxSessionMs: 45 * 60_000 }).runPhase({
+      plan: plan({ containerTimeoutMs: 60_000 }), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(fake.sandboxes[0]!.timeoutMs).toBe(60_000);
+  });
+});
+
 describe('the environment build keeps nothing of ours in the snapshot', () => {
   test('it installs, wipes the run inputs, snapshots, and reports the steps', async () => {
     const fake = fakeSandboxes({
