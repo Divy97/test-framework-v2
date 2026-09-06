@@ -517,6 +517,21 @@ describe('reaching root, on an image that may or may not have sudo', () => {
       }),
     ).rejects.toThrow(/could not ask this image what user it runs commands as/);
     expect(broken.sandboxes[0]!.stopped).toBe(true);
+
+    // And an image that says more than the answer is still read correctly. `output` is
+    // stdout and stderr interleaved, so a motd or one stderr line lands ahead of the uid —
+    // and taking line 0 would refuse a perfectly good root image while naming the banner
+    // as its uid, which is the wrong-layer diagnosis `elevationFor` exists to prevent.
+    const chatty = fakeSandboxes({
+      runsAs: { uid: 0, sudo: false },
+      probeSays: 'Welcome to the sandbox.\nLast login: never\n0\nNO_SUDO',
+      runner,
+    });
+    const spoke = await vercelExecutor({ client: chatty.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(spoke.events.some((one) => one.type === 'TEST_RUN')).toBe(true);
+    expect(chatty.sandboxes[0]!.commands.some((c) => c.includes('sudo -n '))).toBe(false);
   });
 
   test('and an image that is neither is refused with a reason, not a shell error', async () => {

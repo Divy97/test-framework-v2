@@ -81,6 +81,15 @@ export type FakeOptions = {
    */
   runsAs?: { uid: number; sudo: boolean };
   /**
+   * What the elevation probe prints, verbatim, when the answer is not all the image says.
+   *
+   * `output` is stdout and stderr interleaved, so a motd, a shell banner or one line on
+   * stderr arrives ahead of the uid — and the executor read line 0. Overrides `runsAs`
+   * for the probe alone; `runsAs` still decides what the image can actually do, which is
+   * the point: the probe has to reach the right answer about an image that is talking.
+   */
+  probeSays?: string;
+  /**
    * Make any command matching this fail, exit 1, with its own words on `output`.
    *
    * For the paths that READ an exit code. A `sandbox.run` whose status is discarded is
@@ -262,7 +271,10 @@ export function fakeSandboxes(options: FakeOptions = {}): {
         // `mkdir -p` branch either.
         if (command.startsWith('id -u;')) {
           const as = asUser();
-          return { exitCode: 0, output: `${as.uid}\n${as.sudo ? 'HAVE_SUDO' : 'NO_SUDO'}` };
+          return {
+            exitCode: 0,
+            output: options.probeSays ?? `${as.uid}\n${as.sudo ? 'HAVE_SUDO' : 'NO_SUDO'}`,
+          };
         }
         // THE PERMISSION THIS FAKE MODELS FOR COMMANDS, and the reason it exists: every
         // `${elevate}` in the executor was, until this rule, a string no test could be
