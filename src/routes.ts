@@ -264,12 +264,21 @@ export function dashboardRoutes(options: {
     // logins, an App to read issues with, injection — and a page that assumed the hosted
     // answer would offer a local operator buttons that 501.
     if (method === 'GET' && path === '/api/me') {
-      const seen = await visible(headers);
-      const signedIn = seen !== 'anonymous';
-      // `null` is the LOCAL surface — one operator, no accounts — and it is signed in by
-      // construction. Collapsing that to `signedIn: false` would put a sign-in wall in
-      // front of a deployment that has no login to offer.
-      const session = seen !== null && seen !== 'anonymous' ? seen.session : null;
+      // `auth.session()`, NOT `visible()`, and it is the same distinction the `/` route
+      // records above — which this got wrong on the first write.
+      //
+      // `visible()` answers "what may you act on", which means asking GitHub
+      // `GET /user/installations` and querying `installations`. This route needs one bit:
+      // is there somebody. Every document the bundle serves asks this on load, so buying
+      // the full authorization answer here would put a GitHub round-trip on the most-hit
+      // route in the product — and would make the whole dashboard fail to render when
+      // GitHub is down, rather than failing only the pages that are actually about
+      // repositories.
+      const session = options.auth ? await options.auth.session(headers) : null;
+      // A surface with no accounts is the LOCAL one — one operator, no login — and it is
+      // signed in by construction. Collapsing that to `signedIn: false` would put a
+      // sign-in wall in front of a deployment that has no login to offer.
+      const signedIn = options.auth === undefined || session !== null;
       return json({
         accounts: options.auth !== undefined,
         signedIn,

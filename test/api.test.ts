@@ -163,6 +163,31 @@ describe('/api/me is the one route a stranger may ask', () => {
     expect(json.installUrl).toBe('https://example.invalid');
   });
 
+  it('does not ask GitHub what you may act on, because it is not asking that', async () => {
+    // The most-hit route in the product: every document the bundle serves asks it on load.
+    // `visible()` would answer it — and would buy a `GET /user/installations` round trip to
+    // read one bit, and would make the whole dashboard fail to render when GitHub is down
+    // rather than only the pages that are about repositories. The `/` route records the
+    // same distinction; this is the assertion that keeps it.
+    let asked = 0;
+    const route = dashboardRoutes({
+      client: fakeClient(),
+      installUrl: 'https://example.invalid',
+      auth: {
+        session: async () => SESSION,
+        installations: async () => {
+          asked += 1;
+          return [1];
+        },
+      },
+    });
+    await bodyOf(route, 'GET', '/api/me');
+    expect(asked).toBe(0);
+    // The control: a route that IS about repositories still asks.
+    await bodyOf(route, 'GET', '/api/repos');
+    expect(asked).toBe(1);
+  });
+
   it('names the person, their key and what this deployment can do', async () => {
     const { json } = await bodyOf(surface(), 'GET', '/api/me');
     expect(json.signedIn).toBe(true);
