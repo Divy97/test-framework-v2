@@ -49,10 +49,13 @@ const fakePlane = async (options: {
   pollStatus?: number;
   /** What the bill route answers, so a plane that refuses one can be exercised. */
   costStatus?: number;
+  /** What a blob PUT answers, per attempt — the retry policy is the point of two cases. */
+  blobStatus?: (attempt: number) => number;
 } = {}) => {
   const seen: Seen[] = [];
   let handed = false;
   let appends = 0;
+  let blobs = 0;
 
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -78,7 +81,10 @@ const fakePlane = async (options: {
         return send(status, status === 200 ? { appended: 1 } : { error: 'no' });
       }
       if (path.endsWith('/token')) return send(200, { token: `ghs_${seen.length}` });
-      if (path.includes('/blobs/')) return send(201, { ref: 'ok' });
+      if (path.includes('/blobs/')) {
+        const status = options.blobStatus?.(blobs++) ?? 201;
+        return send(status, status < 400 ? { ref: 'ok' } : { error: 'no' });
+      }
       if (path.endsWith('/cost')) return send(options.costStatus ?? 204);
       if (path.endsWith('/finished')) return send(204);
       return send(404, { error: 'no such route' });
@@ -323,6 +329,65 @@ describe('what a run spent goes beside the log, and never into it', () => {
     expect(logs.join('\n')).toMatch(/HTTP 500 to the bill/);
     expect(logs.join('\n')).not.toMatch(/ended badly/);
     expect(plane.seen.some((one) => one.path.endsWith('/finished'))).toBe(true);
+  });
+});
+
+describe('an artifact is a file of ours, and is not given up on once', () => {
+  /** A `sha256:` in an event, with a blob on disk to match. */
+  const artifact = async (root: string, body: string) => {
+    const { put } = await import('../src/blobs.js');
+    return put(root, Buffer.from(body));
+  };
+
+  test('an IMAGE digest is not an artifact, and is never asked for', async () => {
+    // `ENV_BUILT` records the image a phase was created from, and a pinned reference ends
+    // `…/test-framework-v2-sandbox@sha256:abc…` — the same 64 hex digits naming a
+    // container image in somebody else's registry. Every hosted run uploaded its own
+    // image digest and logged `ENOENT` for it, once per run, forever.
+    const root = blobRoot();
+    const ref = await artifact(root, 'a real artifact');
+    const plane = await fakePlane();
+    const { logs } = await oneJob(
+      plane,
+      async (_job, io) => {
+        await io.append(
+          event(1, {
+            image: `vcr.vercel.com/x/test-framework-v2-sandbox@sha256:${'a'.repeat(64)}`,
+            stdout_hash: ref,
+          }),
+        );
+      },
+      root,
+    );
+    const asked = plane.seen.filter((one) => one.path.includes('/blobs/'));
+    // THE control: the real one still goes. A regex that excluded everything would pass a
+    // test that only checked the image was skipped.
+    expect(asked.map((one) => one.path.split('/blobs/')[1])).toEqual([ref]);
+    expect(logs.join('\n')).not.toMatch(/could not upload/);
+  });
+
+  test('a blob the plane drops once is sent again, because a lost ref is an ENOENT for a reader', async () => {
+    // The first hosted run lost one to a single `TypeError: fetch failed`. `append` had
+    // four attempts and this had one, so the log ended up citing a ref the evidence store
+    // does not hold — the shape `collect()` says it exists to prevent, one layer out.
+    const root = blobRoot();
+    const ref = await artifact(root, 'worth keeping');
+    const plane = await fakePlane({ blobStatus: (attempt) => (attempt === 0 ? 503 : 201) });
+    const { logs } = await oneJob(plane, async (_job, io) => void (await io.append(event(1, { stdout_hash: ref }))), root);
+    expect(plane.seen.filter((one) => one.path.includes('/blobs/'))).toHaveLength(2);
+    expect(logs.join('\n')).toMatch(/1 artifact/);
+    expect(logs.join('\n')).not.toMatch(/was refused/);
+  });
+
+  test('but a 4xx is an ANSWER, and is not asked again', async () => {
+    // Same lesson the append path learned in M9. A blob the plane refuses will be refused
+    // again, and a ref it already holds answers 409 — retrying either is noise.
+    const root = blobRoot();
+    const ref = await artifact(root, 'refused');
+    const plane = await fakePlane({ blobStatus: () => 409 });
+    const { logs } = await oneJob(plane, async (_job, io) => void (await io.append(event(1, { stdout_hash: ref }))), root);
+    expect(plane.seen.filter((one) => one.path.includes('/blobs/'))).toHaveLength(1);
+    expect(logs.join('\n')).toMatch(/HTTP 409/);
   });
 });
 

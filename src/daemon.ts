@@ -58,17 +58,32 @@ const WAIT_SECONDS = 25;
 /** Attempts per append before a run's stream is declared lost. */
 const APPEND_ATTEMPTS = 4;
 
+/** And per blob. A lost artifact is a ref in the log that nothing can open. */
+const UPLOAD_ATTEMPTS = 4;
+
 const backoff = (attempt: number) => new Promise((done) => setTimeout(done, 250 * 2 ** attempt));
 
 /**
- * Every `sha256:` ref a stream mentions.
+ * Every `sha256:` ref a stream mentions that names a BLOB of ours.
  *
  * Scanned out of the serialised events rather than folded, deliberately: a run that
  * ended badly still produced artifacts worth having, and `fold()` refuses a stream that
  * does not start at 1. The report builder already reads refs exactly this way.
+ *
+ * `@sha256:` is excluded, and that is not a nicety. 10d's `ENV_BUILT` records the image a
+ * phase was created from, and a pinned image reference ends
+ * `…/test-framework-v2-sandbox@sha256:abc0053b…` — the same 64 hex digits, naming a
+ * container image in somebody else's registry rather than a file in our evidence store.
+ * Every hosted run therefore tried to upload its own image digest and logged
+ * `could not upload … ENOENT` for it, once per run, forever. Seen in the first one.
+ *
+ * Matched on the DELIMITER rather than by parsing the event: a `put()` ref is always
+ * preceded by a quote or a slash and never by `@`, and an image reference always has the
+ * `@`. That holds for any event class either format appears in, including ones not
+ * written yet.
  */
 const refsIn = (events: RunEvent[]): ArtifactRef[] => [
-  ...new Set((JSON.stringify(events).match(/sha256:[0-9a-f]{64}/g) ?? []) as ArtifactRef[]),
+  ...new Set((JSON.stringify(events).match(/(?<!@)\bsha256:[0-9a-f]{64}/g) ?? []) as ArtifactRef[]),
 ];
 
 export async function runDaemon(options: {
@@ -146,17 +161,41 @@ export async function runDaemon(options: {
   const upload = async (runId: string, refs: ArtifactRef[]): Promise<number> => {
     let sent = 0;
     for (const ref of refs) {
-      try {
-        const bytes = await readFile(blobPath(options.blobRoot, ref));
-        const response = await call(`${base}/runner/runs/${runId}/blobs/${ref}`, {
-          method: 'PUT',
-          headers: { ...auth, 'content-type': 'application/octet-stream' },
-          body: new Uint8Array(bytes),
-        });
-        if (response.ok) sent += 1;
-        else log(`${runId}: ${ref} was refused: HTTP ${response.status}`);
-      } catch (error) {
-        log(`${runId}: could not upload ${ref} — ${String(error)}`);
+      // RETRIED, like an append, and for the same reason. This had one attempt while the
+      // event path had four, and the first hosted run lost a blob to a single
+      // `TypeError: fetch failed` — leaving the log citing a ref the evidence store does
+      // not hold, which is an ENOENT for whoever opens the report. `collect()`'s own
+      // comment says that shape is the one thing it exists to prevent; losing it one
+      // layer further out is the same loss.
+      //
+      // A 4xx is an ANSWER and is not retried (M9's lesson, on the append path): a blob
+      // the plane refuses will be refused again, and a ref already stored answers 409.
+      let attempt = 0;
+      for (;;) {
+        try {
+          const bytes = await readFile(blobPath(options.blobRoot, ref));
+          const response = await call(`${base}/runner/runs/${runId}/blobs/${ref}`, {
+            method: 'PUT',
+            headers: { ...auth, 'content-type': 'application/octet-stream' },
+            body: new Uint8Array(bytes),
+          });
+          if (response.ok) {
+            sent += 1;
+            break;
+          }
+          if (response.status < 500 || ++attempt >= UPLOAD_ATTEMPTS) {
+            log(`${runId}: ${ref} was refused: HTTP ${response.status}`);
+            break;
+          }
+        } catch (error) {
+          // A missing FILE will be missing on the next attempt too, so it is not one of
+          // the things waiting fixes — and it is the shape a bad ref produces.
+          if ((error as { code?: string }).code === 'ENOENT' || ++attempt >= UPLOAD_ATTEMPTS) {
+            log(`${runId}: could not upload ${ref} — ${String(error)}`);
+            break;
+          }
+        }
+        await backoff(attempt);
       }
     }
     return sent;
