@@ -724,10 +724,20 @@ describe.sequential('a run, while it happens', () => {
       },
     } as unknown as Db;
     live = await startStatusServer({
+      // EXPLICITLY EPHEMERAL, and asserted below. This file once failed with
+      // `ERR_UNSAFE_PORT` at `http://127.0.0.1:1/` — Chrome refuses a set of low ports
+      // outright — and the failure surfaced fifteen seconds later as "the turns never
+      // reached /agent worked for/", which reads as a bug in the live view rather than as a
+      // fixture that never came up.
+      port: 0,
       // The real tail, over a log that is still being written.
       read: async (_runId, after) => log.filter((event) => event.seq > after) as never,
       routes: chain(dashboardRoutes({ client, installUrl: INSTALL_URL }), staticRoutes()),
     });
+    if (!live.port || live.port < 1024) {
+      why = `the live fixture bound port ${live.port}, which a browser will not open`;
+      return;
+    }
     liveBase = `http://127.0.0.1:${live.port}`;
   });
 
@@ -739,6 +749,9 @@ describe.sequential('a run, while it happens', () => {
   test('fills in as the events land, and becomes a verdict when they stop', async () => {
     if (skipped('the live run')) return;
     const before = browser!.console();
+    // The fixture answered, before anything waits on what it says. A `settle` against a
+    // browser error page burns its whole timeout and then blames the feature.
+    expect((await fetch(`${liveBase}/api/runs/${RUN}/events`)).status, 'the live fixture is not serving').toBe(200);
     await browser!.navigate(`${liveBase}/runs/${RUN}`);
     visited.push(`/runs/${RUN} (live)`);
 
