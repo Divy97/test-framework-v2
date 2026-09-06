@@ -264,9 +264,24 @@ separate `web/` package this document once implied. No framework, no build step,
 same reason `src/github.ts` and `src/browser.ts` are hand-rolled: a dependency here would
 be a large surface for a few pages.
 
-The dashboard is the one that will itch, because [Q5](../SHARED-UNDERSTANDING.md)
-made it the demo. It is deferred rather than cut: v1.5 exists to make a run that
-is worth watching, and a timeline over an empty event log demos nothing.
+**And in 10i that reversed, so this paragraph now describes where it started rather than
+where it is** ([ADR-0022](adr/0022-a-framework-in-front-and-nothing-behind-it.md)). The
+`web/` package this document originally implied exists after all — a Next.js application
+built to a static export, which is HTML, CSS and JavaScript and nothing that runs. The
+reason was not that hand-rolled pages were unpleasant to write: an HTML form cannot send
+the JSON `PUT` that storing a secret or a model key requires, and a function returning a
+string cannot subscribe to the tail. Four screens the product needed could not be built at
+all, and one of them was the button milestone 10 exists for.
+
+What did not change is the sentence this section actually cared about: the plane is still
+the only public process, still the only holder of cookies, and still the only place
+authorization is decided. A static bundle cannot read a session, which is why the export is
+the shape rather than a compromise.
+
+The dashboard was the one that itched, because [Q5](../SHARED-UNDERSTANDING.md)
+made it the demo. It was deferred rather than cut: v1.5 exists to make a run that
+is worth watching, and a timeline over an empty event log demos nothing. The timeline now
+exists, over a log that fills while somebody watches it.
 
 ## Rejected: Anthropic's Managed Agents with a self-hosted sandbox
 
