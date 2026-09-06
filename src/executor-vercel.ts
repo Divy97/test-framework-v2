@@ -12,11 +12,15 @@
 //   - **Tool calls are files.** `writeFiles('/work/rpc/in/<n>.json')` in, the JSON channel
 //     out on the detached command's stdout. `runner-vm.ts` turns the directory back into
 //     the `AsyncIterable<string>` `runJob` already takes.
-//   - **The Runner runs as root, via sudo.** The managed image's default user is uid 1000,
-//     which is the uid the repro drops to — and what keeps an untrusted agent away from
-//     the event channel is the kernel refusing one user another's file descriptors, not
-//     any trick with fd 1. `runner-vm.ts` refuses to start as uid 1000 for exactly this,
-//     so a `sudo` forgotten here is a loud failure rather than a silent hole.
+//   - **The Runner runs as root; HOW is a property of the image.** The repro always drops
+//     to uid 1000 (`runner.ts` decides that, and never inherits it), and what keeps an
+//     untrusted agent away from the event channel is the kernel refusing one user
+//     another's file descriptors, not any trick with fd 1. So the Runner must be some
+//     other user. The managed image's default is uid 1000 with passwordless sudo, so it
+//     gets `sudo -n `; ours are alpine with no `USER` and no sudo binary, so a command is
+//     already root and gets nothing. `elevationFor` asks, once, at open — and
+//     `runner-vm.ts` refuses to start as uid 1000 regardless, so a missed elevation is a
+//     loud failure rather than a silent hole.
 //   - **The store is copied out.** `/blobs` is an ordinary directory in a machine about to
 //     be destroyed, so it is tarred, read back, and `put()` into the host's evidence store
 //     — re-digested on the way in, which is stricter than the `cp` Docker does.
@@ -61,10 +65,10 @@ const MAX_STDERR_CHARS = 8 * 1024;
 /**
  * The most a phase may leave in its store.
  *
- * `/blobs` is handed to uid 1000 so the repro can write its own captures, which means the
- * size is the agent's to choose. Generous — a transcript and a few screenshots are orders
- * of magnitude under it — and finite, because everything under it crosses a network into
- * this process's memory.
+ * The repro writes its own captures into the store, so the size is the agent's to choose
+ * — through `flush()` rather than directly, but the bytes are still its bytes. Generous —
+ * a transcript and a few screenshots are orders of magnitude under it — and finite,
+ * because everything under it crosses a network into this process's memory.
  */
 const MAX_STORE_BYTES = 256 * 1024 * 1024;
 /** The wall clock one phase gets from this process. The platform enforces its own beside it. */
@@ -104,27 +108,73 @@ const BUNDLE = `${WORK}/src.bundle`;
 const JOB = `${WORK}/job.json`;
 
 /**
+ * How this executor becomes root, which depends on the image and is DETECTED.
+ *
+ * The spike measured the root model on Vercel's MANAGED image: `ubuntu`, uid 1000, with
+ * passwordless sudo. Our own images are `node:22-alpine` with no `USER`, so a command
+ * runs as root and there is no sudo binary at all — `sudo: not found` was the second
+ * failure of the first live run, after the session clamp.
+ *
+ * Both are legitimate targets, so neither is assumed. One `id -u` at open decides, and
+ * every command that needs privilege carries the result.
+ */
+type Elevate = string;
+
+/**
  * Make the paths the Runner needs, and hand them to the user `writeFiles` writes as.
  *
- * The managed image runs as uid 1000 with passwordless sudo, and `/`, `/opt` and `/blobs`
- * are root's. Without this every `writeFiles` fails with a permission error that reads
- * like a transport fault. `/blobs` gets the sentinel here rather than in the image,
- * because the Runner refuses a store it cannot prove pre-existed.
+ * `/`, `/opt` and `/blobs` are root's on both images. On the managed one that is the
+ * difference between working and every `writeFiles` failing with a permission error that
+ * reads like a transport fault; on ours the commands are already root and the chown is a
+ * no-op that keeps one code path instead of two. `/blobs` gets the sentinel here rather
+ * than in the image, because the Runner refuses a store it cannot prove pre-existed.
  */
-const PREPARE = [
-  `sudo -n mkdir -p ${WORK} ${SPOOL}/in ${SPOOL}/out /opt/env ${BLOBS} ${HANDOVER}`,
-  `sudo -n chown -R "$(id -u):$(id -g)" ${WORK} /opt/env ${BLOBS} ${HANDOVER}`,
-  `: > ${BLOBS}/.evidence-store`,
-  // Root-owned 0700, so the repro — uid 1000 — cannot forge a `{done: true}` and choose
-  // its own ending, or answer a tool call on the host's behalf.
-  //
-  // Which means the HOST cannot write it either: `writeFiles` runs as uid 1000, the same
-  // user the repro drops to, so there is no ownership that lets one write and not the
-  // other. Tool calls therefore go in through `sudo` (see `deliver`), not through
-  // `writeFiles`. An earlier version of this file did both, and the spool would have
-  // been unwritable on the first live agent phase.
-  `sudo -n chown -R root:root ${SPOOL} && sudo -n chmod -R 0700 ${SPOOL}`,
-].join(' && ');
+const prepareWith = (elevate: Elevate): string =>
+  [
+    `${elevate}mkdir -p ${WORK} ${SPOOL}/in ${SPOOL}/out /opt/env ${BLOBS} ${HANDOVER}`,
+    `${elevate}chown -R "$(id -u):$(id -g)" ${WORK} /opt/env ${BLOBS} ${HANDOVER}`,
+    `: > ${BLOBS}/.evidence-store`,
+    // Root-owned 0700, so the repro — uid 1000 — cannot forge a `{done: true}` and choose
+    // its own ending, or answer a tool call on the host's behalf.
+    //
+    // Whether the HOST can then write it depends on the image, and this is why `deliver`
+    // goes through a command rather than `writeFiles`. On the managed image `writeFiles`
+    // runs as uid 1000 — the same user the repro drops to — so no ownership separates
+    // them; on ours it runs as root, so it could. A command with `elevate` in front is
+    // correct on both, and costs the same round trip either way.
+    `${elevate}chown -R root:root ${SPOOL} && ${elevate}chmod -R 0700 ${SPOOL}`,
+  ].join(' && ');
+
+/**
+ * Work out what this image needs to reach root, or refuse with a reason.
+ *
+ * One round trip, at open, before anything depends on the answer. Refusing here rather
+ * than letting the first `chown` fail matters because that failure reads as a transport
+ * fault — `sh: sudo: not found` inside "the environment build could not be run" — and
+ * sends the reader to the wrong layer entirely.
+ */
+async function elevationFor(sandbox: SandboxHandle): Promise<Elevate> {
+  const probe = await sandbox.run('id -u; command -v sudo >/dev/null 2>&1 && echo HAVE_SUDO || echo NO_SUDO');
+  const said = probe.output.trim();
+  if (probe.exitCode !== 0) {
+    // The probe not RUNNING is a different fact from the image not being root, and
+    // reporting the second when the first happened is what this function exists to
+    // prevent one layer down. `output` is all we have, so it goes in whole.
+    throw new Error(`could not ask this image what user it runs commands as (exit ${probe.exitCode}): ${said || '(nothing)'}`);
+  }
+  // `output` is stdout and stderr interleaved, as the SDK gives it, so line 0 is only the
+  // uid on an image that prints nothing else — a motd, a shell banner or one line on
+  // stderr would make it something else entirely, and the executor would refuse a
+  // perfectly good root image while naming the banner as its uid. The uid is the first
+  // line that is only digits.
+  const uid = said.split('\n').map((one) => one.trim()).find((one) => /^\d+$/.test(one));
+  if (uid === '0') return '';
+  if (said.includes('HAVE_SUDO')) return 'sudo -n ';
+  throw new Error(
+    `this image runs commands as uid ${uid ?? '?'} and has no sudo, so the Runner cannot be started ` +
+      'as a different user from the repro — build the image to run as root, or install sudo',
+  );
+}
 
 /**
  * The probes, and why they exchange data rather than connect.
@@ -144,8 +194,16 @@ const PROBE = {
   route: `node -e "const d=require('dgram').createSocket('udp4');const n=Buffer.concat([Buffer.from([7]),Buffer.from('example'),Buffer.from([3]),Buffer.from('com'),Buffer.from([0])]);const q=Buffer.concat([Buffer.from([0x12,0x34,1,0,0,1,0,0,0,0,0,0]),n,Buffer.from([0,1,0,1])]);setTimeout(()=>{console.log('UDP_TIMEOUT');process.exit(3)},4000);d.on('message',m=>{console.log('UDP_ANSWERED',m.length);process.exit(0)});d.on('error',e=>{console.log('UDP_FAIL',e.code);process.exit(1)});d.send(q,53,'1.1.1.1')"`,
 } as const;
 
-/** How the Runner is started. `sudo`, which is the whole precondition (see the header). */
-const runnerCommand = (entry: string) => `sudo -n ${entry} --job ${JOB} --spool ${SPOOL}`;
+/**
+ * How the Runner is started, as a user the repro is not.
+ *
+ * That difference is the whole precondition (see the header): `runner-vm.ts` refuses to
+ * start as uid 1000 because nothing would then separate the agent from the event channel.
+ * On our images the command is already root and `elevate` is empty; on the managed image
+ * it is `sudo -n `.
+ */
+const runnerCommand = (elevate: Elevate, entry: string) =>
+  `${elevate}${entry} --job ${JOB} --spool ${SPOOL}`;
 
 /**
  * Put one line into the root-owned spool, as root.
@@ -159,7 +217,7 @@ const runnerCommand = (entry: string) => `sudo -n ${entry} --job ${JOB} --spool 
  * One round trip, the same as `writeFiles` would have cost. The spike measured
  * `runCommand` at a p50 under 300ms, which is the same order as a file write.
  */
-const deliver = async (sandbox: SandboxHandle, name: string, line: string): Promise<void> => {
+const deliver = async (sandbox: SandboxHandle, elevate: Elevate, name: string, line: string): Promise<void> => {
   const encoded = Buffer.from(line, 'utf8').toString('base64');
   // `test -s` after the pipe, because `sh -c` reports the LAST command's status and has no
   // `pipefail` to promise otherwise: a `base64` that failed would leave `tee` exiting 0
@@ -167,8 +225,8 @@ const deliver = async (sandbox: SandboxHandle, name: string, line: string): Prom
   // would wait for a reply to a call that was never delivered — the exact silent hang
   // this function exists to make loud.
   const written = await sandbox.run(
-    `printf %s '${encoded}' | base64 -d | sudo -n tee ${SPOOL}/in/${name} > /dev/null; ` +
-      `sudo -n test -s ${SPOOL}/in/${name}`,
+    `printf %s '${encoded}' | base64 -d | ${elevate}tee ${SPOOL}/in/${name} > /dev/null; ` +
+      `${elevate}test -s ${SPOOL}/in/${name}`,
   );
   if (written.exitCode !== 0) {
     // Loudly. A swallowed failure here is an agent loop waiting for a reply that will
@@ -236,7 +294,17 @@ export type VercelExecutorOptions = {
    * something stable across a restart of the same worker.
    */
   tags?: Record<string, string>;
-  /** The command that starts `runner-vm.ts` inside the image. */
+  /**
+   * The command that starts `runner-vm.ts` inside the image.
+   *
+   * The default is where OUR images put it: `Dockerfile` and `Dockerfile.agent` both
+   * `WORKDIR /app` and `COPY src ./src`, and a sandbox created from one starts in `/app`
+   * — measured, in `scripts/spike-vercel/14-our-image.ts`. That last part is why `tsx`
+   * can be a bare specifier here: node resolves `--import` from the cwd upwards, so the
+   * same command run from `/` would die in the loader rather than in the script.
+   *
+   * An image that lays its code out differently passes its own.
+   */
   entrypoint?: string;
   /**
    * The longest session to ask the platform for. Defaults to the Hobby ceiling, which is
@@ -249,7 +317,7 @@ export type VercelExecutorOptions = {
 
 export function vercelExecutor(options: VercelExecutorOptions): Executor & { sweep: () => Promise<number> } {
   const { client } = options;
-  const entry = options.entrypoint ?? 'node --import tsx /engine/src/runner-vm.ts';
+  const entry = options.entrypoint ?? 'node --import tsx /app/src/runner-vm.ts';
   const tags = options.tags ?? { engine: 'test-framework-v2', worker: String(process.pid) };
 
   /** Create, prepare, and record — in the order that leaves nothing unaccounted for. */
@@ -257,13 +325,20 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
     from: { image: string } | { snapshot: string },
     policy: 'allow-all' | 'deny-all',
     plan: { runId: string; containerTimeoutMs?: number },
-  ): Promise<SandboxHandle> => {
+  ): Promise<{ sandbox: SandboxHandle; elevate: Elevate }> => {
     // The smaller of what this phase wants and what the plan permits. Asking for more is
     // not a slow failure — the platform refuses the create outright.
     const timeoutMs = Math.min(plan.containerTimeoutMs ?? PHASE_TIMEOUT_MS, options.maxSessionMs ?? MAX_SESSION_MS);
     const sandbox = await client.create({ from, policy, timeoutMs, tags });
     await remember(options.ledger, { sandboxId: sandbox.id, runId: plan.runId });
-    const prepared = await sandbox.run(PREPARE);
+    let elevate: Elevate;
+    try {
+      elevate = await elevationFor(sandbox);
+    } catch (error) {
+      await sandbox.stop().catch(() => {});
+      throw error;
+    }
+    const prepared = await sandbox.run(prepareWith(elevate));
     if (prepared.exitCode !== 0) {
       // Not recoverable and not the repository's fault: the image is ours. Stopping here
       // rather than proceeding means the failure names the step instead of arriving three
@@ -271,7 +346,7 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
       await sandbox.stop().catch(() => {});
       throw new Error(`could not prepare the sandbox: ${prepared.output.trim().slice(-500)}`);
     }
-    return sandbox;
+    return { sandbox, elevate };
   };
 
   const close = async (sandbox: SandboxHandle, runId: string, phase: string) => {
@@ -287,8 +362,13 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
      *
      * On boot, because the failure it repairs is a worker that died mid-run: the platform
      * will end those sessions at their own timeout, but that is up to an hour of compute
-     * per phase nobody is watching. Returns how many it stopped so a caller can log a
-     * number rather than a shrug.
+     * per phase nobody is watching.
+     *
+     * Returns how many the platform ACCEPTED a stop for, which is not quite the same as
+     * how many were still running: a sandbox `close()` already ended answers the same way
+     * as one this call ended, and telling them apart would cost a status round trip per id
+     * to make a log line more precise. The number that matters is zero-vs-not on a boot
+     * sweep, and that one is exact.
      */
     sweep: async () => {
       // THIS WORKER'S sandboxes, from two sources that agree. The ledger is the record a
@@ -332,7 +412,9 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
         };
         // `allow-all`: install needs a package registry, and this is the one sandbox in a
         // run that is allowed to reach one (ADR-0013). Nothing the agent wrote exists yet.
-        sandbox = await open({ image: plan.image }, 'allow-all', plan);
+        const opened = await open({ image: plan.image }, 'allow-all', plan);
+        sandbox = opened.sandbox;
+        const elevate = opened.elevate;
         await sandbox.writeFiles([
           { path: BUNDLE, content: bytes },
           { path: JOB, content: Buffer.from(`${JSON.stringify(job)}\n`) },
@@ -348,7 +430,7 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
         // for the whole ceiling, which is an hour by default.
         let bell: NodeJS.Timeout | undefined;
         const finished = await Promise.race([
-          sandbox.run(runnerCommand(entry), { timeoutMs: ceiling }),
+          sandbox.run(runnerCommand(elevate, entry), { timeoutMs: ceiling }),
           new Promise<Finished>((resolve) => {
             bell = setTimeout(
               () => resolve({ exitCode: -1, output: `the environment build was stopped after ${ceiling}ms` }),
@@ -385,7 +467,14 @@ export function vercelExecutor(options: VercelExecutorOptions): Executor & { swe
         // The Job, the bundle and the spool are OURS, not the repository's, and a snapshot
         // carrying them would put this run's inputs into every phase that judges — where a
         // reproduction could read the symptom pattern it is supposed to be tested against.
-        await sandbox.run(`sudo -n rm -rf ${WORK} ${BLOBS}`);
+        const scrubbed = await sandbox.run(`${elevate}rm -rf ${WORK} ${BLOBS}`);
+        if (scrubbed.exitCode !== 0) {
+          // Reported, not ignored. A snapshot taken over a failed scrub carries this run's
+          // Job and bundle into every phase that judges from it — where a reproduction can
+          // read the symptom pattern it is supposed to be tested against — and nothing
+          // downstream would ever notice.
+          return { failed: redact(`could not remove this run's inputs before the snapshot: ${scrubbed.output.trim()}`).slice(0, MAX_REASON_CHARS) };
+        }
         const snapshot = await sandbox.snapshot();
         // `snapshot()` stops the sandbox, and the SDK reports what a session cost only
         // from `stop()` — so the environment build, the longest-lived sandbox in a run,
@@ -422,7 +511,7 @@ type Inner = {
     from: { image: string } | { snapshot: string },
     policy: 'allow-all' | 'deny-all',
     plan: { runId: string; containerTimeoutMs?: number },
-  ) => Promise<SandboxHandle>;
+  ) => Promise<{ sandbox: SandboxHandle; elevate: Elevate }>;
   close: (sandbox: SandboxHandle, runId: string, phase: string) => Promise<void>;
   ledger?: Ledger;
 };
@@ -559,7 +648,9 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
     if (Boolean(driver) !== Boolean(overrides.serveTools)) {
       throw new Error('a driver and `serveTools` are the two halves of one protocol; pass both or neither');
     }
-    sandbox = await inner.open(from, wantsNetwork ? 'allow-all' : 'deny-all', plan);
+    const opened = await inner.open(from, wantsNetwork ? 'allow-all' : 'deny-all', plan);
+    sandbox = opened.sandbox;
+    const elevate = opened.elevate;
 
     /** Set when a probe found a way out, which refuses the phase without losing it. */
     let unsealed: string | undefined;
@@ -643,7 +734,7 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
       { path: JOB, content: Buffer.from(`${JSON.stringify({ ...job, afterSeq: afterSeq + pre.length })}\n`) },
     ]);
 
-    const started = await sandbox.start(runnerCommand(inner.entry));
+    const started = await sandbox.start(runnerCommand(elevate, inner.entry));
     const stdout = (async function* () {
       for await (const chunk of started.chunks()) {
         if (chunk.stream === 'stderr') {
@@ -692,6 +783,7 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
         });
         void deliver(
           sandbox!,
+          elevate,
           `${String(calls).padStart(9, '0')}.json`,
           `${JSON.stringify({ call: { id, tool, input } } satisfies WorkerRequest)}\n`,
         ).catch((error: unknown) => {
@@ -727,6 +819,7 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
           // ceiling that says nothing about the real cause.
           await deliver(
             sandbox,
+            elevate,
             `${String(++calls).padStart(9, '0')}.json`,
             `${JSON.stringify({ done: true } satisfies WorkerRequest)}\n`,
           ).catch((error: unknown) => {
@@ -895,8 +988,8 @@ async function collect(sandbox: SandboxHandle, blobRoot: string, staging: string
     }
     const bytes = await sandbox.readFile(`${WORK}/blobs.tar`);
     if (!bytes) return "this sandbox's artifacts could not be read back";
-    // A CEILING, because `/blobs` is handed to uid 1000 and the agent's own commands run
-    // as that user. The event stream has had one since M4 and this did not: a phase that
+    // A CEILING, because what lands in `/blobs` is what the agent's own commands produced.
+    // The event stream has had one since M4 and this did not: a phase that
     // filled its store would have had every byte read into host memory and written into
     // the evidence store. Reported rather than thrown, like every other collection
     // failure — the events are the record and they are worth keeping.

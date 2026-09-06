@@ -14,7 +14,7 @@
 // on every path, including the ones that throw.
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
@@ -156,41 +156,68 @@ describe('the world the Runner needs, and the one thing the host may not write',
     expect([...fake.sandboxes[0]!.prepared]).toEqual(expect.arrayContaining(['/work', '/blobs', '/out']));
   });
 
-  test('a tool call goes in as root, because the host writes as the user the repro is', async () => {
-    // The uid the SDK writes files as and the uid the repro drops to are the same one, so
-    // a spool the host can write is a spool the agent can forge `{done: true}` into. The
-    // fake refuses a `writeFiles` under `/work/rpc`, which is what a real sandbox would do
-    // with a root-owned 0700 directory — so an executor that went back to writing tool
-    // calls that way fails here instead of on the first live agent phase.
-    const fake = fakeSandboxes({
-      runner: async function* ({ awaitSpool }: RunnerContext) {
-        yield line({ env: { ready: true, steps: [], services: [] } });
-        yield line({ ready: true });
-        const call = await awaitSpool((written) => written.includes('"call"'));
-        yield line({ result: { id: (JSON.parse(call) as { call: { id: string } }).call.id, ok: true, output: 'ok' } });
-        await awaitSpool((written) => written.includes('"done":true'));
-        yield line({ finished: { handover: null } });
-      },
+  // A tool call, on BOTH image families, because the transport and the privilege it needs
+  // are two different questions and only one of them has an answer that is the same on
+  // both. Run against the same driver and the same Runner; only the image differs.
+  for (const image of [
+    { name: 'ours: commands are already root', runsAs: { uid: 0, sudo: false } },
+    { name: 'the managed one: uid 1000, and root is a `sudo` away', runsAs: { uid: 1000, sudo: true } },
+  ]) {
+    test(`a tool call goes in as root — ${image.name}`, async () => {
+      // The uid the SDK writes files as and the uid the repro drops to are the same one on
+      // the managed image, so a spool the host can write is a spool the agent can forge
+      // `{done: true}` into. The fake refuses a `writeFiles` under `/work/rpc` there, which
+      // is what a real sandbox would do with a root-owned 0700 directory — so an executor
+      // that went back to writing tool calls that way fails here instead of on the first
+      // live agent phase.
+      //
+      // And it refuses an UNELEVATED command into the same directory, which is the control
+      // that went missing when `deliver` stopped hardcoding `sudo`: dropping `${elevate}`
+      // from either half of `deliver` left every test in this file green, and would have
+      // failed EACCES on the managed image's first live tool call.
+      const fake = fakeSandboxes({
+        runsAs: image.runsAs,
+        runner: async function* ({ awaitSpool }: RunnerContext) {
+          yield line({ env: { ready: true, steps: [], services: [] } });
+          yield line({ ready: true });
+          const call = await awaitSpool((written) => written.includes('"call"'));
+          yield line({ result: { id: (JSON.parse(call) as { call: { id: string } }).call.id, ok: true, output: 'ok' } });
+          await awaitSpool((written) => written.includes('"done":true'));
+          yield line({ finished: { handover: null } });
+        },
+      });
+      const result = await vercelExecutor({ client: fake.client }).runPhase({
+        plan: plan({ recipe: { install: 'npm ci', services: [] } }),
+        source: repo(),
+        afterSeq: 0,
+        phase: 'agent',
+        overrides: { serveTools: true },
+        driver: async ({ invoke }) => void (await invoke('read', { path: 'README' })),
+      });
+      expect(result.exitCode).toBe(0);
+      // Delivered through a COMMAND rather than `writeFiles`, and verified afterwards:
+      // `sh -c` reports the last command's status, so without the `test -s` a failing
+      // `base64` would leave an empty spool file, which the Runner skips forever while the
+      // host waits for a reply.
+      const delivered = fake.sandboxes[0]!.commands.filter((one) => one.includes('/rpc/in/'));
+      expect(delivered).toHaveLength(2); // the call, and `{done:true}`
+      for (const command of delivered) {
+        expect(command).toMatch(/\btee\b/);
+        expect(command).toMatch(/\btest -s\b/);
+      }
+      // The privilege, asserted only where the image needs it. Both halves: `sh -c`
+      // reports the last command's status, so an unelevated `test -s` would be the half
+      // that decides whether the delivery is believed.
+      if (image.runsAs.uid !== 0) {
+        for (const command of delivered) {
+          expect(command).toMatch(/sudo -n tee/);
+          expect(command).toMatch(/sudo -n test -s/);
+        }
+      } else {
+        expect(delivered.some((one) => one.includes('sudo -n '))).toBe(false);
+      }
     });
-    const result = await vercelExecutor({ client: fake.client }).runPhase({
-      plan: plan({ recipe: { install: 'npm ci', services: [] } }),
-      source: repo(),
-      afterSeq: 0,
-      phase: 'agent',
-      overrides: { serveTools: true },
-      driver: async ({ invoke }) => void (await invoke('read', { path: 'README' })),
-    });
-    expect(result.exitCode).toBe(0);
-    // Delivered through `sudo`, and verified afterwards: `sh -c` reports the last
-    // command's status, so without the `test -s` a failing `base64` would leave an empty
-    // spool file, which the Runner skips forever while the host waits for a reply.
-    const delivered = fake.sandboxes[0]!.commands.filter((one) => one.includes('/rpc/in/'));
-    expect(delivered).toHaveLength(2); // the call, and `{done:true}`
-    for (const command of delivered) {
-      expect(command).toMatch(/sudo -n tee/);
-      expect(command).toMatch(/sudo -n test -s/);
-    }
-  });
+  }
 
   test('the in-container agent is refused, because there is no moment to seal it', async () => {
     // `agentPrompt` runs the loop inside the sandbox: a model credential in there, and a
@@ -416,6 +443,110 @@ describe('the agent sandbox is sealed before it is asked anything', () => {
   });
 });
 
+describe('reaching root, on an image that may or may not have sudo', () => {
+  const runner = async function* ({ sandbox }: RunnerContext) {
+    yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 1, symptom_matched: true });
+  };
+
+  test('our images run as root, so nothing is prefixed with sudo', async () => {
+    // The second failure of the first live run: `sh: sudo: not found`. The spike measured
+    // the root model on Vercel's MANAGED image — `ubuntu`, uid 1000, passwordless sudo —
+    // and our own are alpine with no `USER` and no sudo binary. Probed live: uid 0, no
+    // sudo, can write `/`.
+    const fake = fakeSandboxes({ runsAs: { uid: 0, sudo: false }, runner });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(result.events.some((one) => one.type === 'TEST_RUN')).toBe(true);
+    // `sudo -n `, not `sudo` — the probe that decides this asks `command -v sudo`, and a
+    // bare substring match would be satisfied by the question rather than the answer.
+    expect(fake.sandboxes[0]!.commands.some((c) => c.includes('sudo -n '))).toBe(false);
+    // And it still starts the Runner and prepares the world.
+    expect(fake.sandboxes[0]!.commands.some((c) => c.includes('runner-vm'))).toBe(true);
+    expect([...fake.sandboxes[0]!.prepared]).toEqual(expect.arrayContaining(['/work', '/blobs', '/out']));
+  });
+
+  test('the managed image is uid 1000 with sudo, and gets it', async () => {
+    // THE control. Without it the executor could simply have dropped sudo everywhere and
+    // passed — correct for our images and broken for the one the spike measured.
+    const fake = fakeSandboxes({ runsAs: { uid: 1000, sudo: true }, runner });
+    await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(fake.sandboxes[0]!.commands.some((c) => c.includes('sudo -n mkdir'))).toBe(true);
+    expect(fake.sandboxes[0]!.commands.some((c) => c.includes('sudo -n ') && c.includes('runner-vm'))).toBe(true);
+  });
+
+  test('the Runner is started at the path our own Dockerfiles put it', async () => {
+    // Not a string pinned against itself: both facts are READ, from the two files that
+    // decide them. The executor's default named `/engine/src/runner-vm.ts`, which no
+    // Dockerfile has ever created — the third failure of the live run, queued behind the
+    // session clamp and `sudo: not found`, and invisible to every test in this file
+    // because the fake answers any command with a plausible Runner.
+    //
+    // `scripts/spike-vercel/14-our-image.ts` measured the rest against the pushed image:
+    // a sandbox created from it starts in `/app`, so `--import tsx` — a bare specifier
+    // node resolves from the cwd upwards — finds `/app/node_modules`.
+    const fake = fakeSandboxes({ runsAs: { uid: 0, sudo: false }, runner });
+    await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    const started = fake.sandboxes[0]!.commands.find((c) => c.includes('runner-vm'))!;
+
+    for (const file of ['Dockerfile', 'Dockerfile.agent']) {
+      const dockerfile = readFileSync(join(process.cwd(), file), 'utf8');
+      const workdir = /^WORKDIR\s+(\S+)/m.exec(dockerfile)?.[1];
+      expect(workdir, `${file} has no WORKDIR`).toBeTruthy();
+      // `COPY src ./src` under that WORKDIR is what puts the Runner where the command
+      // says it is. If either file stops doing that, this stops being true.
+      expect(dockerfile).toMatch(/^COPY src \.\/src$/m);
+      expect(started).toContain(`${workdir}/src/runner-vm.ts`);
+    }
+    expect(existsSync(join(process.cwd(), 'src/runner-vm.ts'))).toBe(true);
+  });
+
+  test('a probe that did not RUN says so, rather than naming its output as a uid', async () => {
+    // `output` is stdout and stderr interleaved, and the exit code was not read at all —
+    // so a probe that failed produced `runs commands as uid  and has no sudo`, blaming
+    // the image for a transport fault. The same `??`-where-`||`-was-meant shape
+    // `runner.ts` already records as the mistake made twice.
+    const broken = fakeSandboxes({ failsCommand: /^id -u;/, runsAs: { uid: 0, sudo: false } });
+    await expect(
+      vercelExecutor({ client: broken.client }).runPhase({
+        plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+      }),
+    ).rejects.toThrow(/could not ask this image what user it runs commands as/);
+    expect(broken.sandboxes[0]!.stopped).toBe(true);
+
+    // And an image that says more than the answer is still read correctly. `output` is
+    // stdout and stderr interleaved, so a motd or one stderr line lands ahead of the uid —
+    // and taking line 0 would refuse a perfectly good root image while naming the banner
+    // as its uid, which is the wrong-layer diagnosis `elevationFor` exists to prevent.
+    const chatty = fakeSandboxes({
+      runsAs: { uid: 0, sudo: false },
+      probeSays: 'Welcome to the sandbox.\nLast login: never\n0\nNO_SUDO',
+      runner,
+    });
+    const spoke = await vercelExecutor({ client: chatty.client }).runPhase({
+      plan: plan(), source: repo(), afterSeq: 0, phase: 'base', overrides: {}, from: { ref: 'snap-1' },
+    });
+    expect(spoke.events.some((one) => one.type === 'TEST_RUN')).toBe(true);
+    expect(chatty.sandboxes[0]!.commands.some((c) => c.includes('sudo -n '))).toBe(false);
+  });
+
+  test('and an image that is neither is refused with a reason, not a shell error', async () => {
+    // uid 1000 and no sudo means the Runner would run as the same user the repro drops
+    // to, and `runner-vm.ts` refuses that outright. Better to say so at open than to let
+    // a `chown` fail and read as a transport fault.
+    const fake = fakeSandboxes({ runsAs: { uid: 1000, sudo: false }, runner });
+    const built = await vercelExecutor({ client: fake.client }).buildSnapshot(
+      plan(), repo(), 'main', { install: 'npm ci', services: [] },
+    );
+    expect(built).toMatchObject({ failed: expect.stringContaining('no sudo') });
+    expect(fake.sandboxes[0]!.stopped).toBe(true);
+  });
+});
+
 describe('the session we ask for is one the plan will give', () => {
   test('an hour is clamped to the Hobby ceiling, because the platform refuses more', async () => {
     // From the first live run, which died eight seconds in: `400: timeout restricted to
@@ -465,6 +596,38 @@ describe('the environment build keeps nothing of ours in the snapshot', () => {
     const ran = sandbox.commands.findIndex((command) => command.includes('runner-vm'));
     expect(ran).toBeGreaterThanOrEqual(0);
     expect(wiped).toBeGreaterThan(ran);
+  });
+
+  test('the scrub is elevated, and a scrub that failed is REPORTED rather than snapshotted', async () => {
+    // Two controls on one line, because a snapshot taken over a failed scrub is the worst
+    // shape here: it carries this run's Job and bundle into every phase that judges from
+    // it — where a reproduction could read the symptom pattern it is supposed to be
+    // tested against — and nothing downstream would ever notice.
+    //
+    // First that it CAN scrub on the managed image. `rm -rf /work` recurses into a
+    // root:root 0700 spool, so uid 1000 cannot do it; drop the elevation and the fake
+    // refuses exactly as the kernel would.
+    const managed = fakeSandboxes({
+      runsAs: { uid: 1000, sudo: true },
+      runner: async function* () {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+      },
+    });
+    expect(
+      await vercelExecutor({ client: managed.client }).buildSnapshot(plan(), repo(), 'main', { install: 'npm ci', services: [] }),
+    ).toMatchObject({ snapshot: { ref: 'snap-1' } });
+
+    // And then that a scrub which failed anyway is not silently snapshotted over.
+    const refused = fakeSandboxes({
+      failsCommand: /rm -rf \/work/,
+      runner: async function* () {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+      },
+    });
+    const built = await vercelExecutor({ client: refused.client }).buildSnapshot(plan(), repo(), 'main', { install: 'npm ci', services: [] });
+    expect(built).toMatchObject({ failed: expect.stringContaining("could not remove this run's inputs") });
+    expect(refused.snapshots).toEqual([]);
+    expect(refused.sandboxes[0]!.stopped).toBe(true);
   });
 
   test('a recipe that does not boot is REPORTED, not thrown', async () => {

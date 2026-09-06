@@ -21,6 +21,8 @@
 //     inbound-under-`deny-all` as unverified. A method here would invite its use.
 
 import type { Readable } from 'node:stream';
+// Types only — erased, so nothing here loads the SDK. See the assertions below `Sdk`.
+import type { Sandbox as RealSandbox } from '@vercel/sandbox';
 
 /** What a sandbox may reach. `deny-all` is enforced outside the guest (ADR-0021). */
 export type NetworkPolicy = 'allow-all' | 'deny-all';
@@ -197,14 +199,49 @@ export async function* asLines(chunks: AsyncIterable<string>): AsyncIterable<str
  * Structural rather than imported: `@vercel/sandbox` is a dependency of the worker and
  * not of the tests, and typing against the shape means `npm test` does not need it
  * resolvable. The one place it IS imported is `vercelClient()`, behind a dynamic import.
+ *
+ * WHICH MADE THESE SHAPES UNCHECKED, and `as unknown as Sdk` at that import is where the
+ * checking stopped. `SdkSandbox` claimed a `sandboxId` the SDK has never had; the compiler
+ * compared our claim to our claim and agreed, and every id in this system was `undefined`
+ * for as long as the file existed. See the assertions below.
  */
 type Sdk = {
   Sandbox: {
     create(params: Record<string, unknown>): Promise<SdkSandbox>;
     get(params: Record<string, unknown>): Promise<SdkSandbox>;
+    /** A `Paginator`, which is async-iterable and fetches the next page on demand. */
+    list(params: Record<string, unknown>): Promise<AsyncIterable<SdkListed>>;
   };
   Snapshot: { get(params: Record<string, unknown>): Promise<{ delete(): Promise<void> }> };
 };
+
+/**
+ * The three facts above that this file was WRONG about, checked against the real types.
+ *
+ * `import type` is erased at compile time — nothing here loads `@vercel/sandbox`, so a
+ * Docker-only runner still never resolves it and `npm test` still does not need it. What
+ * it buys back is what the cast threw away: rename a property, drop one, or change what
+ * `get` takes, and `npm run typecheck` says so instead of a live worker discovering it as
+ * a swallowed exception in the sweep.
+ *
+ * Deliberately NOT `RealSandbox extends SdkSandbox`. Ours declares
+ * `runCommand(params: Record<string, unknown>)` where the SDK's is fully typed, so whole
+ * assignability fails for a reason that is not a defect — and an assertion that fails for
+ * a reason nobody can fix is one somebody deletes.
+ */
+type Assert<T extends true> = T;
+/** What a sandbox is CALLED. This does not compile unless the property exists. */
+type _SandboxIsNamed = Assert<RealSandbox['name'] extends string ? true : false>;
+/** And what `get` takes to find one again — `{ sandboxId }` was not it. */
+type _GetTakesAName = Assert<Parameters<typeof RealSandbox.get>[0] extends { name: string } ? true : false>;
+/** And that a listed row carries the three fields the sweep reads off it. */
+type _ListedIsAsClaimed = Assert<
+  Awaited<ReturnType<typeof RealSandbox.list>> extends { sandboxes: (infer Row)[] }
+    ? Row extends SdkListed
+      ? true
+      : false
+    : false
+>;
 
 type SdkCommand = {
   cmdId: string;
@@ -216,7 +253,16 @@ type SdkCommand = {
 };
 
 type SdkSandbox = {
-  sandboxId: string;
+  /**
+   * WHAT A SANDBOX IS CALLED, and there is nothing else to call it by.
+   *
+   * This said `sandboxId` — a property `@vercel/sandbox@3.2.1` does not have anywhere in
+   * its surface. Nothing caught it: this is a structural type we wrote ourselves, so the
+   * compiler checked our claim against our claim. Every `id` was `undefined`, which meant
+   * the ledger recorded nothing usable, `SANDBOX_SEALED` carried no sandbox, and `sweep()`
+   * could not name a single machine to stop.
+   */
+  readonly name: string;
   writeFiles(files: { path: string; content: Buffer }[]): Promise<void>;
   readFile(params: { path: string }): Promise<Readable | null>;
   runCommand(params: Record<string, unknown>): Promise<SdkCommand>;
@@ -229,6 +275,13 @@ type SdkSandbox = {
   }>;
 };
 
+/** One row of `Sandbox.list`, which is not a `Sandbox` and shares almost nothing with one. */
+type SdkListed = {
+  name: string;
+  status: 'pending' | 'running' | 'stopping' | 'stopped' | 'failed' | 'aborted' | 'snapshotting';
+  tags?: Record<string, string>;
+};
+
 const drain = async (stream: Readable | null): Promise<Buffer | null> => {
   if (!stream) return null;
   const parts: Buffer[] = [];
@@ -237,7 +290,7 @@ const drain = async (stream: Readable | null): Promise<Buffer | null> => {
 };
 
 const wrap = (sandbox: SdkSandbox): SandboxHandle => ({
-  id: sandbox.sandboxId,
+  id: sandbox.name,
   writeFiles: (files) => sandbox.writeFiles(files),
   // Absence is an answer here, not a fault: the executor reads `/out/agent.bundle` on
   // every agent phase and an agent that committed nothing legitimately leaves none. The
@@ -296,7 +349,7 @@ const wrap = (sandbox: SdkSandbox): SandboxHandle => ({
   stop: async () => {
     const result = await sandbox.stop();
     return {
-      sandboxId: sandbox.sandboxId,
+      sandboxId: sandbox.name,
       ...(result.activeCpuDurationMs === undefined ? {} : { activeCpuMs: result.activeCpuDurationMs }),
       ...(result.duration === undefined ? {} : { durationMs: result.duration }),
       ...(result.networkTransfer?.ingressBytes === undefined
@@ -335,18 +388,36 @@ export async function vercelClient(options: {
         }),
       ),
     list: async (tags) => {
-      // `Sandbox.list` is not in the SDK's typed surface the way create/get are; the spike
-      // used the REST route behind it. Kept as the same shape either way: what the sweep
-      // needs is ids.
-      const listed = (sdk.Sandbox as unknown as {
-        list?: (params: Record<string, unknown>) => Promise<{ sandboxId: string }[]>;
-      }).list;
-      if (!listed) return [];
-      return (await listed({ ...credentials, tags })).map((row) => ({ id: row.sandboxId }));
+      // THE PLATFORM FILTERS BY ONE TAG, so the rest is filtered here.
+      //
+      // `Sandbox.list` takes `tags` but its type is `SingleTagFilter` — a second key is
+      // refused. The sweep's whole point is a pair, `engine` AND this worker, because a
+      // query that matched every worker's machines would have a booting worker stop every
+      // other worker's in-flight phase. So the narrower half goes to the platform and the
+      // rest is applied to what comes back, which is the same answer with more rows on
+      // the wire.
+      const [first, ...rest] = Object.entries(tags);
+      if (!first) return [];
+      const page = await sdk.Sandbox.list({ ...credentials, tags: { [first[0]]: first[1] } });
+      const found: { id: string }[] = [];
+      // A Paginator, not an array — it is async-iterable and pages on demand. Awaiting it
+      // and calling `.map` threw, and `sweep()` swallows a listing that fails, so this
+      // half of the sweep was silently dead from the day it was written.
+      for await (const row of page) {
+        if (rest.some(([key, value]) => row.tags?.[key] !== value)) continue;
+        // Already over. Asking the platform to stop these costs a round trip each and
+        // grows with every run this project has ever done.
+        if (row.status === 'stopped' || row.status === 'failed' || row.status === 'aborted') continue;
+        found.push({ id: row.name });
+      }
+      return found;
     },
     get: async (id) => {
       try {
-        return wrap(await sdk.Sandbox.get({ ...credentials, sandboxId: id }));
+        // BY NAME. `Sandbox.get` takes `{ name }`; `{ sandboxId }` is not a parameter it
+        // has, and the platform answered `Named sandbox 'undefined' not found` — which is
+        // caught below and read as "gone", so every sweep found nothing to stop.
+        return wrap(await sdk.Sandbox.get({ ...credentials, name: id }));
       } catch {
         // Gone is the answer the sweep wants, not an error it has to classify.
         return null;
