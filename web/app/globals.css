@@ -1,0 +1,430 @@
+/*
+ * A FORENSIC REGISTER, not a dashboard, and the typography carries the argument.
+ *
+ * Carried over from `src/web.ts` rather than redrawn, because the argument has not
+ * changed and a repaint would have been the least valuable half of 10i. What changed is
+ * that there are now screens where a person DOES something — starts a run, stores a key,
+ * watches a sandbox seal — and this sheet gained the furniture for those: a tablist, a
+ * live timeline, real forms, and states for pending, failed and empty.
+ *
+ * The rules that held before still hold:
+ *
+ *   - The type splits the way the domain does. A serif for what PEOPLE wrote (headings,
+ *     prose, explanation) and a monospace for every machine fact (ids, commands, exit
+ *     codes, digests, timestamps). You can tell at a glance which you are reading, which
+ *     is the distinction the whole engine exists to hold (ADR-0006).
+ *   - Paper and ink, warm rather than blue-black, because everything else in this
+ *     category is blue-black. Colour is rationed: hairlines and neutrals carry structure,
+ *     and saturation is spent only on a verdict.
+ *   - Every colour is defined on bare `:root` first and only REDEFINED under a scheme. A
+ *     value that exists in one theme is a page that renders unreadable in the other.
+ *
+ * And one rule this file adds, because it now has interactive controls:
+ *
+ *   - COLOUR IS NEVER THE ONLY SIGNAL. Every pass, fail, pending and blocked state
+ *     carries a word or a glyph as well as a hue. A red exit code that is only red is
+ *     invisible to a reader with a colour deficiency and to anyone printing this.
+ */
+
+:root{
+  color-scheme:light dark;
+  --paper:#faf9f6; --ink:#17161a; --muted:#65635c; --rule:#e4e1d9; --rule-strong:#d3cfc4;
+  --panel:#f3f1eb; --code:#eeebe3; --link:#1f4b8f;
+  --ok:#256040; --bad:#8f2727; --pending:#7a5a12;
+  --warn-bg:#fdf5ed; --warn-line:#b4553a; --warn-fg:#6f3320;
+  /* The boundary of a CONTROL, as distinct from a decorative hairline. 3.02:1 against
+   * --paper, which is what WCAG 1.4.11 asks of the thing that identifies an input or a
+   * button; --rule-strong is 1.48:1 and is for structure, not for controls. */
+  --control:#8b8578;
+  --serif:ui-serif,Georgia,Cambria,"Times New Roman",serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  /* One place, so a header height change cannot desynchronise from the scroll offset
+   * every anchored heading needs to clear it. */
+  --top:3.6rem;
+}
+@media (prefers-color-scheme:dark){:root{
+  --paper:#121110; --ink:#eceae3; --muted:#9c978f; --rule:#292722; --rule-strong:#3a372f;
+  --panel:#1a1815; --code:#1e1c18; --link:#b3ccff;
+  --ok:#7fc79b; --bad:#e89b94; --pending:#d9b46a;
+  --warn-bg:#231a14; --warn-line:#c4693f; --warn-fg:#f0c3a8;
+  --control:#6f6a60;
+}}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-padding-top:calc(var(--top) + 1rem)}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font:400 1.0625rem/1.62 var(--serif);
+  font-optical-sizing:auto;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+::selection{background:var(--ink);color:var(--paper)}
+
+/* Machine facts. Tabular figures so a column of numbers reads as a column. */
+code,pre,kbd,samp,th,td,input,textarea,select,button,nav,.mono,.chip,.points{
+  font-family:var(--mono);font-variant-numeric:tabular-nums}
+code{background:var(--code);padding:.1em .34em;border-radius:3px;font-size:.855em;
+  overflow-wrap:anywhere;border:1px solid var(--rule)}
+code.hash{word-break:break-all}
+td a code,td code{background:none;border:0;padding:0}
+pre{margin:0;font-size:.8125rem;line-height:1.6}
+pre code{background:none;border:0;padding:0;word-break:normal}
+
+a{color:var(--link);text-decoration-thickness:1px;text-underline-offset:.18em}
+a:hover{text-decoration-thickness:2px}
+:focus-visible{outline:2px solid var(--link);outline-offset:2px;border-radius:2px}
+
+/* THE SKIP LINK. Visible the moment it is focused and not one pixel before, because the
+ * header carries four links and a keyboard reader should not have to walk them on every
+ * page to reach the thing they came for. */
+.skip{position:absolute;left:-9999px;top:0;z-index:20;background:var(--ink);
+  color:var(--paper);padding:.7rem 1.1rem;border-radius:0 0 4px 0;
+  font-family:var(--mono);font-size:.75rem;letter-spacing:.08em;text-transform:uppercase}
+.skip:focus{left:0}
+
+/* ---- chrome ---- */
+header.top{display:flex;gap:2rem;align-items:baseline;flex-wrap:wrap;
+  padding:1.05rem 2rem;border-bottom:1px solid var(--rule);background:var(--paper);
+  position:sticky;top:0;z-index:5;backdrop-filter:saturate(140%) blur(6px)}
+header.top .brand{font-family:var(--serif);font-size:1.15rem;font-weight:500;
+  letter-spacing:-.01em;text-decoration:none;color:var(--ink)}
+header.top nav{display:flex;gap:1.5rem;font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.14em}
+header.top nav a{color:var(--muted);text-decoration:none;padding-bottom:.15rem;
+  border-bottom:1px solid transparent}
+header.top nav a:hover{color:var(--ink);border-bottom-color:var(--rule-strong)}
+header.top nav a[aria-current=page]{color:var(--ink);border-bottom-color:var(--ink)}
+header.top .out{margin-left:auto;display:flex;gap:.85rem;align-items:baseline}
+header.top .who{font-family:var(--mono);font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.12em;color:var(--muted)}
+header.top .out button{margin-top:0;padding:.32rem .8rem;font-size:.66rem;letter-spacing:.12em}
+main{max-width:74rem;margin:0 auto;padding:3rem 2rem 6rem}
+main:focus{outline:none}
+
+/* ---- type ---- */
+h1{font-size:clamp(1.9rem,1.4rem + 1.6vw,2.6rem);font-weight:400;letter-spacing:-.021em;
+  line-height:1.12;margin:0 0 .6rem}
+h2{font-family:var(--mono);font-size:.7rem;font-weight:500;text-transform:uppercase;
+  letter-spacing:.15em;color:var(--muted);margin:3rem 0 .9rem;padding-bottom:.55rem;
+  border-bottom:1px solid var(--rule)}
+h2:first-child{margin-top:0}
+h3{font-size:1.05rem;font-weight:500;letter-spacing:-.01em;margin:1.6rem 0 .4rem}
+p{margin:.65rem 0;max-width:46rem}
+.hero{font-size:1.2rem;line-height:1.58;max-width:44rem;color:var(--ink)}
+.muted{color:var(--muted)}
+.small{font-size:.855rem;line-height:1.55}
+p.muted.small{font-size:.9rem;line-height:1.6;max-width:44rem}
+ul.plain{padding-left:1.15rem;max-width:46rem}
+ul.plain li{margin:.4rem 0}
+.crumb{font-family:var(--mono);font-size:.72rem;text-transform:uppercase;
+  letter-spacing:.12em;color:var(--muted);margin:0 0 .5rem}
+.crumb a{color:var(--muted)}
+
+/* ---- tables: a register, hairlines only, no stripes ---- */
+.scroll{overflow-x:auto;max-width:100%}
+table{border-collapse:collapse;width:100%;font-size:.8125rem}
+caption{text-align:left;font-family:var(--mono);font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.12em;color:var(--muted);padding-bottom:.6rem}
+th,td{text-align:left;padding:.7rem .85rem;vertical-align:baseline;white-space:nowrap}
+th{font-size:.66rem;font-weight:500;text-transform:uppercase;letter-spacing:.12em;
+  color:var(--muted);border-bottom:1px solid var(--rule-strong);background:var(--paper)}
+td{border-bottom:1px solid var(--rule)}
+tbody tr:hover td{background:var(--panel)}
+td:first-child,th:first-child{padding-left:0}
+td:last-child,th:last-child{padding-right:0}
+td.wrap{white-space:normal;font-family:var(--serif);font-size:.95rem;max-width:32rem}
+th.num,td.num{text-align:right}
+
+/* ---- verdict ----
+ * `.pass` and `.fail` are colour. `.pass::before` and `.fail::before` are the glyph that
+ * makes them legible without it, and the two always travel together. */
+.pass{color:var(--ok);font-weight:500}
+.fail{color:var(--bad);font-weight:500}
+.pending{color:var(--pending);font-weight:500}
+b.fail,b.pass{font-weight:600}
+.mark{font-weight:600;margin-right:.35em}
+
+/* ---- containers ---- */
+.panel{background:var(--panel);border:1px solid var(--rule);border-radius:6px;
+  padding:1.35rem 1.5rem;margin:1.35rem 0}
+.panel h2{margin-top:0}
+.warning{background:var(--warn-bg);border:1px solid var(--warn-line);border-left-width:3px;
+  border-radius:6px;padding:1.35rem 1.5rem;margin:1.35rem 0;color:var(--warn-fg)}
+.warning h2,.refusal h2{border:0;margin:0 0 .5rem;padding:0;color:inherit;
+  font-family:var(--serif);font-size:1.15rem;font-weight:500;text-transform:none;
+  letter-spacing:-.01em}
+.warning a{color:inherit;text-decoration-thickness:2px}
+.refusal{border-left-width:3px}
+
+/* ---- evidence list ---- */
+.grounds{list-style:none;padding:0;margin:.5rem 0}
+.grounds li{padding:.85rem 0;border-bottom:1px solid var(--rule);display:flex;gap:1rem;
+  align-items:baseline;flex-wrap:wrap}
+.grounds li:last-child{border-bottom:0}
+.points{display:inline-block;min-width:3.4rem;font-weight:600;font-size:.8125rem;
+  color:var(--muted);flex:none}
+.refs{margin-top:.35rem;flex-basis:100%}
+.refs code{margin-right:.35rem;font-size:.72rem}
+
+/* ---- chips: a metadata strip, not buttons ---- */
+.strip{display:flex;flex-wrap:wrap;gap:0;margin:1rem 0 0;
+  border-top:1px solid var(--rule);border-bottom:1px solid var(--rule)}
+.chip{padding:.6rem 1.1rem .6rem 0;margin-right:1.1rem;font-size:.72rem;
+  text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}
+.chip b{font-weight:600;text-transform:none;letter-spacing:0;color:var(--ink);
+  font-size:.8125rem}
+
+/* ---- actions ---- */
+.calls{display:flex;gap:.85rem;align-items:center;flex-wrap:wrap;margin:2rem 0}
+.cta{display:inline-block;padding:.72rem 1.5rem;border-radius:4px;background:var(--ink);
+  color:var(--paper);text-decoration:none;font-family:var(--mono);font-size:.775rem;
+  font-weight:500;text-transform:uppercase;letter-spacing:.1em;
+  transition:transform .12s ease,opacity .12s ease}
+.cta:hover{opacity:.88;transform:translateY(-1px)}
+.cta.secondary{background:transparent;color:var(--ink);
+  box-shadow:inset 0 0 0 1px var(--control)}
+.calls .cta{margin:0}
+button{margin-top:1rem;padding:.68rem 1.4rem;border-radius:4px;border:0;cursor:pointer;
+  background:var(--ink);color:var(--paper);font-size:.775rem;font-weight:500;
+  text-transform:uppercase;letter-spacing:.1em}
+button:hover:not(:disabled){opacity:.88}
+/* DISABLED IS VISIBLE. A control that looks live and does nothing is worse than one that
+ * says it cannot act, and the pages here disable Start for real reasons — no key, no
+ * recipe, a run already under way — each of which is explained beside it. */
+/* 0.6, not 0.42. At 0.42 a `button.quiet` label composites to 1.85:1 — WCAG exempts
+ * inactive controls, so this was not a failure, but the comment above claims disabled is
+ * VISIBLE and at 1.85:1 it is not. This holds the claim. */
+button:disabled{opacity:.6;cursor:not-allowed}
+/* `--control`, and this is the set of buttons it matters most for: Delete a secret,
+ * Revoke a runner, Delete the model key, Destroy the artifacts. The four most destructive
+ * controls in the product were the four with the least perceivable boundary. */
+button.quiet{background:transparent;color:var(--muted);
+  box-shadow:inset 0 0 0 1px var(--control);margin-top:0}
+button.quiet:hover:not(:disabled){color:var(--bad);box-shadow:inset 0 0 0 1px var(--bad);opacity:1}
+button.small{padding:.42rem .9rem;font-size:.68rem;margin-top:0}
+
+/* ---- forms ---- */
+.field{margin:1.1rem 0;max-width:42rem}
+.field label{display:block;font-family:var(--mono);font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.12em;color:var(--muted);margin-bottom:.4rem}
+.field .hint{font-size:.855rem;color:var(--muted);margin:.4rem 0 0;max-width:42rem}
+textarea{display:block;width:100%;background:var(--code);color:var(--ink);
+  border:1px solid var(--rule-strong);border-radius:6px;padding:1rem;
+  font-size:.8125rem;line-height:1.6;resize:vertical}
+textarea:focus{border-color:var(--link)}
+input[type=text],input[type=password],input[type=search],input:not([type]),select{
+  background:var(--code);color:var(--ink);
+  /* `--control` rather than `--rule-strong`: a hairline is 1.48:1 against the page, and a
+   * text field whose only boundary is a hairline is a control you cannot see until you
+   * focus it. WCAG 1.4.11 wants 3:1 for the thing that identifies a control. */
+  border:1px solid var(--control);border-radius:4px;padding:.6rem .75rem;
+  /* `min(18rem,100%)`, because `min-width` BEATS `max-width` in the used-value algorithm —
+   * so the `max-width:100%` that was here did nothing, and at 320px a 288px control sat in
+   * 283.2px of content box and pushed the page sideways. Every screen with an input
+   * failed WCAG 1.4.10 Reflow. */
+  font-size:.8125rem;min-width:min(18rem,100%);max-width:100%}
+input:focus,select:focus{border-color:var(--link)}
+[aria-invalid=true]{border-color:var(--bad)}
+.error{color:var(--bad);font-size:.855rem;margin:.45rem 0 0;max-width:42rem}
+.said{font-family:var(--mono);font-size:.75rem;color:var(--muted);margin:.6rem 0 0}
+.row{display:flex;gap:.7rem;align-items:flex-end;flex-wrap:wrap}
+
+/* ---- the fold over a long register ---- */
+details{margin:.5rem 0 0}
+summary{font-family:var(--mono);font-size:.72rem;letter-spacing:.04em;color:var(--muted);
+  cursor:pointer;padding:.7rem 0;border-bottom:1px solid var(--rule);list-style:none;
+  display:flex;gap:.6rem;align-items:baseline}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"+";font-weight:600;color:var(--ink)}
+details[open] summary::before{content:"\2212"}
+summary:hover{color:var(--ink)}
+details[open] summary{margin-bottom:.5rem}
+
+/* ---- an empty state that looks deliberate ---- */
+.nothing{border:1px dashed var(--rule-strong);border-radius:6px;padding:2.5rem 1.75rem;
+  margin:1.25rem 0;text-align:left;background:transparent}
+.nothing p{margin:0;max-width:40rem;color:var(--muted)}
+.nothing p + p{margin-top:.7rem}
+.in-force{font-family:var(--mono);font-size:.78rem;letter-spacing:.02em;color:var(--muted);
+  margin:1.35rem 0 0;padding:.7rem 0 0;border-top:1px solid var(--rule)}
+
+/* ---- TABS (10i) ----
+ * The repository screen has four jobs — start a run, read its runs, edit its environment,
+ * pair a machine — and stacking them made the one people came for the one they scrolled
+ * past. This is the ARIA tabs pattern in full: one stop in the tab order, arrows to move,
+ * Home and End to the ends, `aria-selected` and `aria-controls` wired.
+ */
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--rule-strong);margin:1.75rem 0 0;
+  /* `overflow-x:auto` clips the focus ring of the first tab, which has `padding-left:0`
+   * below — so the one indicator a keyboard user has was cut off on the left. The padding
+   * and the negative margin give the outline room without moving anything. */
+  overflow-x:auto;padding-left:3px;margin-left:-3px}
+.tabs button{margin:0;background:transparent;color:var(--muted);border-radius:0;
+  padding:.85rem 1.15rem;font-size:.7rem;letter-spacing:.14em;white-space:nowrap;
+  border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs button:first-child{padding-left:0}
+.tabs button:hover{color:var(--ink);opacity:1}
+.tabs button[aria-selected=true]{color:var(--ink);border-bottom-color:var(--ink)}
+.tabs button .count{font-size:.68rem;color:var(--muted);margin-left:.45rem}
+[role=tabpanel]{padding-top:1.5rem}
+[role=tabpanel]:focus{outline:none}
+
+/* ---- THE LIVE TIMELINE (10i) ----
+ * What a person watches for the four minutes a run takes. One row per phase of the
+ * engine, in the order the engine does them, each one either waiting, happening, or
+ * finished with a fact attached.
+ *
+ * The rule this obeys: a row NEVER shows a verdict the fold has not reached. It reports
+ * events as they arrive and re-reads the fold for anything that is a judgement, because a
+ * timeline that decided for itself whether a run had reproduced would be a second opinion
+ * about what happened (ADR-0009), racing the pull request to the answer.
+ *
+ * Three states, not four. An earlier draft of this comment described rows for phases that
+ * have NOT happened yet — "waiting" — and the styling for it existed while the component
+ * never emitted it. That design is not a small addition: a list of phases to come is a
+ * model of what a run is, which is `fold.ts`'s job and not this file's, and it would be
+ * wrong the first time a run took a path the list did not predict.
+ */
+.timeline{list-style:none;padding:0;margin:1.25rem 0}
+.timeline li{display:grid;grid-template-columns:1.6rem 1fr auto;gap:.9rem;
+  padding:.85rem 0;border-bottom:1px solid var(--rule);align-items:baseline}
+.timeline li:last-child{border-bottom:0}
+.timeline .dot{font-family:var(--mono);font-size:.8rem;line-height:1.6;text-align:center}
+.timeline .what{font-size:.98rem}
+.timeline .what .detail{display:block;font-family:var(--mono);font-size:.75rem;
+  color:var(--muted);margin-top:.2rem;white-space:pre-wrap;overflow-wrap:anywhere}
+.timeline .at{font-family:var(--mono);font-size:.7rem;color:var(--muted);white-space:nowrap}
+.timeline li[data-state=doing] .dot{color:var(--pending)}
+.timeline li[data-state=done] .dot{color:var(--ok)}
+.timeline li[data-state=failed] .dot{color:var(--bad)}
+/* The one piece of motion in the product, on the one row that is actually happening. */
+.timeline li[data-state=doing] .dot{animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* The live region is in the DOM before it has anything to say — inserting one together
+ * with its content announces nothing — but a run that has ENDED leaves it permanently
+ * empty, and an empty flex box with a margin is a gap in the page nobody can explain.
+ * `:empty` collapses it, and only ever after the last thing it had to announce. */
+.live:empty{display:none}
+.live{display:inline-flex;gap:.5rem;align-items:baseline;font-family:var(--mono);
+  font-size:.7rem;text-transform:uppercase;letter-spacing:.12em;color:var(--pending)}
+.live .dot{animation:pulse 1.6s ease-in-out infinite}
+.disconnected{color:var(--bad)}
+
+/* The raw log, folded away. It is the product and it is also 300 lines of JSON, so it is
+ * available and not in the way. */
+.log{max-height:26rem;overflow:auto;border:1px solid var(--rule);border-radius:6px;
+  background:var(--code);padding:.8rem 1rem;font-size:.75rem;line-height:1.7}
+.log div{display:grid;grid-template-columns:3.2rem 1fr;gap:.9rem}
+.log .seq{color:var(--muted)}
+
+/* ---- the issue picker (10i) ---- */
+/* A fieldset for the radio group, with none of a fieldset's furniture: the legend is
+ * for screen readers and the border would be a box around a list that is already a list. */
+fieldset.bare{border:0;padding:0;margin:0;min-width:0}
+.issues{list-style:none;padding:0;margin:1rem 0;border-top:1px solid var(--rule)}
+.issues li{border-bottom:1px solid var(--rule)}
+.issues label{display:grid;grid-template-columns:1.4rem 1fr auto;gap:.9rem;
+  padding:.9rem .4rem;align-items:baseline;cursor:pointer}
+.issues label:hover{background:var(--panel)}
+.issues input{min-width:0}
+.issues .title{font-size:1rem;line-height:1.45}
+.issues .meta{font-family:var(--mono);font-size:.7rem;color:var(--muted);white-space:nowrap}
+.issues li:has(input:checked){background:var(--panel)}
+
+/* ---- states while the network is out (10i) ----
+ * Every screen here is drawn from a fetch, so "loading" and "that failed" are states the
+ * product has now and did not before. Both say which, rather than rendering an empty page
+ * that reads as "you have nothing". */
+.loading{color:var(--muted);font-family:var(--mono);font-size:.75rem;
+  text-transform:uppercase;letter-spacing:.12em;padding:2rem 0}
+.names{list-style:none;padding:0;margin:.6rem 0}
+.names li{display:flex;gap:.9rem;align-items:baseline;padding:.55rem 0;
+  border-bottom:1px solid var(--rule)}
+.names li:last-child{border-bottom:0}
+.names .grow{flex:1}
+
+@media (max-width:40rem){
+  header.top{padding:.9rem 1.15rem;gap:1rem}
+  main{padding:2rem 1.15rem 4rem}
+  .strip{display:block}
+  .timeline li{grid-template-columns:1.4rem 1fr;row-gap:.25rem}
+  .timeline .at{grid-column:2}
+  .issues label{grid-template-columns:1.4rem 1fr;row-gap:.25rem}
+  .issues .meta{grid-column:2}
+}
+
+/* ---- the landing page, which has a different job from every other page ----
+ * Every other page here is an instrument: dense, tabular, for somebody already inside.
+ * This one has to persuade somebody outside, and looking like a README is its own kind of
+ * claim — that nobody cared. So it gets the furniture a product page has.
+ *
+ * What it does NOT get is invented social proof. No logo wall, no "trusted by", no user
+ * count. This product's entire argument is that a claim without evidence is worth
+ * nothing, and a fabricated testimonial on the front of it would be the loudest possible
+ * admission that we do not believe that.
+ */
+.eyebrow{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;
+  letter-spacing:.2em;color:var(--muted);margin:0 0 1.4rem}
+.landing main{max-width:none;padding:0}
+.hero-band{padding:5.5rem 2rem 4.5rem;border-bottom:1px solid var(--rule);
+  background-image:linear-gradient(var(--rule) 1px,transparent 1px),
+    linear-gradient(90deg,var(--rule) 1px,transparent 1px);
+  background-size:100% 5.5rem,5.5rem 100%;background-position:-1px -1px}
+.hero-band > div,.band > div{max-width:74rem;margin:0 auto}
+h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
+  letter-spacing:-.028em;max-width:34ch;margin:0 0 1.4rem}
+.lede{font-size:clamp(1.1rem,1rem + .4vw,1.35rem);line-height:1.55;max-width:64ch;
+  color:var(--muted)}
+.lede b{color:var(--ink);font-weight:600}
+.band{padding:4.5rem 2rem;border-bottom:1px solid var(--rule)}
+.band:last-of-type{border-bottom:0}
+/* An `h2` wearing the eyebrow's clothes. It was a `<p>`, which left the eight `h3`s
+ * inside the steps and cards following `h1.display` with nothing between them — the whole
+ * section structure of the only public page absent from a heading list. */
+.band-head{font-family:var(--mono);font-size:.68rem;font-weight:400;text-transform:uppercase;
+  letter-spacing:.2em;color:var(--muted);margin:0 0 2rem;padding:0;border:0}
+.specimen{border:1px solid var(--rule-strong);border-radius:8px;overflow:hidden;
+  background:var(--panel);max-width:52rem}
+.specimen-bar{display:flex;gap:.9rem;align-items:baseline;padding:.8rem 1.2rem;
+  border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:.7rem;
+  text-transform:uppercase;letter-spacing:.12em;color:var(--muted);background:var(--paper)}
+.specimen-body{padding:1.5rem 1.2rem}
+.verdict{font-family:var(--mono);font-size:.8125rem;line-height:2}
+.verdict .n{color:var(--muted);display:inline-block;min-width:3.6rem}
+.steps{display:grid;gap:0;counter-reset:step;max-width:56rem}
+.step{display:grid;grid-template-columns:3.2rem 1fr;gap:1.2rem;padding:1.5rem 0;
+  border-top:1px solid var(--rule)}
+.step:last-child{border-bottom:1px solid var(--rule)}
+.step::before{counter-increment:step;content:counter(step,decimal-leading-zero);
+  font-family:var(--mono);font-size:.75rem;color:var(--muted);letter-spacing:.08em}
+.step h3{margin:0 0 .35rem;font-size:1.15rem;font-weight:500;letter-spacing:-.01em}
+.step p{margin:0;color:var(--muted);font-size:1rem}
+.cards{display:grid;gap:1px;background:var(--rule);
+  grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));border:1px solid var(--rule)}
+.card{background:var(--paper);padding:1.6rem 1.5rem}
+.card h3{margin:0 0 .5rem;font-size:1.1rem;font-weight:500;letter-spacing:-.01em}
+.card p{margin:0;color:var(--muted);font-size:.97rem}
+footer.foot{padding:2.5rem 2rem 4rem;border-top:1px solid var(--rule)}
+footer.foot > div{max-width:74rem;margin:0 auto;display:flex;gap:1.5rem;
+  flex-wrap:wrap;align-items:baseline;justify-content:space-between}
+footer.foot p{margin:0;font-family:var(--mono);font-size:.72rem;color:var(--muted);
+  letter-spacing:.04em;max-width:52ch}
+
+@media (max-width:40rem){
+  .hero-band{padding:3.5rem 1.15rem 3rem;background-size:100% 4rem,4rem 100%}
+  .band{padding:3rem 1.15rem}
+  footer.foot{padding:2rem 1.15rem 3rem}
+  .step{grid-template-columns:2.4rem 1fr;gap:.8rem}
+}
+
+/* Last, so it wins. Nothing here needs motion to be understood, and the pulse on a live
+ * run is the only thing that moves at all — which is exactly the kind of thing that
+ * triggers vestibular symptoms if it is not switched off when asked. */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  .cta:hover{transform:none}
+}
+
+/* Visually hidden, still read aloud. Used for the live region's announcements and for the
+ * words that make a colour-coded verdict legible to a screen reader. */
+.sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0 0 0 0);white-space:nowrap;border:0}

@@ -46,9 +46,13 @@ destroyed when the run ends.
 - **The user's own OpenRouter key**, stored like a secret, spent by the worker on that
   user's runs.
 - **A Next.js dashboard in `web/`, same origin, behind the plane**, which becomes a JSON API
-  and an SSE feed. ADR-0022, written in 10i, will reverse the README's no-framework decision
-  and say what does not move: the plane stays the only public process, the only holder of
-  cookies, and the only place authorization is decided.
+  and an SSE feed. [ADR-0022](adr/0022-a-framework-in-front-and-nothing-behind-it.md),
+  written in 10i, reverses the README's no-framework decision and says what does not move:
+  the plane stays the only public process, the only holder of cookies, and the only place
+  authorization is decided. It is a **static export** — HTML, CSS and JavaScript and nothing
+  that runs — which is not a compromise but the only shape that keeps that sentence true: a
+  Next server would have had to read the cookie to render, and authorization would then live
+  in two codebases.
 - **Not in this milestone, deliberately:** an MCP surface (first item of M11, cheap once the
   API exists); serving blobs by ref (refs stay text until redaction-at-read is designed);
   diff-coverage.
@@ -81,7 +85,7 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | |
 | **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | merged; #66 |
 | **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
-| **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | |
+| **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | merged |
 | **10j** | recipe `env` and `required`; `blocked` | | merged; #70 |
 | **10k** | the model key and secrets: stored, listed by name, never read back | 10j | merged; #71 |
 | **10l** | secrets injected only under `deny-all`, with the guard executed | 10d, 10k | |
@@ -141,6 +145,71 @@ something an HTML form can send, and writing the JavaScript for one into `src/we
 file 10i deletes — would be work done twice. The form arrives with the Next.js UI, which
 sends JSON natively. Until then a value is stored with one `curl`, and the API is the
 tested surface.
+
+**10i is done, and what it found is that the gap was never cosmetic.** Four things a person
+has to do had no screen at all: store a model key, store a secret, pick an issue and press
+Start, and watch a four-minute run. Each of them had a route — built, authorized, tested,
+deployed — and `curl` as its only client. `POST /api/runs` is milestone 10's entire thesis
+and nothing in the product called it; the SSE tail has been streaming since milestone 5 and
+nothing consumed it.
+
+**Two tests skip without a built bundle, and they hold the checks that only real Next output
+can give** — the landing page pre-rendered into `index.html`, and the CSP hashing against the
+flight data Next actually emits. `npm test` does not build; `npm run test:full` does, and is
+what a full-signal run means from 10i on. Both skips print what is missing by name, in the
+same words the missing-Chromium one uses, because "not built" and "broken" produce the same
+blank page and only one of them is a bug.
+
+What shipped: `web/` as a Next.js static export, seven screens, and the plane serving them
+from its own port (`src/static.ts`). `src/web.ts` — 1,390 lines — is deleted, and every route
+on the surface is now `/api/`.
+
+**Two defects it found in code that was already merged**: `run_projection.ended_at` is not
+always written, so keying "is this run over" on it put a live indicator and a *verdict not
+yet* chip on a run that had opened a pull request — the fold's `status` is the authority and
+is what the screens now ask; and this repository's `.dockerignore` matched `node_modules` at
+the root only, so a second npm project would have shipped its whole dependency tree into the
+build context.
+
+**And nine it found in its own, of which two are the interesting ones.**
+
+*The live view was dead.* `sse.ts` writes `event: <type>` on every frame — deliberately, so a
+consumer can subscribe per type — and `EventSource.onmessage` handles only the default
+`message` type. So the first version delivered nothing: an open connection, a clean console,
+and **0 events** for the whole of a run. Nothing here could have caught it. `sse.test.ts`
+proves the server's frames are right and they were; `screens.test.tsx` proves the timeline
+renders frames handed to it and it does; the defect lived in the two lines between, and only
+a browser with a log growing underneath it can see those. `test/dashboard.browser.test.ts`
+now has one.
+
+*Every sealed sandbox rendered as a security failure.* `SANDBOX_SEALED` carries
+`probe: { dns, route }`; the timeline read them at the top level, so `undefined === false`
+was false and the row said **"a probe inside it still found: DNS, a route"** — with a red ✗ —
+on every run of every repository. Four more payloads were read by the wrong field name.
+*Both tests covering that component passed*, because their fixtures were hand-written objects
+carrying the same guess the code made. **A fixture invented alongside the code it checks is
+not a check; it is the same guess written twice.** Every payload fixture is now typed as its
+real type from `src/events.ts`, which also gained a runtime `EVENT_TYPES` with two
+`Assert<>`s making it exhaustive against `EventPayload` in both directions — the dashboard
+keeps its own copy, and `test/screens.test.tsx` asserts the two are identical.
+
+The rest, briefly: the throttle on re-reading the fold could swallow the *final* refetch, so a
+finished run said "still going" for ever; pressing Start landed on "No such run", because the
+projection does not exist until a worker claims the job (`/api/runs/:id/evidence` now answers
+**202 queued** and the page polls); `/api/me` called GitHub on every page load to read one
+bit; a non-uuid run id was a 500 echoing the caller's own path back at them; `useJson`
+rendered the previous run's data under the new run's URL for a full round trip; one bad field
+blanked the entire application; and the 320px reflow, a dangling `aria-controls`, four
+destructive controls with no busy state and nowhere for focus to land, and a live view that
+announced nothing at all.
+
+**Two things about the suite are worth recording as process rather than as defects.** A slice
+taken to end-of-file deleted seven `readRunnerConfig` tests that have nothing to do with this
+milestone — the only coverage the two image defaults, the blob root and the substrate
+validation had. And `test/authz.test.ts`, 27 authorization tests and the largest such body in
+the repository, was left pointing at deleted routes rather than ported. Both were found by
+review, not by the suite: a deleted test file is silent by construction, and a red one is
+easy to read as somebody else's problem.
 
 Rough order: week 1 — 10a and 10g; weeks 2–3 — 10b, 10c, 10j, 10k; weeks 4–5 — 10d, 10i;
 week 6 — 10e, 10h; week 7 — 10f, 10l, 10m; week 8 — 10n and real runs on repositories the

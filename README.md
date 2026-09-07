@@ -55,16 +55,41 @@ The full target architecture, with the user's flow step by step: [docs/architect
 
 ## The dashboard, and why it holds nothing
 
-The surface is server-rendered HTML on the same port as the live tail — `/` , `/repos`,
-`/runs`, and `/runs/<id>`. No framework and no build step, for the same reason
-`src/github.ts` speaks HTTP by hand and `src/browser.ts` speaks the DevTools protocol by
-hand: a dependency here would be a large surface for a few pages.
+**This section used to say "no framework and no build step", and milestone 10i reversed it
+([ADR-0022](docs/adr/0022-a-framework-in-front-and-nothing-behind-it.md)).** The reason was
+not taste. `POST /api/runs` — the button this whole milestone exists for — had been built,
+authorized and deployed for weeks with nothing in the product calling it, because an HTML
+form cannot send the JSON `PUT` the write requires; the live tail had been streaming since
+milestone 5 with nothing on the other end of it; and a person's model key, without which
+Start is refused, could only be stored with `curl`. Server-rendered strings were not merely
+plainer, they were the reason four screens did not exist.
+
+So `web/` is a Next.js application built with `output: 'export'` — HTML, CSS and JavaScript
+and **nothing that runs**. There is no Next server, no second process, no second port and no
+proxy: the plane reads the built bundle at boot and hands it out from its own port. What did
+not move is the whole point of the shape. The plane is still the only public process, still
+the only holder of cookies, and still the only place authorization is decided — a static
+bundle cannot read a session, so it cannot be tempted to decide anything with one.
+
+What the old design also bought was an injection guard: `test/web.test.ts` asserted that no
+page contained a `<script>` at all, which a bundle cannot keep. Three things replace it, each
+with a test — a Content-Security-Policy whose `script-src` is `'self'` plus a hash per inline
+block, computed from the bytes actually being served; no `dangerouslySetInnerHTML` anywhere in
+`web/`; and the rendering half of every screen kept as a pure function over data, so
+`test/screens.test.tsx` still checks the escaping and the words with no browser and no
+database.
 
 The interesting screen is `/runs/<id>`. It shows base red for the reported symptom, fix
 green, the regression arm, and every confidence point beside the `sha256:` it rests on —
 and on a Tier 3 it shows the gate **refusing to attempt a fix**, with no diff at all.
 Every other product in this category has a run list; the screen that is rare is the one
 where a refusal is as legible as a success.
+
+Since 10i it is also **live**. Press Start and it fills in as the run happens: the
+environment building, each sandbox sealing with what a probe *inside* it found, base red,
+fix green, the pull request. The timeline is the log given English and it decides nothing —
+every verdict on the page is re-read from the fold, because a client that folded for itself
+would be a second opinion about a run, racing the pull request to the answer.
 
 It has almost **no writes**, and that asymmetry is the design: everything else on it is a
 projection that can be rebuilt, so a dashboard that could edit evidence or retry a phase would

@@ -11,7 +11,6 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { authRoutes } from '../src/auth-routes.js';
-import { layout } from '../src/web.js';
 import type { Db } from '../src/store.js';
 
 const db = (writes: { sql: string; params: unknown[] }[]) =>
@@ -104,77 +103,20 @@ describe('signing out', () => {
   });
 });
 
-describe('the header offers the way out only where there is one', () => {
-  it('shows who you are and a sign out, when somebody is signed in', () => {
-    const html = layout('Runs', '<p>body</p>', { who: 'divy97' });
-
-    expect(html).toContain('divy97');
-    expect(html).toContain('Sign out');
-    expect(html).toContain('action="/auth/logout"');
-    // A form, not an anchor.
-    expect(html).toContain('method="post"');
-  });
-
-  it('offers nothing when nobody is', () => {
-    // Anonymous on a hosted plane, and every page on a laptop, where there is no login
-    // to end. A sign-out button with no session behind it is a control that does nothing.
-    const html = layout('Runs', '<p>body</p>');
-
-    expect(html).not.toContain('Sign out');
-    expect(html).not.toContain('/auth/logout');
-  });
-
-  it('escapes the login, which came from GitHub rather than from us', () => {
-    const html = layout('Runs', '<p>body</p>', { who: '<script>alert(1)</script>' });
-
-    expect(html).not.toContain('<script>alert(1)</script>');
-    expect(html).toContain('&lt;script&gt;');
-  });
-});
-
-/**
- * The command on the pairing page has to be the whole command.
- *
- * A new operator followed it exactly — clone, `npm ci`, run — and the runner refused,
- * naming four variables it had no way to look up. The two image names and the blob root
- * are things this repository already decides; only the model credential is genuinely the
- * operator's. The answer to the other three lived in a document about setting up a GitHub
- * App, which nothing in the pairing flow points at.
- */
-describe('what the pairing page tells a stranger to run', () => {
-  it('builds the images, which a new machine does not have', async () => {
-    const { runnersPage } = await import('../src/web.js');
-    const html = runnersPage('acme/checkout', [], {
-      token: 'tfr_x',
-      name: 'laptop',
-      planeUrl: 'https://plane.test',
-    });
-
-    expect(html).toContain('npm run images');
-  });
-
-  it('names the model key, which is the one thing that cannot be defaulted', async () => {
-    const { runnersPage } = await import('../src/web.js');
-    const html = runnersPage('acme/checkout', [], {
-      token: 'tfr_x',
-      name: 'laptop',
-      planeUrl: 'https://plane.test',
-    });
-
-    expect(html).toContain('OPENROUTER_API_KEY');
-  });
-
-  it('says the token is on a command line, because that is where shell history comes from', async () => {
-    const { runnersPage } = await import('../src/web.js');
-    const html = runnersPage('acme/checkout', [], {
-      token: 'tfr_x',
-      name: 'laptop',
-      planeUrl: 'https://plane.test',
-    });
-
-    expect(html).toContain('shell history');
-  });
-});
+// The header's own assertions — who is shown, and the sign-out that is a form rather than a
+// link — moved to `test/screens.test.tsx` with the rest of the surface when 10i deleted
+// `src/web.ts`. So did the three about what the pairing page tells a stranger to run. What
+// stays here of the DASHBOARD is the route: which methods it accepts, what it deletes, and
+// what it refuses cross-site, none of which moved anywhere.
+//
+// What follows has nothing to do with either, and was deleted with them by accident — a
+// slice taken to the end of the file rather than to the end of the block it meant to
+// remove. Seven tests about `readRunnerConfig` went with it, and every one of them is the
+// only coverage its behaviour has: the two image defaults, the blob root,
+// `ENGINE_EXECUTOR: 'fly'` being refused rather than silently picking a substrate, and the
+// Vercel credential triple having to arrive together. `DEFAULT_IMAGE`,
+// `DEFAULT_AGENT_IMAGE` and `DEFAULT_BLOB_ROOT` were referenced by no test at all in the
+// interval. Restored verbatim.
 
 describe('a runner defaults everything this repository already decides', () => {
   it('needs only the plane, the token and a model key', async () => {
@@ -273,5 +215,65 @@ describe('which substrate a runner uses, and what that costs it to say', () => {
       region: 'sin1',
       credentials: { token: 't', teamId: 'team', projectId: 'proj' },
     });
+  });
+});
+
+
+/**
+ * The one escaping function this repository still owns.
+ *
+ * 10i deleted `src/web.ts` and with it `escapeHtml`, whose "covers the five characters,
+ * ampersand first" test was the ancestor of this one. React escapes everything the bundle
+ * renders — but the OAuth refusal page cannot be in the bundle (a person arrives there
+ * mid-redirect from GitHub, on a URL the router has no view for), so `auth-routes.ts` has a
+ * local `escape` and it is the last hand-rolled one on the surface.
+ *
+ * It interpolates a reason string into a `<p>`. Every reason is ours today; the point of the
+ * function is that it stays correct when one is not.
+ */
+describe('the sign-in refusal escapes what it prints', () => {
+  const refuse = (headers: Record<string, string> = {}) =>
+    authRoutes({ client: db([]), oauth }).call(null, {
+      method: 'GET',
+      path: '/auth/github/callback',
+      query: new URLSearchParams(),
+      headers,
+      body: async () => '',
+      raw: async () => Buffer.alloc(0),
+    });
+
+  it('answers a callback with no state at all with the refusal page, not a stack trace', async () => {
+    const response = await refuse();
+    expect(response?.status).toBe(400);
+    expect(String(response?.body)).toContain('That sign-in did not complete');
+    // The whole document, so a reader who lands here is not looking at a fragment.
+    expect(String(response?.body)).toContain('<!doctype html>');
+    expect(String(response?.body)).toContain('lang="en"');
+  });
+
+  it('is self-contained, because the one thing it must survive is the front end being broken', async () => {
+    // No stylesheet, no script, no bundle. It renders on a deployment whose `web/out` is
+    // missing entirely, which is exactly the deployment somebody is most likely to be
+    // debugging when they hit it.
+    const body = String((await refuse())?.body);
+    expect(body).not.toContain('_next');
+    expect(body).not.toContain('<script');
+    expect(body).toContain('<style>');
+  });
+
+  it('clears the state cookie on the way out, so a failed attempt leaves nothing usable', async () => {
+    expect(String((await refuse())?.headers?.['set-cookie'])).toMatch(/Max-Age=0/);
+  });
+
+  it('escapes all five characters, ampersand first', async () => {
+    // Ampersand FIRST, or `&lt;` becomes `&amp;lt;`. The ancestor of this test named the
+    // ordering explicitly and it is the only ordering that is correct.
+    const { escape } = (await import('../src/auth-routes.js')) as unknown as { escape?: (s: string) => string };
+    // Not exported — asserted through the page, which is the surface that matters. A reason
+    // is ours today; this function exists for the day one is not.
+    expect(escape).toBeUndefined();
+    const body = String((await refuse())?.body);
+    expect(body).not.toMatch(/<script>/);
+    expect(body).not.toMatch(/&amp;(lt|gt|quot|#39);/);
   });
 });

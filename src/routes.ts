@@ -35,23 +35,35 @@ import { sameOrigin, type Route } from './sse.js';
 import type { Session } from './auth.js';
 import { forgetRun, tombstoneFor } from './forget.js';
 import { enqueueJob, listRunners, openJobFor, pairRunner, revokeRunner } from './plane.js';
-import {
-  escapeHtml,
-  evidencePage,
-  landingPage,
-  onboardPage,
-  repositoriesPage,
-  runnersPage,
-  runsPage,
-  type Mode,
-} from './web.js';
+
+/**
+ * WHERE the engine runs, which changes what this surface may promise.
+ *
+ * `local` is `serve.ts`: one operator, containers on this machine, and installing a
+ * repository starts a drafting run that fills the recipe box for them.
+ *
+ * `plane` is the hosted control plane, which holds no model key and runs no containers by
+ * design (ADR-0011, ADR-0019) — work goes to a paired runner. Nothing drafts there yet, so
+ * a screen that offers "draft a recipe" is offering something that will not happen.
+ *
+ * Explicit rather than inferred from whether login is configured. Those are two different
+ * questions, and conflating them is exactly the bug the landing page had.
+ *
+ * It lived in `src/web.ts` until 10i, which deleted that file. It is not a rendering
+ * concern and never was: it is what a deployment can do, reported to the UI by `/api/me`.
+ */
+export type Mode = 'local' | 'plane';
 
 
-const html = (body: string, status = 200) => ({ status, type: 'text/html; charset=utf-8', body });
 const json = (body: unknown, status = 200) => ({
   status,
   type: 'application/json',
   body: JSON.stringify(body, null, 2),
+  // `nosniff`, and it is the one header this surface and `src/static.ts` disagreed about —
+  // on the surface that carries secret NAMES and repository data, which is the wrong way
+  // round. Not exploitable against a modern browser; it costs nothing and the alternative
+  // is two answers to "does this service set it" depending on which route you asked.
+  headers: { 'x-content-type-options': 'nosniff' } as Record<string, string>,
 });
 
 /**
@@ -148,6 +160,20 @@ export function dashboardRoutes(options: {
     return `${proto}://${host}`;
   };
 
+/**
+ * A run id, or nothing.
+ *
+ * `run_projection.run_id` is a `uuid` column, and Postgres refuses to compare one with
+ * anything else — so `/api/runs/zzz/evidence` threw, and `sse.ts` turned the throw into a
+ * **500 carrying the raw Postgres message**, which quotes the caller's own path segment
+ * back at them. `tailAuthorizer` has guarded exactly this since 10g, eight lines away in a
+ * sibling module; these routes did not.
+ *
+ * 404 is the right answer and the one every other "no such run" gives, so a stranger
+ * probing ids learns the same nothing either way.
+ */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
   const visible = async (
     headers: Record<string, string | string[] | undefined>,
   ): Promise<{ session: Session; repos: Set<string> } | null | 'anonymous'> => {
@@ -230,12 +256,70 @@ export function dashboardRoutes(options: {
       if (session) {
         return { status: 302, type: 'text/plain', body: 'signed in\n', headers: { location: '/repos' } };
       }
-      // The sign-in link exists only where signing in does. Locally there is no login —
-      // one operator, 127.0.0.1 — and offering one would be a button that leads nowhere.
-      return html(landingPage(install, { signIn: options.auth !== undefined }));
+      // Signed out: `null`, so the static bundle answers with the landing page (10i).
+      //
+      // The redirect above is the reason this route still exists at all now that the
+      // pages are a bundle. The bundle COULD make the same decision — it asks `/api/me`
+      // on load — but it would paint the landing page first and replace it a moment
+      // later, so every signed-in visitor to the front door would see a marketing page
+      // flash past. A 302 decided here, where the cookie already is, has no such moment.
+      return null;
     }
 
-    if (method === 'GET' && path === '/repos') {
+    // ── WHO IS ASKING (10i) ──────────────────────────────────────────────────────
+    //
+    // The one route that answers 200 for a stranger. Every other `/api/` GET 401s when
+    // nobody is signed in, and that is right for a route returning somebody's data — but
+    // this one exists to be asked BEFORE anything is known, by a page that has to decide
+    // whether to render an application or a way in. A 401 here would make "signed out",
+    // the ordinary state of a first visit, arrive as a failure.
+    //
+    // It exists at all because the UI is a static bundle (ADR-0022): there is no render
+    // on this side that could read the cookie and decide, so the decision the `/` route
+    // above makes server-side has to be askable over HTTP.
+    //
+    // Every field is about the DEPLOYMENT or the person, never about a repository. What
+    // this surface can promise differs between `serve.ts` and the plane — drafting,
+    // logins, an App to read issues with, injection — and a page that assumed the hosted
+    // answer would offer a local operator buttons that 501.
+    if (method === 'GET' && path === '/api/me') {
+      // `auth.session()`, NOT `visible()`, and it is the same distinction the `/` route
+      // records above — which this got wrong on the first write.
+      //
+      // `visible()` answers "what may you act on", which means asking GitHub
+      // `GET /user/installations` and querying `installations`. This route needs one bit:
+      // is there somebody. Every document the bundle serves asks this on load, so buying
+      // the full authorization answer here would put a GitHub round-trip on the most-hit
+      // route in the product — and would make the whole dashboard fail to render when
+      // GitHub is down, rather than failing only the pages that are actually about
+      // repositories.
+      const session = options.auth ? await options.auth.session(headers) : null;
+      // A surface with no accounts is the LOCAL one — one operator, no login — and it is
+      // signed in by construction. Collapsing that to `signedIn: false` would put a
+      // sign-in wall in front of a deployment that has no login to offer.
+      const signedIn = options.auth === undefined || session !== null;
+      return json({
+        accounts: options.auth !== undefined,
+        signedIn,
+        login: session?.login ?? null,
+        mode: options.mode ?? 'plane',
+        installUrl: install,
+        // Absent where there are no accounts, because there is nobody to bill: `serve.ts`
+        // spends the operator's own environment. `null` would read as "you have not set
+        // one", which is a prompt to visit a settings page that cannot store it.
+        modelKey: session ? await hasModelKey(client, session.githubId) : null,
+        secrets: { enabled: secretsEnabled() },
+        // Whether the issue picker and Start can work at all. Both 501 without an App,
+        // and a page that renders them anyway is a button whose only outcome is an error.
+        github: options.github !== undefined,
+        // Whether anything can destroy an artifact here (9e). The forget control is a
+        // 501 on a surface holding no blobs, and offering it there promises a deletion
+        // this deployment cannot perform.
+        forgetting: options.blobRoot !== undefined,
+      });
+    }
+
+    if (method === 'GET' && path === '/api/repos') {
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const installations = (await listInstallations(client)).filter(
@@ -249,10 +333,18 @@ export function dashboardRoutes(options: {
           runs: runs.filter((run) => run.repo === installation.repo).length,
         })),
       );
-      return html(repositoriesPage(rows, chrome(who)));
+      return json(
+        rows.map(({ installation, hasRecipe, runs: count }) => ({
+          repo: installation.repo,
+          account: installation.account,
+          connectedAt: installation.connectedAt,
+          onboarded: hasRecipe,
+          runs: count,
+        })),
+      );
     }
 
-    if (method === 'GET' && (path === '/runs' || path === '/api/runs')) {
+    if (method === 'GET' && path === '/api/runs') {
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const repo = query.get('repo') ?? undefined;
@@ -261,52 +353,94 @@ export function dashboardRoutes(options: {
       const runs = (await listRuns(client, repo)).filter(
         (run) => who === null || who.repos.has(run.repo),
       );
-      return path === '/api/runs' ? json(runs) : html(runsPage(runs, repo, chrome(who)));
+      return json(runs);
     }
 
-    const run = /^\/runs\/([^/]+)$/.exec(path);
-    if (method === 'GET' && run) {
-      const runId = decodeURIComponent(run[1]!);
+    // ── THE LOG, READ RATHER THAN TAILED (10i) ───────────────────────────────────
+    //
+    // `GET /runs/:id/events` is the SSE tail (ADR-0005) and stays exactly what it is. This
+    // is the same rows for a run that has ALREADY ENDED, and it exists because the tail is
+    // the wrong tool for one: `tailRun` polls `seq > $2` every 250ms for as long as the
+    // client is connected, and the dashboard passes no `until`, so an evidence page left
+    // open in a tab would poll a log that cannot gain another row, four times a second,
+    // forever.
+    //
+    // So the page streams a live run and reads a finished one. Same authorization as the
+    // evidence view — deciding it twice is how the two come to disagree.
+    const log = /^\/api\/runs\/([^/]+)\/events$/.exec(path);
+    if (method === 'GET' && log) {
+      const runId = decodeURIComponent(log[1]!);
+      if (!UUID.test(runId)) return json({ error: 'no such run' }, 404);
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, runId);
+      if (!row || (who !== null && !who.repos.has(row.repo))) return json({ error: 'no such run' }, 404);
+      return json(await readRun(client, runId));
+    }
+
+    const run = /^\/api\/runs\/([^/]+)\/evidence$/.exec(path);
+    if (method === 'GET' && run) {
+      const runId = decodeURIComponent(run[1]!);
+      if (!UUID.test(runId)) return json({ error: 'no such run' }, 404);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      const row = await readRunRow(client, runId);
+      if (!row) {
+        // QUEUED, not missing — and the difference is the first thing a person sees after
+        // pressing Start. `enqueueJob` writes a row to `jobs` and nothing else; the log's
+        // first event, and therefore the projection, comes from the worker that claims it
+        // (ADR-0019). For the seconds between, `run_projection` has nothing, and answering
+        // 404 sent everybody who used the button straight to "No such run" — a dead end,
+        // with no retry, for a run that was about to start perfectly normally.
+        //
+        // Authorized the way everything else here is: the job carries the repository, and a
+        // caller who may not see it gets the ordinary 404.
+        const { rows } = await client.query(
+          'select repo, issue_number from jobs where run_id = $1',
+          [runId],
+        );
+        const job = rows[0] as { repo: string; issue_number: number | null } | undefined;
+        if (!job || (who !== null && !who.repos.has(job.repo))) return json({ error: 'no such run' }, 404);
+        // 202: the request is fine and the thing is not ready yet. The page polls this and
+        // says a worker has not claimed it, which is true and is what is happening.
+        return json({ queued: true, repo: job.repo, issue_number: job.issue_number }, 202);
+      }
       // The same answer for "no such run" and "not yours". A run id is a uuid, so this
       // costs a legitimate user nothing and tells a stranger nothing about what exists.
-      if (!row || (who !== null && !who.repos.has(row.repo))) {
-        return html(`<!doctype html><title>not found</title><p>No such run.</p>`, 404);
-      }
-      // The page is rendered from the LOG, not from the row. The row is a cache and says
-      // so; an evidence view built from a cache would be evidence at one remove, which is
-      // the one thing this screen cannot be.
+      if (who !== null && !who.repos.has(row.repo)) return json({ error: 'no such run' }, 404);
+      // The view is built from the LOG, not from the row. The row is a cache and says so;
+      // an evidence view built from a cache would be evidence at one remove, which is the
+      // one thing this screen cannot be.
       const events = await readRun(client, runId);
       const state = fold(events);
-      return html(
-        evidencePage({
-          row,
-          state,
-          score: confidence(state),
-          usage: await readUsage(client, runId),
-          compute: await readCompute(client, runId),
-          forgotten: await tombstoneFor(client, runId),
-        }),
-      );
+      const view = {
+        row,
+        state,
+        score: confidence(state),
+        usage: await readUsage(client, runId),
+        compute: await readCompute(client, runId),
+        forgotten: await tombstoneFor(client, runId),
+      };
+      // The FOLD on the wire, not the events. A client that folded for itself would be a
+      // second implementation of what happened, free to disagree with `report.ts` and the
+      // pull request about whether a run reproduced — which is the mistake ADR-0009 is
+      // about and which this codebase has made twice. The tail streams raw events for
+      // liveness; the verdict has one author.
+      return json(view);
     }
 
     // FORGETTING (9e). A POST, behind the same origin check every write here gets, and
     // behind the same authorization the run's own page gets — deleting somebody's
     // evidence is not a lesser thing to be allowed to do than reading it.
-    const forgetting = /^\/runs\/([^/]+)\/forget$/.exec(path);
+    const forgetting = /^\/api\/runs\/([^/]+)\/forget$/.exec(path);
     if (method === 'POST' && forgetting) {
       const runId = decodeURIComponent(forgetting[1]!);
+      if (!UUID.test(runId)) return json({ error: 'no such run' }, 404);
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
       const row = await readRunRow(client, runId);
-      if (!row || (who !== null && !who.repos.has(row.repo))) {
-        return html(`<!doctype html><title>not found</title><p>No such run.</p>`, 404);
-      }
-      if (!options.blobRoot) {
-        return html(`<!doctype html><title>not here</title><p>This surface stores no artifacts.</p>`, 501);
-      }
+      if (!row || (who !== null && !who.repos.has(row.repo))) return json({ error: 'no such run' }, 404);
+      if (!options.blobRoot) return json({ error: 'this surface stores no artifacts' }, 501);
       await forgetRun(client, {
         runId,
         // Named, because "who asked" is the only part of a deletion anybody can audit
@@ -314,12 +448,11 @@ export function dashboardRoutes(options: {
         requestedBy: who === null ? 'the local operator' : who.session.login,
         blobRoot: options.blobRoot,
       });
-      return {
-        status: 303,
-        type: 'text/plain',
-        body: 'forgotten\n',
-        headers: { location: `/runs/${encodeURIComponent(runId)}` },
-      };
+      // The count, because it is the only thing about a deletion anybody can check
+      // afterwards — the bytes are gone by definition, and `requestedBy` above is the
+      // only other part of it that survives.
+      const tombstone = await tombstoneFor(client, runId);
+      return json({ forgotten: true, removed: tombstone?.removed ?? 0 });
     }
 
     // ── SECRETS (M10, ADR-0017) ──────────────────────────────────────────────────
@@ -441,6 +574,168 @@ export function dashboardRoutes(options: {
       return json(await listOpenIssues(options.github, token, repo, page));
     }
 
+    // ── RUNNERS, AS JSON (10i) ───────────────────────────────────────────────────
+    //
+    // The screen `runnersPage` rendered, for a UI that is not a form. Pairing is the
+    // interesting one: the token exists in exactly one response and can never be shown
+    // again, which is why the HTML version RENDERED rather than redirected. A JSON
+    // answer carries it the same way and is the more honest shape for it — there is no
+    // page here that could be mistaken for somewhere to find it later.
+    //
+    // Behind the same origin check and the same authorization as every write on this
+    // surface. A pairing token is a credential for a machine that will execute somebody's
+    // recipe, so `may you see this repository` is asked by GitHub first, as always.
+    const apiRunners = /^\/api\/repos\/(.+?)\/runners(?:\/([^/]+)\/revoke)?$/.exec(path);
+    if (apiRunners && (method === 'GET' || method === 'POST')) {
+      const repo = decodeURIComponent(apiRunners[1]!);
+      const revoke = apiRunners[2] === undefined ? null : decodeURIComponent(apiRunners[2]);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
+      const installation = await loadInstallation(client, repo);
+      if (!installation) return json({ error: 'not connected' }, 404);
+
+      if (revoke !== null) {
+        if (method !== 'POST') return json({ error: 'POST to revoke' }, 405);
+        // The INSTALLATION, not just the repository in the path. Authorizing the repo and
+        // then trusting the id from the URL let anyone with access to any repository
+        // revoke somebody else's machine — the bug the HTML route records above.
+        return (await revokeRunner(client, revoke, installation.installationId))
+          ? json({ revoked: revoke })
+          : json({ error: 'no such runner' }, 404);
+      }
+      if (method === 'GET') {
+        return json({
+          runners: await listRunners(client, installation.installationId),
+          // The URL the operator is READING this on, which is the one their runner has to
+          // dial. The HTML page printed the literal string `<this service>` here once,
+          // served from the host it should have been naming.
+          planeUrl: origin(headers),
+        });
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await body());
+      } catch {
+        return json({ error: 'the body is not JSON' }, 400);
+      }
+      const name = typeof (parsed as { name?: unknown } | null)?.name === 'string'
+        ? (parsed as { name: string }).name.trim()
+        : '';
+      if (!name) return json({ error: 'send { "name": "…" }' }, 400);
+      const { token, runner } = await pairRunner(client, {
+        installationId: installation.installationId,
+        name,
+      });
+      // ONCE. Nothing stores this in a form we can read back, and no route returns it
+      // again — the same property the secrets routes have, arrived at from the other
+      // direction: there, a value goes in and never comes out; here, one comes out and
+      // is never asked for.
+      return json({ paired: runner, token, planeUrl: origin(headers) }, 201);
+    }
+
+    // ── APPROVING A RECIPE, AS JSON (10i) ────────────────────────────────────────
+    //
+    // The same write the form below performs, and deliberately not a second one: it
+    // parses with `parseRecipe`, stores with `saveRecipe`, clears the draft and fires
+    // `onApproved`, in that order and for the reasons recorded there. What differs is
+    // only the envelope — a `PUT` with a JSON body, which is what a page that is not a
+    // form can send.
+    //
+    // Everything ADR-0013 says about the form applies here unchanged. This stores shell
+    // commands the engine later executes verbatim in a sandbox with a package registry
+    // reachable, and nothing sandboxes them from that sandbox. The controls that make
+    // that acceptable are the origin check at the top of this function and the human who
+    // pressed the button; neither is weakened by the content type, and a JSON route that
+    // skipped either would be the same decision with the control removed.
+    //
+    // BEFORE the catch-all below, whose `(.+)` would otherwise swallow `…/recipe` and
+    // answer a repository named `acme/widgets/recipe` does not exist.
+    const recipeRoute = /^\/api\/repos\/(.+)\/recipe$/.exec(path);
+    if (recipeRoute && (method === 'PUT' || method === 'GET')) {
+      const repo = decodeURIComponent(recipeRoute[1]!);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
+      if (!(await loadInstallation(client, repo))) return json({ error: 'not connected' }, 404);
+      if (method === 'GET') return json({ recipe: await loadRecipe(client, repo) });
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await body());
+      } catch {
+        return json({ error: 'the body is not JSON' }, 400);
+      }
+      // `{ recipe: … }` rather than the recipe at the top level, so this body has room to
+      // gain a field — and so `null` and `42`, both of which parse, cannot reach
+      // `parseRecipe` as a recipe-shaped thing they are not.
+      const asked = (parsed ?? {}) as { recipe?: unknown };
+      try {
+        const draft = parseRecipe(asked.recipe);
+        await saveRecipe(client, repo, draft);
+        await clearDraft(client, repo).catch(() => {});
+        options.onApproved?.(repo);
+        // The timestamp, because it is the only thing that distinguishes a click that
+        // stored something from a click that changed nothing — the gap `onboardPage`
+        // records as having convinced the first person to use it that the button was
+        // broken, while an empty recipe had in fact been approved for real.
+        return json({ approved: true, approvedAt: (await loadStored(client, repo))?.approvedAt ?? null });
+      } catch (error) {
+        // 400 with the message, never swallowed, and the framing is the page's: what
+        // failed is the document, not the project. `parseRecipe` validates shape and
+        // nothing about what the commands do, and a refusal presented as a finding about
+        // somebody's repository is the one presentation ADR-0007's amendment forbids.
+        return json({ error: String((error as Error).message ?? error) }, 400);
+      }
+    }
+
+    // ── ONE REPOSITORY (10i) ─────────────────────────────────────────────────────
+    //
+    // LAST of the `/api/repos/` routes, and the order is load-bearing rather than tidy.
+    // `owner/name` contains a slash, so this pattern's `(.+)` matches
+    // `acme/widgets/secrets` and `acme/widgets/issues` just as happily as the repository
+    // itself. The specific routes are above and have already returned by the time this
+    // is reached; moving it up would shadow the secrets write — the highest-privilege
+    // route on this surface — with a read that answers 200.
+    //
+    // Everything the repository's screen needs, in one answer. Four round trips to draw
+    // one page is four chances to render a recipe beside a proof of a different one.
+    const repoDetail = /^\/api\/repos\/(.+)$/.exec(path);
+    if (method === 'GET' && repoDetail) {
+      const repo = decodeURIComponent(repoDetail[1]!);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      // The same 404 and the same words the issue picker and the secrets routes give,
+      // for the same reason: a stranger probing names learns nothing about which
+      // repositories this service knows.
+      if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
+      const installation = await loadInstallation(client, repo);
+      if (!installation) return json({ error: 'not connected' }, 404);
+      const [recipe, stored, draft, names, runs] = await Promise.all([
+        loadRecipe(client, repo),
+        loadStored(client, repo),
+        loadDraft(client, repo),
+        listRepoSecretNames(client, repo),
+        listRuns(client, repo),
+      ]);
+      return json({
+        repo,
+        account: installation.account,
+        connectedAt: installation.connectedAt,
+        onboarded: recipe !== null,
+        recipe,
+        approvedAt: stored?.approvedAt ?? null,
+        proof: stored?.proof ?? null,
+        // Sent beside the recipe rather than merged into it, and the consumer decides.
+        // `onboardPage` documents the rule — an approved recipe wins outright, because a
+        // draft beside the one in force reads as a live second proposal — and deciding it
+        // here would put that rule in two places.
+        draft: draft?.draft ?? null,
+        secrets: { names, enabled: secretsEnabled() },
+        runs,
+      });
+    }
+
     // THE BUTTON (M10). Starting a run is a write to `jobs`: dispatch, not the log. The
     // worker that claims the job writes `RUN_REQUESTED` as seq 1, exactly as it did when
     // a webhook delivery put the job there, so the plane still produces nothing
@@ -528,156 +823,24 @@ export function dashboardRoutes(options: {
     if (method === 'GET' && api) {
       const who = await visible(headers);
       if (who === 'anonymous') return anonymous(path);
-      const row = await readRunRow(client, decodeURIComponent(api[1]!));
+      const runId = decodeURIComponent(api[1]!);
+      if (!UUID.test(runId)) return json({ error: 'no such run' }, 404);
+      const row = await readRunRow(client, runId);
       return row && (who === null || who.repos.has(row.repo))
         ? json(row)
         : json({ error: 'no such run' }, 404);
     }
 
-    // RUNNERS (9c). The pairing token is minted here, and it is minted *because* a human
-    // is authenticated: one login for a person, one credential for a machine, and the
-    // second is a consequence of the first rather than a second thing to remember.
-    const runners = /^\/repos\/(.+)\/runners$/.exec(path);
-    const revoking = /^\/repos\/(.+)\/runners\/([^/]+)\/revoke$/.exec(path);
-    if (runners || revoking) {
-      const repo = decodeURIComponent((revoking ?? runners)![1]!);
-      const who = await visible(headers);
-      if (who === 'anonymous') return anonymous(path);
-      if (who !== null && !who.repos.has(repo)) {
-        return html(`<!doctype html><title>not connected</title><p>${escapeHtml(repo)} is not connected.</p>`, 404);
-      }
-      const installation = await loadInstallation(client, repo);
-      if (!installation) {
-        return html(`<!doctype html><title>not connected</title><p>${escapeHtml(repo)} is not connected.</p>`, 404);
-      }
-
-      if (method === 'POST' && revoking) {
-        // The installation, not just the repository in the path. Authorizing the repo
-        // and then trusting the runner id from the URL let anyone with access to ANY
-        // repository revoke somebody else's runner — the id was never checked against
-        // the installation being viewed. `revokeRunner` now requires the installation
-        // and updates nothing on a mismatch.
-        const revoked = await revokeRunner(
-          client,
-          decodeURIComponent(revoking[2]!),
-          installation.installationId,
-        );
-        if (!revoked) {
-          // The same answer a runner that does not exist gets. A revoke that quietly
-          // reported success for somebody else's machine would be the bug wearing a
-          // redirect.
-          return html(`<!doctype html><title>not found</title><p>No such runner.</p>`, 404);
-        }
-        return {
-          status: 303,
-          type: 'text/plain',
-          body: 'revoked\n',
-          headers: { location: `/repos/${encodeURIComponent(repo)}/runners` },
-        };
-      }
-
-      if (method === 'POST' && runners) {
-        const name = new URLSearchParams(await body()).get('name')?.trim();
-        if (!name) return html(runnersPage(repo, await listRunners(client, installation.installationId), undefined, chrome(who)), 400);
-        const { token } = await pairRunner(client, { installationId: installation.installationId, name });
-        // Rendered rather than redirected, because the token exists in exactly one
-        // response and a 303 would throw it away on the way to the page that cannot
-        // show it again.
-        return html(
-          runnersPage(repo, await listRunners(client, installation.installationId), {
-            token,
-            name,
-            // The URL the operator is READING this on, which is the one their runner has
-            // to dial. It used to print the literal string `<this service>`, on a page
-            // served from the host it should have been naming.
-            planeUrl: origin(headers),
-          }, chrome(who)),
-        );
-      }
-
-      if (method === 'GET' && runners) {
-        return html(runnersPage(repo, await listRunners(client, installation.installationId), undefined, chrome(who)));
-      }
-    }
-
-    // ONBOARDING. `owner/repo` has a slash in it, so the repo is the rest of the path.
-    const onboard = /^\/repos\/(.+)\/onboard$/.exec(path);
-    // GET or POST, named rather than left to the allowlist above. That allowlist gained
-    // `PUT` and `DELETE` for the secrets routes, and this block has no method check of its
-    // own — so without this line a `PUT` fell straight into "THE ONE WRITE" below and
-    // stored shell commands the engine executes verbatim, and a `DELETE` rendered a 400
-    // onboarding page. Neither was reachable cross-site (the origin check still applies),
-    // and both were a second door onto the highest-privilege write in this surface, added
-    // as a side effect of an unrelated change.
-    if (onboard && (method === 'GET' || method === 'POST')) {
-      const repo = decodeURIComponent(onboard[1]!);
-      // BEFORE the installation lookup, and before the body is read. This is the write
-      // that stores commands the engine executes verbatim, so the question "may you"
-      // comes first and is answered by GitHub, not by us (ADR-0013, ADR-0019).
-      const who = await visible(headers);
-      if (who === 'anonymous') return anonymous(path);
-      if (who !== null && !who.repos.has(repo)) {
-        // 404 rather than 403: a stranger probing repository names learns nothing about
-        // which ones this service knows.
-        return html(`<!doctype html><title>not connected</title><p>${escapeHtml(repo)} is not connected.</p>`, 404);
-      }
-      const installation = await loadInstallation(client, repo);
-      if (!installation) {
-        // ESCAPED. `repo` is a path segment, so this string is whatever a stranger put
-        // in a URL — interpolating it raw was a stored-nothing, reflected-everything XSS.
-        return html(`<!doctype html><title>not connected</title><p>${escapeHtml(repo)} is not connected.</p>`, 404);
-      }
-
-      if (method === 'GET') {
-        // `loadDraft` even when a recipe already exists: `onboardPage` is the one that
-        // decides `current` wins, and computing that here would be a second copy of a
-        // rule that already lives in one place.
-        const [recipe, draft, stored, names] = await Promise.all([
-          loadRecipe(client, repo),
-          loadDraft(client, repo),
-          loadStored(client, repo),
-          listRepoSecretNames(client, repo),
-        ]);
-        return html(
-          onboardPage(repo, recipe, draft?.draft, undefined, stored, chrome(who), {
-            names,
-            enabled: secretsEnabled(),
-          }),
-        );
-      }
-
-      // THE ONE WRITE. A human is approving commands the engine will execute verbatim in
-      // a sandbox with a package registry reachable, and nothing sandboxes them from that
-      // sandbox — the approval IS the control (ADR-0013), which is why this is a POST a
-      // person makes and not something a drafting agent can complete on its own.
-      const raw = await body();
-      try {
-        const draft = parseRecipe(JSON.parse(new URLSearchParams(raw).get('recipe') ?? ''));
-        await saveRecipe(client, repo, draft);
-        // Best-effort, and after the write it can never invalidate: the draft row is
-        // advisory (`recipe_drafts`'s own comment says losing it costs nothing but a
-        // re-draft), so a failure here must not turn a successful approval into an error
-        // response. Cleared rather than left behind because a stale draft shown beside the
-        // recipe now actually in force reads as a second, live proposal.
-        await clearDraft(client, repo).catch(() => {});
-        // AFTER the write, never before: proving is about the commands now in force,
-        // and a proof of something that failed to store would be a proof of nothing.
-        options.onApproved?.(repo);
-        // 303 with a Location, so a refresh re-renders the recipe rather than re-posting
-        // it. Without the header this was a status code pretending to be a redirect.
-        return {
-          status: 303,
-          type: 'text/plain',
-          body: 'stored\n',
-          headers: { location: `/repos/${encodeURIComponent(repo)}/onboard` },
-        };
-      } catch (error) {
-        // Rendered back with the message, never swallowed: `parseRecipe` refuses a shape
-        // that would fail later inside a container, where it reads as the user's project
-        // being broken rather than as their recipe being wrong.
-        return html(onboardPage(repo, null, undefined, String((error as Error).message ?? error)), 400);
-      }
-    }
+    // The HTML surface that used to live here — the landing page, the repository list, the
+    // run list, the evidence page, the onboarding form, the runners form — is gone (10i).
+    // Every one of them is now a screen in `web/`, drawn from the JSON above and served as
+    // a static bundle by `src/static.ts`. `src/web.ts` is deleted; ADR-0022 records the
+    // reversal of the README's no-framework decision and what did not move with it.
+    //
+    // What that means for this function: EVERY route here is now `/api/`, and the
+    // `anonymous()` helper's non-API branch is unreachable. It is kept anyway, because the
+    // day a non-API route comes back is the day somebody wants a redirect rather than a
+    // 401 for it, and rediscovering that is worse than carrying four lines.
 
     return null;
   };

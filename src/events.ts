@@ -500,6 +500,49 @@ export type EventPayload =
   | { type: 'PR_OPENED'; payload: PrOpenedV1 }
   | { type: 'RUN_ENDED'; payload: RunEndedV1 };
 
+/**
+ * The same sixteen names, at RUNTIME (10i).
+ *
+ * The union above is erased, and there is now a consumer that needs the list to exist at
+ * run time: `EventSource` has no wildcard. `formatEvent` writes `event: <type>` on every
+ * frame — deliberately, so a consumer can subscribe per type — and the consequence is that
+ * `onmessage` never fires for any of them, because `onmessage` handles only the default
+ * `message` type. A browser must `addEventListener` for each name it wants.
+ *
+ * That is exactly the bug this constant exists to stop recurring: the dashboard's live view
+ * shipped once with `onmessage` and showed *0 events* for the whole of a run, silently and
+ * with a clean console.
+ *
+ * The two assertions below make the list exhaustive in both directions at compile time — a
+ * type added to the union and not to this array is an error, and so is the reverse. The
+ * dashboard keeps its own copy (it is a separate bundle and cannot import this module), and
+ * `test/screens.test.tsx` asserts the two are identical.
+ */
+export const EVENT_TYPES = [
+  'RUN_REQUESTED',
+  'REPRO_REGISTERED',
+  'SANDBOX_CREATED',
+  'ENV_BUILT',
+  'SANDBOX_SEALED',
+  'ATTEMPT_STARTED',
+  'ENV_READY',
+  'AGENT_MESSAGE',
+  'AGENT_FINISHED',
+  'AGENT_HANDED_OVER',
+  'TEST_RUN',
+  'SUITE_RUN',
+  'FIX_DIFF_OBSERVED',
+  'VERIFICATION_ABORTED',
+  'PR_OPENED',
+  'RUN_ENDED',
+] as const;
+
+type Assert<T extends true> = T;
+/** Every type in the union is in the array. */
+type _NoneMissing = Assert<EventPayload['type'] extends (typeof EVENT_TYPES)[number] ? true : false>;
+/** And nothing in the array is not a type. */
+type _NoneInvented = Assert<(typeof EVENT_TYPES)[number] extends EventPayload['type'] ? true : false>;
+
 /** One row of the events table: envelope + typed payload. */
 export type RunEvent = EventPayload & {
   run_id: string;

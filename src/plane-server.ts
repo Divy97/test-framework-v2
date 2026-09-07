@@ -16,12 +16,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureBlobRoot } from './blobs.js';
 import { authRoutes } from './auth-routes.js';
+import { staticRoutes } from './static.js';
 import { installationsFor, readSession, cookieValue, type OAuthConfig, type Session } from './auth.js';
 import { webhookRoute, WEBHOOK_PATH, installationToken, type GitHubApp, type Intake } from './github.js';
 import { forgetInstallation, reconcileInstallation } from './installations.js';
 import { dashboardRoutes } from './routes.js';
 import { runnerRoutes } from './runner-api.js';
-import { startStatusServer, type Route } from './sse.js';
+import { chain, startStatusServer } from './sse.js';
 import { loadEnv, connect, readRunAfter, type Db, ready, close } from './store.js';
 
 export type PlaneConfig = {
@@ -65,22 +66,6 @@ async function applySchema(client: Db): Promise<void> {
   const sql = await readFile(join(here, '..', 'db', 'schema.sql'), 'utf8');
   await client.query(sql);
 }
-
-/**
- * Try each route in turn; the first that answers wins.
- *
- * `null` already means "not mine" in this contract, so composition is free and no route
- * has to know what else is mounted.
- */
-export const chain =
-  (...routes: Route[]): Route =>
-  async (request) => {
-    for (const route of routes) {
-      const answer = await route(request);
-      if (answer) return answer;
-    }
-    return null;
-  };
 
 /**
  * What the plane does with a delivery (M6a, M10).
@@ -227,6 +212,12 @@ export async function startPlane(config: PlaneConfig): Promise<{
         // The plane holds the App key, so it is the surface that may read issues (M10).
         github: { token: mint },
       }),
+      // LAST, and it is the only route here that answers a path it was not given (10i).
+      // Every page in the product is one document out of `web/`'s static export, and this
+      // hands it out — but only after everything above has declined, because it treats an
+      // unmatched page path as "the dashboard, which will decide". A route added below this
+      // one would never be reached.
+      staticRoutes(),
     ),
   });
 

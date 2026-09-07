@@ -223,13 +223,14 @@ describe('approving a recipe proves the repository (8f)', () => {
     provedAt: 'T',
   };
 
+  // A `PUT` with a JSON body since 10i. The same `parseRecipe`, the same `saveRecipe`, the
+  // same `onApproved` in the same order — only the envelope moved, because the form route
+  // went with `src/web.ts`.
   const approve = (port: number) =>
-    fetch(`http://127.0.0.1:${port}/repos/o/r/onboard`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        recipe: JSON.stringify({ install: 'npm ci', services: [], test: 'npm test' }),
-      }).toString(),
+    fetch(`http://127.0.0.1:${port}/api/repos/o%2Fr/recipe`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ recipe: { install: 'npm ci', services: [], test: 'npm test' } }),
       redirect: 'manual',
     });
 
@@ -252,7 +253,7 @@ describe('approving a recipe proves the repository (8f)', () => {
     });
     services.push(service);
 
-    expect((await approve(service.eventsPort)).status).toBe(303);
+    expect((await approve(service.eventsPort)).status).toBe(200);
 
     // Fired, not awaited — the human who pressed approve gets their page back
     // immediately, and this lands afterwards.
@@ -286,7 +287,7 @@ describe('approving a recipe proves the repository (8f)', () => {
     });
     services.push(service);
 
-    expect((await approve(service.eventsPort)).status).toBe(303);
+    expect((await approve(service.eventsPort)).status).toBe(200);
     await vi.waitFor(() => expect(logs.join('\n')).toContain('could not be proved'));
     expect(logs.join('\n')).toContain('the daemon went away');
 

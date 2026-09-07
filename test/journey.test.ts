@@ -6,9 +6,17 @@
 // like" is a sequence a person walks through, and a suite made entirely of unit tests can
 // have every one of them green while the path between them is broken.
 //
-// Real Postgres, real HTTP, real HMAC, real routes, real HTML. The one fake is the run
-// itself: `runFromIssue` costs containers and a model, and `test/run.test.ts` already
-// drives it end to end. What is under test here is the wiring around it.
+// Real Postgres, real HTTP, real HMAC, real routes. The one fake is the run itself:
+// `runFromIssue` costs containers and a model, and `test/run.test.ts` already drives it end
+// to end. What is under test here is the wiring around it.
+//
+// SINCE 10i, "real HTML" is gone from that list and the steps below say why. The dashboard
+// is a static bundle, so a `GET /repos` returns one document that is the same for every
+// path — asserting on its bytes would assert on the shell rather than on the product. The
+// journey therefore walks the JSON the bundle is drawn from, which is the same wiring seen
+// one layer down: the same routes, the same authorization, the same fold. What the SCREENS
+// say about it is `test/screens.test.tsx`; that they arrive and render is
+// `test/dashboard.browser.test.ts`.
 
 import { createHmac, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -183,11 +191,18 @@ describe.sequential('a repository from install to evidence', () => {
 
   it('3. the repository shows as not onboarded on the dashboard', async () => {
     if (!ready) return;
-    const html = await (await page('/repos')).text();
-    expect(html).toContain(REPO);
-    expect(html).toMatch(/not onboarded yet/i);
-    // Per-segment encoding, so the slash survives: `/repos/owner/repo/onboard`.
-    expect(html).toContain(`/repos/${REPO}/onboard`);
+    const rows = (await (await page('/api/repos')).json()) as { repo: string; onboarded: boolean }[];
+    const row = rows.find((one) => one.repo === REPO);
+    // The row's most important column: a run against a repository with no recipe boots
+    // nothing and reports a bug that was never shown.
+    expect(row?.onboarded).toBe(false);
+
+    // And the document served for that path is the application, not a 404 — the half of
+    // this step that is still about HTML, and the only half a bundle can answer.
+    const shell = await page('/repos');
+    expect(shell.status).toBe(200);
+    expect(shell.headers.get('content-type')).toMatch(/text\/html/);
+    expect(shell.headers.get('content-security-policy')).toMatch(/script-src 'self'/);
   });
 
   it('4. approving a recipe is a human POST, and it is the only write there is', async () => {
@@ -195,18 +210,17 @@ describe.sequential('a repository from install to evidence', () => {
     // ADR-0013: the approval is the only control on a stored command we will execute
     // verbatim, in a sandbox, with a registry reachable. So it is a form a person
     // submits — not something the drafting agent can complete on its own.
-    const form = await (await page(`/repos/${REPO}/onboard`)).text();
-    expect(form).toMatch(/verbatim/);
-    expect(form).toContain('<textarea');
-
+    // A `PUT` with a JSON body since 10i — the envelope changed, the control did not. What
+    // the screen SAYS about it ("verbatim", "you are the control") is asserted where the
+    // screen lives, in `test/screens.test.tsx`.
     const recipe = { install: 'npm ci', services: [], test: 'npm test' };
-    const response = await page(`/repos/${REPO}/onboard`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ recipe: JSON.stringify(recipe) }).toString(),
+    const response = await page(`/api/repos/${encodeURIComponent(REPO)}/recipe`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ recipe }),
       redirect: 'manual',
     });
-    expect(response.status).toBe(303);
+    expect(response.status).toBe(200);
     expect(await loadRecipe(client!, REPO)).toMatchObject({ install: 'npm ci' });
   });
 
@@ -214,13 +228,15 @@ describe.sequential('a repository from install to evidence', () => {
     if (!ready) return;
     // `parseRecipe` refuses a shape that would otherwise fail inside a container, where
     // it reads as the user's project being broken rather than their recipe being wrong.
-    const response = await page(`/repos/${REPO}/onboard`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ recipe: '{"services":[{"name":"WEB","command":"x","port":1}]}' }).toString(),
+    const response = await page(`/api/repos/${encodeURIComponent(REPO)}/recipe`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ recipe: { services: [{ name: 'WEB', command: 'x', port: 1 }] } }),
     });
     expect(response.status).toBe(400);
-    expect(await response.text()).toMatch(/lowercase name/);
+    // Its OWN reason, carried through rather than flattened into "that failed" — the refusal
+    // is about the document, and a reader has to be able to fix it.
+    expect(((await response.json()) as { error: string }).error).toMatch(/lowercase name/);
     // And the good recipe from step 4 survived the bad submission.
     expect(await loadRecipe(client!, REPO)).toMatchObject({ install: 'npm ci' });
   });
@@ -254,14 +270,26 @@ describe.sequential('a repository from install to evidence', () => {
     const row = await readRunRow(client!, runId);
     expect(row).toMatchObject({ repo: REPO, issue_number: 2, tier: 3 });
 
-    const list = await (await page(`/runs?repo=${encodeURIComponent(REPO)}`)).text();
-    expect(list).toContain(runId);
+    const list = (await (await page(`/api/runs?repo=${encodeURIComponent(REPO)}`)).json()) as {
+      run_id: string;
+    }[];
+    expect(list.map((one) => one.run_id)).toContain(runId);
 
-    const evidence = await (await page(`/runs/${runId}`)).text();
-    // A Tier 3 must VISIBLY refuse rather than quietly show an empty page — the gate
-    // holding is the credibility of every verdict the system does issue.
-    expect(evidence).toMatch(/no fix was attempted/i);
-    expect(evidence).not.toContain('<h2>The diff</h2>');
+    const evidence = (await (await page(`/api/runs/${runId}/evidence`)).json()) as {
+      score: { tier: number; grounds: unknown[] };
+      state: { reproduced: boolean; fixDiff: unknown };
+      row: { repo: string };
+    };
+    // A Tier 3 REFUSED, and the refusal is what the run produced — the gate holding is the
+    // credibility of every verdict the system does issue. That it is stated in those words
+    // on the screen ("No fix was attempted", "this is the deliverable, not a failure to
+    // produce one") is `test/screens.test.tsx`; what this walk proves is that the fold
+    // reaches that answer and the surface hands it over intact.
+    expect(evidence.score.tier).toBe(3);
+    expect(evidence.state.reproduced).toBe(false);
+    // No change is offered, so there is none for the page to draw.
+    expect(evidence.state.fixDiff).toBeNull();
+    expect(evidence.row.repo).toBe(REPO);
   });
 
   it('8. the JSON surface answers the same thing the page does', async () => {
