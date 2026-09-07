@@ -742,6 +742,16 @@ describe.sequential('a run, while it happens', () => {
   });
 
   afterAll(async () => {
+    // AWAY FROM THE PAGE FIRST. The browser is shared for the whole file, and this test
+    // leaves it on a run page holding an `EventSource`. Closing the server under an open
+    // stream makes the browser retry against a dead port and write
+    // `net::ERR_CONNECTION_REFUSED` into the console — which the next test then reads as
+    // its own, because `console()` accumulates.
+    try {
+      if (browser) await browser.navigate('about:blank');
+    } catch {
+      // The browser is gone, which is the outer `afterAll`'s business rather than this one's.
+    }
     await live?.close();
     live = null;
   });
@@ -794,5 +804,69 @@ describe.sequential('a run, while it happens', () => {
     // whole buffer here fails on somebody else's intentional throw.
     const since = browser!.console().slice(before.length);
     expect(since, 'the live view logged something').not.toMatch(/^\[(error|warning)\]/im);
+  });
+});
+
+/**
+ * A signed-out visitor, on a surface that HAS accounts.
+ *
+ * The rest of this file drives the local surface — no `auth`, so `/api/me` answers
+ * "signed in by construction" and nothing 401s. That left the hosted path's most common
+ * first request untested, and it was firing a doomed one: `me.data` is null on the first
+ * render, so the application rendered for a tick, `Repos` mounted, and `GET /api/repos`
+ * came back 401. Four of them in the console of the first page anybody loads.
+ */
+describe.sequential('a stranger on a surface with accounts', () => {
+  let hosted: StatusServer | null = null;
+  let hostedBase = '';
+
+  beforeAll(async () => {
+    if (why) return;
+    hosted = await startStatusServer({
+      port: 0,
+      read: async () => [],
+      routes: chain(
+        dashboardRoutes({
+          client: fixtureClient(),
+          installUrl: INSTALL_URL,
+          // Accounts exist and nobody is signed in — the hosted plane's ordinary state.
+          auth: { session: async () => null, installations: async () => [] },
+        }),
+        staticRoutes(),
+      ),
+    });
+    hostedBase = `http://127.0.0.1:${hosted.port}`;
+  });
+
+  afterAll(async () => {
+    await hosted?.close();
+    hosted = null;
+  });
+
+  test('is shown the way in, and no request is made that cannot succeed', async () => {
+    if (skipped('the signed-out path')) return;
+    const before = browser!.console();
+    await browser!.navigate(`${hostedBase}/repos`);
+    visited.push('/repos (signed out)');
+    const page = await settle(/sign in/i, '/repos signed out');
+    expect(page).toMatch(/there is no account here yet/i);
+    expect(page).toContain('SIGN IN WITH GITHUB');
+
+    // THE assertion. A 401 here is not a broken page — it is a request the app should never
+    // have made, and the console is the only place it shows.
+    const since = browser!.console().slice(before.length);
+    expect(since, 'the signed-out page made a request that could not succeed').not.toMatch(/401/);
+    expect(since).not.toMatch(/^\[(error|warning)\]/im);
+  });
+
+  test('and the front door is the landing page, not the application', async () => {
+    if (skipped('the front door')) return;
+    // `dashboardRoutes` returns null for `/` when nobody is signed in, so the bundle answers
+    // — and the bundle renders the pitch, because `/api/me` says there are accounts and this
+    // visitor is not in one.
+    await browser!.navigate(`${hostedBase}/`);
+    visited.push('/ (signed out)');
+    const page = await settle(/proves the bug existed/, '/ signed out');
+    expect(page).toMatch(/install on github/i);
   });
 });

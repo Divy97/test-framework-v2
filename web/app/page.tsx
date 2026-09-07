@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { Me } from '../lib/api';
 import { useJson, usePath } from '../lib/hooks';
+import { Loading } from '../components/bits';
 import { Boundary } from '../components/Boundary';
 import { Chrome } from '../components/Chrome';
 import { Landing, LandingFooter } from '../components/views/Landing';
@@ -94,6 +95,15 @@ export default function App() {
       </div>
     );
   }
+
+  // BEFORE ANY VIEW, because a view fetches on mount and the answer decides whether it may.
+  //
+  // `me.data` is null on the first render, so without this the signed-out case rendered the
+  // application for one tick — long enough for `Repos` to mount and fire `GET /api/repos`,
+  // which 401s. Harmless to the page and not harmless in general: a doomed request on every
+  // page load by every signed-out visitor, and four `401` lines in the console of a product
+  // whose browser test uses a clean console as its load-bearing signal.
+  if (me.loading) return <Shell me={null} path={path} go={go} main={main} announced={announced}><Loading what="your account" /></Shell>;
 
   // Signed out, anywhere but the front door. Every `/api/` route below would answer 401,
   // and rendering six of those as six error panels is a worse way of saying "sign in".
