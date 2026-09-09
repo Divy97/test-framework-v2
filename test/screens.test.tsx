@@ -39,7 +39,7 @@ import type {
   SandboxSealedV1,
   VerificationAbortedV1,
 } from '../src/events.js';
-import { EVENT_TYPES as CLIENT_EVENT_TYPES } from '../web/lib/hooks';
+import { EVENT_TYPES as CLIENT_EVENT_TYPES, tabTitle } from '../web/lib/hooks';
 import { Checklist, isWaiting, steps } from '../web/components/Checklist';
 import { missingNames } from '../web/lib/required';
 import { review } from '../web/lib/review';
@@ -1525,5 +1525,40 @@ describe('the recipe is reviewed as what it will do', () => {
     expect(html).toContain('<textarea');
     // And the warning it sits under is unchanged.
     expect(html).toMatch(/you are the control/i);
+  });
+});
+
+// ── what the tab says while a machine is working (10n) ──────────────────────
+//
+// The page counts the wait up now, but only for somebody looking at it, and nobody watches
+// a browser tab for two and a half minutes. The half that matters is the last case here:
+// finishing while the tab is HIDDEN, and still saying so when they come back. A title that
+// reverts the moment the job ends tells a person who was away exactly nothing — they
+// return to the words the page had before they left, and reload to find out.
+
+describe('the tab carries the wait', () => {
+  test('says what is being waited on, and on which repository', () => {
+    expect(tabTitle({ waiting: true, settledWhileAway: false, label: 'Drafting a recipe', base: 'acme/widgets' })).toBe(
+      '· Drafting a recipe — acme/widgets',
+    );
+  });
+
+  test('says it finished, when it finished while they were away', () => {
+    expect(tabTitle({ waiting: false, settledWhileAway: true, label: null, base: 'acme/widgets' })).toBe('✓ Done — acme/widgets');
+  });
+
+  test('and leaves the title alone the rest of the time', () => {
+    // `null` is "leave it", not "clear it". The router owns the title otherwise, and a
+    // hook that blanked it on every render would fight `page.tsx` for the name of every
+    // page in the product.
+    expect(tabTitle({ waiting: false, settledWhileAway: false, label: null, base: 'acme/widgets' })).toBeNull();
+    // Waiting on something with no name is nothing to announce either.
+    expect(tabTitle({ waiting: true, settledWhileAway: false, label: null, base: 'acme/widgets' })).toBeNull();
+  });
+
+  test('waiting wins over a stale done, so a second job does not read as finished', () => {
+    expect(tabTitle({ waiting: true, settledWhileAway: true, label: 'Checking the environment builds', base: 'acme/widgets' })).toContain(
+      'Checking the environment builds',
+    );
   });
 });

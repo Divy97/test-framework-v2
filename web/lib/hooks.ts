@@ -284,3 +284,86 @@ const VERDICT_MOVING: readonly EventType[] = [
 // `Set<string>` built from string literals checks nothing, which is how an event type that
 // does not exist sat in this list unnoticed.
 const CHANGES_THE_VERDICT = new Set<string>(VERDICT_MOVING);
+
+/**
+ * WHAT THE TAB SAYS WHILE A MACHINE IS WORKING (10n).
+ *
+ * Drafting a recipe takes a couple of minutes. The page shows that now, counting up — but
+ * only to somebody looking at it, and nobody watches a browser tab for two and a half
+ * minutes. They switch away, and the one thing they wanted to know is the one thing they
+ * then cannot see.
+ *
+ * The tab title can carry it, and unlike a notification it needs no permission prompt, no
+ * decision about whether to ask for one, and works with the tab in the background from the
+ * first render.
+ *
+ * The half that matters is `settled`: when the work finishes while the tab is HIDDEN,
+ * saying so and keeping it said until they look. A title that quietly reverts the moment
+ * the job ends tells a person who was away exactly nothing — they come back to the same
+ * words the page had before they left, and reload to find out.
+ *
+ * Pure, and separated from the effect below, because what the tab should say is a decision
+ * with four inputs and the DOM write is one line.
+ */
+export function tabTitle(at: {
+  waiting: boolean;
+  /** Finished since this page last had the reader's attention. */
+  settledWhileAway: boolean;
+  /** What is being waited on — 'Drafting a recipe'. */
+  label: string | null;
+  base: string;
+}): string | null {
+  if (at.waiting) return at.label === null ? null : `· ${at.label} — ${at.base}`;
+  if (at.settledWhileAway) return `✓ Done — ${at.base}`;
+  // `null` is "leave the title alone", not "clear it": the router owns it the rest of the
+  // time, and a hook that blanked it on every render would fight `page.tsx` for the name
+  // of every page.
+  return null;
+}
+
+/**
+ * Put `tabTitle` on the document, and put it back afterwards.
+ *
+ * `settledWhileAway` is tracked here rather than asked of the caller: it is a fact about
+ * this tab's visibility over time, which no render has access to.
+ */
+export function useTabTitle(waiting: boolean, label: string | null, base: string): void {
+  const wasWaiting = useRef(false);
+  const [settledWhileAway, setSettled] = useState(false);
+
+  useEffect(() => {
+    const hidden = typeof document === 'undefined' ? false : document.hidden;
+    // The TRANSITION out of waiting, not the state: `waiting === false` is also true
+    // before anything ever started, and announcing "Done" to somebody who has done
+    // nothing is worse than saying nothing.
+    if (wasWaiting.current && !waiting && hidden) setSettled(true);
+    wasWaiting.current = waiting;
+    if (waiting) setSettled(false);
+  }, [waiting]);
+
+  // Cleared the moment they look, which is the only signal that the message landed.
+  useEffect(() => {
+    if (!settledWhileAway) return;
+    const seen = () => {
+      if (!document.hidden) setSettled(false);
+    };
+    document.addEventListener('visibilitychange', seen);
+    window.addEventListener('focus', seen);
+    return () => {
+      document.removeEventListener('visibilitychange', seen);
+      window.removeEventListener('focus', seen);
+    };
+  }, [settledWhileAway]);
+
+  useEffect(() => {
+    const wanted = tabTitle({ waiting, settledWhileAway, label, base });
+    if (wanted === null) return;
+    const before = document.title;
+    document.title = wanted;
+    // Restored on the way out, so leaving this page does not leave its status in the tab
+    // of whatever the reader went to next.
+    return () => {
+      document.title = before;
+    };
+  }, [waiting, settledWhileAway, label, base]);
+}

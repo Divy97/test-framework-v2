@@ -2,7 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Me, RepoDetail } from '../../lib/api';
-import { useJson } from '../../lib/hooks';
+import { useJson, useTabTitle } from '../../lib/hooks';
 import { Failed, Loading, Tabs, When } from '../bits';
 import { Checklist, isWaiting, steps } from '../Checklist';
 import { Environment } from './Environment';
@@ -66,7 +66,13 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
   // people leave open. `tick` re-renders so the elapsed time on the waiting step counts up
   // rather than freezing at whatever it said when the last answer arrived.
   const [tick, setTick] = useState(() => Date.now());
-  const waiting = detail.data === null ? false : isWaiting(steps(repo, detail.data, me, tick));
+  const current = detail.data === null ? [] : steps(repo, detail.data, me, tick);
+  const waiting = isWaiting(current);
+  // AND IN THE TAB (10n), because nobody watches a browser tab for two and a half minutes.
+  // They switch away, and the one thing they wanted to know becomes the one thing they
+  // cannot see — so the title carries it, and says so afterwards if it finished while
+  // they were gone.
+  useTabTitle(waiting, current.find((step) => step.state === 'waiting')?.title ?? null, repo);
   const reload = detail.reload;
   useEffect(() => {
     if (!waiting) return;
