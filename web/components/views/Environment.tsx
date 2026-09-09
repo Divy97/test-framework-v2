@@ -42,6 +42,9 @@ export function Environment({
   me: Me | null;
   onChanged: () => void;
 }) {
+  const [asking, setAsking] = useState(false);
+  const [asked, setAsked] = useState<{ ok: boolean; text: string } | null>(null);
+
   // What fills the box, in priority order. An approved recipe always wins — it is the one
   // actually in force, and a draft beside it is a stale second opinion nobody asked for.
   const initial = detail.recipe
@@ -113,18 +116,53 @@ export function Environment({
           can act on differently. */}
       {!detail.recipe && !isDraft ? (
         <div className="panel">
-          <h2>No proposal has arrived — the box is yours to fill.</h2>
+          {/* A BUTTON, because until 10n there was none (10n).
+              This panel told a reader that drafting exists, that it happens somewhere else,
+              and that an empty box might mean no machine was free — while offering no way
+              to ask for one. Installing the App queued drafting for EVERY repository it
+              could see instead, which spent the operator's key on repositories nobody had
+              opened and left the one somebody cared about waiting behind them.
+              Asking is the instruction; installing was only permission. */}
+          <h2>Nothing has been proposed for this repository yet.</h2>
           <p>
-            Drafting reads your project and proposes a recipe for you to review. It runs where
-            the containers run, so this service queues it and a machine picks it up — which
-            means an empty box either has no machine free yet, or means a drafting session ran
-            and had nothing it was willing to propose.
+            Drafting explores your project in a container — installs it, boots it, looks at
+            it — and proposes the commands a run should use. It takes a couple of minutes,
+            spends your model key, and produces a proposal you review before anything uses
+            it. Nothing runs against {repo} until you approve.
           </p>
-          <p className="muted small">
-            Either way you are not waiting on it: write the commands that install, boot and
-            test your project and approve them, and a proposal that arrives later will not
-            overwrite what you approved.
+          <p className="calls">
+            <button
+              type="button"
+              disabled={asking || me?.modelKey === null}
+              onClick={() => {
+                setAsking(true);
+                void send('POST', `/api/repos/${encodeURIComponent(repo)}/draft`).then((answer) => {
+                  setAsking(false);
+                  setAsked(
+                    answer.ok
+                      ? { ok: true, text: 'Asked. A machine will pick this up — reload in a minute or two.' }
+                      : { ok: false, text: answer.error ?? 'that failed' },
+                  );
+                  if (answer.ok) onChanged();
+                });
+              }}
+            >
+              {asking ? 'Asking…' : 'Propose a recipe'}
+            </button>
           </p>
+          <Said said={asked} />
+          {me?.modelKey === null ? (
+            <p className="muted small">
+              Drafting spends the model key of whoever asks for it, and this account has not
+              stored one. <a href="/settings">Store a key</a> and this button becomes live.
+            </p>
+          ) : (
+            <p className="muted small">
+              You do not have to wait for it. Write the commands that install, boot and test
+              your project and approve them — a proposal that arrives later will not overwrite
+              what you approved.
+            </p>
+          )}
         </div>
       ) : null}
 

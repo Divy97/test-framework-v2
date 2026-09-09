@@ -53,10 +53,18 @@ const fakeClient = (writes: string[] = []) =>
   }) as unknown as Db;
 
 /** A surface where this person can see installation 1 and nothing else. */
-const surface = (options: { session?: Session | null; installations?: number[]; writes?: string[] } = {}) =>
+const surface = (
+  options: {
+    session?: Session | null;
+    installations?: number[];
+    writes?: string[];
+    onDraftRequested?: (repo: string, by: number | null) => void;
+  } = {},
+) =>
   dashboardRoutes({
     client: fakeClient(options.writes),
     installUrl: 'https://example.invalid',
+    ...(options.onDraftRequested ? { onDraftRequested: options.onDraftRequested } : {}),
     auth: {
       session: async () => (options.session === undefined ? SESSION : options.session),
       installations: async () => options.installations ?? [1],
@@ -130,6 +138,22 @@ describe('a stranger is told, on every route', () => {
     expect(response?.status).toBe(401);
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(false);
   });
+
+  it('an anonymous request for a draft starts nothing', async () => {
+    // `POST …/draft` (10n) stores nothing itself, which is exactly why it is easy to file
+    // under "reads". It starts a container that clones somebody's code and spends a model
+    // key, so it is gated like every other write here.
+    const asked: string[] = [];
+    const response = await call(
+      surface({ session: null, onDraftRequested: (repo: string) => asked.push(repo) }),
+      'POST',
+      '/api/repos/mine%2Frepo/draft',
+      '',
+      JSON_POST,
+    );
+    expect(response?.status).toBe(401);
+    expect(asked).toEqual([]);
+  });
 });
 
 describe('being signed in is not being allowed', () => {
@@ -142,6 +166,40 @@ describe('being signed in is not being allowed', () => {
 
     expect(response?.status).toBe(404);
     expect(writes.some((sql) => sql.includes('insert into recipes'))).toBe(false);
+  });
+
+  it('asking for a draft on a repository you cannot see starts nothing', async () => {
+    // The same shape as the approval test above and for the same reason: installation 2 is
+    // not theirs. A pass here means a stranger can make this engine clone a private
+    // repository they cannot see and bill somebody else's key for reading it.
+    const asked: string[] = [];
+    const response = await call(
+      surface({ onDraftRequested: (repo: string) => asked.push(repo) }),
+      'POST',
+      '/api/repos/theirs%2Frepo/draft',
+      '',
+      JSON_POST,
+    );
+    expect(response?.status).toBe(404);
+    expect(asked).toEqual([]);
+  });
+
+  it('and asking for one you CAN see starts it, with the asker attached', async () => {
+    // The control, plus the point of the route: `by` is what makes the worker bill the
+    // person who asked. Without it `/model-key` answers null and the operator pays, which
+    // is what installing the App used to do for every repository it could see.
+    const asked: { repo: string; by: number }[] = [];
+    const response = await call(
+      surface({ onDraftRequested: (repo: string, by: number | null) => asked.push({ repo, by: by ?? -1 }) }),
+      'POST',
+      '/api/repos/mine%2Frepo/draft',
+      '',
+      JSON_POST,
+    );
+    expect(response?.status).toBe(202);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.repo).toBe('mine/repo');
+    expect(asked[0]!.by).toBeGreaterThan(0);
   });
 
   it('and approving for one you CAN see is stored, so the refusal is not blanket', async () => {

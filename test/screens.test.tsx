@@ -1113,20 +1113,38 @@ describe('an empty recipe box says why it is empty', () => {
     const html = bare('plane');
     expect(html).not.toMatch(/there is no drafting yet/);
     expect(html).not.toMatch(/holds no model key and runs nothing itself/);
-    expect(html).toMatch(/No proposal has arrived/);
+    expect(html).toMatch(/Nothing has been proposed/);
   });
 
-  test('and gives BOTH reasons a box can be empty, which are acted on differently', () => {
+  test('it offers a way to ASK, which is the whole thing it used to be missing', () => {
+    // Until 10n this panel described drafting, said it happens somewhere else, and offered
+    // no button. Installing the App queued drafting for every repository it could see
+    // instead — which spent the OPERATOR's key on repositories nobody had opened, and left
+    // the one somebody cared about queued behind them. Permission is not an instruction;
+    // this button is the instruction.
     const html = bare('plane');
-    expect(html).toMatch(/no machine free yet/);
-    expect(html).toMatch(/nothing it was willing to propose/);
-    // And says the reader is not blocked on either.
-    expect(html).toMatch(/will not\s+overwrite what you approved/);
+    expect(html).toMatch(/Propose a recipe/);
+    // And it says what pressing it costs, because it starts a container and spends a key.
+    expect(html).toMatch(/spends your model key/);
+    expect(html).toMatch(/couple of minutes/);
+    // Nothing is claimed about machines being free — that was the old panel apologising
+    // for work the reader had not asked for.
+    expect(html).not.toMatch(/no machine free yet/);
+  });
+
+  test('and the button is dead until there is a key to bill', () => {
+    // `me.modelKey` is null in this fixture. Drafting spends the key of whoever asks, so
+    // offering a live button to somebody with no key stored is a button whose only
+    // possible outcome is a failure the page could have predicted.
+    const html = bare('plane');
+    expect(html).toMatch(/disabled/);
+    expect(html).toMatch(/has not\s+stored one/);
+    expect(html).toContain('/settings');
   });
 
   test('the same panel on a laptop, because the answer no longer depends on the surface', () => {
     // It was gated on `mode === 'plane'`, so a local operator with an empty box was told
     // nothing at all. Both deployments now draft; only the machine differs.
-    expect(bare('local')).toMatch(/No proposal has arrived/);
+    expect(bare('local')).toMatch(/Nothing has been proposed/);
   });
 });

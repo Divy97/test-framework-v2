@@ -79,15 +79,43 @@ async function applySchema(client: Db): Promise<void> {
  * in it. It throws; the caller decides what an escape costs.
  */
 /**
- * How many repositories one delivery may start drafting runs for.
+ * Queue one drafting run, for the person who asked for it.
  *
- * Five, because the flow this exists to serve is somebody installing the App on a
- * repository or a few and wanting the box filled in. A bulk add — an account switched to
- * "all repositories" — is a different intent wearing the same event, and the cost of
- * reading them as the same thing is one sandbox, one clone and one agent session per
- * repository, charged to whoever's key it is.
+ * Exported and taking its dependencies, for the reason `planeIntake` is: this was a
+ * lambda inside `startPlane`, and the one line in it that matters could be deleted with
+ * the whole suite staying green. Verified by doing exactly that — `requestedBy` removed,
+ * 48 authorization tests still passing, because they assert what the ROUTE hands to this
+ * callback and nothing had ever asked what this callback does with it.
+ *
+ * `requestedBy` is what that line is for. Without it `/runner/runs/:id/model-key` answers
+ * null and the worker falls back to its own configuration, which is the operator's key —
+ * so a drafting run somebody asked for would be billed to whoever runs the service. That
+ * is precisely the mistake this milestone removed from the install path; leaving it
+ * reachable from the button would have moved it rather than fixed it.
  */
-const DRAFT_FANOUT_CEILING = 5;
+export function planeDraftRequest(deps: { client: Db; log: (line: string) => void }): (repo: string, by: number | null) => void {
+  return (repo, by) => {
+    // `void`, because the person who pressed the button is owed an answer now rather than
+    // when a row has been written — the same reason `onApproved` does not await.
+    void (async () => {
+      const installation = await loadInstallation(deps.client, repo);
+      // Not an error: the route already refused a repository this plane does not know, so
+      // reaching here means it was removed in between. Nothing to draft, nobody to tell.
+      if (!installation) return;
+      await enqueueJob(deps.client, {
+        installationId: installation.installationId,
+        repo,
+        kind: 'draft',
+        // `null` never reaches here in practice — the plane has accounts, so the route
+        // always has a session — and the column is nullable for the webhook-era rows that
+        // predate the button. Spelt out rather than asserted away.
+        ...(by === null ? {} : { requestedBy: by }),
+        intake: { kind: 'draft', repo },
+      });
+      deps.log(`${repo}: ${by} asked for a recipe — queued a drafting run`);
+    })().catch((error: unknown) => deps.log(`could not queue a drafting run for ${repo}: ${String(error)}`));
+  };
+}
 
 export function planeIntake(deps: {
   client: Db;
@@ -121,59 +149,34 @@ export function planeIntake(deps: {
           `reconciled to ${held} held${removed > 0 ? `, ${removed} marked removed` : ''}`,
       );
 
-      // DRAFTING, AS A JOB (10h). A repository that has just become known has no recipe,
-      // and until now the hosted plane left the box empty and said so — while `serve.ts`
-      // filled it in, because a laptop has Docker and a model key. This queues the same
-      // work for a worker.
+      // INSTALLING QUEUES NOTHING (10n), and this is the second time the trigger has been
+      // wrong in the same direction.
       //
-      // One job per repository NAMED IN THIS DELIVERY, and only for repositories that have
-      // no recipe and no draft already: reconciliation happens on every `installation` and
-      // `installation_repositories` delivery, so drafting on all of them would re-explore a
-      // repository every time somebody adds a second one to the same App.
+      // 10h queued one drafting run per repository named in a delivery, so that a
+      // repository you had just connected would find a proposal waiting instead of an
+      // empty box. Reasonable for the repository you just connected. Wrong for an install,
+      // because an install is not a work order:
       //
-      // A draft is never a recipe. It lands in `recipe_drafts` and a human still approves
-      // it (ADR-0013) — which is why this is safe to start without asking anybody.
+      //   - NOBODY ASKED. Granting the App access means it may read your issues and clone
+      //     your code. It does not mean explore all hundred of these.
+      //   - NOBODY WAS PAYING. `enqueueJob` here set no `requestedBy`, so `/model-key`
+      //     answered null and the worker fell back to its OWN configuration — the
+      //     operator's key, spent on repositories nobody had opened. The same billing
+      //     mistake `io.modelKey()` fixed for runs, in the path beside it.
+      //   - AND THE HUMAN COULD NOT ASK. The Environment panel said "no proposal has
+      //     arrived — the box is yours to fill" and offered no way to request one. So the
+      //     ninety-nine repositories nobody cared about were drafted, and the one somebody
+      //     did care about waited behind them.
       //
-      // UP TO A CEILING, and the ceiling is the whole reason this block is not a cost
-      // incident. "Named in this delivery" was read as "a small delta" — the comment above
-      // literally reasons about "somebody adds a second one to the same App". Setting an
-      // installation to *all repositories* is also a delta, and on this account GitHub
-      // delivered one `installation_repositories.added` naming **176 repositories**. This
-      // loop queued 176 drafting runs in one second: 176 sandboxes, 176 clones, 176 agent
-      // sessions at roughly thirteen cents each. It was survived only because the model key
-      // was over its spend cap that minute and every job died in eighteen seconds.
+      // Measured, not theorised: switching this installation to *all repositories* fired
+      // one delivery naming 176, and this loop queued 176 agent sessions in a second —
+      // about twenty-three dollars of somebody else's money. A ceiling of five was the
+      // first answer and it was a bandage on a wrong default; it capped the blast radius
+      // and left the trigger, the billing and the missing button exactly as they were.
       //
-      // Beyond the ceiling it queues NOTHING rather than an arbitrary first handful. There
-      // is no principled way to choose five of 176, drafting is available on demand — open
-      // the repository, or `npm run reconcile` — and a human deciding which repositories
-      // are worth exploring is the same control ADR-0013 already puts in front of the
-      // recipe itself.
-      if (intake.repos.length > DRAFT_FANOUT_CEILING) {
-        deps.log(
-          `installation ${intake.installationId}: ${intake.repos.length} repositories named, ` +
-            `which is over the drafting ceiling of ${DRAFT_FANOUT_CEILING} — queued none. ` +
-            `Open a repository to draft it, or run \`npm run reconcile -- ${intake.installationId}\`.`,
-        );
-        return;
-      }
-      for (const repo of intake.repos) {
-        try {
-          if ((await loadRecipe(deps.client, repo)) !== null) continue;
-          if ((await loadDraft(deps.client, repo)) !== null) continue;
-          await enqueueJob(deps.client, {
-            installationId: intake.installationId,
-            repo,
-            kind: 'draft',
-            intake: { kind: 'draft', repo },
-          });
-          deps.log(`${repo}: queued a drafting run — a worker will propose a recipe`);
-        } catch (error) {
-          // Per repository, so one failure does not cost the others their draft. And never
-          // rethrown: this is reconciliation's tail, and a delivery GitHub will retry must
-          // not be failed over a proposal nobody is waiting on.
-          deps.log(`${repo}: could not queue a drafting run — ${String(error)}`);
-        }
-      }
+      // Drafting now happens when a signed-in person presses `Propose a recipe` on one
+      // repository, which carries intent, a payer and a scope of one — the control
+      // ADR-0013 already puts in front of the recipe itself.
       return;
     }
     // AN ISSUE DELIVERY STARTS NOTHING (M10). Runs start from the dashboard, pressed by a
@@ -299,6 +302,7 @@ export async function startPlane(config: PlaneConfig): Promise<{
             });
           })().catch((error: unknown) => log(`could not queue a proving run for ${repo}: ${String(error)}`));
         },
+        onDraftRequested: planeDraftRequest({ client, log }),
         auth: {
           session,
           installations: (who) => installationsFor(who),

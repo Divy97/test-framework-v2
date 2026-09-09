@@ -371,14 +371,13 @@ export async function serve(options: ServeOptions): Promise<Service> {
             });
             const recipe = await loadRecipe(client, repo);
             log(`${repo}: installed${recipe ? '' : ' — not onboarded yet, no recipe approved'}`);
-            // DRAFTING (M6b). Its own failure is caught right here rather than by the
-            // `catch` around this whole loop — a repository this cannot draft for must
-            // not stop the NEXT repository in the same delivery from being recorded.
-            if (!recipe) {
-              await draftForRepo(repo, intake.installationId).catch((error) => {
-                log(`${repo}: could not draft a recipe — ${String((error as Error).message ?? error)}`);
-              });
-            }
+            // NO DRAFTING HERE ANY MORE (10n). This called `draftForRepo` for every
+            // repository in the delivery that had no recipe, which is a full agent session
+            // each — clone, boot, propose — on an install that only granted permission to
+            // read. `draftForRepo` is unchanged and now runs from `POST
+            // /api/repos/:repo/draft`, pressed by a person, for one repository. The long
+            // form of the argument is in `plane-server.ts`, where the hosted half of the
+            // same mistake lived.
           } else {
             await removeInstallation(client, repo);
             log(`${repo}: removed`);
@@ -528,6 +527,27 @@ export async function serve(options: ServeOptions): Promise<Service> {
         // just pressed approve is owed a page now. The result lands in the row and the
         // next render of this page shows it.
         onApproved: (repo) => void proveForRepo(repo),
+        // In-process, because a laptop has Docker and the operator's own key — the same
+        // reason `onApproved` proves here rather than queueing. `by` is ignored: this
+        // surface has one operator, and the key it spends is theirs either way.
+        // ON THE TAIL, not beside it. This surface runs one thing at a time — that is what
+        // `tail` is — and a drafting session is a container and a model key, the two things
+        // it is serialising. Fired as a bare `void` promise it raced whatever else was
+        // running, and `drain()` returned before it had finished, which is also what made
+        // its own test unable to see it.
+        onDraftRequested: (repo) => {
+          tail = tail.then(async () => {
+            const installation = await loadInstallation(client, repo);
+            // Not an error: the route already refused a repository this surface does not
+            // know, so reaching here means it was removed in between.
+            if (!installation) return;
+            // Caught HERE, so a repository that cannot be drafted does not poison the tail
+            // for everything queued behind it.
+            await draftForRepo(repo, installation.installationId).catch((error: unknown) =>
+              log(`${repo}: could not draft a recipe — ${String((error as Error).message ?? error)}`),
+            );
+          });
+        },
       }),
       // The dashboard, from `web/`'s static export (10i). A checkout that has never run
       // `npm run web:build` has no bundle, and `staticRoutes` answers that with a page
