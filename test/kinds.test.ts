@@ -99,6 +99,37 @@ describe('a worker does the thing its job says', () => {
     expect(io.findings).toEqual([{ draft: { install: 'npm ci', services: [] } }]);
   });
 
+  it('and SAYS it proposed something, because the branch that worked said nothing', async () => {
+    // The first drafting session that ever succeeded in production wrote a real recipe for
+    // `Divy97/portfolio-v2` — its port, its install command, four required secrets — and
+    // left `took` and `0 event(s), 0 artifact(s)` in the log with nothing in between.
+    // Indistinguishable from the silent FAILURE fixed earlier the same day, and for the
+    // same reason: nobody wrote a line for the branch that worked.
+    const said: string[] = [];
+    const log = console.log;
+    console.log = (...parts: unknown[]) => void said.push(parts.map(String).join(' '));
+    try {
+      await engineExecute(CONFIG, undefined, undefined, {
+        clone: async () => {},
+        draft: async () =>
+          ({
+            ok: true,
+            draft: { install: 'npm ci', services: [], required: ['TOKEN'] },
+            usage: { turns: 12, input_tokens: 40_000, output_tokens: 900 },
+          }) as never,
+      })(job({ kind: 'draft', recipe: null }), fakeIo());
+    } finally {
+      console.log = log;
+    }
+
+    const all = said.join('\n');
+    expect(all).toContain('proposed a recipe for a human to approve');
+    // The SHAPE, and what it cost — enough to know the session ended with something in it.
+    expect(all).toContain('3 field(s)');
+    expect(all).toContain('12 turn(s)');
+    expect(all).toContain('40000 in / 900 out');
+  });
+
   it('a drafting session that proposed nothing stores nothing', async () => {
     // An ordinary outcome — the agent explored and had nothing it was willing to propose —
     // and an empty draft would put a box in front of a human saying an agent filled it in.
