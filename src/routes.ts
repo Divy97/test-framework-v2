@@ -43,8 +43,14 @@ import { enqueueJob, listRunners, openJobFor, pairRunner, revokeRunner } from '.
  * repository starts a drafting run that fills the recipe box for them.
  *
  * `plane` is the hosted control plane, which holds no model key and runs no containers by
- * design (ADR-0011, ADR-0019) — work goes to a paired runner. Nothing drafts there yet, so
- * a screen that offers "draft a recipe" is offering something that will not happen.
+ * design (ADR-0011, ADR-0019) — work goes to a paired runner.
+ *
+ * It said "nothing drafts there yet, so a screen that offers to draft a recipe is offering
+ * something that will not happen", and 10h made that false: the plane queues `prove` and
+ * `draft` jobs and a worker serves them. What `mode` still distinguishes is WHERE the work
+ * runs and therefore how long it takes to arrive — a laptop starts a container itself; a
+ * plane waits for a machine to be free — which is why the screens now say "no proposal has
+ * arrived" rather than naming a deployment that cannot produce one.
  *
  * Explicit rather than inferred from whether login is configured. Those are two different
  * questions, and conflating them is exactly the bug the landing page had.

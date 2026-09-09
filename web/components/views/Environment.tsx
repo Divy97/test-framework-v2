@@ -105,14 +105,25 @@ export function Environment({
         </div>
       ) : null}
 
-      {!detail.recipe && !isDraft && me?.mode === 'plane' ? (
+      {/* NOTHING YET, rather than nothing ever — 10h changed which of those is true.
+          This said "on a hosted plane there is no drafting yet" and it was correct: the
+          plane holds no model key and starts no containers, so installing the App drafted
+          nothing. It now QUEUES the work and a worker does it, so the honest state of an
+          empty box is "no proposal has arrived", and that has two possible causes a reader
+          can act on differently. */}
+      {!detail.recipe && !isDraft ? (
         <div className="panel">
-          <h2>Nothing drafted this — the box is yours to fill.</h2>
+          <h2>No proposal has arrived — the box is yours to fill.</h2>
           <p>
-            Drafting reads your project and proposes a recipe, and it runs where the
-            containers run. This service holds no model key and runs nothing itself, so on a
-            hosted plane there is no drafting yet: write the commands that install, boot and
-            test your project, and approve them.
+            Drafting reads your project and proposes a recipe for you to review. It runs where
+            the containers run, so this service queues it and a machine picks it up — which
+            means an empty box either has no machine free yet, or means a drafting session ran
+            and had nothing it was willing to propose.
+          </p>
+          <p className="muted small">
+            Either way you are not waiting on it: write the commands that install, boot and
+            test your project and approve them, and a proposal that arrives later will not
+            overwrite what you approved.
           </p>
         </div>
       ) : null}

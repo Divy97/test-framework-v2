@@ -68,7 +68,9 @@ destroyed when the run ends.
 - A single worker of ours cannot claim jobs today: `claimJob` filters by installation and a
   runner row is per installation. Fixed in 10e.
 - The plane runs no proving and no drafting; both live behind `serve.ts`. On the hosted
-  product, approving a recipe proves nothing. Jobs gain a `kind`; 10h.
+  product, approving a recipe proves nothing. Jobs gain a `kind`; 10h. **Done — the plane
+  queues both and a worker serves them; the sentence above describes what 10h found, not
+  what is true now.**
 - `run_usage` is never written on the hosted path. 10f.
 
 ## The work

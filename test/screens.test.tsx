@@ -1048,3 +1048,49 @@ describe('the skeleton in an empty recipe box', () => {
     expect(skeleton).not.toMatch(/npm install|pip install|bundle install/);
   });
 });
+
+describe('an empty recipe box says why it is empty', () => {
+  const me: Me = {
+    accounts: true, signedIn: true, login: 'd', mode: 'plane',
+    installUrl: 'https://x.invalid', modelKey: null,
+    secrets: { enabled: false }, github: true, forgetting: true,
+  };
+  const bare = (mode: Me['mode']) =>
+    render(
+      <Environment
+        repo="acme/widgets"
+        detail={{
+          repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
+          onboarded: false, recipe: null, approvedAt: null, proof: null, draft: null,
+          secrets: { names: [], enabled: false }, runs: [],
+        }}
+        me={{ ...me, mode }}
+        onChanged={() => {}}
+      />,
+    );
+
+  test('it no longer claims a hosted plane cannot draft, because 10h made it able to', () => {
+    // The panel said "on a hosted plane there is no drafting yet", which was true until the
+    // plane started queueing `draft` jobs for a worker. A screen that keeps a limitation
+    // after it is lifted is worse than one that never mentioned it: a reader takes it as a
+    // reason not to wait.
+    const html = bare('plane');
+    expect(html).not.toMatch(/there is no drafting yet/);
+    expect(html).not.toMatch(/holds no model key and runs nothing itself/);
+    expect(html).toMatch(/No proposal has arrived/);
+  });
+
+  test('and gives BOTH reasons a box can be empty, which are acted on differently', () => {
+    const html = bare('plane');
+    expect(html).toMatch(/no machine free yet/);
+    expect(html).toMatch(/nothing it was willing to propose/);
+    // And says the reader is not blocked on either.
+    expect(html).toMatch(/will not\s+overwrite what you approved/);
+  });
+
+  test('the same panel on a laptop, because the answer no longer depends on the surface', () => {
+    // It was gated on `mode === 'plane'`, so a local operator with an empty box was told
+    // nothing at all. Both deployments now draft; only the machine differs.
+    expect(bare('local')).toMatch(/No proposal has arrived/);
+  });
+});
