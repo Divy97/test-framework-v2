@@ -107,7 +107,10 @@ export function Settings({ me, onChanged }: { me: Me | null; onChanged: () => vo
           />
           <p className="hint" id="model-key-hint">
             It is spent by the worker, on your runs, and never leaves it — the sandbox that
-            runs an agent holds neither this key nor your GitHub token.
+            runs an agent holds neither this key nor your GitHub token. We check it against{' '}
+            {provider} before saving, which costs a few tokens on the key itself. A key with
+            a spend limit needs enough headroom for a whole session: a drafting run is tens
+            of turns, not one.
           </p>
         </div>
       </div>
@@ -121,7 +124,7 @@ export function Settings({ me, onChanged }: { me: Me | null; onChanged: () => vo
               setBusy(false);
               setSaid(
                 answer.ok
-                  ? { ok: true, text: `Stored for ${provider}.` }
+                  ? { ok: true, text: `Stored for ${provider}, and ${provider} accepted it.` }
                   : { ok: false, text: answer.error ?? 'that failed' },
               );
               if (answer.ok) {

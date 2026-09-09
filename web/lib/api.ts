@@ -36,10 +36,18 @@ const parse = async <T,>(response: Response): Promise<Answer<T>> => {
     // people to read a stack trace than to read the status code sitting next to it.
     return { status: response.status, ok: false, data: null, error: `the server answered ${response.status} and not JSON` };
   }
-  const error =
-    response.ok || body === null || typeof body !== 'object'
-      ? null
-      : ((body as { error?: unknown }).error as string | undefined) ?? `request failed (${response.status})`;
+  // `detail` folded in, not dropped. A refusal this surface can do nothing about — a
+  // model key the provider will not accept — is only actionable if the provider's own
+  // sentence reaches the person, and `error` alone is our summary of it. The key route
+  // answers `{ error: 'openrouter refused this key…', detail: 'Key limit exceeded…' }`
+  // and the second half is the one that says what to go and fix.
+  const said = body === null || typeof body !== 'object' ? {} : (body as { error?: unknown; detail?: unknown });
+  const head = typeof said.error === 'string' ? said.error : `request failed (${response.status})`;
+  const error = response.ok
+    ? null
+    : typeof said.detail === 'string' && said.detail !== ''
+      ? `${head} — ${said.detail}`
+      : head;
   return { status: response.status, ok: response.ok, data: response.ok ? (body as T) : null, error };
 };
 
