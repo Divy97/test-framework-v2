@@ -280,19 +280,23 @@ async function onboardingJob(
   job: DaemonJob,
   io: DaemonIo,
   executor?: RunPlan['executor'],
+  work: Work = {},
 ): Promise<void> {
+  const clone = work.clone ?? cloneRepository;
+  const prove = work.prove ?? proveRepository;
+  const draft = work.draft ?? draftRecipe;
   const workspace = await mkdtemp(join(tmpdir(), `engine-${job.kind}-`));
   try {
     const source = join(workspace, 'source');
     // The token, per job, from the plane — there is no App key on this machine (ADR-0012).
-    await cloneRepository(repoUrl(job.repo), source, await io.token());
+    await clone(repoUrl(job.repo), source, await io.token());
 
     if (job.kind === 'prove') {
       // A recipe is what there is to prove. Absent means it was withdrawn between the
       // approval that queued this and now, which is not a failure — there is nothing to
       // prove and nobody to tell.
       if (!job.recipe) return;
-      const proof = await proveRepository({
+      const proof = await prove({
         runId: job.runId,
         repoPath: source,
         image: config.image,
@@ -303,7 +307,7 @@ async function onboardingJob(
       return;
     }
 
-    const outcome = await draftRecipe({
+    const outcome = await draft({
       runId: job.runId,
       repoPath: source,
       image: config.image,
@@ -321,7 +325,30 @@ async function onboardingJob(
   }
 }
 
-export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor'], spent?: ComputeLog) {
+/**
+ * The three pieces of real work, injected so a test can watch the DISPATCH without them.
+ *
+ * Each costs containers, minutes and a model credential, and each is already driven end to
+ * end somewhere else — `sandbox.test.ts` for proving and drafting with real containers,
+ * `run.test.ts` for a run. What has never had a test is which of the three a job reaches,
+ * which is exactly the decision 10h added and exactly what these let a test see.
+ *
+ * The same shape `serve.ts` has used for `draft` and `prove` since 8f, and for the same
+ * reason recorded there.
+ */
+export type Work = {
+  clone?: (remote: string, into: string, token?: string) => Promise<void>;
+  prove?: typeof proveRepository;
+  draft?: typeof draftRecipe;
+  run?: typeof runFromIssue;
+};
+
+export function engineExecute(
+  config: RunnerConfig,
+  executor?: RunPlan['executor'],
+  spent?: ComputeLog,
+  work: Work = {},
+) {
   return async (job: DaemonJob, io: DaemonIo): Promise<void> => {
     // ── THREE KINDS OF WORK, ONE WORKER (10h) ───────────────────────────────────────
     //
@@ -337,7 +364,7 @@ export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor
     // asymmetry was invisible because the only deployment anybody onboarded against was
     // the laptop.
     if (job.kind === 'prove' || job.kind === 'draft') {
-      await onboardingJob(config, job, io, executor);
+      await onboardingJob(config, job, io, executor, work);
       return;
     }
 
@@ -359,7 +386,7 @@ export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor
 
     let result: Awaited<ReturnType<typeof runFromIssue>> | undefined;
     try {
-      result = await runFromIssue({
+      result = await (work.run ?? runFromIssue)({
         ...(executor ? { executor } : {}),
         intake: job.intake as IssueIntake,
         // No App key on this machine. `installationToken` asks the plane instead, every

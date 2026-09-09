@@ -21,6 +21,8 @@ import { installationsFor, readSession, cookieValue, type OAuthConfig, type Sess
 import { webhookRoute, WEBHOOK_PATH, installationToken, type GitHubApp, type Intake } from './github.js';
 import { forgetInstallation, loadInstallation, reconcileInstallation } from './installations.js';
 import { enqueueJob } from './plane.js';
+import { loadDraft } from './drafts.js';
+import { loadRecipe } from './recipe.js';
 import { dashboardRoutes } from './routes.js';
 import { runnerRoutes } from './runner-api.js';
 import { chain, startStatusServer } from './sse.js';
@@ -107,6 +109,37 @@ export function planeIntake(deps: {
         `installation ${intake.installationId}: ${intake.action} ${intake.repos.length} named, ` +
           `reconciled to ${held} held${removed > 0 ? `, ${removed} marked removed` : ''}`,
       );
+
+      // DRAFTING, AS A JOB (10h). A repository that has just become known has no recipe,
+      // and until now the hosted plane left the box empty and said so — while `serve.ts`
+      // filled it in, because a laptop has Docker and a model key. This queues the same
+      // work for a worker.
+      //
+      // One job per repository NAMED IN THIS DELIVERY, and only for repositories that have
+      // no recipe and no draft already: reconciliation happens on every `installation` and
+      // `installation_repositories` delivery, so drafting on all of them would re-explore a
+      // repository every time somebody adds a second one to the same App.
+      //
+      // A draft is never a recipe. It lands in `recipe_drafts` and a human still approves
+      // it (ADR-0013) — which is why this is safe to start without asking anybody.
+      for (const repo of intake.repos) {
+        try {
+          if ((await loadRecipe(deps.client, repo)) !== null) continue;
+          if ((await loadDraft(deps.client, repo)) !== null) continue;
+          await enqueueJob(deps.client, {
+            installationId: intake.installationId,
+            repo,
+            kind: 'draft',
+            intake: { kind: 'draft', repo },
+          });
+          deps.log(`${repo}: queued a drafting run — a worker will propose a recipe`);
+        } catch (error) {
+          // Per repository, so one failure does not cost the others their draft. And never
+          // rethrown: this is reconciliation's tail, and a delivery GitHub will retry must
+          // not be failed over a proposal nobody is waiting on.
+          deps.log(`${repo}: could not queue a drafting run — ${String(error)}`);
+        }
+      }
       return;
     }
     // AN ISSUE DELIVERY STARTS NOTHING (M10). Runs start from the dashboard, pressed by a
