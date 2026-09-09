@@ -177,6 +177,25 @@ export type RepoDetail = {
   draft: unknown;
   secrets: { names: string[]; enabled: boolean };
   runs: RunRow[];
+  /**
+   * The drafting and proving work for this repository (10n).
+   *
+   * Neither has a log, a projection or a page of its own, so a screen waiting on one could
+   * not tell queued from running from finished-having-produced-nothing. The panel said the
+   * box might be empty because no machine was free OR because a session declined, asked
+   * the reader to pick, and then asked them to reload. `note` is why it produced nothing,
+   * in the worker's own words — testimony, and the thing that tells "wait" apart from "go
+   * and fix your key".
+   */
+  activity: RepoActivity[];
+};
+
+export type RepoActivity = {
+  kind: 'run' | 'prove' | 'draft';
+  queuedAt: string;
+  dispatchedAt: string | null;
+  finishedAt: string | null;
+  note: string | null;
 };
 
 export type Issue = { number: number; title: string; html_url: string; created_at?: string; comments?: number };

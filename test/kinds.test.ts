@@ -43,10 +43,13 @@ const job = (over: Partial<DaemonJob> = {}): DaemonJob => ({
 });
 
 /** A typed fake — never a cast, for the reason `runner-main.test.ts` records at length. */
-const fakeIo = (over: Partial<DaemonIo> = {}): DaemonIo & { findings: unknown[] } => {
+const fakeIo = (over: Partial<DaemonIo> = {}): DaemonIo & { findings: unknown[]; notes: string[] } => {
   const findings: unknown[] = [];
+  const notes: string[] = [];
   return {
     findings,
+    notes,
+    note: (text: string) => void notes.push(text),
     append: async () => {},
     token: async () => 'an-installation-token',
     cost: async () => {},
@@ -56,7 +59,13 @@ const fakeIo = (over: Partial<DaemonIo> = {}): DaemonIo & { findings: unknown[] 
     // which is what a webhook-era job and the local product both do.
     modelKey: async () => null,
     ...over,
-  } as DaemonIo & { findings: unknown[] };
+  };
+  // NO CAST, which is what the comment above this function has claimed since it was
+  // written. It ended in `as DaemonIo & { findings: unknown[] }`, and a cast is why
+  // `io.note` could be added to `DaemonIo` — and CALLED by the draft path this file
+  // tests — while every fake here silently lacked it. A missing member is a runtime
+  // `is not a function`, thrown inside the thing under test, which reads as a bug in the
+  // code rather than in the fixture.
 };
 
 describe('the three kinds are a closed set, and the database agrees', () => {
@@ -149,6 +158,14 @@ describe('a worker does the thing its job says', () => {
     })(job({ kind: 'draft', recipe: null }), io);
 
     expect(io.findings).toEqual([]);
+    // AND SAYS WHY, on the job row, which is where the onboarding screen reads it (10n).
+    // Storing nothing was already right; storing nothing SILENTLY left a reader unable to
+    // tell "no machine free yet" from "your model key is out of budget" from "this
+    // repository has no commits". All three were the same empty box, and they call for
+    // three different actions. The reason existed the whole time, in the worker's stdout.
+    expect(io.notes).toHaveLength(1);
+    expect(io.notes[0]).toContain('No recipe was proposed');
+    expect(io.notes[0]).toContain('it could not find a test command');
   });
 
   it('a prove job for a repository whose recipe was withdrawn does nothing, quietly', async () => {

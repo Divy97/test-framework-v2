@@ -34,7 +34,7 @@ import { readRun, type Db } from './store.js';
 import { sameOrigin, type Route } from './sse.js';
 import type { Session } from './auth.js';
 import { forgetRun, tombstoneFor } from './forget.js';
-import { enqueueJob, listRunners, openJobFor, pairRunner, revokeRunner } from './plane.js';
+import { enqueueJob, listRunners, openJobFor, pairRunner, repoActivity, revokeRunner } from './plane.js';
 
 /**
  * WHERE the engine runs, which changes what this surface may promise.
@@ -802,12 +802,15 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
       const installation = await loadInstallation(client, repo);
       if (!installation) return json({ error: 'not connected' }, 404);
-      const [recipe, stored, draft, names, runs] = await Promise.all([
+      const [recipe, stored, draft, names, runs, activity] = await Promise.all([
         loadRecipe(client, repo),
         loadStored(client, repo),
         loadDraft(client, repo),
         listRepoSecretNames(client, repo),
         listRuns(client, repo),
+        // The drafting and proving work, which has no log and no projection and was
+        // therefore invisible to the screen waiting on it (10n).
+        repoActivity(client, repo),
       ]);
       return json({
         repo,
@@ -824,6 +827,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
         draft: draft?.draft ?? null,
         secrets: { names, enabled: secretsEnabled() },
         runs,
+        activity,
       });
     }
 

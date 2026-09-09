@@ -512,6 +512,7 @@ describe('the environment screen says what approving did', () => {
     draft: null,
     secrets: { names: [], enabled: false },
     runs: [],
+    activity: [],
     ...over,
   });
   const me: Me = {
@@ -931,6 +932,7 @@ describe('the copy that carries a decision', () => {
     draft: null,
     secrets: { names: [], enabled: false },
     runs: [],
+    activity: [],
     ...over,
   });
   const me: Me = {
@@ -996,7 +998,7 @@ describe('the proof of a repository, which is stored as opaque JSON', () => {
     repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
     onboarded: true, recipe: { install: 'npm ci', services: [], test: 'npm test' },
     approvedAt: '2026-09-01T18:12:33.928Z', proof, draft: null,
-    secrets: { names: [], enabled: false }, runs: [],
+    secrets: { names: [], enabled: false }, runs: [], activity: [],
   });
   const me: Me = {
     accounts: true, signedIn: true, login: 'divy97', mode: 'plane',
@@ -1066,7 +1068,7 @@ describe('the skeleton in an empty recipe box', () => {
         detail={{
           repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
           onboarded: false, recipe: null, approvedAt: null, proof: null, draft: null,
-          secrets: { names: [], enabled: false }, runs: [],
+          secrets: { names: [], enabled: false }, runs: [], activity: [],
         }}
         me={{
           accounts: true, signedIn: true, login: 'd', mode: 'plane', installUrl: 'https://x.invalid',
@@ -1098,7 +1100,7 @@ describe('an empty recipe box says why it is empty', () => {
         detail={{
           repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
           onboarded: false, recipe: null, approvedAt: null, proof: null, draft: null,
-          secrets: { names: [], enabled: false }, runs: [],
+          secrets: { names: [], enabled: false }, runs: [], activity: [],
         }}
         me={{ ...me, mode }}
         onChanged={() => {}}

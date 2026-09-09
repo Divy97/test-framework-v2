@@ -327,6 +327,9 @@ async function onboardingJob(
     // indistinguishable from a job that never ran.
     if (!outcome.ok) {
       console.log(`${job.repo}: drafting produced nothing — ${outcome.reason}`);
+      // AND ON THE ROW, so the onboarding screen can say it. The log line above has been
+      // here since 8f and is read by nobody who is waiting for the box to fill in.
+      io.note(`No recipe was proposed. ${outcome.reason}`);
       // The transcript too, bounded. It is testimony and no verdict rests on it (ADR-0006),
       // and it is the only account of what the agent was doing for those 37 seconds — which
       // is the whole question when a session proposes nothing.

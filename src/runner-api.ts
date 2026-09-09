@@ -440,7 +440,20 @@ export function runnerRoutes(options: {
       // not a lesser thing to be allowed to do than writing to it.
       const check = await appendFromRunner(client, runner, runId, []);
       if ('refused' in check) return json({ error: check.refused }, 403);
-      await finishJob(client, runId);
+      // An OPTIONAL note — why this job produced nothing (10n). A body at all is new, so
+      // an older worker that posts none still finishes its job exactly as before.
+      let note: string | null = null;
+      const raw = await body();
+      if (raw !== '') {
+        try {
+          const said = JSON.parse(raw) as { note?: unknown };
+          if (typeof said.note === 'string' && said.note.trim() !== '') note = said.note;
+        } catch {
+          // A malformed body is not a reason to leave the job dispatched forever. The
+          // finish is the point; the explanation is a courtesy.
+        }
+      }
+      await finishJob(client, runId, note);
       return { status: 204, type: 'application/json', body: '' };
     }
 
