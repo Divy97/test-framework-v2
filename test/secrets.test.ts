@@ -155,10 +155,20 @@ const fakeClient = (rows: { name: string }[] = []) =>
     }),
   }) as unknown as Db;
 
-const surface = (options: { client?: Db; installations?: number[] } = {}) =>
+const surface = (
+  options: {
+    client?: Db;
+    installations?: number[];
+    checkKey?: (provider: string, key: string) => Promise<{ ok: boolean; detail: string }>;
+  } = {},
+) =>
   dashboardRoutes({
     client: options.client ?? fakeClient(),
     installUrl: 'https://example.invalid',
+    // A key that always works, so the route stores what it is given. The real checker
+    // spends a request on a real provider — with the CANARY as the bearer token, in the
+    // sweep below — and a test suite must not reach the network to find that out.
+    checkKey: options.checkKey ?? (async () => ({ ok: true, detail: 'a fake accepted it' })),
     auth: {
       session: async () => SESSION,
       installations: async () => options.installations ?? [1],
@@ -250,6 +260,50 @@ describe('the secrets routes answer with names and never with values', () => {
     // filed under a name nothing reads is a credential held for nothing.
     const wrong = await call(surface(), 'PUT', '/api/settings/model-key', JSON.stringify({ provider: 'acme', key: 'k' }));
     expect(wrong?.status).toBe(400);
+  });
+
+  test('a key the provider refuses is not stored, and the refusal is quoted', async () => {
+    // The onboarding failure this closes. The route checked the length of the string and
+    // the spelling of the provider and stored whatever it was handed, so a key that was
+    // revoked, expired, or over its spend cap was accepted and shown as configured — and
+    // the first thing to discover otherwise was an agent seventeen turns into the first
+    // drafting session on a repository the person had just connected.
+    const asked: { provider: string; key: string }[] = [];
+    const refusing = surface({
+      checkKey: async (provider, key) => {
+        asked.push({ provider, key });
+        return { ok: false, detail: 'Key limit exceeded (total limit)' };
+      },
+    });
+    const response = await call(
+      refusing,
+      'PUT',
+      '/api/settings/model-key',
+      JSON.stringify({ provider: 'openrouter', key: 'sk-or-spent' }),
+    );
+
+    expect(response?.status).toBe(400);
+    const body = JSON.parse(String(response?.body)) as { error: string; detail: string };
+    expect(body.error).toContain('has not been saved');
+    // The provider's own words reach the person, because ours would be a guess at which
+    // of expired, revoked, out of credit, or not entitled to this model it was.
+    expect(body.detail).toContain('Key limit exceeded');
+    // And it was really asked, with the key it was given — a route that skipped the check
+    // and hard-coded the 400 would pass every assertion above.
+    expect(asked).toEqual([{ provider: 'openrouter', key: 'sk-or-spent' }]);
+  });
+
+  test('a key the provider accepts is stored, and says it was checked', async () => {
+    const response = await call(
+      surface({ checkKey: async () => ({ ok: true, detail: 'the key answered' }) }),
+      'PUT',
+      '/api/settings/model-key',
+      JSON.stringify({ provider: 'openrouter', key: 'sk-or-good' }),
+    );
+    expect(response?.status).toBe(200);
+    const body = JSON.parse(String(response?.body)) as { stored: boolean; checked: string };
+    expect(body.stored).toBe(true);
+    expect(body.checked).toBe('the key answered');
   });
 });
 
@@ -372,6 +426,11 @@ describe('THE test: a value stored through the surface never comes back out of i
     const surface = dashboardRoutes({
       client: client as unknown as Db,
       installUrl: 'https://example.invalid',
+      // Accepting, so the model key really is STORED and this sweep is asking whether a
+      // stored value leaks — which is the whole point of it. With the real checker the
+      // canary would be refused, nothing would be stored, and every assertion below would
+      // pass on a surface that had written nothing.
+      checkKey: async () => ({ ok: true, detail: 'a fake accepted it' }),
       auth: { session: async () => ({ ...SESSION, githubId: GITHUB_ID }), installations: async () => [1] },
     });
     const path = `/api/repos/${encodeURIComponent(REPO)}/secrets`;

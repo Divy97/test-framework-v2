@@ -634,3 +634,53 @@ describe('a run that has been started but not yet claimed', () => {
     expect(status).toBe(404);
   });
 });
+
+// ── what a refusal looks like by the time a page has it (10n) ────────────────
+//
+// `parse` in `web/lib/api.ts` used to read `error` and drop everything else, so a route
+// that answers with our summary AND the provider's own sentence lost the half that says
+// what to go and fix. The model-key route is the one that matters: "openrouter refused
+// this key" is not actionable, and "Key limit exceeded (total limit)" is.
+
+describe('an error detail reaches the page', () => {
+  it('folds detail into the error a caller reads', async () => {
+    const answers = [
+      {
+        body: { error: 'openrouter refused this key, so it has not been saved', detail: 'Key limit exceeded (total limit)' },
+        status: 400,
+      },
+      { body: { error: 'not connected' }, status: 404 },
+      { body: { stored: true, provider: 'openrouter', checked: 'the key answered' }, status: 200 },
+    ];
+    const fetches = vi.fn(async (_url: unknown, _init?: unknown) => {
+      const next = answers.shift()!;
+      return new Response(JSON.stringify(next.body), {
+        status: next.status,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    const original = globalThis.fetch;
+    globalThis.fetch = fetches as unknown as typeof globalThis.fetch;
+    try {
+      const { send } = await import('../web/lib/api.js');
+
+      const refused = await send('PUT', '/api/settings/model-key', { provider: 'openrouter', key: 'k' });
+      expect(refused.ok).toBe(false);
+      expect(refused.error).toContain('refused this key');
+      // The provider's own words, which is the whole point.
+      expect(refused.error).toContain('Key limit exceeded');
+
+      // A route with no detail is unchanged — no dangling separator.
+      const plain = await send('DELETE', '/api/settings/model-key');
+      expect(plain.error).toBe('not connected');
+
+      // And success carries no error at all, detail or otherwise.
+      const stored = await send<{ checked: string }>('PUT', '/api/settings/model-key', {});
+      expect(stored.ok).toBe(true);
+      expect(stored.error).toBeNull();
+      expect(stored.data?.checked).toBe('the key answered');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});

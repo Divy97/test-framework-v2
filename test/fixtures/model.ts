@@ -131,7 +131,22 @@ export type ChatTurn = {
  */
 export function fakeChat(
   turns: ChatTurn[],
-  options: { status?: number; body?: string; repeatLast?: boolean; errorBody?: { message?: string; code?: number } } = {},
+  options: {
+    status?: number;
+    body?: string;
+    repeatLast?: boolean;
+    errorBody?: { message?: string; code?: number };
+    /**
+     * Serve this many turns normally, THEN answer `status`/`body` for every request after.
+     *
+     * The failure that needed it: a real drafting session booted the app, passed its
+     * healthcheck, drove the browser and saw the bug over sixteen turns, and then the API
+     * answered `403 Key limit exceeded`. Failing from the first request — the only thing
+     * this fixture could do before — exercises none of the code that decides what to call
+     * a loop that had already done the work.
+     */
+    failAfter?: number;
+  } = {},
 ): Promise<FakeModel> {
   const requests: Record<string, unknown>[] = [];
   let served = 0;
@@ -145,7 +160,7 @@ export function fakeChat(
       } catch {
         requests.push({ unparsed: Buffer.concat(chunks).toString() });
       }
-      if (options.status !== undefined) {
+      if (options.status !== undefined && served >= (options.failAfter ?? 0)) {
         response.writeHead(options.status, { 'content-type': 'application/json' });
         response.end(options.body ?? '{"error":{"message":"scripted"}}');
         return;

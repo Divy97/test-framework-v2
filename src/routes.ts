@@ -19,7 +19,7 @@ import { intake, listOpenIssues, readIssue, type Fetcher } from './github.js';
 import { listInstallations, loadInstallation } from './installations.js';
 import { listRuns, readCompute, readRunRow, readUsage } from './readmodel.js';
 import { ENV_NAME, loadStored, loadRecipe, parseRecipe, saveRecipe } from './recipe.js';
-import { PROVIDERS } from './loop.js';
+import { PROVIDERS, checkModelKey } from './loop.js';
 import {
   deleteModelKey,
   deleteRepoSecret,
@@ -89,6 +89,14 @@ export function dashboardRoutes(options: {
   client: Db;
   /** Injected so a test can drive the surface without a GitHub App registered. */
   installUrl?: string;
+  /**
+   * Asks a model provider whether a key works, before this surface stores it (10n).
+   *
+   * Injected for the same reason `installUrl` is: the real one spends a request on a real
+   * provider, and a test that drives this route must not need an account to do it. The
+   * default is `checkModelKey`, so a deployment that says nothing still asks.
+   */
+  checkKey?: (provider: string, key: string) => Promise<{ ok: boolean; detail: string }>;
   /**
    * Called after a recipe is stored, to prove the repository actually runs (8f).
    *
@@ -555,8 +563,31 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       }
       if (typeof key !== 'string' || key === '') return json({ error: 'send { "key": "…" }' }, 400);
       if (key.length > MAX_SECRET_CHARS) return json({ error: 'that value is too long to be a key' }, 413);
+      // ASKED, BEFORE IT IS STORED (10n).
+      //
+      // This route used to check the length of the string and the spelling of the provider
+      // and store whatever it was handed. Nothing anywhere then asked the provider whether
+      // the key worked, so the first thing that found out was an agent, mid-run, and the
+      // person had by then been shown a settings page saying their key was configured.
+      //
+      // It happened: an OpenRouter key capped at two dollars, spent, refused with a 403
+      // seventeen turns into the first drafting session on a newly connected repository.
+      // A key that has not been asked is not a key that works, and this surface will not
+      // say it is.
+      const checked = await (options.checkKey ?? checkModelKey)(provider, key);
+      if (!checked.ok) {
+        return json(
+          {
+            error: `${provider} refused this key, so it has not been saved`,
+            // The provider's own words, verbatim. They name which of expired, revoked, out
+            // of credit, or not entitled to this model it was, and ours would be a guess.
+            detail: checked.detail,
+          },
+          400,
+        );
+      }
       await putModelKey(client, githubId, provider, key);
-      return json({ stored: true, provider });
+      return json({ stored: true, provider, checked: checked.detail });
     }
 
     // THE ISSUE PICKER (M10). Authorized like every other page — may you see this

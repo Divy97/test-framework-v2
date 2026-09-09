@@ -37,7 +37,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RunEvent } from './events.js';
 import { fold } from './fold.js';
-import { runAgentLoop, type AgentTranscript, type LoopUsage } from './loop.js';
+import { runAgentLoop, type AgentTranscript, type LoopUsage, type TranscriptLine } from './loop.js';
 import type { Recipe } from './recipe.js';
 import type { Job } from './runner.js';
 import { dockerExecutor } from './executor-docker.js';
@@ -1383,6 +1383,26 @@ export type DraftOutcome =
  * already are (M6a, ADR-0013) — current, mutable, and not a fact about a run,
  * because until a human approves it nothing has run against it at all.
  */
+/**
+ * The last thing the loop said went wrong, or `null` if it never said anything.
+ *
+ * Read off the transcript rather than plumbed through `AgentTranscript`, because the
+ * transcript is where the loop already writes it and a second channel for the same fact
+ * is a second thing to keep in step.
+ */
+const lastLoopError = (lines: readonly TranscriptLine[]): string | null => {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (lines[i]!.claimed_type !== 'loop_error') continue;
+    try {
+      const message = (JSON.parse(lines[i]!.raw) as { message?: unknown }).message;
+      if (typeof message === 'string' && message.trim() !== '') return message.slice(0, 500);
+    } catch {
+      // A line that will not parse cannot name a cause. Keep looking further back.
+    }
+  }
+  return null;
+};
+
 export async function draftRecipe(plan: DraftPlan): Promise<DraftOutcome> {
   const empty: LoopUsage = {
     turns: 0,
@@ -1501,9 +1521,22 @@ export async function draftRecipe(plan: DraftPlan): Promise<DraftOutcome> {
     try {
       return { ok: true, draft: extractRecipeDraft(assistantText), transcriptText: debugText, usage: transcript.usage };
     } catch (error) {
+      // A session that was CUT OFF did not decline to propose a recipe, and the missing
+      // fenced block is a symptom of that rather than the reason for it. The first real
+      // draft job on a new repository reported `the drafting session produced no fenced
+      // JSON block` after the model API answered 403 — true, and useless, and it sent the
+      // reader looking at `prompts/recipe.md` for a fault that was a spend cap.
+      //
+      // So when the loop says it was stopped, the loop's account wins. It is the only one
+      // that names a cause, and `stopped` is the field that exists to tell a truncated
+      // transcript from a complete one.
+      const cutOff = transcript.stopped === 'exit' ? null : lastLoopError(transcript.lines);
       return {
         ok: false,
-        reason: String((error as Error).message ?? error),
+        reason:
+          cutOff === null
+            ? String((error as Error).message ?? error)
+            : `the drafting session was cut off (${transcript.stopped}) — ${cutOff}`,
         transcriptText: debugText,
         usage: transcript.usage,
       };

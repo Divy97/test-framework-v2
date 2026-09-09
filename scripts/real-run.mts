@@ -81,6 +81,11 @@ const mapped = intake('issues', {
   installation: { id: 987654 },
 })!;
 
+// `intake()` returns the union, and `runFromIssue` takes the issue half. Narrowed with a
+// throw rather than a cast: this script's whole purpose is to exercise the real path, and
+// a cast would let a fixture that stopped being an issue delivery run anyway.
+if (mapped.kind !== 'issue') throw new Error(`expected an issue delivery, got ${mapped.kind}`);
+
 const events: RunEvent[] = [];
 console.log(`running ${model} against the demo repository …`);
 const started = process.hrtime.bigint();

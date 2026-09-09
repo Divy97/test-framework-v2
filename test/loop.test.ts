@@ -16,9 +16,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { createServer } from 'node:http';
-import { effortLevel, MODEL, modelId, runAgentLoop } from '../src/loop.js';
+import { checkModelKey, effortLevel, MODEL, modelId, runAgentLoop } from '../src/loop.js';
 import { TOOL_SCHEMAS, ToolHost, type ToolWorld } from '../src/tools.js';
-import { call, fakeModel, type FakeModel } from './fixtures/model.js';
+import { call, fakeChat, fakeModel, fnCall, type FakeModel } from './fixtures/model.js';
 
 const dirs: string[] = [];
 const hosts: ToolHost[] = [];
@@ -192,6 +192,14 @@ describe('the loop ends honestly', () => {
     // of the attempt is a failure to observe, and those are not the same thing.
     expect(transcript.exitCode).toBe(-1);
     expect(claimed(transcript)).toContain('loop_error');
+    // And it SAYS SO in `stopped`, which this asserted nothing about for four
+    // milestones. The fallback was `lines.length === 0 ? 'spawn_failed' : 'exit'`, so a
+    // loop that lost the model part-way through reported `exit` — a value with no
+    // `CUT_OFF` entry in `report.ts`, which means the person who filed the bug was told
+    // the agent had finished and found nothing. Mutating this line back to `exit` left
+    // the whole suite green, which is how it survived.
+    expect(transcript.stopped).toBe('api_error');
+    expect(transcript.stopped).not.toBe('exit');
   });
 
   test('a runaway transcript stops at the cap and records that it did', async () => {
@@ -462,5 +470,83 @@ describe('what a run costs is measured, not guessed', () => {
       expect(source, file).toContain("stopped = 'turn_cap'");
       expect(source, file).toContain('iteration ceiling');
     }
+  });
+});
+
+// ── the key, asked before it is trusted (10n) ───────────────────────────────
+//
+// `PUT /api/settings/model-key` injects this, and every test of that route injects a
+// fake — so without the four below, replacing this whole function with
+// `return { ok: true }` leaves the suite green and the feature inert while looking
+// present. That is the failure class the engine exists to refuse, and it was in the
+// check that exists to catch it.
+
+describe('a model key is asked before it is stored', () => {
+  test('openrouter: a spent key is refused, in the provider\'s own words', async () => {
+    const model = await fakeChat([], {
+      status: 403,
+      body: '{"error":{"message":"Key limit exceeded (total limit)","code":403}}',
+    });
+    models.push(model);
+    const outcome = await checkModelKey('openrouter', 'sk-or-spent', {
+      model: 'cheap/model',
+      baseURL: model.baseURL,
+    });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain('403');
+    expect(outcome.detail).toContain('Key limit exceeded');
+  });
+
+  test('openrouter: a working key that drives the tools is accepted', async () => {
+    const model = await fakeChat([{ tool_calls: [fnCall('glob', { pattern: '*' })] }]);
+    models.push(model);
+    const outcome = await checkModelKey('openrouter', 'sk-or-good', {
+      model: 'cheap/model',
+      baseURL: model.baseURL,
+    });
+    expect(outcome.ok).toBe(true);
+  });
+
+  test('openrouter: a key that works on a model which will not call tools is refused', async () => {
+    // The other way a stored key produces nothing: it is valid, it is funded, and the
+    // model answers the prompt in prose. A run on it reads as an agent that explored and
+    // declined, which is indistinguishable from a real Tier 3 (ADR-0015).
+    const model = await fakeChat([{ content: 'Sure! I would call glob("*").' }]);
+    models.push(model);
+    const outcome = await checkModelKey('openrouter', 'sk-or-chatty', {
+      model: 'cheap/model',
+      baseURL: model.baseURL,
+    });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain('structured tool call');
+  });
+
+  test('anthropic: the check does not send ENGINE_MODEL to Anthropic', async () => {
+    // `ENGINE_MODEL` means "a model id" on both providers and they do not share a
+    // vocabulary. The local `.env` sets it to `moonshotai/kimi-k2-thinking`; sending that
+    // to the Anthropic API is a 404, so checking an Anthropic key on a machine configured
+    // for OpenRouter would have refused a live key and blamed the key. Found by reading
+    // the diff, not by a failure — nothing else here sets `ENGINE_MODEL`.
+    const before = process.env.ENGINE_MODEL;
+    process.env.ENGINE_MODEL = 'moonshotai/kimi-k2-thinking';
+    const model = await fakeModel([{ content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' }]);
+    models.push(model);
+    try {
+      const outcome = await checkModelKey('anthropic', 'sk-ant-fine', { baseURL: model.baseURL });
+      expect(outcome.ok).toBe(true);
+      expect(model.requests[0]?.model).toBe('claude-haiku-4-5');
+      expect(model.requests[0]?.model).not.toBe('moonshotai/kimi-k2-thinking');
+    } finally {
+      if (before === undefined) delete process.env.ENGINE_MODEL;
+      else process.env.ENGINE_MODEL = before;
+    }
+  });
+
+  test('anthropic: a refused key is refused here too', async () => {
+    const model = await fakeModel([], { status: 401 });
+    models.push(model);
+    const outcome = await checkModelKey('anthropic', 'sk-ant-revoked', { baseURL: model.baseURL });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).not.toBe('');
   });
 });

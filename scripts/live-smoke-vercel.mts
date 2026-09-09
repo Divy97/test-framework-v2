@@ -93,6 +93,11 @@ const events: RunEvent[] = [];
 console.log(`running ${model} on Vercel sandboxes …`);
 console.log(`  base  ${IMAGE}`);
 console.log(`  agent ${AGENT_IMAGE}`);
+// `intake()` returns the union, and `runFromIssue` takes the issue half. Narrowed with a
+// throw rather than a cast: this script's whole purpose is to exercise the real path, and
+// a cast would let a fixture that stopped being an issue delivery run anyway.
+if (mapped.kind !== 'issue') throw new Error(`expected an issue delivery, got ${mapped.kind}`);
+
 const started = process.hrtime.bigint();
 
 let result;

@@ -24,7 +24,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { BetaRunnableTool } from '@anthropic-ai/sdk/lib/tools/BetaRunnableTool';
 import type { AgentFinishedV1 } from './events.js';
-import { DEFAULT_OPENROUTER_MODEL, OPENROUTER_BASE, runOpenRouterLoop } from './openrouter.js';
+import { DEFAULT_OPENROUTER_MODEL, OPENROUTER_BASE, probeToolCalling, runOpenRouterLoop } from './openrouter.js';
 import { TOOL_SCHEMAS } from './tools.js';
 
 /** The model v1.5 runs on, and the thinking configuration ADR-0011's milestone names. */
@@ -313,6 +313,69 @@ export async function askOnce(options: {
   }
 }
 
+/**
+ * Ask the provider whether this key can actually drive a run, before storing it.
+ *
+ * `PUT /api/settings/model-key` used to check the length of the string and the spelling
+ * of the provider and store whatever it was given. So a key that was revoked, expired, or
+ * over its spend cap was accepted, shown as configured, and failed for the first time
+ * seventeen turns into a drafting session on a repository the person had just connected —
+ * where the cost of the mistake is highest and the diagnosis is hardest. A real one did:
+ * a two-dollar OpenRouter key with `limit_remaining: 0`, refused with a 403 the log then
+ * reported as an iteration ceiling.
+ *
+ * One request, a handful of tokens, spent on the key being tested — which is what the key
+ * is for, and the only way to learn the answer. It is charged to whoever is saving it.
+ *
+ * A failure here is deliberately not fatal to the *engine*: the caller decides whether to
+ * store anyway. What it must never do is claim a key works because nobody asked.
+ */
+export async function checkModelKey(
+  provider: string,
+  key: string,
+  options: { model?: string; baseURL?: string } = {},
+): Promise<{ ok: boolean; detail: string }> {
+  if (providerName(provider) === 'openrouter') {
+    // The model the WORKER will reach for, not one of our choosing: a key that works on a
+    // cheap model and is not entitled to the configured one is still a key that cannot do
+    // the job. `probeToolCalling` also screens a model that answers in prose instead of
+    // calling tools (ADR-0015), which is the other way this silently produces nothing.
+    return probeToolCalling({
+      apiKey: key,
+      model: options.model ?? process.env.ENGINE_MODEL ?? DEFAULT_OPENROUTER_MODEL,
+      ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
+    });
+  }
+  try {
+    const client = new Anthropic({
+      apiKey: key,
+      maxRetries: 0,
+      timeout: 20_000,
+      ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
+    });
+    await client.messages.create({
+      // A FIXED cheap model, deliberately not `modelId()`. That reads `ENGINE_MODEL`,
+      // which means "a model id" on both providers with different vocabularies — the
+      // local `.env` sets it to `moonshotai/kimi-k2-thinking`, and sending that to the
+      // Anthropic API is a 404. So checking an Anthropic key on a machine configured for
+      // OpenRouter would have refused a perfectly good key and blamed the key.
+      //
+      // The narrowing this accepts: a key with credit for Haiku and none for Opus passes
+      // here. That is the right trade — the question this answers is whether the key is
+      // live, and the OpenRouter path, which is the actual default, does check the real
+      // model because entitlements there are per-model.
+      model: ASK_MODEL,
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    return { ok: true, detail: 'the key answered' };
+  } catch (error) {
+    // The provider's own words. Ours would be a guess at which of expired, revoked,
+    // out of credit, or not entitled to this model it was.
+    return { ok: false, detail: String((error as Error).message ?? error).slice(0, 500) };
+  }
+}
+
 export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscript> {
   if (providerName(options.provider) === 'openrouter') {
     const apiKey = options.apiKey ?? options.authToken ?? process.env.OPENROUTER_API_KEY;
@@ -483,9 +546,16 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
     // A model API error, a refusal, a rate limit. All of them are things the
     // agent's turn did, recorded as testimony; none of them is a reason to lose
     // the transcript that arrived before it.
+    //
+    // `api_error` rather than the `exit` this used to fall back to. `exit` has no
+    // `CUT_OFF` entry in `report.ts`, so a loop that lost its model mid-sentence was
+    // reported to the person who filed the bug as an agent that had finished and found
+    // nothing — the exact substitution `turn_cap` was added to stop. Nor is it
+    // `spawn_failed`: a loop sixteen turns in did get going, and saying it never started
+    // sends whoever reads it to look at the wrong thing.
     record('loop_error', { message: String(error) });
     if (stopped === 'exit') {
-      stopped = lines.length === 0 ? 'spawn_failed' : 'exit';
+      stopped = 'api_error';
       exitCode = -1;
     }
   }
