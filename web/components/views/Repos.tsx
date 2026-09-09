@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import type { Me, RepoRow } from '../../lib/api';
 import { useJson } from '../../lib/hooks';
 import { Failed, Loading, When } from '../bits';
@@ -37,8 +38,17 @@ export function Repos({ me, go }: { me: Me | null; go: (to: string) => void }) {
  * a built bundle.
  */
 export function Register({ rows, me, go }: { rows: RepoRow[]; me: Me | null; go: (to: string) => void }) {
-  const ready = rows.filter((row) => row.onboarded);
-  const waiting = rows.filter((row) => !row.onboarded);
+  // A FILTER, because the honest instruction used to be "use your browser's find" (10n).
+  // Granting the App access to a whole account is the ordinary case — this one has 177
+  // repositories and onboards them one at a time — and the list is the first screen after
+  // signing in. Client-side over rows already fetched, the same shape `Start` uses for
+  // issues; there is no second request and nothing to debounce.
+  const [filter, setFilter] = useState('');
+  const needle = filter.trim().toLowerCase();
+  const shown = needle === '' ? rows : rows.filter((row) => row.repo.toLowerCase().includes(needle));
+  const ready = shown.filter((row) => row.onboarded);
+  const waiting = shown.filter((row) => !row.onboarded);
+  const total = { ready: rows.filter((row) => row.onboarded).length };
 
   // The caption carries the COUNT, which the `<h2>` above it does not. A caption that
   // repeats its own heading is read twice by a screen reader and is noise on the page.
@@ -125,14 +135,57 @@ export function Register({ rows, me, go }: { rows: RepoRow[]; me: Me | null; go:
         </div>
       ) : (
         <>
+          {/* THE KEY, ASKED HERE (10n). It is needed for drafting and for every run, and
+              it used to be discovered at step eight of fifteen as a button that would not
+              press — on a repository the reader had already committed to. This is the
+              first screen after signing in, and thirty seconds spent here removes a detour
+              from the middle of the flow. Not a blocker: a reader who wants to look around
+              first is not stopped. */}
+          {me?.accounts && me.modelKey === null ? (
+            <div className="notice">
+              <p>
+                <b>You have not stored a model key.</b> Drafting a recipe and starting a run
+                both spend the key of whoever asks for them, so nothing here can start until
+                there is one. It takes about thirty seconds.
+              </p>
+              <p className="calls">
+                <a className="cta" href="/settings">
+                  Store a model key
+                </a>
+              </p>
+            </div>
+          ) : null}
+          {rows.length > 12 ? (
+            <p className="field">
+              <label htmlFor="repo-filter">Find a repository</label>
+              <input
+                id="repo-filter"
+                type="search"
+                value={filter}
+                onChange={(event) => setFilter(event.target.value)}
+                placeholder="owner/name"
+                autoComplete="off"
+              />
+              {needle === '' ? null : (
+                <span className="hint" role="status">
+                  {shown.length === 0
+                    ? `Nothing matches “${filter.trim()}”.`
+                    : `${shown.length} of ${rows.length} match “${filter.trim()}”.`}
+                </span>
+              )}
+            </p>
+          ) : null}
           <p className="hero">
-            {ready.length === 0
+            {total.ready === 0
               ? 'Nothing here can run yet — a repository needs an approved recipe before an issue on it does anything.'
               : // The plural agrees with the TOTAL, not with the onboarded count — "1 of 2
                 // repository is onboarded" is what the other way round produces, and it is
                 // the sentence at the top of the first screen anybody sees.
-                `${ready.length} of ${rows.length} ${rows.length === 1 ? 'repository is' : 'repositories are'} onboarded and can take work. ${
-                  rows.length - ready.length === 1 ? 'The other is' : 'The rest are'
+                // Counted over ALL rows, never the filtered ones: this is the top-line
+                // fact about the account, and a filter that quietly rewrote it would make
+                // typing into a search box look like repositories being onboarded.
+                `${total.ready} of ${rows.length} ${rows.length === 1 ? 'repository is' : 'repositories are'} onboarded and can take work. ${
+                  rows.length - total.ready === 1 ? 'The other is' : 'The rest are'
                 } connected and waiting.`}
           </p>
           {ready.length > 0 ? (

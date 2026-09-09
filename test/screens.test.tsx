@@ -40,7 +40,11 @@ import type {
   VerificationAbortedV1,
 } from '../src/events.js';
 import { EVENT_TYPES as CLIENT_EVENT_TYPES } from '../web/lib/hooks';
+import { Checklist, isWaiting, steps } from '../web/components/Checklist';
+import { missingNames } from '../web/lib/required';
+import { missingRequired } from '../src/recipe.js';
 import { Chrome } from '../web/components/Chrome';
+import { Start } from '../web/components/views/Start';
 import { Evidence } from '../web/components/views/Evidence';
 import { Environment } from '../web/components/views/Environment';
 import { Landing } from '../web/components/views/Landing';
@@ -1148,5 +1152,240 @@ describe('an empty recipe box says why it is empty', () => {
     // It was gated on `mode === 'plane'`, so a local operator with an empty box was told
     // nothing at all. Both deployments now draft; only the machine differs.
     expect(bare('local')).toMatch(/Nothing has been proposed/);
+  });
+});
+
+// ── where you are, and the one thing to do next (10n) ────────────────────────
+//
+// The flow this exists for was rated 5/10 by the person who owns it: fifteen steps with
+// hard dependencies, and the product named none of them. The model key turned up at step
+// eight as a button that would not press; required secrets turned up at step fourteen, as
+// a run that came back blocked; two waits ended with "reload in a minute or two".
+//
+// `steps()` is asserted rather than the markup, because the ORDER and the single `now` are
+// the whole feature — a checklist with two next actions is the menu the reader already had.
+
+describe('the checklist names one next action', () => {
+  const me = (over: Partial<Me> = {}): Me => ({
+    accounts: true, signedIn: true, login: 'd', mode: 'plane',
+    installUrl: 'https://x.invalid', modelKey: { provider: 'openrouter' },
+    secrets: { enabled: true }, github: true, forgetting: true,
+    ...over,
+  });
+
+  const detail = (over: Partial<RepoDetail> = {}): RepoDetail => ({
+    repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
+    onboarded: false, recipe: null, approvedAt: null, proof: null, draft: null,
+    secrets: { names: [], enabled: true }, runs: [], activity: [],
+    ...over,
+  });
+
+  const at = (list: ReturnType<typeof steps>, id: string) => list.find((step) => step.id === id)!;
+  const nows = (list: ReturnType<typeof steps>) => list.filter((step) => step.state === 'now');
+
+  test('EXACTLY one step is the next action, in every state', () => {
+    // The property the whole component rests on. Two `now`s is a menu; zero is a dead end.
+    const cases: RepoDetail[] = [
+      detail(),
+      detail({ draft: { install: 'npm ci' } }),
+      detail({ activity: [{ kind: 'draft', queuedAt: '2026-09-09T00:00:00.000Z', dispatchedAt: null, finishedAt: null, note: null }] }),
+      detail({ onboarded: true, recipe: { install: 'npm ci', services: [], test: 'npm test' }, approvedAt: '2026-09-09T00:00:00.000Z' }),
+      detail({
+        onboarded: true,
+        recipe: { install: 'npm ci', services: [], test: 'npm test', required: ['TOKEN'] },
+        approvedAt: '2026-09-09T00:00:00.000Z',
+        proof: { state: 'ready' },
+      }),
+    ];
+    for (const [n, one] of cases.entries()) {
+      const list = steps('acme/widgets', one, me());
+      // At most one — a `waiting` or `failed` step claims the reader's attention instead,
+      // and then nothing else may also be `now`.
+      expect(nows(list).length, `case ${n}`).toBeLessThanOrEqual(1);
+      expect(list.length, `case ${n}`).toBeGreaterThan(3);
+    }
+  });
+
+  test('the model key is the first thing asked, because everything after it spends one', () => {
+    const list = steps('acme/widgets', detail(), me({ modelKey: null }));
+    expect(at(list, 'key').state).toBe('now');
+    expect(at(list, 'key').href).toBe('/settings');
+    // And nothing else competes with it.
+    expect(nows(list)).toHaveLength(1);
+    // On a deployment with no accounts there is nobody to ask — the operator's key is the
+    // only key, and asking would be a step that cannot be completed.
+    expect(at(steps('acme/widgets', detail(), me({ accounts: false })), 'key').state).toBe('done');
+  });
+
+  test('a drafting job in flight says how long, rather than telling you to reload', () => {
+    const list = steps(
+      'acme/widgets',
+      detail({
+        activity: [{ kind: 'draft', queuedAt: '2026-09-09T12:00:00.000Z', dispatchedAt: '2026-09-09T12:00:10.000Z', finishedAt: null, note: null }],
+      }),
+      me(),
+      Date.parse('2026-09-09T12:01:40.000Z'),
+    );
+    const draft = at(list, 'draft');
+    expect(draft.state).toBe('waiting');
+    expect(draft.detail).toContain('90s');
+    expect(draft.detail).not.toMatch(/reload/i);
+    // Waiting is what makes the page poll, so this is the same flag the timer reads.
+    expect(isWaiting(list)).toBe(true);
+  });
+
+  test('a job still queued says so, which is a different thing from running', () => {
+    const list = steps(
+      'acme/widgets',
+      detail({ activity: [{ kind: 'draft', queuedAt: '2026-09-09T12:00:00.000Z', dispatchedAt: null, finishedAt: null, note: null }] }),
+      me(),
+      Date.parse('2026-09-09T12:00:30.000Z'),
+    );
+    expect(at(list, 'draft').detail).toContain('waiting for a machine');
+  });
+
+  test('a failed draft says WHY, in the words the worker used', () => {
+    // The four indistinguishable empties this closes: no machine free, a session that
+    // declined, an out-of-budget key, a repository with no commits. Each calls for a
+    // different action, and the screen used to offer the reader a guess between two.
+    const list = steps(
+      'acme/widgets',
+      detail({
+        activity: [{
+          kind: 'draft', queuedAt: '2026-09-09T12:00:00.000Z', dispatchedAt: '2026-09-09T12:00:01.000Z',
+          finishedAt: '2026-09-09T12:00:20.000Z',
+          note: 'No recipe was proposed. the drafting session was cut off (api_error) — HTTP 403 — Key limit exceeded (total limit)',
+        }],
+      }),
+      me(),
+    );
+    expect(at(list, 'draft').state).toBe('failed');
+    expect(at(list, 'draft').detail).toContain('Key limit exceeded');
+    // A failure is not a "next action" the reader can press, so nothing is `now` behind it.
+    expect(nows(list)).toHaveLength(0);
+    expect(isWaiting(list)).toBe(false);
+  });
+
+  test('required secrets appear as a step, which is the one the flow had no room for', () => {
+    const withRequired = detail({
+      onboarded: true,
+      recipe: { install: 'npm ci', services: [], test: 'npm test', required: ['SPOTIFY_CLIENT_ID', 'GITHUB_TOKEN'] },
+      approvedAt: '2026-09-09T00:00:00.000Z',
+      proof: { state: 'ready' },
+    });
+    const list = steps('acme/widgets', withRequired, me());
+    expect(at(list, 'secrets').state).toBe('now');
+    expect(at(list, 'secrets').title).toContain('2 values');
+    expect(at(list, 'secrets').detail).toContain('SPOTIFY_CLIENT_ID');
+
+    // Stored, and it settles.
+    const stored = steps('acme/widgets', { ...withRequired, secrets: { names: ['SPOTIFY_CLIENT_ID', 'GITHUB_TOKEN'], enabled: true } }, me());
+    expect(at(stored, 'secrets').state).toBe('done');
+    expect(at(stored, 'run').state).toBe('now');
+
+    // A recipe that requires nothing gets no step at all — an empty checklist row is a
+    // question the reader has to answer before they can ignore it.
+    expect(steps('acme/widgets', detail({ onboarded: true, recipe: { install: 'npm ci', services: [] } }), me()).find((s) => s.id === 'secrets')).toBeUndefined();
+  });
+
+  test('a value the recipe hard-codes is not asked for again', () => {
+    // `env` satisfying a `required` name is the rule `src/recipe.ts` holds, and the two
+    // copies of it have to agree or this screen asks for something a run already has.
+    const list = steps(
+      'acme/widgets',
+      detail({
+        onboarded: true,
+        recipe: { install: 'npm ci', services: [], test: 'npm test', required: ['PORT'], env: { PORT: '3000' } },
+        approvedAt: '2026-09-09T00:00:00.000Z',
+      }),
+      me(),
+    );
+    expect(at(list, 'secrets').state).toBe('done');
+  });
+
+  test('and it renders the current step as the page’s one call to action', () => {
+    const html = render(
+      <Checklist repo="acme/widgets" detail={detail()} me={me({ modelKey: null })} now={Date.parse('2026-09-09T12:00:00.000Z')} />,
+    );
+    expect(html).toContain('Store a model key');
+    expect(html).toContain('/settings');
+    // Every state carries a WORD, not only a glyph and a colour.
+    expect(html).toMatch(/do this next/);
+    expect(html).toMatch(/aria-current="step"/);
+  });
+});
+
+// ── the two copies of one rule (10n) ────────────────────────────────────────
+//
+// `missingNames` in `web/lib/required.ts` is `missingRequired` from `src/recipe.ts`,
+// rewritten because the browser bundle must not import the engine. Two copies of a rule
+// is a thing that drifts, and the drift here is silent and expensive: the screen would
+// ask for a value a run already has, or stay quiet about one it needs and let the reader
+// press Start into a blocked run.
+
+describe('the browser and the engine agree on what is missing', () => {
+  const cases: { recipe: { required?: string[]; env?: Record<string, string> }; stored: string[] }[] = [
+    { recipe: {}, stored: [] },
+    { recipe: { required: ['A'] }, stored: [] },
+    { recipe: { required: ['A'] }, stored: ['A'] },
+    { recipe: { required: ['A', 'B'] }, stored: ['B'] },
+    // `env` satisfies a name — and an EMPTY value does not, which is the half an agent
+    // could otherwise use to unblock a run into a half-configured boot.
+    { recipe: { required: ['A'], env: { A: '1' } }, stored: [] },
+    { recipe: { required: ['A'], env: { A: '' } }, stored: [] },
+    { recipe: { required: ['A', 'B'], env: { A: '1' } }, stored: ['C'] },
+  ];
+
+  test('for every shape either could be handed', () => {
+    for (const one of cases) {
+      const label = JSON.stringify(one);
+      expect(missingNames(one.recipe, one.stored), label).toEqual(
+        missingRequired(one.recipe as Parameters<typeof missingRequired>[0], one.stored),
+      );
+    }
+  });
+});
+
+// ── the blocker Start never answered (10n) ──────────────────────────────────
+//
+// `Start`'s own comment says every reason a run can be refused is answered BEFORE the
+// button, in the words the API would use, so nobody presses a button whose only outcome
+// is a refusal they could have been told about while they were choosing. Missing secrets
+// were the one it did not answer: the recipe NAMES what it needs, nothing compared that to
+// what was stored, and `missingRequired` in `src/run.ts` stopped the run correctly — after
+// the person had chosen an issue, pressed Start, and waited for a container.
+
+describe('Start refuses a run it can predict will be refused', () => {
+  const me: Me = {
+    accounts: true, signedIn: true, login: 'd', mode: 'plane',
+    installUrl: 'https://x.invalid', modelKey: { provider: 'openrouter' },
+    secrets: { enabled: true }, github: true, forgetting: true,
+  };
+  const onboarded = (over: Partial<RepoDetail> = {}): RepoDetail => ({
+    repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
+    onboarded: true,
+    recipe: { install: 'npm ci', services: [], test: 'npm test', required: ['SPOTIFY_CLIENT_ID'] },
+    approvedAt: '2026-09-09T00:00:00.000Z', proof: null, draft: null,
+    secrets: { names: [], enabled: true }, runs: [], activity: [],
+    ...over,
+  });
+
+  test('names the value that is missing, and where to put it', () => {
+    const html = render(<Start repo="acme/widgets" detail={onboarded()} me={me} go={() => {}} />);
+    expect(html).toContain('SPOTIFY_CLIENT_ID');
+    expect(html).toMatch(/not\s+stored/);
+    // The words the run itself would use — it stops BEFORE booting rather than reporting a
+    // bug it could not see, and saying so is the difference between a refusal and a fault.
+    expect(html).toMatch(/stop before booting/);
+    expect(html).toContain('#environment');
+  });
+
+  test('and says nothing once the value is stored, so the refusal is not blanket', () => {
+    // Without this the test above passes on a screen that refuses every run.
+    const html = render(
+      <Start repo="acme/widgets" detail={onboarded({ secrets: { names: ['SPOTIFY_CLIENT_ID'], enabled: true } })} me={me} go={() => {}} />,
+    );
+    expect(html).not.toContain('SPOTIFY_CLIENT_ID');
+    expect(html).not.toMatch(/stop before booting/);
   });
 });

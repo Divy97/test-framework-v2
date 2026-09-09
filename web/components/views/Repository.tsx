@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Me, RepoDetail } from '../../lib/api';
 import { useJson } from '../../lib/hooks';
 import { Failed, Loading, Tabs, When } from '../bits';
+import { Checklist, isWaiting, steps } from '../Checklist';
 import { Environment } from './Environment';
 import { Runners } from './Runners';
 import { Start } from './Start';
@@ -55,6 +56,26 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
   useEffect(() => {
     if (!asked.current && onboarded === false) setTab('environment');
   }, [onboarded]);
+
+  // WAITING IS NOT THE READER'S JOB (10n). Drafting takes a couple of minutes and proving
+  // about half one, and both used to end with "reload in a minute or two" — an instruction
+  // to poll a server by hand about a job that server can see. Two blind waits in a
+  // fifteen-step flow, and the worst moment in the product.
+  //
+  // Five seconds while something is in flight, and NOTHING otherwise: this is a page
+  // people leave open. `tick` re-renders so the elapsed time on the waiting step counts up
+  // rather than freezing at whatever it said when the last answer arrived.
+  const [tick, setTick] = useState(() => Date.now());
+  const waiting = detail.data === null ? false : isWaiting(steps(repo, detail.data, me, tick));
+  const reload = detail.reload;
+  useEffect(() => {
+    if (!waiting) return;
+    const timer = setInterval(() => {
+      setTick(Date.now());
+      reload();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [waiting, reload]);
 
   const tabs = useRef<HTMLDivElement>(null);
   const choose = (next: Tab) => {
@@ -123,6 +144,18 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
           </span>
         )}
       </p>
+
+      {/* ABOVE THE TABS, because "what should I do" is not one of three views of this
+          repository — it is the question a reader arrives with, and the tabs are how they
+          act on the answer. `onGo` moves them to the tab that holds the action, so the
+          one call to action on this page is never a dead end. */}
+      <Checklist
+        repo={repo}
+        detail={data}
+        me={me}
+        now={tick}
+        onGo={(id) => choose(id === 'secrets' || id === 'draft' || id === 'approve' ? 'environment' : 'start')}
+      />
 
       <div ref={tabs}>
       <Tabs<Tab>

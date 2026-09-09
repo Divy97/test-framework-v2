@@ -151,6 +151,12 @@ const fixtureClient = (): Db => {
     if (sql.includes('from recipe_drafts where repo = $1')) {
       return [];
     }
+    // The drafting and proving work for a repository (10n). Nothing here has any, which is
+    // the state that matters: the checklist's job on this fixture is to say what to do
+    // next, not to report a job in flight.
+    if (sql.includes('from jobs')) {
+      return [];
+    }
     if (sql.includes('from run_projection where run_id = $1')) {
       return params[0] === DEMO_RUN_ID ? [RUN_ROW] : [];
     }
@@ -544,6 +550,23 @@ describe.sequential('the dashboard, driven in a real browser', () => {
 
     // The control: an ONBOARDED repository is untouched and still opens on Start.
     expect(await visit('/repos/acme/widgets', /start a run/i)).toMatch(/Pick the issue to work on|no GitHub App/i);
+  });
+
+  test('the checklist tells a reader where they are and what to do next', async () => {
+    if (skipped('the checklist')) return;
+    // The whole point of 10n, driven for real: `steps()` has unit tests, and this asserts
+    // the thing they cannot — that it is mounted, on the page, above the tabs, on a
+    // repository that has not been onboarded.
+    const page = await visit(`/repos/${UNONBOARDED}`, /you are the control/i);
+
+    // The path, visible in full including the parts not reached — that is the value of a
+    // checklist over a single "next step" line.
+    expect(page).toMatch(/approve the recipe/i);
+    expect(page).toMatch(/start a run on an issue/i);
+    // Exactly one step is the next action, and the words say so rather than only a colour.
+    expect(page.match(/do this next/gi) ?? []).toHaveLength(1);
+    // This fixture has no draft, no recipe and no activity, so getting one proposed is it.
+    expect(page).toMatch(/get a recipe proposed/i);
   });
 
   test('the run register renders, and links to the run', async () => {

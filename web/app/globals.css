@@ -430,6 +430,55 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .card{background:var(--paper);padding:1.6rem 1.5rem}
 .card h3{margin:0 0 .5rem;font-size:1.1rem;font-weight:500;letter-spacing:-.01em}
 .card p{margin:0;color:var(--muted);font-size:.97rem}
+/*
+ * A PROMPT, not a warning (10n).
+ *
+ * The model-key ask on the repository list. It uses the warn tokens because it IS the
+ * thing standing between the reader and anything working — but it stops nothing and must
+ * not read like an error, so it gets the ground and the rule and none of the alarm.
+ */
+.notice{background:var(--warn-bg);border:1px solid var(--warn-line);border-left-width:3px;
+  border-radius:6px;padding:1rem 1.2rem;margin:0 0 1.5rem;max-width:56rem;color:var(--warn-fg)}
+.notice p{margin:0}
+.notice p + p{margin-top:.9rem}
+.notice .calls{margin:.9rem 0 0}
+
+/*
+ * THE CHECKLIST (10n) — where you are, and the one thing to do next.
+ *
+ * Deliberately quiet. It sits above the tabs on every repository page, including the ones
+ * where every step is done, so a loud treatment would shout at a reader who has nothing
+ * left to do. Structure carries it: a hairline box, mono glyphs in a fixed gutter so the
+ * titles align, and colour spent only on the two states that are not neutral.
+ *
+ * `--panel` ground rather than a border alone, because it has to read as one object when
+ * six lines of it sit above a tablist that also has hairlines.
+ */
+.checklist{background:var(--panel);border:1px solid var(--rule);border-radius:8px;
+  padding:1.25rem 1.4rem;margin:0 0 2rem;max-width:56rem}
+.checklist ol{list-style:none;margin:0;padding:0;display:grid;gap:.7rem}
+.checklist li{display:grid;grid-template-columns:1.4rem 1fr;gap:.7rem;align-items:baseline}
+.checklist .mark{font-family:var(--mono);font-size:.85rem;color:var(--muted);text-align:center}
+.checklist .what{display:block}
+.checklist .what b{font-weight:500}
+/* The reason, the elapsed time, or the worker's own words about a failure. */
+.checklist .why{display:block;color:var(--muted);font-size:.92rem;line-height:1.45;margin-top:.15rem;
+  /* A `note` can carry a provider's error with a URL in it and no spaces to break on. */
+  overflow-wrap:anywhere}
+/* A step nobody is being asked to do yet recedes, and is NOT hidden: the value of the
+ * list is that the whole path is visible, including the parts not reached. */
+.checklist .step-later > .what b{color:var(--muted);font-weight:400}
+.checklist .step-done .mark{color:var(--ok)}
+.checklist .step-now > .what b{color:var(--ink);font-weight:600}
+.checklist .step-now .mark{color:var(--ink)}
+.checklist .step-failed .mark{color:var(--bad)}
+.checklist .step-failed > .what b{color:var(--bad)}
+.checklist .step-waiting .mark{color:var(--pending)}
+.checklist .calls{margin:1.25rem 0 0}
+
+/* `.sr` — the visually-hidden helper every state above relies on — is already defined
+ * further down this sheet, and a second copy is a second thing to keep in step. */
+
 footer.foot{padding:2.5rem 2rem 4rem;border-top:1px solid var(--rule)}
 footer.foot > div{max-width:74rem;margin:0 auto;display:flex;gap:1.5rem;
   flex-wrap:wrap;align-items:baseline;justify-content:space-between}
