@@ -60,6 +60,62 @@ production-shaped or not. The milestone's own instruction stands; what changes i
 that the block is now a named piece of infrastructure that does not exist, not an
 open question.
 
+## Amended by 10l (2026-09-09): the absence became observable, so injection unblocked — for two phases
+
+The paragraph above is superseded and left standing, because *how* it was superseded is the
+interesting part. It said the block was "a named piece of infrastructure that does not
+exist", and it named the wrong one.
+
+What this ADR asked for was an **absence**, and it assumed the only way to have one was to
+remove the agent sandbox's network by pre-warming its dependencies. The microVM substrate
+([ADR-0021](0021-the-sandbox-is-a-microvm-we-do-not-operate.md)) supplied a different route
+to the same property: the phases that **judge** are created `deny-all`, and — this is the
+part that matters — they are **probed from the inside, and probed before they are handed a
+line of the repository's code or a Job**. `SANDBOX_SEALED` records what that probe found.
+
+So the rule this ADR wanted can now be stated as a condition a machine checks rather than
+an architecture we are waiting for:
+
+> A stored credential may enter a sandbox only if a probe **inside** that sandbox, run after
+> the policy was applied and before the Job was written, found neither DNS nor a route.
+
+That is `mayInject` in [`src/executor.ts`](../../src/executor.ts) — one function, shared by
+both executors so they cannot answer differently, returning a *reason* rather than a boolean
+so a refusal can be recorded in words.
+
+**What it unblocked, and what it did not.**
+
+- **The phases that judge get them.** `base`, `fix` and the suite run — so a project's own
+  `test` command, which is the regression arm, and anything the reproduction runs. These are
+  sealed before they receive anything.
+- **`install`, `migrate`, `seed` and a service's startup do not, and will not under this
+  design.** They run in the agent sandbox, which is created `allow-all` because `install`
+  needs a registry (ADR-0013) and is sealed only after the recipe has already replayed. The
+  original objection applies to them unchanged, and the pre-warm work above is still what
+  would remove it. **A repository whose `install` needs a private token cannot be served
+  yet**, and the run says so rather than half-booting.
+- **Docker injects nothing at all.** `--network none` removes every interface, so there is
+  nothing to probe *from* and nothing that executor can report having observed. `mayInject`
+  refuses on `probe: null`, and that is correct rather than pessimistic: "the flag we passed
+  usually works" is exactly the claim the probe exists because this ADR would not accept it.
+  The local product runs against repositories its operator owns and configures by hand.
+
+**A refusal is a note, not a failure.** A withheld value is recorded as
+`VERIFICATION_ABORTED` with `cause: 'secrets_withheld'`, and that cause is deliberately
+absent from every branch that reads one — the fold disqualifies an attempt on `environment`
+and `ceiling` and blocks a run on `missing_env`; this one changes no verdict. The phase ran;
+what a reader learns is that a world they configured was not fully supplied. Turning it into
+a failure would make a fact about our network a finding about somebody's bug, which
+[ADR-0007](0007-reproduce-first-gate.md)'s amendment forbids. A run that genuinely cannot proceed
+without a value never reaches a sandbox: `missingRequired` blocks it first, and since 10l it
+says whether the value is *unset* or *unreachable on this deployment*, because those ask
+different things of the reader.
+
+**What the abort may contain.** A count and the rule. Never a value, and not even the
+variable's name — an event is append-only and kept forever, and
+[`redact.ts`](../../src/redact.ts) covers a value that reaches a command line but nothing
+covers one written deliberately into a payload.
+
 **Rejected: "non-production values only," enforced by UI copy.** A label is not a
 control. Nothing stops a person from pasting a real key into a field that says not
 to, and the sandbox cannot tell a test key from a production one by looking at it —

@@ -82,13 +82,13 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | merged; #69 |
 | **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | merged; #72 |
 | **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | merged; #75, #77, #78, #79 |
-| **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | |
+| **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | merged; #80 |
 | **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | merged; #66 |
 | **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
 | **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | merged |
 | **10j** | recipe `env` and `required`; `blocked` | | merged; #70 |
 | **10k** | the model key and secrets: stored, listed by name, never read back | 10j | merged; #71 |
-| **10l** | secrets injected only under `deny-all`, with the guard executed | 10d, 10k | |
+| **10l** | secrets injected only under `deny-all`, with the guard executed | 10d, 10k | merged |
 | **10m** | orientation, plan, critic — off by default, proven inert, then measured | | |
 | **10n** | every line of the record that this milestone made false | all | |
 
@@ -122,6 +122,33 @@ What is left of the worker's own deploy is a Vercel account token, which the CLI
 mint (`403 cannot create tokens for this app`). Until it exists the worker runs on the
 author's laptop against the production plane, which is the same process with a different
 `FLY_MACHINE_ID`.
+
+**10l is done, and what unblocked it was not the thing ADR-0017 was waiting for.**
+
+That ADR asked for an *absence* — no stored credential in a container with a network route
+— and assumed the only way to get one was to pre-warm the agent's dependencies so its
+sandbox could lose its network too. The microVM substrate supplied a different route to the
+same property: the phases that judge are created `deny-all` and **probed from the inside,
+before they are handed a line of the repository's code or a Job**. That makes the absence a
+condition a machine checks rather than an architecture to wait for, and `mayInject` in
+`src/executor.ts` is the check — one function, shared by both executors so they cannot
+answer differently, returning a reason rather than a boolean so a refusal can be recorded.
+
+**Which commands actually see a stored value, and this is the part worth stating loudly:**
+the project's own `test` command and anything the reproduction runs. **Not `install`,
+`migrate`, `seed`, or a service's startup** — those run in the agent sandbox, which has a
+registry reachable by design (ADR-0013) and is sealed only afterwards. A repository whose
+*install* needs a private token still cannot be served, and the run says so rather than
+half-booting. Docker injects nothing at all: `--network none` leaves nothing to probe from,
+and an unobserved seal is not one.
+
+Two things it found on the way, neither about secrets. `secretNames` had been on the run
+request since 10j and **nothing ever set it** — so a recipe declaring `required` blocked
+every time, even with the value stored; 10j shipped the gate, 10k the storage, and nothing
+connected them until now. And `test/runner-main.test.ts`'s daemon fake was
+`as unknown as` its own interface, so adding a method to `DaemonIo` was a clean `tsc` and
+four runtime failures — the same lesson `src/vercel-client.ts` records about the SDK,
+arrived at from the other side. The fake is typed now.
 
 **10k has two deploy prerequisites, and the next deploy fails without them.**
 `PLANE_SECRETS_KEY` is now in the plane's `REQUIRED` set, so a deployment that does not
