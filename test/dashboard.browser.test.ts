@@ -522,6 +522,23 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     expect(panel).toContain('STRIPE_KEY');
   });
 
+  test('a repository with no approved recipe opens on the tab where the work is', async () => {
+    if (skipped('the unonboarded default')) return;
+    // `start` was the default for EVERY repository, so the first thing somebody saw after
+    // connecting one was the Start tab — the one action they cannot take yet — while the
+    // recipe awaiting their approval sat behind a tab they had no reason to open. The
+    // status line said "not onboarded yet" in small grey print and named no next step.
+    const page = await visit(`/repos/${UNONBOARDED}`, /you are the control/i);
+    // The Environment panel, not Start's issue picker.
+    expect(page).toMatch(/Read this before you approve/i);
+    // And the fragment agrees, so the tab on screen is the tab the URL names — reloading
+    // or sharing it lands in the same place.
+    expect(page).not.toMatch(/Pick the issue to work on/i);
+
+    // The control: an ONBOARDED repository is untouched and still opens on Start.
+    expect(await visit('/repos/acme/widgets', /start a run/i)).toMatch(/Pick the issue to work on|no GitHub App/i);
+  });
+
   test('the run register renders, and links to the run', async () => {
     // The one screen with a link to it on every page in the product, and the one the rest
     // of this file never visited.

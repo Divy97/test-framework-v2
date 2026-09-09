@@ -23,6 +23,10 @@ type Tab = 'start' | 'environment' | 'runners';
 export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: (to: string) => void }) {
   const detail = useJson<RepoDetail>(`/api/repos/${encodeURIComponent(repo)}`);
   const [tab, setTab] = useState<Tab>('start');
+  // Whether the tab on screen was ASKED for — by a link with a fragment, or by clicking.
+  // Without this the default below would keep dragging a reader back to Environment every
+  // time the detail refetched, overriding the tab they had just chosen.
+  const asked = useRef(false);
 
   // BEFORE THE PAINT. Read in an ordinary effect, `/repos/x#environment` rendered the Start
   // tab first — mounting it and firing its `GET …/issues` — and then switched. A layout
@@ -31,15 +35,30 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
   useBeforePaint(() => {
     const fromHash = () => {
       const hash = window.location.hash.replace('#', '');
-      setTab(hash === 'environment' || hash === 'runners' ? hash : 'start');
+      const named = hash === 'environment' || hash === 'runners' || hash === 'start';
+      asked.current = named;
+      setTab(named ? (hash as Tab) : 'start');
     };
     fromHash();
     window.addEventListener('hashchange', fromHash);
     return () => window.removeEventListener('hashchange', fromHash);
   }, [repo]);
 
+  // LAND WHERE THE WORK IS (10n). `start` was the default for every repository, including
+  // one with no approved recipe — so the first thing a person saw after connecting a
+  // repository was the Start tab, which is the one thing they cannot do yet, while the
+  // recipe waiting for their approval sat behind a tab they had no reason to open. The
+  // status line said "not onboarded yet" in small grey print and named no next step.
+  //
+  // Only when nobody asked for a tab, and only until they do.
+  const onboarded = detail.data?.onboarded;
+  useEffect(() => {
+    if (!asked.current && onboarded === false) setTab('environment');
+  }, [onboarded]);
+
   const tabs = useRef<HTMLDivElement>(null);
   const choose = (next: Tab) => {
+    asked.current = true;
     setTab(next);
     // A tab changed from somewhere OTHER than the tablist — the "Write its recipe" link in
     // Start's blocker — unmounts the thing that was just activated, and focus falls to
