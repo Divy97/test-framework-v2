@@ -25,23 +25,47 @@ export function Landing({ installUrl, signIn }: { installUrl: string; signIn: bo
             is the evidence: <b>every claim it makes is a command it executed itself</b>, in a
             container of its own, recorded in an append-only log.
           </p>
+          {/*
+            ONE DOOR (10n). This was two CTAs of near-equal weight — `Install on GitHub`
+            primary, `Sign in` secondary — and they are not alternatives. Both are
+            required, in sequence, and every order dead-ends: install first and GitHub
+            returns you here with no session, still looking at the landing page; sign in
+            first and Repositories says nothing is connected. Two buttons for a two-step
+            sequence forces a guess where both guesses lose.
+
+            The old copy underneath admitted it in as many words — "the install button …
+            is the right answer and not a way in — signing in is" — which documented the
+            flaw rather than fixing it.
+
+            So signing in is the only call. It works from every state a visitor can be in:
+            never installed, installed already, or coming back. Afterwards the app KNOWS
+            which, and can name the one next thing instead of offering a menu — which is
+            also where installing belongs, on the Repositories page that can see whether
+            anything is connected.
+          */}
           <p className="calls">
-            <a className="cta" href={installUrl}>
-              Install on GitHub
-            </a>
             {signIn ? (
-              <a className="cta secondary" href="/auth/github">
-                Sign in
+              <a className="cta" href="/auth/github">
+                Continue with GitHub
               </a>
-            ) : null}
+            ) : (
+              // No accounts on this deployment — `serve.ts`, one operator on 127.0.0.1.
+              // There is nothing to sign in to, so installing IS the way in.
+              <a className="cta" href={installUrl}>
+                Install on GitHub
+              </a>
+            )}
           </p>
-          {signIn ? (
-            <p className="muted small">
-              Already installed it? GitHub sends the install button to your existing
-              installation&rsquo;s settings, which is the right answer and not a way in —
-              signing in is.
-            </p>
-          ) : null}
+          <p className="muted small">
+            {signIn ? (
+              <>
+                You pick which repositories to connect after signing in, and you can change
+                it whenever. Nothing is read until you do.
+              </>
+            ) : (
+              <>Installing grants access to the repositories you pick, and nothing else.</>
+            )}
+          </p>
         </div>
       </section>
 

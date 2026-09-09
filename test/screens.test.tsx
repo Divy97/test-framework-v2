@@ -363,13 +363,34 @@ describe('the landing page argues without manufacturing proof', () => {
     expect(render(<Landing installUrl="https://x.invalid" signIn />)).toContain('/auth/github');
   });
 
+  test('ONE call to action, because install and sign-in are a sequence not a choice', () => {
+    // This page offered both at once, `Install on GitHub` primary and `Sign in` secondary.
+    // They are not alternatives: both are required, and every order dead-ends — install
+    // first and GitHub returns you here with no session; sign in first and Repositories
+    // says nothing is connected. Two buttons for two sequential steps forces a guess in
+    // which both guesses lose.
+    const hosted = render(<Landing installUrl="https://install.invalid" signIn />);
+    const calls = [...hosted.matchAll(/class="cta[^"]*"/g)];
+    expect(calls).toHaveLength(1);
+    expect(hosted).toContain('Continue with GitHub');
+    // And the install URL is NOT a call to action here. It belongs on the page that can
+    // see whether anything is connected.
+    expect(hosted).not.toContain('https://install.invalid');
+
+    // The local surface has no accounts, so installing is the only way in and stays the
+    // one call — this must not silently leave that deployment with no door at all.
+    const local = render(<Landing installUrl="https://install.invalid" signIn={false} />);
+    expect([...local.matchAll(/class="cta[^"]*"/g)]).toHaveLength(1);
+    expect(local).toContain('https://install.invalid');
+  });
+
   test('it is pre-renderable — no hook, no fetch, no window', () => {
     // This is the markup Next writes into `index.html`, which is the one document a
     // crawler, a link preview or a reader with JavaScript disabled ever receives. A hook
     // here would make it an empty shell for all three.
     const html = render(<Landing installUrl="https://x.invalid" signIn />);
     expect(html).toContain('proves the bug existed');
-    expect(html).toContain('Install on GitHub');
+    expect(html).toContain('Continue with GitHub');
   });
 });
 
