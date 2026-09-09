@@ -291,3 +291,66 @@ describe('a runner takes the kinds it asked for and no others', () => {
     expect(claimed?.kind).toBe('draft');
   });
 });
+
+/**
+ * Whose key pays for a run.
+ *
+ * `POST /api/runs` has refused a person with no stored key since 10k — 412, "no model key" —
+ * and the plane has answered `/runner/runs/:id/model-key` since then too. **Nothing asked
+ * it.** So the check had no consequence: a person stored a key, was told it would be spent
+ * on their runs, and the worker spent its own `OPENROUTER_API_KEY` instead. The operator's
+ * account paid for strangers' runs, and nothing anywhere said so.
+ */
+describe('a run spends the key of whoever pressed Start', () => {
+  const loopOf = async (billed: { provider: string; key: string } | null) => {
+    let seen: unknown;
+    const io = fakeIo({ modelKey: async () => billed });
+    await engineExecute(CONFIG, undefined, undefined, {
+      clone: async () => {},
+      run: async (request) => {
+        seen = (request as { loop?: unknown }).loop;
+        return { runId: 'r', state: {} } as never;
+      },
+    })(job(), io);
+    return seen as { provider: string; apiKey: string; model: string };
+  };
+
+  it('theirs, when the plane names one', async () => {
+    const loop = await loopOf({ provider: 'anthropic', key: 'sk-ant-theirs' });
+    // `apiKey`, which is what `runAgentLoop` reads. `modelKey()` answers `key`, and a spread
+    // of one onto the other added a field nothing reads and kept spending the operator's
+    // account — passing every other assertion here while doing so.
+    expect(loop.apiKey).toBe('sk-ant-theirs');
+    // The PROVIDER travels with the key. A key for one provider spent through another's
+    // wire format is a run that does nothing and reports it as a finding about the bug —
+    // `default-provider-is-openrouter` is the same trap from the fixture side.
+    expect(loop.provider).toBe('anthropic');
+    // And the rest of this worker's configuration survives: the model and effort are the
+    // operator's choice, not the payer's.
+    expect(loop.model).toBe('m');
+  });
+
+  it("the worker's own, when there is nobody to bill", async () => {
+    // A webhook-era job, and every run on the local product. This is what every run did
+    // before the button existed and it must keep working.
+    const loop = await loopOf(null);
+    expect(loop.apiKey).toBe('k');
+    expect(loop.provider).toBe('openrouter');
+  });
+
+  it('and a plane that will not answer stops the run rather than billing the wrong account', async () => {
+    // Falling back on a transport error is the failure this method exists to fix: it spends
+    // the operator's key silently, which is indistinguishable from working.
+    const io = fakeIo({
+      modelKey: async () => {
+        throw new Error('the plane would not hand over the model key: HTTP 500');
+      },
+    });
+    await expect(
+      engineExecute(CONFIG, undefined, undefined, { clone: async () => {}, run: async () => ({}) as never })(
+        job(),
+        io,
+      ),
+    ).rejects.toThrow(/model key/);
+  });
+});

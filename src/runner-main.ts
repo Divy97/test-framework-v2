@@ -395,8 +395,14 @@ export function engineExecute(
     // `null` is the ordinary answer for a job nobody pressed Start on and for a deployment
     // with no accounts, and the fallback is this worker's own configuration — which is
     // exactly what every run did before the button existed.
+    // MAPPED, not spread. `modelKey()` answers `{ provider, key }` — the shape
+    // `secrets.ts` stores and the plane's route returns — and `runAgentLoop` reads
+    // `apiKey`. A `{ ...config.loop, ...theirs }` therefore added a `key` field nothing
+    // reads, left `apiKey` as the worker's own, and went on spending the operator's account
+    // while looking exactly like a fix. The test below is what caught it.
     const theirs = await io.modelKey();
-    const loop = theirs === null ? config.loop : { ...config.loop, ...theirs };
+    const loop =
+      theirs === null ? config.loop : { ...config.loop, provider: theirs.provider, apiKey: theirs.key };
 
     let result: Awaited<ReturnType<typeof runFromIssue>> | undefined;
     try {
