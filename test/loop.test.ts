@@ -192,6 +192,14 @@ describe('the loop ends honestly', () => {
     // of the attempt is a failure to observe, and those are not the same thing.
     expect(transcript.exitCode).toBe(-1);
     expect(claimed(transcript)).toContain('loop_error');
+    // And it SAYS SO in `stopped`, which this asserted nothing about for four
+    // milestones. The fallback was `lines.length === 0 ? 'spawn_failed' : 'exit'`, so a
+    // loop that lost the model part-way through reported `exit` — a value with no
+    // `CUT_OFF` entry in `report.ts`, which means the person who filed the bug was told
+    // the agent had finished and found nothing. Mutating this line back to `exit` left
+    // the whole suite green, which is how it survived.
+    expect(transcript.stopped).toBe('api_error');
+    expect(transcript.stopped).not.toBe('exit');
   });
 
   test('a runaway transcript stops at the cap and records that it did', async () => {
