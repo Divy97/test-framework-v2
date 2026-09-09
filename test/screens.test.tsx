@@ -921,12 +921,25 @@ describe('the copy that carries a decision', () => {
   });
 
   test('and one that IS injected says what that does and does not buy', () => {
-    // The other branch, which nothing rendered. A value in a sealed sandbox satisfies a
-    // startup check and cannot reach the service it authenticates to — somebody who is not
-    // told that stores a real key and files a bug about a timeout.
+    // A value in a sealed sandbox satisfies a startup check and cannot reach the service it
+    // authenticates to — somebody who is not told that stores a real key and files a bug
+    // about a timeout.
     const html = env({ secrets: { names: ['STRIPE_KEY'], enabled: true } });
-    expect(html).toMatch(/no route out/);
+    expect(html).toMatch(/no DNS and no route out/);
     expect(html).not.toMatch(/not yet injected/i);
+  });
+
+  test('and names the commands that do NOT see them, which is the easy part to omit', () => {
+    // ADR-0017's own risk list: "a secret under deny-all satisfies a startup check and
+    // nothing else, and the UI has to say so." 10l made that concrete — the phases that
+    // judge are sealed and get the values; `install` runs while a registry is still
+    // reachable and never will. A page that said only "injected" would be true and useless.
+    const html = env({ secrets: { names: ['STRIPE_KEY'], enabled: true } });
+    expect(html).toMatch(/install/);
+    expect(html).toMatch(/service&#x27;s startup|service’s startup/);
+    expect(html).toMatch(/private token/);
+    // And it says which ones DO, or the warning is just a refusal.
+    expect(html).toMatch(/your project(&#x27;|’)s own/);
   });
 
   test('10j: configuration goes in the recipe, a credential goes in required', () => {

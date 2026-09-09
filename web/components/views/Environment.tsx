@@ -390,12 +390,33 @@ function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail
       )}
 
       {detail.secrets.enabled ? (
-        <p>
-          These are injected into runs on this deployment. The worker injects them only into
-          a sandbox it has just observed to have no route out (ADR-0017), so a value here
-          satisfies a startup check and a suite that reads it — in a sealed sandbox it cannot
-          reach the service it authenticates to, and that is the point.
-        </p>
+        <>
+          <p>
+            These are injected into runs on this deployment — into a sandbox the engine has
+            just probed <em>from the inside</em> and found to have no DNS and no route out
+            (ADR-0017). A value here therefore satisfies a startup check and a suite that
+            reads it, and cannot reach the service it authenticates to. That is the point,
+            not a limitation.
+          </p>
+          {/* THE PART THAT IS EASY TO LEAVE OUT, and ADR-0017's own risk list says it has to
+              be said: "a secret under deny-all satisfies a startup check and nothing else,
+              and the UI has to say so." Somebody who is not told this stores a real key and
+              files a bug about a timeout. */}
+          <p className="muted small">
+            <b>Which commands actually see them:</b> your project&rsquo;s own{' '}
+            <code>test</code> command, and anything the reproduction runs — the phases that
+            judge, which are sealed before they are handed a line of your code.{' '}
+            <b>
+              Not <code>install</code>, <code>migrate</code>, <code>seed</code>, or a
+              service&rsquo;s startup.
+            </b>{' '}
+            Those run while the sandbox still has a package registry reachable, because
+            installing dependencies needs one — and a stored credential may not exist in a
+            container with a route out. If your <code>install</code> needs a private token,
+            this engine cannot run your project yet, and it will say so rather than half-boot
+            it.
+          </p>
+        </>
       ) : (
         <div className="warning">
           <h2>Stored, and not yet injected into any run.</h2>
