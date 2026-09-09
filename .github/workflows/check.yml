@@ -65,7 +65,17 @@ jobs:
       # Ephemeral, and that is correct: nothing sealed in this database outlives the job, so
       # there is nothing for a lost key to make unreadable. It exists because
       # `readPlaneConfig` and the secrets tests refuse to run without one.
-      PLANE_SECRETS_KEY: ci-only-key-not-a-secret-0000000000000=
+      #
+      # BASE64 OF EXACTLY 32 BYTES, and it has to be. This was
+      # `ci-only-key-not-a-secret-0000000000000=` — a string written to READ like a label,
+      # which is also almost-valid base64 that decodes to 24 bytes. `sealingKey` needs 32
+      # for AES-256 and threw, so six secrets tests failed on every CI run since the
+      # workflow was added, with an error naming the real cause that nobody read because
+      # the run was red for twenty other reasons.
+      #
+      # It still says what it is: decode it and you get the ASCII
+      # `ci-only-key-not-a-secret-0000000`, which is 32 characters on purpose.
+      PLANE_SECRETS_KEY: Y2ktb25seS1rZXktbm90LWEtc2VjcmV0LTAwMDAwMDA=
       ENGINE_CHROMIUM_BIN: /usr/bin/google-chrome
 
     steps:
