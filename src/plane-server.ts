@@ -281,9 +281,29 @@ export async function startPlane(config: PlaneConfig): Promise<{
     ),
   });
 
+  // THE PUBLIC ORIGIN, when there is one (10n).
+  //
+  // This printed `http://127.0.0.1:<port>/webhook  <- tell the App this` on every boot,
+  // including on the hosted plane — where it is an instruction to point a GitHub App at
+  // a loopback address inside a Fly machine. An operator checking whether the App was
+  // configured correctly was told, by the service itself, that it was not.
+  //
+  // Derived from the OAuth callback rather than a new setting: that URL is already the
+  // one GitHub has to be able to reach, so a deployment where it is wrong is broken for
+  // sign-in too, and there is nothing here for a second variable to disagree with.
+  const publicOrigin = (() => {
+    try {
+      return new URL(config.oauth.callbackUrl).origin;
+    } catch {
+      return null;
+    }
+  })();
+  const local = `http://127.0.0.1:${surface.port}`;
+
   log(`plane up`);
-  log(`  surface  http://127.0.0.1:${surface.port}/`);
-  log(`  webhook  http://127.0.0.1:${surface.port}${WEBHOOK_PATH}  <- tell the App this`);
+  log(`  surface  ${publicOrigin ?? local}/`);
+  log(`  webhook  ${publicOrigin ?? local}${WEBHOOK_PATH}  <- the App must point here, and its webhook must be Active`);
+  if (publicOrigin) log(`  locally  ${local}/`);
 
   return {
     port: surface.port,
