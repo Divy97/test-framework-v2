@@ -78,6 +78,17 @@ async function applySchema(client: Db): Promise<void> {
  * needs a database and every credential, and this is the one part of it with a decision
  * in it. It throws; the caller decides what an escape costs.
  */
+/**
+ * How many repositories one delivery may start drafting runs for.
+ *
+ * Five, because the flow this exists to serve is somebody installing the App on a
+ * repository or a few and wanting the box filled in. A bulk add — an account switched to
+ * "all repositories" — is a different intent wearing the same event, and the cost of
+ * reading them as the same thing is one sandbox, one clone and one agent session per
+ * repository, charged to whoever's key it is.
+ */
+const DRAFT_FANOUT_CEILING = 5;
+
 export function planeIntake(deps: {
   client: Db;
   mint: (installationId: number) => Promise<string>;
@@ -122,6 +133,29 @@ export function planeIntake(deps: {
       //
       // A draft is never a recipe. It lands in `recipe_drafts` and a human still approves
       // it (ADR-0013) — which is why this is safe to start without asking anybody.
+      //
+      // UP TO A CEILING, and the ceiling is the whole reason this block is not a cost
+      // incident. "Named in this delivery" was read as "a small delta" — the comment above
+      // literally reasons about "somebody adds a second one to the same App". Setting an
+      // installation to *all repositories* is also a delta, and on this account GitHub
+      // delivered one `installation_repositories.added` naming **176 repositories**. This
+      // loop queued 176 drafting runs in one second: 176 sandboxes, 176 clones, 176 agent
+      // sessions at roughly thirteen cents each. It was survived only because the model key
+      // was over its spend cap that minute and every job died in eighteen seconds.
+      //
+      // Beyond the ceiling it queues NOTHING rather than an arbitrary first handful. There
+      // is no principled way to choose five of 176, drafting is available on demand — open
+      // the repository, or `npm run reconcile` — and a human deciding which repositories
+      // are worth exploring is the same control ADR-0013 already puts in front of the
+      // recipe itself.
+      if (intake.repos.length > DRAFT_FANOUT_CEILING) {
+        deps.log(
+          `installation ${intake.installationId}: ${intake.repos.length} repositories named, ` +
+            `which is over the drafting ceiling of ${DRAFT_FANOUT_CEILING} — queued none. ` +
+            `Open a repository to draft it, or run \`npm run reconcile -- ${intake.installationId}\`.`,
+        );
+        return;
+      }
       for (const repo of intake.repos) {
         try {
           if ((await loadRecipe(deps.client, repo)) !== null) continue;
