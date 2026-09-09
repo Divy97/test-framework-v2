@@ -36,6 +36,23 @@ const madeRunners: string[] = [];
 const madeRuns: string[] = [];
 
 beforeAll(async () => {
+  // ── WHY THIS FILE FAILS 10–15 TESTS AGAINST A SHARED DATABASE ───────────────────
+  //
+  // Not contention with itself, which is what it looked like for weeks. `vitest.config.ts`
+  // loads `.env`, this repository's `.env` points at the production database, and a live
+  // global worker there long-polls `/runner/jobs` every 500ms taking any installation's job
+  // of any kind. It claims the jobs this file queues — verified in the worker's own log,
+  // which shows it taking `o/r`, the repository below — so `claimJob` here returns 204 and
+  // the assertions about who holds what fail.
+  //
+  // It goes the other way too: the worker is handed a repository that does not exist, tries
+  // to clone it, and fails. Harmless, and noise in a production log.
+  //
+  // `test/kinds.test.ts` gates on `ENGINE_TEST_QUEUE=1` for exactly this reason. This file
+  // is left as it is deliberately — it predates the hosted worker and its coverage is worth
+  // more than a clean summary — but the failures are explained rather than mysterious, and
+  // the fix is a database of your own: `docker compose up -d`, and point `DATABASE_URL` at
+  // it. Then this file is deterministic.
   if (!process.env.DATABASE_URL) {
     why = 'DATABASE_URL is not set (copy .env.example to .env and `docker compose up -d`)';
     return;

@@ -158,24 +158,47 @@ describe('a worker does the thing its job says', () => {
  * cannot serve it, and the job would then sit stranded until the two-minute reclaim.
  */
 /**
- * Skip, loudly, rather than fail — the house rule from `test/store.test.ts`. A queue test
- * that fails for want of a database teaches nothing and trains people to ignore a red suite.
+ * Skip, loudly, rather than fail — the house rule from `test/store.test.ts`.
+ *
+ * AND A SECOND GATE, which is the one worth reading. A test that writes to `jobs` needs a
+ * queue nobody else is draining, and `vitest.config.ts` loads `.env` — which on this
+ * repository points at the PRODUCTION database, where a live global worker long-polls
+ * `/runner/jobs` every 500ms and takes any installation's job of any kind.
+ *
+ * So this is not flakiness, it is a race with a real worker, and it goes both ways: the test
+ * loses jobs it queued, and the worker is handed `acme/kinds-run` — a repository that does
+ * not exist — which it dutifully claims, fails to clone, and logs. Verified in the worker's
+ * own output while writing this file, alongside `o/r`: `test/plane.test.ts`'s repository,
+ * which means **that file's long-standing 10–15 failures are this, not contention with
+ * itself.**
+ *
+ * `ENGINE_TEST_QUEUE=1` is the opt-in, and the right way to set it is a database of your
+ * own: `docker compose up -d` and a `DATABASE_URL` pointing at it. Then this is
+ * deterministic, and nothing a test queues reaches a machine that will try to run it.
  */
 let client: ReturnType<typeof connect> | null = null;
 let why = '';
 try {
   if (!process.env.DATABASE_URL) why = 'DATABASE_URL is not set (copy .env.example to .env)';
-  else client = connect();
+  else if (process.env.ENGINE_TEST_QUEUE !== '1') {
+    why =
+      'this test writes to `jobs`, and a live worker drains the queue that `.env` points at — ' +
+      'set ENGINE_TEST_QUEUE=1 against a database of your own (`docker compose up -d`)';
+  } else client = connect();
 } catch (error) {
   why = String(error);
 }
+if (why) console.log(`SKIPPED (the job queue): ${why}`);
 
 describe('a runner takes the kinds it asked for and no others', () => {
   const made: { runs: string[]; runners: string[] } = { runs: [], runners: [] };
   afterAll(async () => {
     if (!client) return;
     await client.query('delete from jobs where run_id = any($1)', [made.runs]).catch(() => {});
-    for (const id of made.runners) await revokeRunner(client, id, 424243).catch(() => {});
+    for (const id of made.runners) {
+      await revokeRunner(client, id, 424243).catch(() => {});
+      await revokeRunner(client, id, 424244).catch(() => {});
+    }
     await client.query('delete from runners where id = any($1)', [made.runners]).catch(() => {});
     await close(client);
   });
@@ -195,7 +218,7 @@ describe('a runner takes the kinds it asked for and no others', () => {
   };
 
   it('claims only the kind it named, and leaves the rest queued', async () => {
-    if (!client) return void expect(why).toBe('SKIP');
+    if (!client) return void console.log(`SKIPPED (the job queue): ${why}`);
     await ready(client);
     const runJob = await queue('run');
     const proveJob = await queue('prove');
@@ -216,21 +239,45 @@ describe('a runner takes the kinds it asked for and no others', () => {
   });
 
   it('and a runner that names nothing takes any of them, which is what every older one does', async () => {
-    if (!client) return void expect(why).toBe('SKIP');
-    const draftJob = await queue('draft');
-    const { runner } = await pairRunner(client, { installationId: INSTALLATION, name: 'kinds-test-any' });
+    if (!client) return void console.log(`SKIPPED (the job queue): ${why}`);
+    // ITS OWN INSTALLATION, and the queue drained before the assertion.
+    //
+    // The first version of this asked only "did it claim something" on the shared
+    // installation above, which the previous test had already left a `run` job on — so it
+    // passed or failed depending on the order two tests ran in, against a database this
+    // suite shares with itself. A test whose subject is "the default takes any kind" has to
+    // control what kinds are there.
+    const alone = 424244;
+    const drained: string[] = [];
+    const { runner } = await pairRunner(client, { installationId: alone, name: 'kinds-test-any' });
     made.runners.push(runner.id);
+    // Anything left from an earlier interrupted run of this file.
+    for (let i = 0; i < 10; i += 1) {
+      const stale = await claimJob(client, runner);
+      if (!stale) break;
+      drained.push(stale.runId);
+      await client.query('update jobs set finished_at = now() where run_id = $1', [stale.runId]);
+    }
+
+    const draftJob = await enqueueJob(client, {
+      installationId: alone,
+      repo: 'acme/kinds-any',
+      intake: { kind: 'draft' },
+      kind: 'draft',
+    });
+    made.runs.push(draftJob);
 
     const claimed = await claimJob(client, runner);
-    // The oldest open job on this installation, whatever kind — the pre-10h behaviour, kept
-    // by defaulting to all three rather than by a special case.
-    expect(claimed).not.toBeNull();
+    // The `draft` job specifically — a runner that names no kinds gets one it never asked
+    // for, which is the pre-10h behaviour kept by defaulting to all three rather than by a
+    // special case.
+    expect(claimed?.runId).toBe(draftJob);
+    expect(claimed?.kind).toBe('draft');
     expect(JOB_KINDS).toContain(claimed!.kind);
-    void draftJob;
   });
 
   it('the kind survives the round trip, so a worker does what was queued', async () => {
-    if (!client) return void expect(why).toBe('SKIP');
+    if (!client) return void console.log(`SKIPPED (the job queue): ${why}`);
     const id = await queue('draft');
     const { runner } = await pairRunner(client, { installationId: INSTALLATION, name: 'kinds-test-rt' });
     made.runners.push(runner.id);
