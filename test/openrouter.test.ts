@@ -400,9 +400,16 @@ describe('the probe refuses a model that cannot drive the tools', () => {
   });
 
   it('fails on an HTTP error rather than reporting a usable model', async () => {
-    model = await fakeChat([], { status: 401 });
+    model = await fakeChat([], { status: 403, body: '{"error":{"message":"Key limit exceeded (total limit)"}}' });
     const outcome = await probeToolCalling({ apiKey: 'k', model: 'cheap/model', baseURL: model.baseURL });
-    expect(outcome).toEqual({ ok: false, detail: 'HTTP 401' });
+    expect(outcome.ok).toBe(false);
+    expect(outcome.detail).toContain('403');
+    // AND the body. This asserted `detail: 'HTTP 401'` exactly, which passed while the
+    // probe threw the provider's explanation away — the same hole the loop had, and the
+    // reason a spent key looked like an iteration ceiling. What an operator needs from a
+    // refused key is which of expired, revoked, out of credit, or not entitled to this
+    // model it was, and only the provider knows.
+    expect(outcome.detail).toContain('Key limit exceeded');
   });
 
   it('fails when the endpoint is unreachable instead of throwing', async () => {

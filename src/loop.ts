@@ -24,7 +24,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { BetaRunnableTool } from '@anthropic-ai/sdk/lib/tools/BetaRunnableTool';
 import type { AgentFinishedV1 } from './events.js';
-import { DEFAULT_OPENROUTER_MODEL, OPENROUTER_BASE, runOpenRouterLoop } from './openrouter.js';
+import { DEFAULT_OPENROUTER_MODEL, OPENROUTER_BASE, probeToolCalling, runOpenRouterLoop } from './openrouter.js';
 import { TOOL_SCHEMAS } from './tools.js';
 
 /** The model v1.5 runs on, and the thinking configuration ADR-0011's milestone names. */
@@ -310,6 +310,59 @@ export async function askOnce(options: {
     return text || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Ask the provider whether this key can actually drive a run, before storing it.
+ *
+ * `PUT /api/settings/model-key` used to check the length of the string and the spelling
+ * of the provider and store whatever it was given. So a key that was revoked, expired, or
+ * over its spend cap was accepted, shown as configured, and failed for the first time
+ * seventeen turns into a drafting session on a repository the person had just connected —
+ * where the cost of the mistake is highest and the diagnosis is hardest. A real one did:
+ * a two-dollar OpenRouter key with `limit_remaining: 0`, refused with a 403 the log then
+ * reported as an iteration ceiling.
+ *
+ * One request, a handful of tokens, spent on the key being tested — which is what the key
+ * is for, and the only way to learn the answer. It is charged to whoever is saving it.
+ *
+ * A failure here is deliberately not fatal to the *engine*: the caller decides whether to
+ * store anyway. What it must never do is claim a key works because nobody asked.
+ */
+export async function checkModelKey(
+  provider: string,
+  key: string,
+  options: { model?: string; baseURL?: string } = {},
+): Promise<{ ok: boolean; detail: string }> {
+  if (providerName(provider) === 'openrouter') {
+    // The model the WORKER will reach for, not one of our choosing: a key that works on a
+    // cheap model and is not entitled to the configured one is still a key that cannot do
+    // the job. `probeToolCalling` also screens a model that answers in prose instead of
+    // calling tools (ADR-0015), which is the other way this silently produces nothing.
+    return probeToolCalling({
+      apiKey: key,
+      model: options.model ?? process.env.ENGINE_MODEL ?? DEFAULT_OPENROUTER_MODEL,
+      ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
+    });
+  }
+  try {
+    const client = new Anthropic({
+      apiKey: key,
+      maxRetries: 0,
+      timeout: 20_000,
+      ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
+    });
+    await client.messages.create({
+      model: modelId(options.model),
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    return { ok: true, detail: 'the key answered' };
+  } catch (error) {
+    // The provider's own words. Ours would be a guess at which of expired, revoked,
+    // out of credit, or not entitled to this model it was.
+    return { ok: false, detail: String((error as Error).message ?? error).slice(0, 500) };
   }
 }
 

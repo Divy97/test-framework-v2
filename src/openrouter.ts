@@ -146,7 +146,14 @@ export async function probeToolCalling(options: {
         ],
       }),
     });
-    if (!response.ok) return { ok: false, detail: `HTTP ${response.status}` };
+    if (!response.ok) {
+      // The body, not just the status — the same fix as the loop's. `HTTP 403` on its own
+      // sent a real diagnosis in the wrong direction for an afternoon; the sentence that
+      // said `Key limit exceeded (total limit)`, and the URL that raises it, was in the
+      // body this used to throw away.
+      const detail = (await response.text()).slice(0, 500).trim();
+      return { ok: false, detail: `HTTP ${response.status}${detail === '' ? '' : ` — ${detail}`}` };
+    }
     const body = (await response.json()) as ChatResponse;
     // Before reading the answer, check the answer is one. A rejected request must never
     // be reportable as a fact about the model's capabilities.
