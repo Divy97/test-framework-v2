@@ -354,7 +354,17 @@ export async function checkModelKey(
       ...(options.baseURL === undefined ? {} : { baseURL: options.baseURL }),
     });
     await client.messages.create({
-      model: modelId(options.model),
+      // A FIXED cheap model, deliberately not `modelId()`. That reads `ENGINE_MODEL`,
+      // which means "a model id" on both providers with different vocabularies — the
+      // local `.env` sets it to `moonshotai/kimi-k2-thinking`, and sending that to the
+      // Anthropic API is a 404. So checking an Anthropic key on a machine configured for
+      // OpenRouter would have refused a perfectly good key and blamed the key.
+      //
+      // The narrowing this accepts: a key with credit for Haiku and none for Opus passes
+      // here. That is the right trade — the question this answers is whether the key is
+      // live, and the OpenRouter path, which is the actual default, does check the real
+      // model because entitlements there are per-model.
+      model: ASK_MODEL,
       max_tokens: 1,
       messages: [{ role: 'user', content: 'hi' }],
     });

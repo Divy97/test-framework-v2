@@ -521,6 +521,27 @@ describe('a model key is asked before it is stored', () => {
     expect(outcome.detail).toContain('structured tool call');
   });
 
+  test('anthropic: the check does not send ENGINE_MODEL to Anthropic', async () => {
+    // `ENGINE_MODEL` means "a model id" on both providers and they do not share a
+    // vocabulary. The local `.env` sets it to `moonshotai/kimi-k2-thinking`; sending that
+    // to the Anthropic API is a 404, so checking an Anthropic key on a machine configured
+    // for OpenRouter would have refused a live key and blamed the key. Found by reading
+    // the diff, not by a failure — nothing else here sets `ENGINE_MODEL`.
+    const before = process.env.ENGINE_MODEL;
+    process.env.ENGINE_MODEL = 'moonshotai/kimi-k2-thinking';
+    const model = await fakeModel([{ content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' }]);
+    models.push(model);
+    try {
+      const outcome = await checkModelKey('anthropic', 'sk-ant-fine', { baseURL: model.baseURL });
+      expect(outcome.ok).toBe(true);
+      expect(model.requests[0]?.model).toBe('claude-haiku-4-5');
+      expect(model.requests[0]?.model).not.toBe('moonshotai/kimi-k2-thinking');
+    } finally {
+      if (before === undefined) delete process.env.ENGINE_MODEL;
+      else process.env.ENGINE_MODEL = before;
+    }
+  });
+
   test('anthropic: a refused key is refused here too', async () => {
     const model = await fakeModel([], { status: 401 });
     models.push(model);
