@@ -13,6 +13,13 @@ import { DEFAULT_OPENROUTER_MODEL, openAiTools, probeToolCalling, runOpenRouterL
 import { TOOL_SCHEMAS } from '../src/tools.js';
 import { type FakeModel, fakeChat, fnCall } from './fixtures/model.js';
 import { draftRecipe } from '../src/orchestrate.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 import { cleanupFixtures, demoRepo } from './fixtures/repo.js';
 
 let model: FakeModel | undefined;
@@ -630,5 +637,48 @@ describe('a cut-off drafting session reports what cut it off', () => {
       await model.close();
       cleanupFixtures();
     }
+  });
+});
+
+// ── an empty repository is a state, not a crash (10n) ────────────────────────
+//
+// The most likely state of a repository somebody has just created and connected: no
+// commits. `git rev-parse HEAD` exits non-zero on one, and a real `draft` job on
+// `Divy97/git-practice` died as
+//   ended badly — Error: Command failed: git -C … rev-parse HEAD
+//   fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree
+// which is a stack trace where an answer belongs.
+
+describe('drafting an empty repository', () => {
+  it('says the repository has no commits instead of throwing git at somebody', async () => {
+    const bare = await mkdtemp(join(tmpdir(), 'engine-empty-repo-'));
+    await execFileAsync('git', ['-C', bare, 'init', '--quiet']);
+    let ran = false;
+
+    const outcome = await draftRecipe({
+      runId: '3f1c9a52-7b0e-4d2f-9c41-8a6e5d0b21c7',
+      repoPath: bare,
+      image: 'engine:test',
+      loop: { provider: 'openrouter', apiKey: 'k' },
+      executor: {
+        kind: 'docker' as const,
+        runPhase: async () => {
+          ran = true;
+          return {} as never;
+        },
+        buildSnapshot: async () => ({ failed: 'not used' }),
+        dropSnapshot: async () => {},
+      } as never,
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toContain('no commits');
+    // Nothing about git's own words reaches the caller.
+    expect(outcome.reason).not.toContain('rev-parse');
+    expect(outcome.reason).not.toContain('ambiguous argument');
+    // And no container was started for a repository with nothing in it.
+    expect(ran).toBe(false);
+    await rm(bare, { recursive: true, force: true });
   });
 });

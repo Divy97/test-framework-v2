@@ -1170,6 +1170,28 @@ export function namesLookingUnset(output: string, handled: Iterable<string> = []
  * can run anything against; `ready_with_caveats` means it built and something the
  * engine needs is missing or already broken; `ready` means neither.
  */
+/**
+ * The commit `HEAD` names, or `null` when the repository has none.
+ *
+ * An EMPTY repository — created on GitHub and never pushed to — makes
+ * `git rev-parse HEAD` exit non-zero with `ambiguous argument 'HEAD'`, and both callers
+ * below used to let that throw. A real `draft` job on `Divy97/git-practice` died as
+ * `ended badly — Error: Command failed: git -C … rev-parse HEAD`, which is a stack trace
+ * where an answer belongs: the repository is fine, it is simply empty, and that is the
+ * single most likely state of a repository somebody has just created and connected.
+ */
+const headCommit = async (repoPath: string): Promise<string | null> => {
+  try {
+    const { stdout } = await execFile('git', ['-C', repoPath, 'rev-parse', 'HEAD']);
+    return stdout.trim() || null;
+  } catch {
+    // Deliberately not distinguishing "no commits" from "not a git repository". Both mean
+    // there is no tree to explore, the caller says so in the same words either way, and
+    // guessing between them from git's stderr is how a wrong message gets written.
+    return null;
+  }
+};
+
 export type RepoProof = {
   state: 'ready' | 'ready_with_caveats' | 'blocked';
   /** The commit it was proved at. A proof is about a tree, not about a repository. */
@@ -1226,8 +1248,17 @@ export async function proveRepository(plan: {
     // branch but the default under `refs/remotes`, and the container's own clone
     // transfers `refs/heads/*` only.
     await execFile('git', ['clone', '--quiet', '--no-local', '--mirror', '--', plan.repoPath, source]);
-    const { stdout } = await execFile('git', ['-C', source, 'rev-parse', 'HEAD']);
-    const commit = stdout.trim();
+    const commit = await headCommit(source);
+    if (commit === null) {
+      return {
+        state: 'blocked',
+        commit: '',
+        environment: { built: false, failed: 'the repository has no commits, so there was no tree to build' },
+        caveats: ['This repository has no commits yet. Push one and approve the recipe again.'],
+        unproved: [],
+        provedAt,
+      };
+    }
 
     const proving: RunPlan = {
       runId: plan.runId,
@@ -1420,8 +1451,15 @@ export async function draftRecipe(plan: DraftPlan): Promise<DraftOutcome> {
   await writeFile(join(store, '.evidence-store'), '');
 
   try {
-    const { stdout } = await execFile('git', ['-C', plan.repoPath, 'rev-parse', 'HEAD']);
-    const baseRef = stdout.trim();
+    const baseRef = await headCommit(plan.repoPath);
+    if (baseRef === null) {
+      return {
+        ok: false,
+        reason: 'the repository has no commits yet, so there is nothing to explore',
+        transcriptText: '',
+        usage: empty,
+      };
+    }
 
     const draftPlan: RunPlan = {
       runId: plan.runId,
