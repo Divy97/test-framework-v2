@@ -39,7 +39,26 @@ import type { RunEvent } from './events.js';
 export type Runner = { id: string; installationId: number | null; name: string };
 
 /** One unit of work: a delivery the plane accepted, waiting for a machine. */
-export type Job = { runId: string; installationId: number; repo: string; intake: unknown };
+/**
+ * The three kinds of work a runner can be handed (10h).
+ *
+ * A closed union rather than a string, and the database has the matching CHECK, so the two
+ * cannot drift into disagreement about what is dispatchable.
+ */
+export type JobKind = 'run' | 'prove' | 'draft';
+export const JOB_KINDS: readonly JobKind[] = ['run', 'prove', 'draft'];
+
+export type Job = {
+  runId: string;
+  installationId: number;
+  repo: string;
+  intake: unknown;
+  /**
+   * What to do with it. `run` for every row written before 10h, by the column's default —
+   * so a worker reading an old job does the thing that job was queued for.
+   */
+  kind: JobKind;
+};
 
 /**
  * `tfr_` so a leaked token is greppable in a log, a paste, or a support ticket, and
@@ -240,12 +259,17 @@ export async function enqueueJob(
     requestedBy?: number;
     /** Copied out of the intake so `openJobFor` is an index lookup, not a jsonb scan. */
     issueNumber?: number;
+    /**
+     * What kind of work this is (10h). `run` when unsaid, which is what every caller
+     * before 10h meant and what the column defaults to.
+     */
+    kind?: JobKind;
   },
 ): Promise<string> {
   const runId = randomUUID();
   await client.query(
-    `insert into jobs (run_id, installation_id, repo, intake, requested_by, issue_number)
-       values ($1, $2, $3, $4, $5, $6)`,
+    `insert into jobs (run_id, installation_id, repo, intake, requested_by, issue_number, kind)
+       values ($1, $2, $3, $4, $5, $6, $7)`,
     [
       runId,
       options.installationId,
@@ -253,6 +277,7 @@ export async function enqueueJob(
       JSON.stringify(options.intake),
       options.requestedBy ?? null,
       options.issueNumber ?? null,
+      options.kind ?? 'run',
     ],
   );
   return runId;
