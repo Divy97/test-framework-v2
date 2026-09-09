@@ -12,7 +12,7 @@
 
 import type { Db } from './store.js';
 import { digest, put } from './blobs.js';
-import { loadRecipe, parseRecipe, saveProof } from './recipe.js';
+import { loadRecipe, saveProof } from './recipe.js';
 import { saveDraft } from './drafts.js';
 import { projectOne } from './readmodel.js';
 import type { ArtifactRef, RunEvent } from './events.js';
@@ -313,16 +313,27 @@ export function runnerRoutes(options: {
       // `Environment.tsx` renders whatever shape it finds, because a proof written by an
       // older engine has to render as what it is rather than throw.
       if (of.proof !== undefined) await saveProof(client, facts.repo, of.proof);
-      // A DRAFT goes through `parseRecipe` FIRST, and this is the one validation on this
-      // route that is not optional. It is an agent's output — the agent is untrusted by
-      // construction and its prompt contains text a stranger wrote (ADR-0013) — and a draft
-      // that cannot parse is a box a human is asked to approve and cannot even read. Stored
-      // as a draft either way, never as a recipe: the human is still the control.
+      // A DRAFT IS STORED UNVALIDATED, and the first version of this route got that wrong
+      // in a way that cost five agent sessions per bad draft.
+      //
+      // `draftRecipe` returns `draft: unknown` and says why in its own docblock: *"this
+      // function's job is to run the agent and hand back its words, not to decide whether
+      // they are a recipe a human should see. `parseRecipe` runs at the point a human is
+      // about to be shown the result."* `serve.ts` has always stored it unvalidated for that
+      // reason, and `Environment.tsx` already handles a proposal it cannot even stringify —
+      // it falls back to the skeleton and says an agent wrote what is in the box.
+      //
+      // Rejecting it here with a 400 made `io.finding` throw, which left the job open, which
+      // re-dispatched it up to `MAX_DISPATCHES` — five drafting sessions against the same
+      // repository, each producing the same unparseable proposal, for a failure retrying
+      // cannot fix. The human is the control either way; a proposal they can see and reject
+      // is worth more than four more attempts to produce one.
+      //
+      // What IS checked is that it is a JSON object, because `recipe_drafts` stores jsonb
+      // and a string or an array there is not a thing any screen can pre-fill a box from.
       if (of.draft !== undefined) {
-        try {
-          parseRecipe(of.draft);
-        } catch (error) {
-          return json({ error: `that draft is not a recipe: ${String((error as Error).message ?? error)}` }, 400);
+        if (typeof of.draft !== 'object' || of.draft === null || Array.isArray(of.draft)) {
+          return json({ error: 'a draft must be a JSON object' }, 400);
         }
         await saveDraft(client, facts.repo, of.draft);
       }

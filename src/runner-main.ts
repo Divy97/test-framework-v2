@@ -384,6 +384,26 @@ export function engineExecute(
     // recipe's `required` names can be satisfied at all.
     const stored = await io.secrets();
 
+    // ── WHOSE KEY PAYS FOR THIS RUN (10k, wired here) ───────────────────────────────
+    //
+    // The plane has answered `/runner/runs/:id/model-key` since 10k and nothing ever asked
+    // it, so the whole "who pays" design was a check with no consequence: `POST /api/runs`
+    // refuses a person who has stored no key (412), they store one, and this worker then
+    // spent its OWN `OPENROUTER_API_KEY` on their run. A person was told their key would be
+    // used and it was not, and the operator's account paid for strangers' runs.
+    //
+    // `null` is the ordinary answer for a job nobody pressed Start on and for a deployment
+    // with no accounts, and the fallback is this worker's own configuration — which is
+    // exactly what every run did before the button existed.
+    // MAPPED, not spread. `modelKey()` answers `{ provider, key }` — the shape
+    // `secrets.ts` stores and the plane's route returns — and `runAgentLoop` reads
+    // `apiKey`. A `{ ...config.loop, ...theirs }` therefore added a `key` field nothing
+    // reads, left `apiKey` as the worker's own, and went on spending the operator's account
+    // while looking exactly like a fix. The test below is what caught it.
+    const theirs = await io.modelKey();
+    const loop =
+      theirs === null ? config.loop : { ...config.loop, provider: theirs.provider, apiKey: theirs.key };
+
     let result: Awaited<ReturnType<typeof runFromIssue>> | undefined;
     try {
       result = await (work.run ?? runFromIssue)({
@@ -398,7 +418,7 @@ export function engineExecute(
         blobRoot: config.blobRoot,
         runId: job.runId,
         append: io.append,
-        loop: config.loop,
+        loop,
         // NAMES for the gate, VALUES for the injection, and they travel separately on
         // purpose: `secretNames` reaches `missingRequired`, which decides whether the run
         // happens, and is safe to log. `secrets` reaches the executor and is not.

