@@ -12,12 +12,14 @@
 //
 // `npx tsx src/runner-main.ts`, with ENGINE_PLANE_URL and ENGINE_RUNNER_TOKEN set.
 
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensureBlobRoot } from './blobs.js';
 import { runDaemon, type DaemonIo, type DaemonJob } from './daemon.js';
-import type { IssueIntake } from './github.js';
+import { cloneRepository, repoUrl, type IssueIntake } from './github.js';
 import { providerName } from './loop.js';
-import type { RunPlan } from './orchestrate.js';
+import { draftRecipe, proveRepository, type RunPlan } from './orchestrate.js';
 import { runFromIssue } from './run.js';
 import { loadEnv } from './store.js';
 import type { ComputeRow } from './readmodel.js';
@@ -256,8 +258,89 @@ export async function executorFor(
   });
 }
 
+/**
+ * A `prove` or a `draft` job: clone, run the thing, send the answer to the plane (10h).
+ *
+ * Deliberately NOT a run. Neither of these writes an event, and that is the whole reason
+ * they are separate: a proof is a fact about whether this engine can run somebody's project
+ * and a draft is an agent's proposal nobody has approved — putting either in an append-only
+ * log about a user's bug is what `readmodel.ts` explains this project does not do
+ * (ADR-0006). So there is no `RUN_REQUESTED`, no fold, and nothing on the run list.
+ *
+ * The clone is the worker's, using a token the plane mints per job. The recipe travels with
+ * the dispatch (`runner-api.ts` reads it fresh), so a `prove` job proves what is approved
+ * NOW rather than what was approved when the job was queued.
+ *
+ * A failure here is logged and rethrown to the daemon, which leaves the job open for a
+ * re-dispatch — a proving run that could not start must never look like an approval that
+ * did not take, and the recipe is stored either way.
+ */
+async function onboardingJob(
+  config: RunnerConfig,
+  job: DaemonJob,
+  io: DaemonIo,
+  executor?: RunPlan['executor'],
+): Promise<void> {
+  const workspace = await mkdtemp(join(tmpdir(), `engine-${job.kind}-`));
+  try {
+    const source = join(workspace, 'source');
+    // The token, per job, from the plane — there is no App key on this machine (ADR-0012).
+    await cloneRepository(repoUrl(job.repo), source, await io.token());
+
+    if (job.kind === 'prove') {
+      // A recipe is what there is to prove. Absent means it was withdrawn between the
+      // approval that queued this and now, which is not a failure — there is nothing to
+      // prove and nobody to tell.
+      if (!job.recipe) return;
+      const proof = await proveRepository({
+        runId: job.runId,
+        repoPath: source,
+        image: config.image,
+        recipe: job.recipe,
+        ...(executor ? { executor } : {}),
+      });
+      await io.finding({ proof });
+      return;
+    }
+
+    const outcome = await draftRecipe({
+      runId: job.runId,
+      repoPath: source,
+      image: config.image,
+      agentImage: config.agentImage,
+      loop: config.loop,
+      ...(executor ? { executor } : {}),
+    });
+    // A drafting session that produced nothing is an ordinary outcome — the agent explored
+    // and had nothing it was willing to propose — and storing an empty draft would put a
+    // box in front of a human that says an agent filled it in.
+    if (!outcome.ok) return;
+    await io.finding({ draft: outcome.draft });
+  } finally {
+    await rm(workspace, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor'], spent?: ComputeLog) {
   return async (job: DaemonJob, io: DaemonIo): Promise<void> => {
+    // ── THREE KINDS OF WORK, ONE WORKER (10h) ───────────────────────────────────────
+    //
+    // Dispatched here rather than in `runDaemon`, because the two new kinds need exactly
+    // what this function already has: a config, an executor, and an `io` that can mint a
+    // token and send a result home. `kind` defaults to `run` in the database, so a job
+    // queued before 10h — and every test that queues one without saying — takes the path
+    // below unchanged.
+    //
+    // Why they are jobs at all: the plane holds no model key and starts no containers
+    // (ADR-0011, ADR-0019), so approving a recipe there proved nothing and installing the
+    // App drafted nothing, while both worked on a laptop where `serve.ts` has Docker. The
+    // asymmetry was invisible because the only deployment anybody onboarded against was
+    // the laptop.
+    if (job.kind === 'prove' || job.kind === 'draft') {
+      await onboardingJob(config, job, io, executor);
+      return;
+    }
+
     // `try/finally` so a run that ended badly still reports what it burned getting there.
     // A failed run is the one whose cost is most worth knowing.
     // ── THE STORED VALUES, ONCE PER RUN (10l, ADR-0017) ─────────────────────────────

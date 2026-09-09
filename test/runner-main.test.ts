@@ -46,6 +46,7 @@ const bills: { usage?: unknown[]; compute?: unknown[] }[] = [];
  * `src/vercel-client.ts` records about the SDK, arrived at from the other side.
  */
 const stored: (Record<string, string> | null)[] = [null];
+const findings: { proof?: unknown; draft?: unknown }[] = [];
 const io: DaemonIo = {
   append: async () => {},
   token: async () => 'an-installation-token',
@@ -53,6 +54,7 @@ const io: DaemonIo = {
   // `null` by default: the shape every test in this file was written under, which is a
   // deployment that does not inject. A test that wants values pushes them.
   secrets: async () => stored.at(-1) ?? null,
+  finding: async (of) => void findings.push(of),
 };
 
 beforeEach(() => {

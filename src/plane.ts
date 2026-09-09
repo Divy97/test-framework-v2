@@ -327,9 +327,20 @@ export async function openJobFor(client: Db, repo: string, issueNumber: number):
 export async function claimJob(
   client: Db,
   runner: Runner,
-  options: { waitMs?: number } = {},
+  options: { waitMs?: number; kinds?: readonly JobKind[] } = {},
 ): Promise<Job | null> {
   const deadline = Date.now() + (options.waitMs ?? 0);
+  // WHICH KINDS THIS RUNNER CAN SERVE (10h), and all three when it does not say.
+  //
+  // A runner asks, rather than the plane deciding, because the answer is a fact about the
+  // machine: drafting and proving need a model key and an executor, and a worker started
+  // without one must not take a job it will fail. Defaulting to all three keeps every
+  // caller written before 10h — and every test — meaning what it meant.
+  //
+  // Filtered in SQL rather than after the fact, because a claim that fetched a job and then
+  // put it back would have dispatched it: `runner_id` and `dispatches` are already written
+  // by the time a JavaScript filter could look.
+  const kinds = [...(options.kinds ?? JOB_KINDS)];
   for (;;) {
     const { rows } = await client.query(
       // `$1 is null or installation_id = $1` — one predicate, two runners.
@@ -396,20 +407,24 @@ export async function claimJob(
                    and not exists (select 1 from events e where e.run_id = j.run_id)
                  )
                )
+             and j.kind = any($5::text[])
              order by j.queued_at
              limit 1
              for update skip locked
          )
-       returning run_id, installation_id, repo, intake`,
-      [runner.installationId, runner.id, STRANDED_AFTER_MS, MAX_DISPATCHES],
+       returning run_id, installation_id, repo, intake, kind`,
+      [runner.installationId, runner.id, STRANDED_AFTER_MS, MAX_DISPATCHES, kinds],
     );
-    const row = rows[0] as { run_id: string; installation_id: string; repo: string; intake: unknown } | undefined;
+    const row = rows[0] as
+      | { run_id: string; installation_id: string; repo: string; intake: unknown; kind: JobKind }
+      | undefined;
     if (row) {
       return {
         runId: row.run_id,
         installationId: Number(row.installation_id),
         repo: row.repo,
         intake: row.intake,
+        kind: row.kind,
       };
     }
     if (Date.now() >= deadline) return null;

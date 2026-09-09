@@ -101,6 +101,8 @@ const JOB: DaemonJob = {
   repo: 'o/r',
   intake: { source: 'github_issue', thread_ref: 'o/r#1' },
   recipe: { services: [], test: 'node --test' },
+  // `run`, which is what every job in this file is about and what the column defaults to.
+  kind: 'run',
 };
 
 const event = (seq: number, payload: Record<string, unknown> = {}): RunEvent =>

@@ -19,7 +19,8 @@ import { authRoutes } from './auth-routes.js';
 import { staticRoutes } from './static.js';
 import { installationsFor, readSession, cookieValue, type OAuthConfig, type Session } from './auth.js';
 import { webhookRoute, WEBHOOK_PATH, installationToken, type GitHubApp, type Intake } from './github.js';
-import { forgetInstallation, reconcileInstallation } from './installations.js';
+import { forgetInstallation, loadInstallation, reconcileInstallation } from './installations.js';
+import { enqueueJob } from './plane.js';
 import { dashboardRoutes } from './routes.js';
 import { runnerRoutes } from './runner-api.js';
 import { chain, startStatusServer } from './sse.js';
@@ -205,6 +206,32 @@ export async function startPlane(config: PlaneConfig): Promise<{
       dashboardRoutes({
         client,
         blobRoot: config.blobRoot,
+        // PROVING, AS A JOB (10h). This callback did not exist on the plane, so approving a
+        // recipe here proved nothing — the screen said "reload in a minute" forever, and
+        // the only deployment where onboarding answered the question was a laptop.
+        //
+        // The plane cannot prove anything itself and never will: it holds no model key and
+        // starts no containers (ADR-0011, ADR-0019). So it queues the work and a worker
+        // claims it, exactly as a run is queued. `void`, because a person who just pressed
+        // approve is owed a response now rather than when a row has been written.
+        onApproved: (repo) => {
+          void (async () => {
+            const installation = await loadInstallation(client, repo);
+            // No installation is not an error here: the route above already refused a
+            // repository this plane does not know, so reaching this means it was removed
+            // between the approval and this line. Nothing to prove, nobody to tell.
+            if (!installation) return;
+            await enqueueJob(client, {
+              installationId: installation.installationId,
+              repo,
+              kind: 'prove',
+              // The intake a prove job needs is the repository, which is a column. Empty
+              // rather than a fabricated issue: `intake` is "the delivery as it arrived",
+              // and inventing one would put a report nobody filed into the record.
+              intake: { kind: 'prove', repo },
+            });
+          })().catch((error: unknown) => log(`could not queue a proving run for ${repo}: ${String(error)}`));
+        },
         auth: {
           session,
           installations: (who) => installationsFor(who),
