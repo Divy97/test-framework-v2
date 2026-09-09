@@ -82,6 +82,20 @@ export type DaemonIo = {
    * free to drift from both.
    */
   finding: (of: { proof?: unknown; draft?: unknown }) => Promise<void>;
+  /**
+   * The key of whoever pressed Start, or `null` for a job with nobody to bill.
+   *
+   * The plane has answered this since 10k and **nothing asked it until now**, which meant
+   * the whole "who pays" design was a check with no consequence: `POST /api/runs` refuses a
+   * person with no stored key (412), they store one, and the worker then spent its OWN
+   * `OPENROUTER_API_KEY` on their run. A person who stored a key was told it would be used
+   * and it was not.
+   *
+   * `null` is the ordinary answer for a webhook-era job and for the local product, where
+   * there is one operator and the key is in the environment — the worker falls back to its
+   * own configuration there, which is what every run did before the button existed.
+   */
+  modelKey: () => Promise<{ provider: string; key: string } | null>;
 };
 
 export type Daemon = {
@@ -320,6 +334,21 @@ export async function runDaemon(options: {
             }
             const body = (await response.json()) as { secrets?: Record<string, string> };
             return body.secrets ?? {};
+          },
+          modelKey: async () => {
+            const response = await call(`${base}/runner/runs/${job!.runId}/model-key`, {
+              method: 'POST',
+              headers: auth,
+            });
+            // THROWN rather than treated as absent. Falling back to the worker's own key on
+            // a transport error is the failure that spends the wrong account silently, which
+            // is the bug this method exists to fix — so an unreadable answer stops the run
+            // rather than quietly billing somebody else.
+            if (!response.ok) {
+              throw new Error(`the plane would not hand over the model key: HTTP ${response.status}`);
+            }
+            const body = (await response.json()) as { provider: string; key: string } | null;
+            return body ?? null;
           },
           finding: async (of) => {
             const response = await call(`${base}/runner/runs/${job!.runId}/finding`, {

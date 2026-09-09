@@ -50,6 +50,9 @@ const fakeIo = (over: Partial<DaemonIo> = {}): DaemonIo & { findings: unknown[] 
     cost: async () => {},
     secrets: async () => null,
     finding: async (of) => void findings.push(of),
+    // `null`: nobody pressed Start on these, so the worker falls back to its own key —
+    // which is what a webhook-era job and the local product both do.
+    modelKey: async () => null,
     ...over,
   } as DaemonIo & { findings: unknown[] };
 };

@@ -47,6 +47,7 @@ const bills: { usage?: unknown[]; compute?: unknown[] }[] = [];
  */
 const stored: (Record<string, string> | null)[] = [null];
 const findings: { proof?: unknown; draft?: unknown }[] = [];
+const billed: ({ provider: string; key: string } | null)[] = [null];
 const io: DaemonIo = {
   append: async () => {},
   token: async () => 'an-installation-token',
@@ -55,6 +56,9 @@ const io: DaemonIo = {
   // deployment that does not inject. A test that wants values pushes them.
   secrets: async () => stored.at(-1) ?? null,
   finding: async (of) => void findings.push(of),
+  // `null` by default: a job nobody pressed Start on, which is every job in this file. A
+  // test that wants the user's key to be spent pushes one.
+  modelKey: async () => billed.at(-1) ?? null,
 };
 
 beforeEach(() => {
