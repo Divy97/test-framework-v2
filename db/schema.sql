@@ -254,6 +254,30 @@ create table if not exists jobs (
   -- The delivery as it arrived, so a re-dispatch replays the same input rather than
   -- a reconstruction of it.
   intake          jsonb       not null,
+  -- WHAT KIND OF WORK THIS IS (M10, 10h).
+  --
+  -- `run` is the original and the default, so every row written before this column existed
+  -- reads correctly: reproduce a reported bug and open a pull request. The other two exist
+  -- because the plane cannot do them itself and had been pretending the question did not
+  -- arise — it holds no model key and starts no containers (ADR-0011, ADR-0019), so
+  -- approving a recipe on the hosted plane proved nothing and installing an App drafted
+  -- nothing, while both worked locally where `serve.ts` has Docker.
+  --
+  --   `prove` — build this repository's environment and run its own test command in the
+  --             sealed container that judges a fix (8f). Answers "will a run here be able
+  --             to say anything", which is the question a person actually has after
+  --             approving a recipe, and the one the UI had a permanent "reload in a
+  --             minute" for.
+  --   `draft` — explore the repository and PROPOSE a recipe for a human to approve
+  --             (ADR-0013). Never stored as one: the proposal lands in `recipe_drafts`
+  --             and a person is still the control.
+  --
+  -- A column rather than a field in `intake`, because the queue is read by `kind` — a
+  -- worker with no Docker can take `run` jobs on the Vercel substrate and must not take a
+  -- `draft` job it cannot serve — and a predicate on jsonb is not something to put in the
+  -- hot path of `for update skip locked`.
+  kind            text        not null default 'run'
+                              check (kind in ('run', 'prove', 'draft')),
   queued_at       timestamptz not null default now(),
   runner_id       uuid        references runners (id),
   dispatched_at   timestamptz,
@@ -296,6 +320,27 @@ create index if not exists jobs_open on jobs (queued_at) where finished_at is nu
 alter table jobs add column if not exists requested_by bigint;
 alter table jobs add column if not exists issue_number integer;
 create index if not exists jobs_open_issue on jobs (repo, issue_number) where finished_at is null;
+
+-- WHAT KIND OF WORK (10h). See the column's comment in the table above for what the three
+-- mean and why it is a column rather than a field in `intake`.
+--
+-- `default 'run'`, so every row written before 10h — and the table definition above, for a
+-- database created fresh — agree without a backfill. The CHECK is added separately and
+-- `not valid` is deliberately NOT used: the default means no existing row can violate it,
+-- so the validating scan is over rows that are all already correct, and doing it now is
+-- cheaper than remembering to validate it later.
+alter table jobs add column if not exists kind text not null default 'run';
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'jobs_kind_known') then
+    alter table jobs add constraint jobs_kind_known check (kind in ('run', 'prove', 'draft'));
+  end if;
+end $$;
+
+-- The queue is read by kind — a worker takes the kinds it can serve — and `jobs_open`
+-- above orders by `queued_at` alone. Extended rather than replaced: the claim still wants
+-- the oldest open job first, now filtered.
+create index if not exists jobs_open_kind on jobs (kind, queued_at) where finished_at is null;
 
 -- Who is logged in (9c). GitHub OAuth is the only human authentication there is.
 --

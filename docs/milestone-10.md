@@ -68,7 +68,9 @@ destroyed when the run ends.
 - A single worker of ours cannot claim jobs today: `claimJob` filters by installation and a
   runner row is per installation. Fixed in 10e.
 - The plane runs no proving and no drafting; both live behind `serve.ts`. On the hosted
-  product, approving a recipe proves nothing. Jobs gain a `kind`; 10h.
+  product, approving a recipe proves nothing. Jobs gain a `kind`; 10h. **Done — the plane
+  queues both and a worker serves them; the sentence above describes what 10h found, not
+  what is true now.**
 - `run_usage` is never written on the hosted path. 10f.
 
 ## The work
@@ -82,13 +84,13 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10c** | the Runner on a machine it is not PID 1 of: spool-in, stream-out | 10b | merged; #69 |
 | **10d** | `VercelExecutor` against a fake client; `ENV_BUILT`, `SANDBOX_SEALED` | 10c | merged; #72 |
 | **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | merged; #75, #77, #78, #79 |
-| **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | |
+| **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | merged; #80 |
 | **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | merged; #66 |
-| **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
+| **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | merged |
 | **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | merged |
 | **10j** | recipe `env` and `required`; `blocked` | | merged; #70 |
 | **10k** | the model key and secrets: stored, listed by name, never read back | 10j | merged; #71 |
-| **10l** | secrets injected only under `deny-all`, with the guard executed | 10d, 10k | |
+| **10l** | secrets injected only under `deny-all`, with the guard executed | 10d, 10k | merged |
 | **10m** | orientation, plan, critic — off by default, proven inert, then measured | | |
 | **10n** | every line of the record that this milestone made false | all | |
 
@@ -122,6 +124,70 @@ What is left of the worker's own deploy is a Vercel account token, which the CLI
 mint (`403 cannot create tokens for this app`). Until it exists the worker runs on the
 author's laptop against the production plane, which is the same process with a different
 `FLY_MACHINE_ID`.
+
+**10l is done, and what unblocked it was not the thing ADR-0017 was waiting for.**
+
+That ADR asked for an *absence* — no stored credential in a container with a network route
+— and assumed the only way to get one was to pre-warm the agent's dependencies so its
+sandbox could lose its network too. The microVM substrate supplied a different route to the
+same property: the phases that judge are created `deny-all` and **probed from the inside,
+before they are handed a line of the repository's code or a Job**. That makes the absence a
+condition a machine checks rather than an architecture to wait for, and `mayInject` in
+`src/executor.ts` is the check — one function, shared by both executors so they cannot
+answer differently, returning a reason rather than a boolean so a refusal can be recorded.
+
+**Which commands actually see a stored value, and this is the part worth stating loudly:**
+the project's own `test` command and anything the reproduction runs. **Not `install`,
+`migrate`, `seed`, or a service's startup** — those run in the agent sandbox, which has a
+registry reachable by design (ADR-0013) and is sealed only afterwards. A repository whose
+*install* needs a private token still cannot be served, and the run says so rather than
+half-booting. Docker injects nothing at all: `--network none` leaves nothing to probe from,
+and an unobserved seal is not one.
+
+Two things it found on the way, neither about secrets. `secretNames` had been on the run
+request since 10j and **nothing ever set it** — so a recipe declaring `required` blocked
+every time, even with the value stored; 10j shipped the gate, 10k the storage, and nothing
+connected them until now. And `test/runner-main.test.ts`'s daemon fake was
+`as unknown as` its own interface, so adding a method to `DaemonIo` was a clean `tsc` and
+four runtime failures — the same lesson `src/vercel-client.ts` records about the SDK,
+arrived at from the other side. The fake is typed now.
+
+**10h is done, and the gap it closed had been invisible because of where it lived.**
+
+The plane holds no model key and starts no containers (ADR-0011, ADR-0019). So on the hosted
+deployment, **approving a recipe proved nothing** — the onboarding screen had a permanent
+"reload in a minute" for a proving run that was never going to start — and **installing the
+App drafted nothing**, leaving an empty recipe box with a paragraph explaining that hosted
+planes do not draft. Both worked perfectly on a laptop, where `serve.ts` has Docker and a
+key, and the laptop was the only deployment anybody onboarded against. `onApproved` was a
+constructor option `serve.ts` passed and `plane-server.ts` did not, and nothing anywhere
+said so.
+
+`jobs` gained a `kind` — `run`, `prove`, `draft`, defaulted and CHECKed — the plane queues
+the two it cannot do, and a worker claims them the way it claims a run. A `prove` job's
+recipe travels with the DISPATCH, read fresh by `runner-api.ts`, so it proves what is
+approved now rather than what was approved when the job was queued. Neither writes an event:
+a proof is a fact about whether this engine can run somebody's project and a draft is an
+agent's proposal nobody approved, so both go home through `POST /runner/runs/:id/finding` to
+`recipes.proof` and `recipe_drafts` — and a draft goes through `parseRecipe` on the way in,
+because it is an untrusted agent's output and a draft that cannot parse is a box a human is
+asked to approve and cannot read.
+
+The claim filters `kind = any($5)` **in SQL**, and that is not a preference: a claim that
+fetched a job and rejected it in JavaScript would already have written `runner_id` and bumped
+`dispatches`. It would have dispatched work to a machine that cannot serve it, and the job
+would sit stranded until the two-minute reclaim.
+
+**And it found the cause of something this repository had been calling flakiness.**
+`test/plane.test.ts` has failed 10–15 of its 44 for weeks, written off as contention with
+itself. It is not: `vitest.config.ts` loads `.env`, `.env` points at the production database,
+and the live worker there long-polls every 500ms taking **any** installation's job of **any**
+kind. It claims the jobs that file queues — the worker's own log shows it taking `o/r` — so
+`claimJob` returns 204 and the assertions about who holds what fail. It goes the other way
+too: the worker is handed a repository that does not exist, claims it, fails to clone it, and
+logs. `test/kinds.test.ts` gates on `ENGINE_TEST_QUEUE=1` for that reason; `plane.test.ts` is
+left alone deliberately, with the cause written where the next person will look. The fix for
+both is a database of your own.
 
 **10k has two deploy prerequisites, and the next deploy fails without them.**
 `PLANE_SECRETS_KEY` is now in the plane's `REQUIRED` set, so a deployment that does not

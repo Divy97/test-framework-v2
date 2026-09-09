@@ -93,7 +93,29 @@ const MAX_OBSERVED_CHARS = 8 * 1024;
 
 const execFile = promisify(execFileCb);
 
-export type RunPlan = Omit<Job, 'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 'repro' | 'agentPrompt'> & {
+export type RunPlan = Omit<
+  Job,
+  'sourcePath' | 'afterSeq' | 'only' | 'fixRef' | 'repro' | 'agentPrompt' | 'secrets'
+> & {
+  /**
+   * Stored credentials OFFERED to this run's phases (10l, ADR-0017).
+   *
+   * A different name from `Job.secrets` on purpose, and the two are the two sides of one
+   * guard: `plan.stored` is what the run has, `job.secrets` is what a particular sandbox
+   * was given, and `mayInject` in `executor.ts` is the only thing that turns one into the
+   * other. `secrets` is omitted from the inherited `Job` fields above so the offered map
+   * cannot be mistaken for an injected one, or reach a Job through a spread.
+   *
+   * On the plan rather than on `PhaseSpec` because a plan reaches every `runPhase` call —
+   * six of them — and the alternative was six call sites each deciding whether their phase
+   * is sealed, which is a fact none of them can see. A seventh added later would have
+   * defaulted to leaking.
+   *
+   * Never logged and never serialised: a plan is passed by reference and no code path
+   * stringifies one, which is what makes this safe to carry here rather than fetch per
+   * phase.
+   */
+  stored?: Record<string, string>;
   /**
    * The fix agent's prompt — as a FUNCTION of the reproduction that was registered,
    * because it has to quote a command that did not exist when the run started.

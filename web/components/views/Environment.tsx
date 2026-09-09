@@ -105,14 +105,25 @@ export function Environment({
         </div>
       ) : null}
 
-      {!detail.recipe && !isDraft && me?.mode === 'plane' ? (
+      {/* NOTHING YET, rather than nothing ever — 10h changed which of those is true.
+          This said "on a hosted plane there is no drafting yet" and it was correct: the
+          plane holds no model key and starts no containers, so installing the App drafted
+          nothing. It now QUEUES the work and a worker does it, so the honest state of an
+          empty box is "no proposal has arrived", and that has two possible causes a reader
+          can act on differently. */}
+      {!detail.recipe && !isDraft ? (
         <div className="panel">
-          <h2>Nothing drafted this — the box is yours to fill.</h2>
+          <h2>No proposal has arrived — the box is yours to fill.</h2>
           <p>
-            Drafting reads your project and proposes a recipe, and it runs where the
-            containers run. This service holds no model key and runs nothing itself, so on a
-            hosted plane there is no drafting yet: write the commands that install, boot and
-            test your project, and approve them.
+            Drafting reads your project and proposes a recipe for you to review. It runs where
+            the containers run, so this service queues it and a machine picks it up — which
+            means an empty box either has no machine free yet, or means a drafting session ran
+            and had nothing it was willing to propose.
+          </p>
+          <p className="muted small">
+            Either way you are not waiting on it: write the commands that install, boot and
+            test your project and approve them, and a proposal that arrives later will not
+            overwrite what you approved.
           </p>
         </div>
       ) : null}
@@ -215,9 +226,17 @@ function Proof({ proof }: { proof: unknown }) {
       <div className="panel">
         <h2>Not proved yet</h2>
         <p className="muted">
-          Approving a recipe starts a proving run: it builds this repository&rsquo;s
-          environment and runs the project&rsquo;s own test command in the sealed container
-          that judges a fix. Reload in a minute.
+          Approving a recipe queues a proving run: a worker builds this
+          repository&rsquo;s environment and runs the project&rsquo;s own test command in the
+          sealed container that judges a fix. That answers the question a person actually has
+          after approving — <em>will a run here be able to say anything at all</em> — before
+          a stranger&rsquo;s issue is the thing that finds out.
+        </p>
+        <p className="muted small">
+          It waits for a machine to pick it up, so this fills in on its own within a minute or
+          two of one being free. <b>Until 10h this page said the same thing and nothing was
+          queued</b> — the plane holds no model key and starts no containers, so approving here
+          proved nothing while the same button on a laptop did.
         </p>
       </div>
     );
@@ -390,12 +409,33 @@ function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail
       )}
 
       {detail.secrets.enabled ? (
-        <p>
-          These are injected into runs on this deployment. The worker injects them only into
-          a sandbox it has just observed to have no route out (ADR-0017), so a value here
-          satisfies a startup check and a suite that reads it — in a sealed sandbox it cannot
-          reach the service it authenticates to, and that is the point.
-        </p>
+        <>
+          <p>
+            These are injected into runs on this deployment — into a sandbox the engine has
+            just probed <em>from the inside</em> and found to have no DNS and no route out
+            (ADR-0017). A value here therefore satisfies a startup check and a suite that
+            reads it, and cannot reach the service it authenticates to. That is the point,
+            not a limitation.
+          </p>
+          {/* THE PART THAT IS EASY TO LEAVE OUT, and ADR-0017's own risk list says it has to
+              be said: "a secret under deny-all satisfies a startup check and nothing else,
+              and the UI has to say so." Somebody who is not told this stores a real key and
+              files a bug about a timeout. */}
+          <p className="muted small">
+            <b>Which commands actually see them:</b> your project&rsquo;s own{' '}
+            <code>test</code> command, and anything the reproduction runs — the phases that
+            judge, which are sealed before they are handed a line of your code.{' '}
+            <b>
+              Not <code>install</code>, <code>migrate</code>, <code>seed</code>, or a
+              service&rsquo;s startup.
+            </b>{' '}
+            Those run while the sandbox still has a package registry reachable, because
+            installing dependencies needs one — and a stored credential may not exist in a
+            container with a route out. If your <code>install</code> needs a private token,
+            this engine cannot run your project yet, and it will say so rather than half-boot
+            it.
+          </p>
+        </>
       ) : (
         <div className="warning">
           <h2>Stored, and not yet injected into any run.</h2>

@@ -41,7 +41,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { put } from './blobs.js';
 import type { RunEvent } from './events.js';
-import { own, type EnvSnapshot, type Executor, type PhaseResult, type PhaseSpec } from './executor.js';
+import { mayInject, own, type EnvSnapshot, type Executor, type PhaseResult, type PhaseSpec } from './executor.js';
 import type { RunPlan } from './orchestrate.js';
 import type { Recipe, ReplayOutcome } from './recipe.js';
 import { redact } from './redact.js';
@@ -669,6 +669,8 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
 
     /** Set when a probe found a way out, which refuses the phase without losing it. */
     let unsealed: string | undefined;
+    /** What the probe actually saw, or null while it has not run. `mayInject` reads it. */
+    let observedProbe: { dns: boolean; route: boolean } | null = null;
 
     /**
      * The phase, refused, with the record kept.
@@ -725,6 +727,7 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
           payload: { v: 1, sandbox_id: at.id, phase, policy: 'deny-all', probe: observed },
         }),
       );
+      observedProbe = observed;
       if (observed.dns || observed.route) {
         unsealed =
           `the ${phase} sandbox still reached the network under deny-all ` +
@@ -744,10 +747,53 @@ async function runPhase(spec: PhaseSpec, inner: Inner): Promise<PhaseResult> {
     // The Runner continues the log after whatever this executor wrote first, so its own
     // events cannot collide with the seal's seq. The fold refuses a gap and a duplicate
     // alike, and neither would be visible until a real run folded.
+    // ── THE INJECTION, AND THE ONE MOMENT IT IS LEGAL (10l, ADR-0017) ─────────────
+    //
+    // HERE, and nowhere earlier, because everything the guard needs is true exactly now:
+    // the sandbox was created with a policy, a probe ran inside it and reported what it
+    // found, and the Job has not yet been written. `mayInject` is the rule and it is shared
+    // with `executor-docker.ts` so the two cannot drift.
+    //
+    // A refusal is not an error. The phase runs WITHOUT the values and the reason is
+    // recorded, because the alternative — failing the run — would turn a fact about this
+    // deployment's network into a finding about somebody's bug, which ADR-0007's amendment
+    // forbids. What stops a run proceeding on a world it needed a credential for is
+    // upstream: `missingRequired` blocks before any sandbox exists.
+    const offered = plan.stored ?? {};
+    let injected: string[] = [];
+    if (Object.keys(offered).length > 0) {
+      const refused = mayInject({ phase, networked: wantsNetwork, probe: observedProbe });
+      if (refused) {
+        pre.push(
+          own(plan.runId, 0, {
+            type: 'VERIFICATION_ABORTED',
+            payload: {
+              v: 1,
+              phase: 'setup',
+              cause: 'secrets_withheld',
+              // NAMES, never values. This is an event, and an event is append-only and
+              // forever — `redact.ts` covers a value that reaches a command line, and the
+              // only defence for one that reaches a payload is never putting it there.
+              reason: `${Object.keys(offered).length} stored value(s) were withheld: ${refused}`.slice(
+                0,
+                MAX_REASON_CHARS,
+              ),
+            },
+          }),
+        );
+      } else {
+        injected = Object.keys(offered).sort();
+        job.secrets = offered;
+      }
+    }
+
     await sandbox.writeFiles([
       { path: BUNDLE, content: bytes },
       { path: JOB, content: Buffer.from(`${JSON.stringify({ ...job, afterSeq: afterSeq + pre.length })}\n`) },
     ]);
+    // The Job is on the wire; the map goes out of this scope with it. Nothing below reads
+    // `offered` again, and nothing anywhere writes it to the log.
+    void injected;
 
     const started = await sandbox.start(runnerCommand(elevate, inner.entry));
     const stdout = (async function* () {

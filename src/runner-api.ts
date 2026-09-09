@@ -12,12 +12,15 @@
 
 import type { Db } from './store.js';
 import { digest, put } from './blobs.js';
-import { loadRecipe } from './recipe.js';
+import { loadRecipe, parseRecipe, saveProof } from './recipe.js';
+import { saveDraft } from './drafts.js';
 import { projectOne } from './readmodel.js';
 import type { ArtifactRef, RunEvent } from './events.js';
 import {
   appendFromRunner,
   claimJob,
+  JOB_KINDS,
+  type JobKind,
   finishJob,
   jobFacts,
   sawRunner,
@@ -123,12 +126,35 @@ export function runnerRoutes(options: {
     if (method === 'GET' && path === '/runner/jobs') {
       const asked = Number(query.get('wait') ?? '0') * 1000;
       const waitMs = Number.isFinite(asked) ? Math.min(Math.max(asked, 0), MAX_WAIT_MS) : 0;
-      const job = await claimJob(client, runner, { waitMs });
+      // WHICH KINDS THIS RUNNER WILL SERVE (10h), from the query string, and all three when
+      // it does not ask — which is what every runner built before 10h does, and what it
+      // means: a `run` job is the only kind that existed for it to take.
+      //
+      // Filtered to the known set rather than passed through, because this reaches
+      // `kind = any($5)` and a caller-supplied array is a caller-supplied predicate. An
+      // unknown name matches nothing, so a typo would silently mean "take nothing forever"
+      // — a runner that looks healthy and never works. Dropping it and honouring the rest
+      // is the answer a person can debug; naming none is refused below.
+      const wanted = (query.get('kinds') ?? '').split(',').filter((one): one is JobKind =>
+        (JOB_KINDS as readonly string[]).includes(one),
+      );
+      if (query.get('kinds') !== null && wanted.length === 0) {
+        return json({ error: `kinds must name at least one of ${JOB_KINDS.join(', ')}` }, 400);
+      }
+      const job = await claimJob(client, runner, {
+        waitMs,
+        ...(wanted.length > 0 ? { kinds: wanted } : {}),
+      });
       if (!job) return { status: 204, type: 'application/json', body: '' };
       // The recipe travels with the dispatch, read FRESH rather than stored on the job.
       // It is current configuration (ADR-0013) — a human may have corrected it since
       // this delivery was queued, and the run that is about to start should replay what
       // is approved now, not what was approved when the issue was filed.
+      //
+      // A `draft` job is the one kind that expects NO recipe: it exists to propose one.
+      // Reading it anyway costs one indexed lookup and keeps the answer's shape identical
+      // for all three, which is worth more than the query — a worker that had to branch on
+      // kind to know whether a field would be present is a worker with two contracts.
       const recipe = await loadRecipe(client, job.repo);
       return json({ ...job, recipe });
     }
@@ -251,6 +277,58 @@ export function runnerRoutes(options: {
     // ends of it are constrained: the caller has to hold a run, and the plane refuses
     // `/secrets` outright until this deployment has enabled injection, because 10l is
     // what proves the sandbox they land in has no route out.
+    // ── WHAT A prove OR draft JOB PRODUCED (10h) ────────────────────────────────
+    //
+    // The one route on this surface that stores something which is not an event, and it is
+    // deliberately not one: a proof is a fact about whether this engine can run somebody's
+    // project, and a draft is an agent's proposal that no human has approved. Neither is an
+    // observation about a user's bug, so neither belongs in an append-only log about one
+    // (ADR-0006). They go to `recipes.proof` and `recipe_drafts`, which is where the local
+    // product has always put them.
+    //
+    // Authorized through `appendFromRunner` like every other run-scoped route: a runner
+    // gets to write for the run it holds and nothing it can name. The repository comes from
+    // the JOB rather than the body — a runner that could name one would be able to overwrite
+    // any repository's recipe draft on this plane, which is somebody else's onboarding.
+    const finding = /^\/runner\/runs\/([^/]+)\/finding$/.exec(path);
+    if (method === 'POST' && finding) {
+      const runId = decodeURIComponent(finding[1]!);
+      const authorized = await appendFromRunner(client, runner, runId, []);
+      if ('refused' in authorized) {
+        return json({ error: authorized.refused }, authorized.refused.includes('no such run') ? 404 : 403);
+      }
+      const facts = await jobFacts(client, runId);
+      if (!facts) return json({ error: 'no such run' }, 404);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await body());
+      } catch {
+        return json({ error: 'the body is not JSON' }, 400);
+      }
+      const of = (parsed ?? {}) as { proof?: unknown; draft?: unknown };
+      if (of.proof === undefined && of.draft === undefined) {
+        return json({ error: 'send { "proof": … } or { "draft": … }' }, 400);
+      }
+      // A PROOF is stored as it arrives: `loadStored` reads it back defensively and
+      // `Environment.tsx` renders whatever shape it finds, because a proof written by an
+      // older engine has to render as what it is rather than throw.
+      if (of.proof !== undefined) await saveProof(client, facts.repo, of.proof);
+      // A DRAFT goes through `parseRecipe` FIRST, and this is the one validation on this
+      // route that is not optional. It is an agent's output — the agent is untrusted by
+      // construction and its prompt contains text a stranger wrote (ADR-0013) — and a draft
+      // that cannot parse is a box a human is asked to approve and cannot even read. Stored
+      // as a draft either way, never as a recipe: the human is still the control.
+      if (of.draft !== undefined) {
+        try {
+          parseRecipe(of.draft);
+        } catch (error) {
+          return json({ error: `that draft is not a recipe: ${String((error as Error).message ?? error)}` }, 400);
+        }
+        await saveDraft(client, facts.repo, of.draft);
+      }
+      return json({ stored: [of.proof !== undefined ? 'proof' : null, of.draft !== undefined ? 'draft' : null].filter(Boolean) });
+    }
+
     const wants = /^\/runner\/runs\/([^/]+)\/(secrets|model-key)$/.exec(path);
     if (method === 'POST' && wants) {
       const runId = decodeURIComponent(wants[1]!);

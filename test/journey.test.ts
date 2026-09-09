@@ -91,6 +91,32 @@ const deliver = async (event: string, payload: unknown) => {
 const page = async (path: string, init?: RequestInit) =>
   fetch(`http://127.0.0.1:${service!.eventsPort}${path}`, init);
 
+/**
+ * A JSON answer, or a failure that says what actually happened.
+ *
+ * `page(...).json()` on a 500 throws `Unexpected token 'e', "terminating"... is not valid
+ * JSON` — which is Postgres saying *terminating connection due to administrator command*
+ * (Neon suspending an idle branch) arriving through `startStatusServer`'s catch-all as
+ * `text/plain`. Twenty minutes into a suite run that reads as a broken assertion about the
+ * dashboard; it is a database that went away.
+ *
+ * So the status is checked first and the body is quoted. The distinction this file exists
+ * for is whether the STEPS COMPOSE, and it cannot make that claim about a step whose
+ * failure it has misattributed.
+ */
+const asJson = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+  const response = await page(path, init);
+  const body = await response.text();
+  if (!response.ok) {
+    throw new Error(`GET ${path} answered HTTP ${response.status}: ${body.slice(0, 200)}`);
+  }
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    throw new Error(`GET ${path} answered ${response.status} and not JSON: ${body.slice(0, 200)}`);
+  }
+};
+
 const issueDelivery = (number: number) => ({
   action: 'opened',
   issue: {
@@ -191,7 +217,7 @@ describe.sequential('a repository from install to evidence', () => {
 
   it('3. the repository shows as not onboarded on the dashboard', async () => {
     if (!ready) return;
-    const rows = (await (await page('/api/repos')).json()) as { repo: string; onboarded: boolean }[];
+    const rows = await asJson<{ repo: string; onboarded: boolean }[]>('/api/repos');
     const row = rows.find((one) => one.repo === REPO);
     // The row's most important column: a run against a repository with no recipe boots
     // nothing and reports a bug that was never shown.
@@ -270,16 +296,14 @@ describe.sequential('a repository from install to evidence', () => {
     const row = await readRunRow(client!, runId);
     expect(row).toMatchObject({ repo: REPO, issue_number: 2, tier: 3 });
 
-    const list = (await (await page(`/api/runs?repo=${encodeURIComponent(REPO)}`)).json()) as {
-      run_id: string;
-    }[];
+    const list = await asJson<{ run_id: string }[]>(`/api/runs?repo=${encodeURIComponent(REPO)}`);
     expect(list.map((one) => one.run_id)).toContain(runId);
 
-    const evidence = (await (await page(`/api/runs/${runId}/evidence`)).json()) as {
+    const evidence = await asJson<{
       score: { tier: number; grounds: unknown[] };
       state: { reproduced: boolean; fixDiff: unknown };
       row: { repo: string };
-    };
+    }>(`/api/runs/${runId}/evidence`);
     // A Tier 3 REFUSED, and the refusal is what the run produced — the gate holding is the
     // credibility of every verdict the system does issue. That it is stated in those words
     // on the screen ("No fix was attempted", "this is the deliverable, not a failure to

@@ -11,6 +11,7 @@
 // mocks it, which is why it is its own file.
 
 import { beforeEach, describe, expect, test, vi } from 'vitest';
+import type { DaemonIo } from '../src/daemon.js';
 import type { ComputeRow } from '../src/readmodel.js';
 import type { ComputeLog } from '../src/runner-main.js';
 type ComputeRow2 = Omit<ComputeRow, 'run_id'>;
@@ -35,11 +36,26 @@ const job = {
 } as unknown as Parameters<ReturnType<typeof engineExecute>>[0];
 
 const bills: { usage?: unknown[]; compute?: unknown[] }[] = [];
-const io = {
+/**
+ * TYPED, not cast.
+ *
+ * This was `as unknown as Parameters<...>[1]`, and the cast is what let it fall behind the
+ * interface it stands in for: 10l added `secrets` to `DaemonIo`, `tsc` had nothing to say,
+ * and four tests failed at run time with `io.secrets is not a function`. A fake that cannot
+ * disagree with its own type is the whole value of having one — the same lesson
+ * `src/vercel-client.ts` records about the SDK, arrived at from the other side.
+ */
+const stored: (Record<string, string> | null)[] = [null];
+const findings: { proof?: unknown; draft?: unknown }[] = [];
+const io: DaemonIo = {
   append: async () => {},
   token: async () => 'an-installation-token',
-  cost: async (spent: { usage?: unknown[]; compute?: unknown[] }) => void bills.push(spent),
-} as unknown as Parameters<ReturnType<typeof engineExecute>>[1];
+  cost: async (spent) => void bills.push(spent),
+  // `null` by default: the shape every test in this file was written under, which is a
+  // deployment that does not inject. A test that wants values pushes them.
+  secrets: async () => stored.at(-1) ?? null,
+  finding: async (of) => void findings.push(of),
+};
 
 beforeEach(() => {
   runFromIssue.mockClear();

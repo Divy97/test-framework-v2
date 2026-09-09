@@ -921,12 +921,25 @@ describe('the copy that carries a decision', () => {
   });
 
   test('and one that IS injected says what that does and does not buy', () => {
-    // The other branch, which nothing rendered. A value in a sealed sandbox satisfies a
-    // startup check and cannot reach the service it authenticates to — somebody who is not
-    // told that stores a real key and files a bug about a timeout.
+    // A value in a sealed sandbox satisfies a startup check and cannot reach the service it
+    // authenticates to — somebody who is not told that stores a real key and files a bug
+    // about a timeout.
     const html = env({ secrets: { names: ['STRIPE_KEY'], enabled: true } });
-    expect(html).toMatch(/no route out/);
+    expect(html).toMatch(/no DNS and no route out/);
     expect(html).not.toMatch(/not yet injected/i);
+  });
+
+  test('and names the commands that do NOT see them, which is the easy part to omit', () => {
+    // ADR-0017's own risk list: "a secret under deny-all satisfies a startup check and
+    // nothing else, and the UI has to say so." 10l made that concrete — the phases that
+    // judge are sealed and get the values; `install` runs while a registry is still
+    // reachable and never will. A page that said only "injected" would be true and useless.
+    const html = env({ secrets: { names: ['STRIPE_KEY'], enabled: true } });
+    expect(html).toMatch(/install/);
+    expect(html).toMatch(/service&#x27;s startup|service’s startup/);
+    expect(html).toMatch(/private token/);
+    // And it says which ones DO, or the warning is just a refusal.
+    expect(html).toMatch(/your project(&#x27;|’)s own/);
   });
 
   test('10j: configuration goes in the recipe, a credential goes in required', () => {
@@ -957,10 +970,15 @@ describe('the proof of a repository, which is stored as opaque JSON', () => {
   const proof = (it: unknown) =>
     render(<Environment repo="acme/widgets" detail={detail(it)} me={me} onChanged={() => {}} />);
 
-  test('not proved yet says a proving run is what fills it', () => {
+  test('not proved yet says a proving run is what fills it, and that one is queued', () => {
     const html = proof(null);
     expect(html).toMatch(/Not proved yet/);
     expect(html).toMatch(/sealed container that judges a fix/);
+    // QUEUED, not "started" — 10h made proving a job a worker claims, because the plane
+    // holds no model key and starts no containers. The old copy promised a run that, on the
+    // hosted deployment, was never going to happen.
+    expect(html).toMatch(/queues a proving run/);
+    expect(html).toMatch(/waits for a machine/);
   });
 
   test('ready says both halves: the environment built and the suite passed', () => {
@@ -1028,5 +1046,51 @@ describe('the skeleton in an empty recipe box', () => {
     // approving this unchanged stores a recipe that runs nothing at all.
     expect(parsed).toEqual({ install: '', migrate: '', seed: '', services: [], test: '' });
     expect(skeleton).not.toMatch(/npm install|pip install|bundle install/);
+  });
+});
+
+describe('an empty recipe box says why it is empty', () => {
+  const me: Me = {
+    accounts: true, signedIn: true, login: 'd', mode: 'plane',
+    installUrl: 'https://x.invalid', modelKey: null,
+    secrets: { enabled: false }, github: true, forgetting: true,
+  };
+  const bare = (mode: Me['mode']) =>
+    render(
+      <Environment
+        repo="acme/widgets"
+        detail={{
+          repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
+          onboarded: false, recipe: null, approvedAt: null, proof: null, draft: null,
+          secrets: { names: [], enabled: false }, runs: [],
+        }}
+        me={{ ...me, mode }}
+        onChanged={() => {}}
+      />,
+    );
+
+  test('it no longer claims a hosted plane cannot draft, because 10h made it able to', () => {
+    // The panel said "on a hosted plane there is no drafting yet", which was true until the
+    // plane started queueing `draft` jobs for a worker. A screen that keeps a limitation
+    // after it is lifted is worse than one that never mentioned it: a reader takes it as a
+    // reason not to wait.
+    const html = bare('plane');
+    expect(html).not.toMatch(/there is no drafting yet/);
+    expect(html).not.toMatch(/holds no model key and runs nothing itself/);
+    expect(html).toMatch(/No proposal has arrived/);
+  });
+
+  test('and gives BOTH reasons a box can be empty, which are acted on differently', () => {
+    const html = bare('plane');
+    expect(html).toMatch(/no machine free yet/);
+    expect(html).toMatch(/nothing it was willing to propose/);
+    // And says the reader is not blocked on either.
+    expect(html).toMatch(/will not\s+overwrite what you approved/);
+  });
+
+  test('the same panel on a laptop, because the answer no longer depends on the surface', () => {
+    // It was gated on `mode === 'plane'`, so a local operator with an empty box was told
+    // nothing at all. Both deployments now draft; only the machine differs.
+    expect(bare('local')).toMatch(/No proposal has arrived/);
   });
 });

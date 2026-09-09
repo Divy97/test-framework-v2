@@ -1,0 +1,121 @@
+# The check this repository did not have.
+#
+# Every green suite in this project's history was one somebody ran on a laptop, serialised
+# behind whoever was working — which is why two classes of defect kept landing on `main`:
+# a test file left pointing at a route a merge had deleted (27 of them, in 10i), and a
+# check that silently asserts nothing unless a build step ran first.
+#
+# THREE THINGS THIS DELIBERATELY DOES NOT HAVE, each of which would make it worse:
+#
+#   1. **A DATABASE OF ITS OWN, and that is the whole reason this is worth having.**
+#      Not the production one. This repository's `.env` points at production, and the live
+#      worker there long-polls `/runner/jobs` every 500ms taking any installation's job of
+#      any kind — so it claims the jobs `test/plane.test.ts` queues, `claimJob` returns 204,
+#      and 10 to 15 of that file's 44 tests fail. For weeks that was written off as
+#      contention with the suite itself. It is not: against an isolated Postgres the file is
+#      **44 of 44**, and so is every other database-backed test. A service container makes
+#      the whole suite deterministic and stops the tests feeding junk jobs to a real worker.
+#   2. **No built sandbox images.** `test/sandbox.test.ts` needs two Docker images that take
+#      minutes to build and are rebuilt by `npm run images`. It skips without them, loudly.
+#      Container behaviour is proven by the live smoke test and by real runs, not here.
+#   3. **No secrets of any kind.** Nothing in this workflow can reach GitHub as the App,
+#      Vercel, Neon, or a model provider. A check that needs a credential is a check that
+#      cannot run on a fork's pull request.
+#
+# What it DOES cover is everything that is deterministic: both TypeScript programs, the
+# bundle actually building, and the ~870 tests that need nothing but Node — including the
+# browser test, because the runner has Chrome and the bundle is built two steps above it.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch cancels the first. A queue of stale runs is how a check
+# stops being read.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # A queue nobody else drains. See note 1 above for what happens without it.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: events
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d events"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+
+    env:
+      DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/events
+      # The queue tests opt in HERE and only here — the gate exists so that running the
+      # suite against a shared database cannot race a live worker. See test/kinds.test.ts.
+      ENGINE_TEST_QUEUE: '1'
+      # Ephemeral, and that is correct: nothing sealed in this database outlives the job, so
+      # there is nothing for a lost key to make unreadable. It exists because
+      # `readPlaneConfig` and the secrets tests refuse to run without one.
+      PLANE_SECRETS_KEY: ci-only-key-not-a-secret-0000000000000=
+      ENGINE_CHROMIUM_BIN: /usr/bin/google-chrome
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          # TWO lockfiles since 10i — the engine's and the dashboard's. Both are cached, or
+          # the second install is a cold fetch of Next on every run.
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+
+      - name: install
+        run: npm ci
+
+      # BEFORE the tests, and this ordering is the point. Two tests in
+      # `test/static.test.ts` hold the only checks against real Next output — the landing
+      # page pre-rendered into `index.html`, and the CSP hashes computed from the flight
+      # data Next actually emits — and both SKIP without a build. `npm test` does not
+      # build; nothing in the repository ever did, so those two had never run anywhere but
+      # a laptop where somebody happened to have built first.
+      #
+      # `web:build` also runs `tsc` over `web/`, which is the only program that typechecks
+      # `test/screens.test.tsx` — a file the root program excludes because its imports are
+      # resolved by a bundler.
+      - name: build the dashboard
+        run: npm run web:build
+
+      - name: typecheck both programs
+        run: npm run typecheck
+
+      # Chrome is on the runner image, and `test/dashboard.browser.test.ts` looks for it by
+      # path. With the bundle built two steps above, this is a real end-to-end pass: the CSP
+      # this repository serves against the scripts it serves, a `pushState` path resolving
+      # to a view, a live run's log growing under a real browser, and the accessibility floor.
+      # The plane applies this itself on boot, so running it here exercises the same path
+      # rather than a second definition of the schema.
+      - name: apply the schema
+        run: npx tsx src/cli.ts schema --yes
+
+      - name: test
+        run: npx vitest run
+
+      # Only after the suite, and only on a real branch — a fork's pull request has no
+      # permission to build against the registry and should not need one. Proves the plane's
+      # image still assembles, including the `web` stage, which is the half of 10i that no
+      # test touches.
+      - name: the plane image still builds
+        if: github.event_name == 'push'
+        run: docker build -f Dockerfile.plane -t plane:ci .

@@ -15,6 +15,7 @@
 import { readFile } from 'node:fs/promises';
 import type { ArtifactRef, RunEvent } from './events.js';
 import { blobPath } from './blobs.js';
+import type { JobKind } from './plane.js';
 import type { Recipe } from './recipe.js';
 
 /** What the plane hands over. `recipe` is read fresh at dispatch, not stored on the job. */
@@ -24,6 +25,12 @@ export type DaemonJob = {
   repo: string;
   intake: unknown;
   recipe: Recipe | null;
+  /**
+   * What kind of work this is (10h). `run` when the plane does not say, which is what every
+   * job written before 10h is and what the column defaults to — so an older plane and a
+   * newer worker agree without either knowing about the other.
+   */
+  kind: JobKind;
 };
 
 /** What a job execution is given, so it never talks to the plane itself. */
@@ -45,6 +52,36 @@ export type DaemonIo = {
    * bookkeeping.
    */
   cost: (spent: { usage?: unknown[]; compute?: unknown[] }) => Promise<void>;
+  /**
+   * The stored credentials this run's repository has, or `null` (10l, ADR-0017).
+   *
+   * `null` and `{}` are DIFFERENT and the difference decides whether a run happens.
+   * `{}` is "this repository has none stored"; `null` is "this deployment does not hand
+   * them out" — the plane answers 501 until injection is enabled. A worker that read the
+   * second as the first would start a run whose recipe declares `required` names, satisfy
+   * the gate with an empty set, and produce a Tier 3 about a world that was never booted.
+   *
+   * The only call in this product that returns a credential to a caller. It is authorized
+   * as an append is — a runner gets what the run it holds is entitled to and nothing it
+   * can name — and the values are held in memory for one run and offered to sandboxes that
+   * `mayInject` accepts.
+   */
+  secrets: () => Promise<Record<string, string> | null>;
+  /**
+   * The result of a `prove` or a `draft` job, sent back for the plane to store (10h).
+   *
+   * The worker cannot write either itself: it has no database, by the same design that
+   * keeps the App key off it (ADR-0012, ADR-0019). And neither is an EVENT — a proof is a
+   * fact about whether this engine can run somebody's project, and a draft is an agent's
+   * proposal that a human has not approved. Putting either in an append-only log about a
+   * user's bug is precisely what `readmodel.ts` explains this project does not do
+   * (ADR-0006).
+   *
+   * Opaque here on purpose. `RepoProof` and a recipe draft are `orchestrate.ts`'s shapes
+   * and the plane validates what it stores; a second definition in this module would be
+   * free to drift from both.
+   */
+  finding: (of: { proof?: unknown; draft?: unknown }) => Promise<void>;
 };
 
 export type Daemon = {
@@ -265,6 +302,39 @@ export async function runDaemon(options: {
             });
             if (!response.ok) throw new Error(`the plane would not mint a token: HTTP ${response.status}`);
             return ((await response.json()) as { token: string }).token;
+          },
+          secrets: async () => {
+            const response = await call(`${base}/runner/runs/${job!.runId}/secrets`, {
+              method: 'POST',
+              headers: auth,
+            });
+            // 501 is an ANSWER, not a failure: this deployment does not inject yet, and the
+            // caller has to be able to tell that from "this repository has none".
+            if (response.status === 501) return null;
+            if (!response.ok) {
+              // Not `null`, because `null` means a deliberate refusal and this is a fault.
+              // A run that cannot learn whether it has credentials must not proceed as
+              // though it has none — `missingRequired` would then pass an empty set and a
+              // recipe declaring `required` would boot a world it has no values for.
+              throw new Error(`the plane would not hand over stored values: HTTP ${response.status}`);
+            }
+            const body = (await response.json()) as { secrets?: Record<string, string> };
+            return body.secrets ?? {};
+          },
+          finding: async (of) => {
+            const response = await call(`${base}/runner/runs/${job!.runId}/finding`, {
+              method: 'POST',
+              headers: { ...auth, 'content-type': 'application/json' },
+              body: JSON.stringify(of),
+            });
+            // THROWN, unlike `cost`. A bill that could not be written is worth a log line;
+            // a proof or a draft that could not be written is the entire product of the job
+            // — the worker spent containers and a model credential and produced nothing
+            // anybody can see. The daemon logs it and moves on, and the job stays open for
+            // a re-dispatch.
+            if (!response.ok) {
+              throw new Error(`the plane would not store what this job found: HTTP ${response.status}`);
+            }
           },
           cost: async (spent) => {
             if ((spent.usage?.length ?? 0) === 0 && (spent.compute?.length ?? 0) === 0) return;

@@ -437,7 +437,25 @@ export type VerificationAbortedV1 = {
    * nothing folded it, and the microVM substrate adds a second ceiling of its own that
    * fires with this process dead — a failure mode two layers can produce needs a name.
    */
-  cause?: 'handover' | 'collection' | 'environment' | 'missing_env' | 'ceiling';
+  cause?: 'handover' | 'collection' | 'environment' | 'missing_env' | 'ceiling' | 'secrets_withheld';
+  /**
+   * `secrets_withheld` is the one cause here that DISQUALIFIES NOTHING, and it is worth
+   * saying why it is an abort at all (10l, ADR-0017).
+   *
+   * The phase ran. It ran without stored credentials, because the sandbox it would have
+   * entered was not observed to have no way out — the agent's has a route by design, since
+   * `install` needs a registry. Nothing about the reproduction or the verdict is invalid;
+   * what a reader needs to know is that a world they configured was not fully supplied.
+   *
+   * So it is deliberately absent from every branch that reads `cause`: `fold.ts` disqualifies
+   * an attempt on `environment` and `ceiling`, blocks a run on `missing_env`, and
+   * `confidence.ts` reads `handover`. This one is a note in the record and an input to no
+   * verdict — which is checkable, and `test/secrets.test.ts` checks it by folding a log with
+   * one in it and comparing the state to the same log without.
+   *
+   * A run that genuinely CANNOT proceed without a value never gets here: `missingRequired`
+   * blocks it before any sandbox exists.
+   */
   /**
    * The environment variable names a run was missing, when `cause` is `missing_env` (M10).
    *
