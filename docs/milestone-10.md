@@ -84,7 +84,7 @@ Two tracks. B never waits on A until 10h and 10l.
 | **10e** | the worker on Fly `iad`; images to Vercel's registry; a runner that claims for any installation; first live run | 10d | merged; #75, #77, #78, #79 |
 | **10f** | compute cost per sandbox; the record made true; ADR-0021 `accepted` | 10e | merged; #80 |
 | **10g** | manual trigger and the JSON surface; the tail authorized; `issues` ignored | | merged; #66 |
-| **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | |
+| **10h** | jobs of three kinds: `run`, `prove`, `draft` | 10b, 10e | merged |
 | **10i** | Next.js in `web/`; the plane in front; `web.ts` retires; ADR-0022 | 10g | merged |
 | **10j** | recipe `env` and `required`; `blocked` | | merged; #70 |
 | **10k** | the model key and secrets: stored, listed by name, never read back | 10j | merged; #71 |
@@ -149,6 +149,43 @@ connected them until now. And `test/runner-main.test.ts`'s daemon fake was
 `as unknown as` its own interface, so adding a method to `DaemonIo` was a clean `tsc` and
 four runtime failures — the same lesson `src/vercel-client.ts` records about the SDK,
 arrived at from the other side. The fake is typed now.
+
+**10h is done, and the gap it closed had been invisible because of where it lived.**
+
+The plane holds no model key and starts no containers (ADR-0011, ADR-0019). So on the hosted
+deployment, **approving a recipe proved nothing** — the onboarding screen had a permanent
+"reload in a minute" for a proving run that was never going to start — and **installing the
+App drafted nothing**, leaving an empty recipe box with a paragraph explaining that hosted
+planes do not draft. Both worked perfectly on a laptop, where `serve.ts` has Docker and a
+key, and the laptop was the only deployment anybody onboarded against. `onApproved` was a
+constructor option `serve.ts` passed and `plane-server.ts` did not, and nothing anywhere
+said so.
+
+`jobs` gained a `kind` — `run`, `prove`, `draft`, defaulted and CHECKed — the plane queues
+the two it cannot do, and a worker claims them the way it claims a run. A `prove` job's
+recipe travels with the DISPATCH, read fresh by `runner-api.ts`, so it proves what is
+approved now rather than what was approved when the job was queued. Neither writes an event:
+a proof is a fact about whether this engine can run somebody's project and a draft is an
+agent's proposal nobody approved, so both go home through `POST /runner/runs/:id/finding` to
+`recipes.proof` and `recipe_drafts` — and a draft goes through `parseRecipe` on the way in,
+because it is an untrusted agent's output and a draft that cannot parse is a box a human is
+asked to approve and cannot read.
+
+The claim filters `kind = any($5)` **in SQL**, and that is not a preference: a claim that
+fetched a job and rejected it in JavaScript would already have written `runner_id` and bumped
+`dispatches`. It would have dispatched work to a machine that cannot serve it, and the job
+would sit stranded until the two-minute reclaim.
+
+**And it found the cause of something this repository had been calling flakiness.**
+`test/plane.test.ts` has failed 10–15 of its 44 for weeks, written off as contention with
+itself. It is not: `vitest.config.ts` loads `.env`, `.env` points at the production database,
+and the live worker there long-polls every 500ms taking **any** installation's job of **any**
+kind. It claims the jobs that file queues — the worker's own log shows it taking `o/r` — so
+`claimJob` returns 204 and the assertions about who holds what fail. It goes the other way
+too: the worker is handed a repository that does not exist, claims it, fails to clone it, and
+logs. `test/kinds.test.ts` gates on `ENGINE_TEST_QUEUE=1` for that reason; `plane.test.ts` is
+left alone deliberately, with the cause written where the next person will look. The fix for
+both is a database of your own.
 
 **10k has two deploy prerequisites, and the next deploy fails without them.**
 `PLANE_SECRETS_KEY` is now in the plane's `REQUIRED` set, so a deployment that does not

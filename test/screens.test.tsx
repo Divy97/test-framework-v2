@@ -970,10 +970,15 @@ describe('the proof of a repository, which is stored as opaque JSON', () => {
   const proof = (it: unknown) =>
     render(<Environment repo="acme/widgets" detail={detail(it)} me={me} onChanged={() => {}} />);
 
-  test('not proved yet says a proving run is what fills it', () => {
+  test('not proved yet says a proving run is what fills it, and that one is queued', () => {
     const html = proof(null);
     expect(html).toMatch(/Not proved yet/);
     expect(html).toMatch(/sealed container that judges a fix/);
+    // QUEUED, not "started" — 10h made proving a job a worker claims, because the plane
+    // holds no model key and starts no containers. The old copy promised a run that, on the
+    // hosted deployment, was never going to happen.
+    expect(html).toMatch(/queues a proving run/);
+    expect(html).toMatch(/waits for a machine/);
   });
 
   test('ready says both halves: the environment built and the suite passed', () => {

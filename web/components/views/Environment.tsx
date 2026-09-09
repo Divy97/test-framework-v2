@@ -215,9 +215,17 @@ function Proof({ proof }: { proof: unknown }) {
       <div className="panel">
         <h2>Not proved yet</h2>
         <p className="muted">
-          Approving a recipe starts a proving run: it builds this repository&rsquo;s
-          environment and runs the project&rsquo;s own test command in the sealed container
-          that judges a fix. Reload in a minute.
+          Approving a recipe queues a proving run: a worker builds this
+          repository&rsquo;s environment and runs the project&rsquo;s own test command in the
+          sealed container that judges a fix. That answers the question a person actually has
+          after approving — <em>will a run here be able to say anything at all</em> — before
+          a stranger&rsquo;s issue is the thing that finds out.
+        </p>
+        <p className="muted small">
+          It waits for a machine to pick it up, so this fills in on its own within a minute or
+          two of one being free. <b>Until 10h this page said the same thing and nothing was
+          queued</b> — the plane holds no model key and starts no containers, so approving here
+          proved nothing while the same button on a laptop did.
         </p>
       </div>
     );
