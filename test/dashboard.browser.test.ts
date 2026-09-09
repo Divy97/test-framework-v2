@@ -569,6 +569,26 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     expect(page).toMatch(/get a recipe proposed/i);
   });
 
+  test('approving shows the commands that will run, not a wall of JSON', async () => {
+    if (skipped('the recipe review')) return;
+    await browser!.navigate(`${base}/repos/acme/widgets`);
+    visited.push('/repos/acme/widgets (review)');
+    await settle(/start a run/i, '/repos/acme/widgets');
+    const panel = await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
+
+    // The commands, in the order the engine runs them, which is the thing the JSON could
+    // not show — object keys have no order and `services` sits between phases.
+    expect(panel).toMatch(/what will run, in order/i);
+    expect(panel).toContain('npm ci');
+    expect(panel).toContain('npm test');
+    // And what each one is for, in particular the one the engine treats as evidence.
+    expect(panel).toMatch(/your own suite/i);
+    // The JSON is collapsed, not gone: a draft usually needs a fix.
+    expect(panel).toMatch(/edit as json/i);
+    // Collapsed means its content is not rendered, which is the whole point of demoting it.
+    expect(panel).not.toMatch(/are single commands and each may be left empty/i);
+  });
+
   test('the run register renders, and links to the run', async () => {
     // The one screen with a link to it on every page in the product, and the one the rest
     // of this file never visited.
@@ -690,6 +710,14 @@ describe.sequential('the floor, in the browser that renders it', () => {
     visited.push('/repos/acme/widgets');
     await settle(/start a run/i, '/repos/acme/widgets');
     await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
+    // EXPANDED FIRST, since 10n. The recipe is reviewed as a list of the commands it will
+    // run, and the JSON editor is an escape hatch inside a `<details>` — so its label is
+    // hidden with its control until the disclosure is open, which is what a disclosure is
+    // for. `browser.text()` reads RENDERED text and returns nothing for a collapsed one,
+    // so the floor has to open it: the property is "every input has a label pointing at
+    // it", not "every label is on screen at once".
+    await browser!.click('.as-json > summary');
+    await settle(/the recipe, as json/i, 'the JSON editor');
     // The three the screen has: the recipe, and the two halves of storing a secret. Each is
     // asserted by its label's `for`, which only resolves if the `id` is really there.
     for (const [id, label] of [

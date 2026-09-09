@@ -431,6 +431,55 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .card h3{margin:0 0 .5rem;font-size:1.1rem;font-weight:500;letter-spacing:-.01em}
 .card p{margin:0;color:var(--muted);font-size:.97rem}
 /*
+ * THE RECIPE, AS WHAT IT WILL DO (10n).
+ *
+ * Replaces reading raw JSON in a textarea as the primary way to review commands the
+ * engine executes verbatim. Mono for every command, because a command is a machine fact
+ * and this sheet splits the type on who is speaking; serif for the sentence explaining
+ * when it runs, because that is us talking.
+ *
+ * A skipped phase stays in the list rather than being dropped. The ORDER is the thing a
+ * reader could not see in the JSON, and a list with gaps in it does not show an order.
+ */
+.review{margin:0 0 1.5rem;max-width:60rem}
+.review h2{margin:0 0 .9rem}
+.steps-run{list-style:none;margin:0;padding:0;display:grid;gap:1px;
+  background:var(--rule);border:1px solid var(--rule)}
+.steps-run li{background:var(--paper);display:grid;grid-template-columns:7rem 1fr;
+  gap:1rem;padding:.9rem 1.1rem;align-items:baseline}
+.steps-run .tag{font-family:var(--mono);font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--muted);padding-top:.15rem;overflow-wrap:anywhere}
+.steps-run .body{display:block;min-width:0}
+/* Long commands wrap rather than scrolling the page sideways — a command you cannot read
+ * to the end of is a command you cannot review. */
+.steps-run code{display:block;font-family:var(--mono);font-size:.86rem;line-height:1.5;
+  white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink)}
+.steps-run .meta{display:block;color:var(--muted);font-size:.9rem;line-height:1.45;margin-top:.3rem}
+/* A phase that does nothing recedes. It is still listed, because the order matters. */
+.steps-run .step-empty .tag,.steps-run .step-empty .body{opacity:.72}
+/* THE FLAG. The only thing on this page that could ever stop a bad approval, so it gets
+ * the warn treatment — and the bar for showing one is high on purpose, because a screen
+ * that flags something in every recipe teaches the reader to click past the flags. */
+.steps-run .risk{display:grid;grid-template-columns:1.1rem 1fr;gap:.45rem;margin-top:.55rem;
+  padding:.5rem .7rem;background:var(--warn-bg);border-left:3px solid var(--warn-line);
+  border-radius:0 4px 4px 0;color:var(--warn-fg);font-size:.9rem;line-height:1.45}
+.steps-run .risk .mark{font-family:var(--mono);font-weight:700;text-align:center}
+.steps-run .risk code{display:inline;font-size:.85rem;color:var(--warn-fg);background:none;padding:0}
+.warn-line{background:var(--warn-bg);border-left:3px solid var(--warn-line);
+  border-radius:0 4px 4px 0;padding:.7rem 1rem;margin:0 0 1rem;color:var(--warn-fg);
+  font-size:.95rem;line-height:1.5;max-width:60rem}
+/* The JSON, kept and demoted: a draft usually needs a fix, so this is an escape hatch
+ * rather than a thing to remove. */
+.as-json{margin:0 0 1.5rem;max-width:60rem}
+.as-json > summary{font-family:var(--mono);font-size:.72rem;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--muted);cursor:pointer;padding:.4rem 0}
+.as-json > summary:hover{color:var(--ink)}
+
+@media (max-width:640px){
+  .steps-run li{grid-template-columns:1fr;gap:.35rem}
+}
+
+/*
  * A PROMPT, not a warning (10n).
  *
  * The model-key ask on the repository list. It uses the warn tokens because it IS the

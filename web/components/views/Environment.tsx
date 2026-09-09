@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { send, type Me, type RepoDetail } from '../../lib/api';
 import { Said, When } from '../bits';
+import { review } from '../../lib/review';
 
 /**
  * A skeleton that is valid JSON, because the alternative is a trap.
@@ -31,6 +32,81 @@ const SKELETON = JSON.stringify({ install: '', migrate: '', seed: '', services: 
  * one into a file this milestone deletes would have been work done twice. So the product
  * asked people to use a terminal to configure the thing they had just installed.
  */
+/**
+ * What the recipe will actually do, as an ordered list rather than as JSON.
+ *
+ * Rendered from the TEXT being edited, not from the stored recipe, so it tracks the
+ * textarea keystroke by keystroke — the point is to see what you are about to approve,
+ * and a review of the last thing that happened to parse is a review of the wrong thing.
+ */
+function Review({ text }: { text: string }) {
+  const read = review(text);
+
+  if ('error' in read) {
+    return (
+      <div className="nothing">
+        <p>{read.error}</p>
+        <p className="muted small">
+          Nothing can be reviewed until it parses. Fix it below and this fills in as you type.
+        </p>
+      </div>
+    );
+  }
+
+  const runs = read.steps.filter((step) => step.command !== null);
+
+  return (
+    <section className="review" aria-label="What this recipe will run">
+      <h2>What will run, in order</h2>
+      {runs.length === 0 ? (
+        // A recipe of empty strings PARSES, and it is the trap `parseRecipe` and the
+        // skeleton comment both warn about: a run against it boots nothing and reports a
+        // bug that was never shown. Said here, where somebody is about to approve one.
+        <p className="warn-line">
+          <b>This recipe runs nothing.</b> Every command is empty, so a run would boot no
+          project and report that it could not reproduce your bug — which would be a fact
+          about this recipe, not about the bug.
+        </p>
+      ) : null}
+      {read.risks > 0 ? (
+        <p className="warn-line">
+          <b>
+            {read.risks} thing{read.risks === 1 ? '' : 's'} below {read.risks === 1 ? 'is' : 'are'} worth
+            reading twice.
+          </b>{' '}
+          Marked on the command {read.risks === 1 ? 'it' : 'they'} appear{read.risks === 1 ? 's' : ''} in.
+        </p>
+      ) : null}
+      <ol className="steps-run">
+        {read.steps.map((step, n) => (
+          <li key={`${step.phase}-${step.label}-${n}`} className={step.command === null ? 'step-empty' : undefined}>
+            <span className="tag">{step.label}</span>
+            <span className="body">
+              {step.command === null ? (
+                <span className="muted">nothing — this phase is skipped</span>
+              ) : (
+                <code>{step.command}</code>
+              )}
+              {step.detail ? <span className="meta">{step.detail}</span> : null}
+              {step.command === null ? null : <span className="meta">{step.note}</span>}
+              {step.risks.map((risk) => (
+                <span className="risk" key={risk.found}>
+                  {/* The word, not only the colour and the glyph. */}
+                  <span className="mark" aria-hidden="true">
+                    !
+                  </span>
+                  <span className="sr">Worth reading twice: </span>
+                  <code>{risk.found}</code> {risk.says}
+                </span>
+              ))}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 export function Environment({
   repo,
   detail,
@@ -61,6 +137,17 @@ export function Environment({
   // a person mid-edit whose textarea is replaced by a refetch has lost their work to a
   // background poll.
   useEffect(() => setText(initial), [repo]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Whether the text in the box parses at all, which decides whether the JSON editor
+  // starts open: when it does not parse, that editor is the only place the problem can be
+  // fixed, and collapsing it would strand the reader behind a summary they cannot act on.
+  const parsed = (() => {
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      return null;
+    }
+  })();
 
   const approve = () => {
     let parsed: unknown;
@@ -195,26 +282,43 @@ export function Environment({
         </p>
       </div>
 
-      <div className="field">
-        <label htmlFor="recipe">The recipe, as JSON</label>
-        <textarea
-          id="recipe"
-          rows={20}
-          spellCheck={false}
-          value={text}
-          onChange={(event) => setText(event.target.value)}
-          aria-describedby="recipe-hint"
-        />
-        <p className="hint" id="recipe-hint">
-          <code>install</code>, <code>migrate</code>, <code>seed</code> and <code>test</code>{' '}
-          are single commands and each may be left empty; <code>services</code> is a list of
-          long-lived processes, each with a lowercase <code>name</code>, a <code>command</code>{' '}
-          that stays in the foreground, a <code>port</code>, and optionally a{' '}
-          <code>healthcheck</code> URL the engine polls until it answers. <code>test</code> is
-          your project&rsquo;s own suite — it is the regression arm, not the reproduction,
-          which the agent writes.
-        </p>
-      </div>
+      {/* WHAT WILL RUN, before the JSON (10n).
+          The warning above has said for four milestones that these commands execute
+          verbatim with a registry reachable and that the reader is the control. What sat
+          under it was a twenty-row textarea of raw JSON — the most consequential control
+          in the product, presented as a config file. To review it you had to hold the
+          schema in your head, find the commands among the ports and the env, and know
+          which of them the engine treats as a verdict. Most people read two lines and
+          press the button, which makes the control decorative, and a decorative control is
+          worse than none because the page claims it happened. */}
+      <Review text={text} />
+
+      <details className="as-json" open={parsed === null}>
+        {/* OPEN when the text does not parse, because then this is the only place the
+            problem can be fixed and hiding it would strand the reader behind a summary
+            that says "not valid JSON yet" and nothing they can act on. */}
+        <summary>Edit as JSON</summary>
+        <div className="field">
+          <label htmlFor="recipe">The recipe, as JSON</label>
+          <textarea
+            id="recipe"
+            rows={20}
+            spellCheck={false}
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            aria-describedby="recipe-hint"
+          />
+          <p className="hint" id="recipe-hint">
+            <code>install</code>, <code>migrate</code>, <code>seed</code> and <code>test</code>{' '}
+            are single commands and each may be left empty; <code>services</code> is a list of
+            long-lived processes, each with a lowercase <code>name</code>, a <code>command</code>{' '}
+            that stays in the foreground, a <code>port</code>, and optionally a{' '}
+            <code>healthcheck</code> URL the engine polls until it answers. <code>test</code> is
+            your project&rsquo;s own suite — it is the regression arm, not the reproduction,
+            which the agent writes.
+          </p>
+        </div>
+      </details>
       <button type="button" onClick={approve} disabled={busy}>
         {busy ? 'Storing…' : detail.recipe ? 'Approve this recipe' : 'Approve and store'}
       </button>
