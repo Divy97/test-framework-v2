@@ -12,11 +12,13 @@
 // its boundaries; whether proving and drafting themselves work is `sandbox.test.ts`'s
 // question, and it answers it with real containers.
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import { JOB_KINDS, type JobKind } from '../src/plane.js';
 import { engineExecute } from '../src/runner-main.js';
 import type { DaemonIo, DaemonJob } from '../src/daemon.js';
 import type { RunnerConfig } from '../src/runner-main.js';
+import { claimJob, enqueueJob, pairRunner, revokeRunner } from '../src/plane.js';
+import { close, connect, ready } from '../src/store.js';
 
 const CONFIG = {
   planeUrl: 'https://plane.invalid',
@@ -144,5 +146,98 @@ describe('a worker does the thing its job says', () => {
     expect(ran).toHaveLength(1);
     expect(proved).toEqual([]);
     expect(io.findings).toEqual([]);
+  });
+});
+
+/**
+ * The queue, by kind, against a real database.
+ *
+ * `claimJob` filters in SQL rather than after the fact, and the difference is not cosmetic:
+ * a claim that fetched a job and then rejected it in JavaScript would already have written
+ * `runner_id` and bumped `dispatches` — it would have DISPATCHED the job to a runner that
+ * cannot serve it, and the job would then sit stranded until the two-minute reclaim.
+ */
+/**
+ * Skip, loudly, rather than fail — the house rule from `test/store.test.ts`. A queue test
+ * that fails for want of a database teaches nothing and trains people to ignore a red suite.
+ */
+let client: ReturnType<typeof connect> | null = null;
+let why = '';
+try {
+  if (!process.env.DATABASE_URL) why = 'DATABASE_URL is not set (copy .env.example to .env)';
+  else client = connect();
+} catch (error) {
+  why = String(error);
+}
+
+describe('a runner takes the kinds it asked for and no others', () => {
+  const made: { runs: string[]; runners: string[] } = { runs: [], runners: [] };
+  afterAll(async () => {
+    if (!client) return;
+    await client.query('delete from jobs where run_id = any($1)', [made.runs]).catch(() => {});
+    for (const id of made.runners) await revokeRunner(client, id, 424243).catch(() => {});
+    await client.query('delete from runners where id = any($1)', [made.runners]).catch(() => {});
+    await close(client);
+  });
+
+  /** An installation of its own, so these jobs cannot be taken by anything else running. */
+  const INSTALLATION = 424243;
+
+  const queue = async (kind: JobKind) => {
+    const runId = await enqueueJob(client!, {
+      installationId: INSTALLATION,
+      repo: `acme/kinds-${kind}`,
+      intake: { kind },
+      kind,
+    });
+    made.runs.push(runId);
+    return runId;
+  };
+
+  it('claims only the kind it named, and leaves the rest queued', async () => {
+    if (!client) return void expect(why).toBe('SKIP');
+    await ready(client);
+    const runJob = await queue('run');
+    const proveJob = await queue('prove');
+
+    const { runner } = await pairRunner(client, { installationId: INSTALLATION, name: 'kinds-test' });
+    made.runners.push(runner.id);
+
+    // Asks for `prove` only — and gets the prove job, not the run job that was queued
+    // FIRST. `order by queued_at` would have handed over the run without the filter.
+    const claimed = await claimJob(client, runner, { kinds: ['prove'] });
+    expect(claimed?.runId).toBe(proveJob);
+    expect(claimed?.kind).toBe('prove');
+
+    // And the run job was not touched — not claimed, not dispatched, not counted.
+    const { rows } = await client.query('select runner_id, dispatches from jobs where run_id = $1', [runJob]);
+    expect(rows[0]!.runner_id).toBeNull();
+    expect(Number(rows[0]!.dispatches)).toBe(0);
+  });
+
+  it('and a runner that names nothing takes any of them, which is what every older one does', async () => {
+    if (!client) return void expect(why).toBe('SKIP');
+    const draftJob = await queue('draft');
+    const { runner } = await pairRunner(client, { installationId: INSTALLATION, name: 'kinds-test-any' });
+    made.runners.push(runner.id);
+
+    const claimed = await claimJob(client, runner);
+    // The oldest open job on this installation, whatever kind — the pre-10h behaviour, kept
+    // by defaulting to all three rather than by a special case.
+    expect(claimed).not.toBeNull();
+    expect(JOB_KINDS).toContain(claimed!.kind);
+    void draftJob;
+  });
+
+  it('the kind survives the round trip, so a worker does what was queued', async () => {
+    if (!client) return void expect(why).toBe('SKIP');
+    const id = await queue('draft');
+    const { runner } = await pairRunner(client, { installationId: INSTALLATION, name: 'kinds-test-rt' });
+    made.runners.push(runner.id);
+    const claimed = await claimJob(client, runner, { kinds: ['draft'] });
+    expect(claimed?.runId).toBe(id);
+    // THE assertion. Without `kind` on the returning clause the worker would default it to
+    // `run` and re-explore a repository as though somebody had reported a bug in it.
+    expect(claimed?.kind).toBe('draft');
   });
 });
