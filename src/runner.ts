@@ -116,6 +116,22 @@ export type Job = {
   timeoutMs?: number;
   /** Run the sham-fix control. Set when the AGENT wrote the reproduction. */
   controlRun?: boolean;
+  /**
+   * Stored credentials for this repository, resolved at the moment of injection (10l).
+   *
+   * Set by the EXECUTOR and never by a caller, and only for a sandbox it has just
+   * observed to have no route out — `mayInject` in `executor.ts` is the rule and
+   * `PhaseSpec.secrets` is how they are offered. By the time a Job carrying this field
+   * reaches this container, the absence ADR-0017 requires has been established from the
+   * inside.
+   *
+   * Kept apart from `recipe.env` rather than merged into it upstream, for two reasons.
+   * `recipe.env` is recipe content and is displayed by `recipe show`; these are never
+   * displayed anywhere. And `env` reaches the environment build, which is networked —
+   * merging them would have carried a credential into the one sandbox that must not have
+   * one, through a field nobody would think to check.
+   */
+  secrets?: Record<string, string>;
 };
 
 const WORK = '/work';
@@ -573,6 +589,11 @@ async function buildEnvironment(job: Job, emit: (line: string) => void): Promise
   const host = new ToolHost({
     root: ENV_REPO,
     gitDir: `${ENV_REPO}/.git`,
+    // `job.secrets` IS DELIBERATELY ABSENT HERE, and this is the load-bearing omission of
+    // 10l. This is the environment build: it replays `install`, which needs a package
+    // registry, so it is the one world in a run with a network route — and ADR-0017's rule
+    // is that a stored credential may not exist in one. The executor never puts `secrets`
+    // on this Job either; both halves are stated so that neither reads as an oversight.
     env: { ...job.recipe.env, TMPDIR: '/tmp', HOME: '/root' },
   });
   let env: ReplayOutcome;
@@ -989,7 +1010,17 @@ export async function runJob(
     // owns. This env reaches the agent's shells, the recipe replay in the agent sandbox,
     // and — through `runEnv` — every command a phase container judges, which is the point:
     // a project that needs `PORT` to boot needs it to be reproduced, too.
-    return { tree, gitDir: `${root}/gitdir`, env: { ...job.recipe?.env, TMPDIR: tmp, HOME: home } };
+    // `job.secrets` AFTER `recipe.env`, so a recipe cannot shadow a stored credential with
+    // a plaintext one of the same name — the recipe is displayable and these are not, and
+    // the displayable one winning would be a silent downgrade.
+    //
+    // `RESERVED` in `recipe.ts` already stops a recipe setting `TMPDIR`/`HOME`; those stay
+    // last because they are the engine's and belong to neither party.
+    return {
+      tree,
+      gitDir: `${root}/gitdir`,
+      env: { ...job.recipe?.env, ...job.secrets, TMPDIR: tmp, HOME: home },
+    };
   };
 
   // The agent goes first and gets its own seq range, so the log reads in the

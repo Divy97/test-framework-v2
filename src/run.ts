@@ -135,6 +135,32 @@ export type RunRequest = {
    */
   secretNames?: readonly string[];
   /**
+   * The VALUES, for the phases that earn them (10l, ADR-0017).
+   *
+   * Deliberately a separate field from `secretNames` above, which reaches
+   * `missingRequired` and decides whether the run happens at all. Names are safe to log
+   * and are logged; these are neither, and they travel no further than the plan — from
+   * which `mayInject` releases them only into a sandbox observed from the inside to have
+   * no DNS and no route.
+   *
+   * Absent on every path but the hosted worker's. The local CLI and `serve.ts` take their
+   * configuration from the operator's own environment, and `executor-docker.ts` refuses to
+   * inject at all: `--network none` leaves nothing to probe from, and an unobserved seal is
+   * not one.
+   */
+  secrets?: Record<string, string>;
+  /**
+   * Whether this deployment hands stored values out at all (10l).
+   *
+   * `false` is not "there are none" — it is "the plane answered 501, because injection is
+   * not enabled here". Both end a run that declares `required` names, and they must not end
+   * it with the same sentence: one asks the reporter for a value, and the other is about our
+   * configuration and has nothing for them to do. ADR-0007's amendment is about exactly this
+   * confusion in the other direction, and the rule generalises — a fact about us is never
+   * presented as a finding about them.
+   */
+  secretsInjected?: boolean;
+  /**
    * Where the phases run (M10, 10e). Absent, Docker on this machine — the shape every
    * run had before there was a second substrate.
    *
@@ -273,16 +299,18 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       // Every event belongs to an attempt — including the one that says an attempt never
       // began, which the fold would otherwise refuse to place.
       await emit({ ...at(), type: 'ATTEMPT_STARTED', payload: { v: 1, n: 1 } });
+      // WHOSE PROBLEM IT IS, in the sentence. `secretsInjected: false` means the plane
+      // refused to hand values over — this deployment has not enabled injection — so the
+      // names are not "unset", they are unreachable, and there is nothing the reporter can
+      // do about it. Same abort, same block, different sentence.
+      const reason =
+        request.secretsInjected === false
+          ? `required, and this deployment does not inject stored values (ADR-0017): ${missing.join(', ')}`
+          : `required and unset: ${missing.join(', ')}`;
       await emit({
         ...at(),
         type: 'VERIFICATION_ABORTED',
-        payload: {
-          v: 1,
-          phase: 'setup',
-          cause: 'missing_env',
-          reason: `required and unset: ${missing.join(', ')}`,
-          missing,
-        },
+        payload: { v: 1, phase: 'setup', cause: 'missing_env', reason, missing },
       });
       await emit({ ...at(), type: 'RUN_ENDED', payload: { v: 1, reason: 'blocked' } });
       const blocked = fold(events);
@@ -354,6 +382,11 @@ export async function runFromIssue(request: RunRequest): Promise<RunResult> {
       blobRoot: request.blobRoot,
       image: request.image,
       baseRef,
+      // OFFERED to the phases, and injected into none of them by this file (10l). The
+      // executor decides, because the only party that knows whether a sandbox has a route
+      // out is the one that probed it. Absent unless the caller supplied values — a local
+      // CLI run has none, and `{}` and absent mean the same thing to `mayInject`.
+      ...(request.secrets ? { stored: request.secrets } : {}),
       reproPrompt: (sealed) =>
         renderPrompt('repro', { issue, environment: environmentWith(sealed), symptom: symptomPattern }),
       // A function, so it is rendered AFTER the reproduction is registered and can name

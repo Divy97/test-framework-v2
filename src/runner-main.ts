@@ -260,6 +260,20 @@ export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor
   return async (job: DaemonJob, io: DaemonIo): Promise<void> => {
     // `try/finally` so a run that ended badly still reports what it burned getting there.
     // A failed run is the one whose cost is most worth knowing.
+    // ── THE STORED VALUES, ONCE PER RUN (10l, ADR-0017) ─────────────────────────────
+    //
+    // Fetched here rather than per phase, because every phase of a run belongs to one
+    // repository and asking six times would put a credential on the wire six times for one
+    // answer. Held in this scope for the length of the run and offered to sandboxes;
+    // `mayInject` in `executor.ts` decides which of them may have it, and this file
+    // deliberately does not — the only party that knows whether a sandbox has a route out
+    // is the one that probed it.
+    //
+    // `null` means this deployment does not inject. It is passed through as `null` rather
+    // than flattened to `{}`, because `runFromIssue` uses the DIFFERENCE to decide whether a
+    // recipe's `required` names can be satisfied at all.
+    const stored = await io.secrets();
+
     let result: Awaited<ReturnType<typeof runFromIssue>> | undefined;
     try {
       result = await runFromIssue({
@@ -275,6 +289,11 @@ export function engineExecute(config: RunnerConfig, executor?: RunPlan['executor
         runId: job.runId,
         append: io.append,
         loop: config.loop,
+        // NAMES for the gate, VALUES for the injection, and they travel separately on
+        // purpose: `secretNames` reaches `missingRequired`, which decides whether the run
+        // happens, and is safe to log. `secrets` reaches the executor and is not.
+        secretsInjected: stored !== null,
+        ...(stored === null ? {} : { secretNames: Object.keys(stored), secrets: stored }),
       });
     } finally {
       // The model and the machines, in one call, whatever happened above.

@@ -29,7 +29,7 @@ import { isWorkerReply, type Job, type SuiteProbe, type WorkerRequest } from './
 import { redact } from './redact.js';
 import { MAX_REASON_CHARS } from './verify.js';
 import type { RunPlan } from './orchestrate.js';
-import { own, type EnvSnapshot, type Executor, type PhaseResult, type PhaseSpec } from './executor.js';
+import { mayInject, own, type EnvSnapshot, type Executor, type PhaseResult, type PhaseSpec } from './executor.js';
 
 const execFile = promisify(execFileCb);
 
@@ -216,6 +216,8 @@ async function runPhase(spec: PhaseSpec): Promise<PhaseResult> {
   // The agent container gets no repro to run; the phase containers get no agent.
   // Passing both would put an agent beside the phase it is meant to be isolated
   // from, which is the entire point of doing this.
+  /** Set when stored values were offered and the rule refused them; recorded, never dropped. */
+  let withheld: string | undefined;
   const job: Job = {
     runId: plan.runId,
     afterSeq,
@@ -336,6 +338,35 @@ async function runPhase(spec: PhaseSpec): Promise<PhaseResult> {
     // was never built from the agent's image.
     phase === 'agent' ? (plan.agentImage ?? plan.image) : (spec.from?.ref ?? plan.image),
   ];
+
+  // ── THE INJECTION, on the substrate where the seal is not observable (10l) ──────
+  //
+  // `mayInject` is the same rule `executor-vercel.ts` applies, and here it gives the same
+  // answer for a different reason. Docker's `--network none` removes every interface, so
+  // there is nothing to probe FROM inside and nothing this executor can report having
+  // observed — `probe: null`. `mayInject` therefore refuses, and that refusal is correct
+  // rather than pessimistic: ADR-0017 asks for an absence established by observation, and
+  // "the flag we passed usually works" is exactly the claim the vercel probe exists
+  // because it would not accept.
+  //
+  // The consequence is worth stating plainly: **stored secrets are not injected on the
+  // Docker substrate at all.** The local product runs against repositories the operator
+  // owns and can configure by hand; the hosted one is where this matters, and it is the
+  // one that probes.
+  const offeredSecrets = plan.stored ?? {};
+  if (Object.keys(offeredSecrets).length > 0) {
+    const refused = mayInject({
+      phase,
+      networked: phase === 'agent' && Boolean(plan.recipe || plan.draftingEnvironment),
+      probe: null,
+    });
+    // Never silently. The names, never the values — an event is append-only and forever.
+    if (refused) {
+      withheld = `${Object.keys(offeredSecrets).length} stored value(s) were withheld: ${refused}`;
+    } else {
+      job.secrets = offeredSecrets;
+    }
+  }
 
   // `spawn`, not `execFile`. execFile has no `input` option — that belongs to
   // execFileSync — so the Job never reached the container's stdin, `readStdin()`
@@ -529,6 +560,18 @@ async function runPhase(spec: PhaseSpec): Promise<PhaseResult> {
   // were never written to the real store, with nothing anywhere saying the
   // evidence is missing. `cleanup`, because every phase had already been
   // observed when this failed: it is a tidy-up failure, not a failure to look.
+  // A TRIPWIRE, and it should never fire on this substrate: `orchestrate.ts` offers stored
+  // values only to an executor that can observe a seal, so reaching this means somebody
+  // plumbed them to the wrong one. Recorded rather than dropped for exactly that reason —
+  // a guard whose refusal is invisible is a guard nobody can tell is working.
+  if (withheld) {
+    events.push(
+      own(plan.runId, (events.at(-1)?.seq ?? afterSeq) + 1, {
+        type: 'VERIFICATION_ABORTED',
+        payload: { v: 1, phase: 'setup', cause: 'secrets_withheld', reason: withheld.slice(0, MAX_REASON_CHARS) },
+      }),
+    );
+  }
   if (collection) {
     events.push(
       own(plan.runId, (events.at(-1)?.seq ?? afterSeq) + 1, {

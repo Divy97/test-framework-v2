@@ -45,6 +45,21 @@ export type DaemonIo = {
    * bookkeeping.
    */
   cost: (spent: { usage?: unknown[]; compute?: unknown[] }) => Promise<void>;
+  /**
+   * The stored credentials this run's repository has, or `null` (10l, ADR-0017).
+   *
+   * `null` and `{}` are DIFFERENT and the difference decides whether a run happens.
+   * `{}` is "this repository has none stored"; `null` is "this deployment does not hand
+   * them out" — the plane answers 501 until injection is enabled. A worker that read the
+   * second as the first would start a run whose recipe declares `required` names, satisfy
+   * the gate with an empty set, and produce a Tier 3 about a world that was never booted.
+   *
+   * The only call in this product that returns a credential to a caller. It is authorized
+   * as an append is — a runner gets what the run it holds is entitled to and nothing it
+   * can name — and the values are held in memory for one run and offered to sandboxes that
+   * `mayInject` accepts.
+   */
+  secrets: () => Promise<Record<string, string> | null>;
 };
 
 export type Daemon = {
@@ -265,6 +280,24 @@ export async function runDaemon(options: {
             });
             if (!response.ok) throw new Error(`the plane would not mint a token: HTTP ${response.status}`);
             return ((await response.json()) as { token: string }).token;
+          },
+          secrets: async () => {
+            const response = await call(`${base}/runner/runs/${job!.runId}/secrets`, {
+              method: 'POST',
+              headers: auth,
+            });
+            // 501 is an ANSWER, not a failure: this deployment does not inject yet, and the
+            // caller has to be able to tell that from "this repository has none".
+            if (response.status === 501) return null;
+            if (!response.ok) {
+              // Not `null`, because `null` means a deliberate refusal and this is a fault.
+              // A run that cannot learn whether it has credentials must not proceed as
+              // though it has none — `missingRequired` would then pass an empty set and a
+              // recipe declaring `required` would boot a world it has no values for.
+              throw new Error(`the plane would not hand over stored values: HTTP ${response.status}`);
+            }
+            const body = (await response.json()) as { secrets?: Record<string, string> };
+            return body.secrets ?? {};
           },
           cost: async (spent) => {
             if ((spent.usage?.length ?? 0) === 0 && (spent.compute?.length ?? 0) === 0) return;

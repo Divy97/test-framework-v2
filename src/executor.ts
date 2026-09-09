@@ -138,6 +138,44 @@ export type PhaseSpec = {
 };
 
 /**
+ * May this phase be given the stored credentials it was offered?
+ *
+ * Shared by both executors so the answer cannot differ between them, and expressed as a
+ * REASON rather than a boolean so the refusal can be recorded in words.
+ *
+ * The rule is ADR-0017's, and it is an absence rather than a restriction: a value that
+ * authenticates to something outside the sandbox may only exist in a sandbox that has been
+ * observed — from the inside, after the policy was applied — to have no way out. Three
+ * things have to hold, and the third is the one that is easy to forget:
+ *
+ *   1. The sandbox was created `deny-all`. The agent's is not: `install` needs a registry
+ *      (ADR-0013), so it is the one sandbox in a run with a route, and it is sealed only
+ *      after the recipe has already replayed. Secrets are therefore never available to
+ *      `install`, `migrate`, `seed` or a service's startup — which is a real limitation of
+ *      this design and is stated in the UI rather than worked around.
+ *   2. A probe ran inside it and found neither DNS nor a route.
+ *   3. The probe ran BEFORE this Job is written. `executor-vercel.ts` seals a judging
+ *      sandbox before it writes the bundle or the Job, and that ordering is what makes the
+ *      guard meaningful rather than decorative.
+ */
+export function mayInject(at: {
+  phase: PhaseResult['phase'];
+  networked: boolean;
+  probe: { dns: boolean; route: boolean } | null;
+}): string | null {
+  if (at.networked) {
+    return `the ${at.phase} sandbox has a network route, and a stored credential may not enter one (ADR-0017)`;
+  }
+  if (at.probe === null) {
+    return `the ${at.phase} sandbox was not probed, and an unobserved seal is not a seal (ADR-0017)`;
+  }
+  if (at.probe.dns || at.probe.route) {
+    return `the ${at.phase} sandbox still reached the network under deny-all (dns ${at.probe.dns}, route ${at.probe.route})`;
+  }
+  return null;
+}
+
+/**
  * Two host-side obligations travel with this contract, and a remote implementation has
  * to materialise both rather than assume a shared filesystem:
  *
