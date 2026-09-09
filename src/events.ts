@@ -323,7 +323,31 @@ export type AgentFinishedV1 = {
    * against a model that had explored the repository, driven the browser, seen the bug
    * and written the reproduction, and got as far as planning the commit.
    */
-  stopped: 'exit' | 'line_cap' | 'byte_cap' | 'timeout' | 'turn_cap' | 'malformed_tool_call' | 'spawn_failed';
+  /**
+   * `api_error` is the third of these, and it was found the same way as the other two —
+   * by reading a real transcript rather than the code. A drafting session on a new
+   * repository booted the app, passed its healthcheck, loaded the page and saw the bug;
+   * then the model API answered `403 Key limit exceeded` and the loop fell out. Both
+   * paths mislabelled it. OpenRouter's stamped `turn_cap` over it and told the log "the
+   * iteration ceiling was reached while the model was still calling tools", which named
+   * a ceiling that had not been reached and hid a spend cap that had. The Anthropic path
+   * called it `exit`, which has no `CUT_OFF` entry and therefore reads as an agent that
+   * finished.
+   *
+   * `spawn_failed` was the nearest existing value and is wrong: this loop got going, for
+   * sixteen turns. The distinction that matters to whoever reads the report is that
+   * nothing here is a fact about the repository or the model's judgement — the engine
+   * lost its access to the model mid-sentence, and that is ours to fix, not theirs.
+   */
+  stopped:
+    | 'exit'
+    | 'line_cap'
+    | 'byte_cap'
+    | 'timeout'
+    | 'turn_cap'
+    | 'malformed_tool_call'
+    | 'spawn_failed'
+    | 'api_error';
 };
 
 /**

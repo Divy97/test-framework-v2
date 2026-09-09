@@ -57,6 +57,11 @@ const CUT_OFF: Record<string, string> = {
   byte_cap: 'it produced more output than we accept',
   malformed_tool_call: 'it ended a turn inside its own reasoning, without making the call it had planned',
   spawn_failed: 'the agent never started',
+  // Deliberately says whose fault it is. Every other entry describes something the agent
+  // or the repository did; this one describes the engine losing its access to the model,
+  // and a person reading their own bug report should not be left wondering whether their
+  // code caused it.
+  api_error: 'the model API stopped answering us part-way through — which is our problem, not yours',
 };
 
 const TIER_MEANING: Record<number, string> = {

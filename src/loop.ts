@@ -483,9 +483,16 @@ export async function runAgentLoop(options: LoopOptions): Promise<AgentTranscrip
     // A model API error, a refusal, a rate limit. All of them are things the
     // agent's turn did, recorded as testimony; none of them is a reason to lose
     // the transcript that arrived before it.
+    //
+    // `api_error` rather than the `exit` this used to fall back to. `exit` has no
+    // `CUT_OFF` entry in `report.ts`, so a loop that lost its model mid-sentence was
+    // reported to the person who filed the bug as an agent that had finished and found
+    // nothing — the exact substitution `turn_cap` was added to stop. Nor is it
+    // `spawn_failed`: a loop sixteen turns in did get going, and saying it never started
+    // sends whoever reads it to look at the wrong thing.
     record('loop_error', { message: String(error) });
     if (stopped === 'exit') {
-      stopped = lines.length === 0 ? 'spawn_failed' : 'exit';
+      stopped = 'api_error';
       exitCode = -1;
     }
   }

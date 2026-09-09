@@ -12,6 +12,8 @@ import { effortLevel, providerName, runAgentLoop } from '../src/loop.js';
 import { DEFAULT_OPENROUTER_MODEL, openAiTools, probeToolCalling, runOpenRouterLoop } from '../src/openrouter.js';
 import { TOOL_SCHEMAS } from '../src/tools.js';
 import { type FakeModel, fakeChat, fnCall } from './fixtures/model.js';
+import { draftRecipe } from '../src/orchestrate.js';
+import { cleanupFixtures, demoRepo } from './fixtures/repo.js';
 
 let model: FakeModel | undefined;
 afterEach(async () => {
@@ -299,9 +301,59 @@ describe('the ceilings are real', () => {
       baseURL: model.baseURL,
     });
     expect(transcript.exitCode).toBe(-1);
-    expect(transcript.stopped).toBe('spawn_failed');
+    // `api_error`, not the `spawn_failed` this asserted for as long as `stopped` was
+    // guessed from a line count. The name of this test is the argument: a loop the API
+    // refused mid-run is not a loop that never got going, and the two send whoever reads
+    // the report to look at different things.
+    expect(transcript.stopped).toBe('api_error');
     expect(transcript.lines[0]!.raw).toContain('429');
-    expect(transcript.lines[0]!.raw).toContain('slow down');
+    // The body, IN the message. Every reader of a transcript renders `loop_error` by its
+    // `message` alone, so a cause in a field beside it is a cause nobody sees — which is
+    // how a real `403 Key limit exceeded` reached the log as the string `HTTP 403`.
+    const first = JSON.parse(transcript.lines[0]!.raw) as { message: string };
+    expect(first.message).toContain('slow down');
+  });
+
+  it('does not call a spend cap an iteration ceiling', async () => {
+    // The production failure this file exists to stop repeating. A real `draft` job on a
+    // new repository ran sixteen tool-calling turns — it booted the app, passed
+    // `/healthz`, loaded the page, saw the orders — and then OpenRouter answered
+    //   403 {"error":{"message":"Key limit exceeded (total limit) ..."}}
+    // The loop broke, left `stopped` at `exit`, and fell into the `turn_cap` relabel at
+    // the bottom, so the only thing the log said was "the iteration ceiling was reached
+    // while the model was still calling tools". The ceiling was 25 and it was nowhere
+    // near it. An operator reading that goes looking at `prompts/recipe.md` and
+    // `maxIterations` for a fault that was a two-dollar key.
+    model = await fakeChat([{ tool_calls: [fnCall('glob', { pattern: '*' })] }], {
+      repeatLast: true,
+      failAfter: 3,
+      status: 403,
+      body: '{"error":{"message":"Key limit exceeded (total limit)","code":403}}',
+    });
+    const transcript = await runOpenRouterLoop({
+      prompt: 'p',
+      invoke: recorder().invoke,
+      apiKey: 'k',
+      baseURL: model.baseURL,
+      maxIterations: 25,
+    });
+
+    expect(transcript.stopped).toBe('api_error');
+    expect(transcript.exitCode).toBe(-1);
+    // The work it DID do survives — three turns of it, both halves of every tool call.
+    expect(transcript.usage.turns).toBe(3);
+    expect(transcript.lines.filter((line) => line.claimed_type === 'tool_result')).toHaveLength(3);
+
+    const errors = transcript.lines
+      .filter((line) => line.claimed_type === 'loop_error')
+      .map((line) => (JSON.parse(line.raw) as { message: string }).message);
+    // Exactly one account of what went wrong, and it names the cause.
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('403');
+    expect(errors[0]).toContain('Key limit exceeded');
+    // The lie, gone. Both halves of it: the label and the sentence.
+    expect(transcript.stopped).not.toBe('turn_cap');
+    expect(errors.join(' ')).not.toContain('iteration ceiling');
   });
 
   it('totals what it spent', async () => {
@@ -384,7 +436,7 @@ describe('a 200 is not proof the request was accepted', () => {
       apiKey: 'k',
       baseURL: model.baseURL,
     });
-    expect(transcript.stopped).toBe('spawn_failed');
+    expect(transcript.stopped).toBe('api_error');
     expect(transcript.exitCode).toBe(-1);
     expect(transcript.lines[0]!.raw).toContain('api error 404');
     expect(transcript.lines[0]!.raw).toContain('no endpoints found');
@@ -514,5 +566,62 @@ describe('the suite has no model configuration of its own', () => {
       expect(config).toContain(key);
     }
     expect(config).toMatch(/delete process\.env\[key\]/);
+  });
+});
+
+// ── what the caller is told a cut-off session was ────────────────────────────
+//
+// `runOpenRouterLoop` naming the cause correctly buys nothing if the layer above
+// overwrites it, and that is exactly what happened. `draftRecipe` reported the FIRST
+// real draft job on a new repository as "the drafting session produced no fenced JSON
+// block" — true, and a description of the symptom. The session had been cut off by a
+// 403 four lines earlier in its own transcript.
+
+describe('a cut-off drafting session reports what cut it off', () => {
+  it('prefers the loop error over the missing JSON block', async () => {
+    const fixture = demoRepo();
+    const model = await fakeChat([{ tool_calls: [fnCall('glob', { pattern: '*' })] }], {
+      repeatLast: true,
+      failAfter: 2,
+      status: 403,
+      body: '{"error":{"message":"Key limit exceeded (total limit)","code":403}}',
+    });
+
+    // Enough of an executor to hand the driver an `invoke` and get out of the way. What
+    // is under test is the sentence `draftRecipe` returns, not a container.
+    const executor = {
+      kind: 'docker' as const,
+      runPhase: async (spec: {
+        phase: string;
+        driver?: (io: { invoke: (name: string, input: unknown) => Promise<{ ok: boolean; output: string }> }) => Promise<void>;
+      }) => {
+        await spec.driver?.({ invoke: async () => ({ ok: true, output: 'ok' }) });
+        return { phase: spec.phase, events: [], exitCode: 0, stderr: '' } as never;
+      },
+      buildSnapshot: async () => ({ failed: 'not used' }),
+      dropSnapshot: async () => {},
+    };
+
+    try {
+      const outcome = await draftRecipe({
+        runId: '3f1c9a52-7b0e-4d2f-9c41-8a6e5d0b21c7',
+        repoPath: fixture.repo,
+        image: 'engine:test',
+        loop: { provider: 'openrouter', apiKey: 'k', baseURL: model.baseURL },
+        executor: executor as never,
+      });
+
+      expect(outcome.ok).toBe(false);
+      if (outcome.ok) return;
+      // The cause, in the sentence an operator reads.
+      expect(outcome.reason).toContain('403');
+      expect(outcome.reason).toContain('Key limit exceeded');
+      expect(outcome.reason).toContain('api_error');
+      // And NOT the symptom it used to report instead.
+      expect(outcome.reason).not.toContain('no fenced JSON block');
+    } finally {
+      await model.close();
+      cleanupFixtures();
+    }
   });
 });

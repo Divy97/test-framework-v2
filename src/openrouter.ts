@@ -235,16 +235,24 @@ export async function runOpenRouterLoop(options: OpenRouterOptions): Promise<Age
         // Told as testimony, exactly as the Anthropic path does: an agent that fails is
         // an observation, and losing the transcript to save the exception is the trade
         // this codebase refuses.
-        record('loop_error', { message: `HTTP ${response.status}`, body: (await response.text()).slice(0, 2000) });
+        //
+        // The body goes in the MESSAGE, not beside it. It used to be a second field, and
+        // every reader of a transcript renders `loop_error` by its `message` alone — so a
+        // real 403 reached the log as the four characters `HTTP 403` while the sentence
+        // that said WHY (`Key limit exceeded (total limit)`, and the URL that fixes it)
+        // sat in a field nothing printed. A cause that is stored and never shown is a
+        // cause nobody has.
+        const detail = (await response.text()).slice(0, 2000).trim();
+        record('loop_error', { message: `HTTP ${response.status}${detail === '' ? '' : ` — ${detail}`}` });
         exitCode = -1;
-        if (lines.length === 1) stopped = 'spawn_failed';
+        stopped = 'api_error';
         break;
       }
       body = (await response.json()) as ChatResponse;
     } catch (error) {
       record('loop_error', { message: String(error) });
       exitCode = -1;
-      if (lines.length === 1) stopped = 'spawn_failed';
+      stopped = 'api_error';
       break;
     }
 
@@ -255,7 +263,7 @@ export async function runOpenRouterLoop(options: OpenRouterOptions): Promise<Age
     if (failed !== null) {
       record('loop_error', { message: failed });
       exitCode = -1;
-      if (lines.length === 1) stopped = 'spawn_failed';
+      stopped = 'api_error';
       break;
     }
 
@@ -263,6 +271,7 @@ export async function runOpenRouterLoop(options: OpenRouterOptions): Promise<Age
     if (!message) {
       record('loop_error', { message: 'the response carried no message', body });
       exitCode = -1;
+      stopped = 'api_error';
       break;
     }
 
