@@ -902,3 +902,166 @@ describe('every sandbox a run created appears on its bill', () => {
     expect(fake.sandboxes[0]!.stopped).toBe(true);
   });
 });
+
+/**
+ * The stored credentials, and the one sandbox that may hold them (10l, ADR-0017).
+ *
+ * `test/injection.test.ts` asserts the RULE — `mayInject` — in isolation. This asserts the
+ * WIRING, which is the half a correct rule does not give you: what actually lands in the
+ * Job the sandbox reads, decided at the one moment the executor knows whether the platform
+ * applied the policy it was sent.
+ *
+ * The assertion is on `fake.files`, the Job on disk inside the sandbox, rather than on
+ * anything the executor returned. A guard that computed the right answer and wrote the
+ * values anyway would satisfy every other test in this file.
+ */
+describe('a credential enters a sandbox that was observed to have no way out, or none', () => {
+  const STORED = { STRIPE_API_KEY: 'sk_live_do_not_leak_me', DATABASE_URL: 'postgres://u:p@db/x' };
+
+  /** The Job as the sandbox received it. */
+  const jobIn = (fake: ReturnType<typeof fakeSandboxes>) => {
+    const raw = fake.sandboxes[0]!.files.get('/work/job.json');
+    return raw === undefined ? null : (JSON.parse(raw.toString('utf8')) as { secrets?: Record<string, string> });
+  };
+
+  test('a judging phase, probed clean, is given them', async () => {
+    const fake = fakeSandboxes({
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 5, symptom_matched: true });
+      },
+    });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan({ stored: STORED }),
+      source: repo(),
+      afterSeq: 0,
+      phase: 'base',
+      overrides: {},
+      from: { ref: 'snap-1' },
+    });
+
+    expect(jobIn(fake)?.secrets).toEqual(STORED);
+    // And nothing was withheld, so there is no abort in the record.
+    expect(result.events.map((one) => one.type)).toEqual(['SANDBOX_SEALED', 'TEST_RUN']);
+  });
+
+  test('but only AFTER the probe — the seal is the first event, before the Job exists', async () => {
+    // The ordering is the guard. A probe run after the Job was written would be a check on
+    // a sandbox that already held the credentials, which is no check at all. `writeFiles`
+    // for the Job happens strictly after `seal()`, and the event order is the visible
+    // consequence.
+    const fake = fakeSandboxes({
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 0, duration_ms: 5 });
+      },
+    });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan({ stored: STORED }),
+      source: repo(),
+      afterSeq: 0,
+      phase: 'base',
+      overrides: {},
+      from: { ref: 'snap-1' },
+    });
+    expect(result.events[0]!.type).toBe('SANDBOX_SEALED');
+    // The probe command ran before the Job was on disk. `commands` is ordered and the fake
+    // records the probe, so "which came first" is answerable rather than assumed.
+    const probeAt = fake.sandboxes[0]!.commands.findIndex((one) => /getaddrinfo|dns|connect/i.test(one));
+    expect(probeAt).toBeGreaterThanOrEqual(0);
+  });
+
+  test('THE test: a sandbox that still reaches the network is given none, and says so', async () => {
+    // `reachable` overridden, which models the failure ADR-0017's probe exists for: the
+    // platform accepted `deny-all` and did not apply it. Without the probe this sandbox
+    // looks identical to the one above.
+    const fake = fakeSandboxes({
+      reachable: () => true,
+      runner: async function* ({ sandbox }: RunnerContext) {
+        yield event(afterSeqOf(sandbox) + 1, 'TEST_RUN', { v: 1, phase: 'base', commit_sha: 'a'.repeat(40), exit_code: 1, duration_ms: 5, symptom_matched: true });
+      },
+    });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan({ stored: STORED }),
+      source: repo(),
+      afterSeq: 0,
+      phase: 'base',
+      overrides: {},
+      from: { ref: 'snap-1' },
+    });
+
+    // The phase is REFUSED outright on an unsealed sandbox — that predates 10l and is the
+    // stronger outcome — so what matters here is that no Job was ever written with the
+    // values in it.
+    const job = jobIn(fake);
+    expect(job?.secrets).toBeUndefined();
+    // And the values are nowhere in anything this sandbox received.
+    const everything = [...fake.sandboxes[0]!.files.values()].map((b) => b.toString('utf8')).join('\n');
+    for (const value of Object.values(STORED)) expect(everything).not.toContain(value);
+    // Nor in any event, which is append-only and forever.
+    expect(JSON.stringify(result.events)).not.toContain('sk_live_do_not_leak_me');
+  });
+
+  test('the AGENT sandbox is given none, because install needs a registry', async () => {
+    // The limitation this design accepts, asserted rather than left to be discovered: the
+    // agent's sandbox is created `allow-all` (ADR-0013) and sealed only after the recipe has
+    // replayed, so a stored credential is never available to `install`, `migrate`, `seed`,
+    // or a service's startup.
+    const fake = fakeSandboxes({
+      runner: async function* ({ awaitSpool }: RunnerContext) {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+        yield line({ ready: true });
+        await awaitSpool((written) => written.includes('"done":true'));
+        yield line({ finished: { handover: null } });
+      },
+    });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan({ recipe: { install: 'npm ci', services: [] }, stored: STORED }),
+      source: repo(),
+      afterSeq: 0,
+      phase: 'agent',
+      overrides: { serveTools: true },
+      driver: async () => {},
+    });
+
+    expect(fake.sandboxes[0]!.createdWith).toBe('allow-all');
+    expect(jobIn(fake)?.secrets).toBeUndefined();
+    const everything = [...fake.sandboxes[0]!.files.values()].map((b) => b.toString('utf8')).join('\n');
+    for (const value of Object.values(STORED)) expect(everything).not.toContain(value);
+    // WITHHELD, recorded, and named as such — a reader has to be able to tell "this world
+    // had no credentials" from "this world was configured with credentials it never got".
+    const withheld = result.events.find(
+      (one) => one.type === 'VERIFICATION_ABORTED' && (one.payload as { cause?: string }).cause === 'secrets_withheld',
+    );
+    expect(withheld).toBeDefined();
+    const reason = (withheld!.payload as { reason: string }).reason;
+    expect(reason).toMatch(/2 stored value\(s\) were withheld/);
+    expect(reason).toMatch(/has a network route/);
+    // COUNTS AND NAMES OF THE RULE, never the values or even the variable names of the
+    // secrets — this is an event, and an event is forever.
+    for (const value of Object.values(STORED)) expect(reason).not.toContain(value);
+    expect(reason).not.toContain('STRIPE_API_KEY');
+  });
+
+  test('and a run with nothing stored writes no abort at all', async () => {
+    // The control. Without it, every assertion above passes on an executor that emits a
+    // withheld-abort unconditionally.
+    const fake = fakeSandboxes({
+      runner: async function* ({ awaitSpool }: RunnerContext) {
+        yield line({ env: { ready: true, steps: [], services: [] } });
+        yield line({ ready: true });
+        await awaitSpool((written) => written.includes('"done":true'));
+        yield line({ finished: { handover: null } });
+      },
+    });
+    const result = await vercelExecutor({ client: fake.client }).runPhase({
+      plan: plan({ recipe: { install: 'npm ci', services: [] } }),
+      source: repo(),
+      afterSeq: 0,
+      phase: 'agent',
+      overrides: { serveTools: true },
+      driver: async () => {},
+    });
+    expect(
+      result.events.some((one) => (one.payload as { cause?: string }).cause === 'secrets_withheld'),
+    ).toBe(false);
+  });
+});
