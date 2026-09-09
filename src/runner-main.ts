@@ -316,9 +316,32 @@ async function onboardingJob(
       ...(executor ? { executor } : {}),
     });
     // A drafting session that produced nothing is an ordinary outcome — the agent explored
-    // and had nothing it was willing to propose — and storing an empty draft would put a
-    // box in front of a human that says an agent filled it in.
-    if (!outcome.ok) return;
+    // and had nothing it was willing to propose — and storing an empty draft would put a box
+    // in front of a human that says an agent filled it in.
+    //
+    // BUT IT SAYS WHY, and the first version did not. `serve.ts` has logged
+    // `drafting produced nothing — <reason>` since 8f; this returned silently, so a real
+    // draft job in production finished in 37 seconds having stored nothing and left
+    // `0 event(s), 0 artifact(s)` as the only trace. From the outside — a person who has
+    // just installed the App on a new repository and is looking at an empty box — that is
+    // indistinguishable from a job that never ran.
+    if (!outcome.ok) {
+      console.log(`${job.repo}: drafting produced nothing — ${outcome.reason}`);
+      // The transcript too, bounded. It is testimony and no verdict rests on it (ADR-0006),
+      // and it is the only account of what the agent was doing for those 37 seconds — which
+      // is the whole question when a session proposes nothing.
+      // `?? ''`, because this is the one place in the worker that reads a value straight
+      // off an agent-driven path for the purpose of explaining a failure. A log line that
+      // throws while reporting why something produced nothing replaces a legible outcome
+      // with an unhandled read of `undefined`.
+      const said = (outcome.transcriptText ?? '').trim();
+      if (said !== '') console.log(`${job.repo}: the drafting agent said — ${said.slice(-1200)}`);
+      console.log(
+        `${job.repo}: spent ${outcome.usage?.turns ?? 0} turn(s), ` +
+          `${outcome.usage?.input_tokens ?? 0} in / ${outcome.usage?.output_tokens ?? 0} out`,
+      );
+      return;
+    }
     await io.finding({ draft: outcome.draft });
   } finally {
     await rm(workspace, { recursive: true, force: true }).catch(() => {});

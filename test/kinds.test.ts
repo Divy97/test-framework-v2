@@ -105,7 +105,16 @@ describe('a worker does the thing its job says', () => {
     const io = fakeIo();
     await engineExecute(CONFIG, undefined, undefined, {
       clone: async () => {},
-      draft: async () => ({ ok: false, reason: 'it could not find a test command' }) as never,
+      // THE WHOLE OUTCOME, not just `ok` and `reason`. A partial one let the worker's
+      // failure path read `transcriptText.trim()` off `undefined` — the fixture was lying
+      // about a shape the type requires, and the `as never` is what let it.
+      draft: async () =>
+        ({
+          ok: false,
+          reason: 'it could not find a test command',
+          transcriptText: '',
+          usage: { turns: 0, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        }) as never,
     })(job({ kind: 'draft', recipe: null }), io);
 
     expect(io.findings).toEqual([]);
@@ -504,4 +513,65 @@ describe('a finding comes home, and a bad draft is not retried five times', () =
  */
 afterAll(async () => {
   if (client) await close(client);
+});
+
+/**
+ * A drafting session that proposes nothing has to say so.
+ *
+ * A real `draft` job in production finished in 37 seconds having stored nothing, and the
+ * only trace was `0 event(s), 0 artifact(s)`. From the outside — somebody who has just
+ * installed the App on a new repository and is looking at an empty recipe box — that is
+ * indistinguishable from a job that never ran, and there is nothing to act on either way.
+ * `serve.ts` has logged the reason since 8f; `onboardingJob` returned silently.
+ */
+describe('a drafting session that proposes nothing says why', () => {
+  const said: string[] = [];
+  const spy = () => {
+    const real = console.log;
+    said.length = 0;
+    console.log = (...parts: unknown[]) => void said.push(parts.join(' '));
+    return () => void (console.log = real);
+  };
+
+  it('names the reason, quotes the transcript, and reports what it spent', async () => {
+    const restore = spy();
+    try {
+      await engineExecute(CONFIG, undefined, undefined, {
+        clone: async () => {},
+        draft: async () =>
+          ({
+            ok: false,
+            reason: 'it could not find a test command',
+            transcriptText: 'I looked at package.json and there are no scripts.',
+            usage: { turns: 7, input_tokens: 4210, output_tokens: 180, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          }) as never,
+      })(job({ kind: 'draft', recipe: null }), fakeIo());
+    } finally {
+      restore();
+    }
+    const all = said.join('\n');
+    expect(all).toMatch(/drafting produced nothing — it could not find a test command/);
+    // The transcript, because it is the only account of what the agent was doing — and the
+    // whole question when a session proposes nothing is what it was looking at.
+    expect(all).toMatch(/no scripts/);
+    // And the cost, because a session that produced nothing still spent tokens.
+    expect(all).toMatch(/7 turn\(s\), 4210 in \/ 180 out/);
+  });
+
+  it('and a session that DID propose something logs no such thing', async () => {
+    // The control. Without it, the assertion above passes on a worker that reports failure
+    // unconditionally.
+    const restore = spy();
+    const io = fakeIo();
+    try {
+      await engineExecute(CONFIG, undefined, undefined, {
+        clone: async () => {},
+        draft: async () => ({ ok: true, draft: { install: 'npm ci', services: [] } }) as never,
+      })(job({ kind: 'draft', recipe: null }), io);
+    } finally {
+      restore();
+    }
+    expect(said.join('\n')).not.toMatch(/produced nothing/);
+    expect(io.findings).toEqual([{ draft: { install: 'npm ci', services: [] } }]);
+  });
 });
