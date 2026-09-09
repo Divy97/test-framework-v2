@@ -465,7 +465,14 @@ describe.sequential('the dashboard, driven in a real browser', () => {
 
   test('the evidence page shows base red, fix green, the tier and every ground', async () => {
     if (skipped('the evidence page')) return;
-    const page = await visit(`/runs/${DEMO_RUN_ID}`, /the reproduction arm/i);
+    // TWO REQUESTS, and this waited for one. `visit` settles on the Evidence section,
+    // which comes from `/evidence`; the timeline below it is built from a SEPARATE
+    // `/events` read, and the assertions further down were being made before that read had
+    // landed. It failed on `the run was requested` in CI and locally, at 19ms — fast
+    // enough that the second request had not answered — while the live-run test asserting
+    // the identical string passed, because that one waits for it.
+    await visit(`/runs/${DEMO_RUN_ID}`, /the reproduction arm/i);
+    const page = await settle(/the run was requested/i, 'the finished run\u2019s timeline');
 
     // The verdict, from the fold rather than from the row.
     expect(page).toMatch(/tier 1/i);
