@@ -883,7 +883,13 @@ describe.sequential('a stranger on a surface with accounts', () => {
     // visitor is not in one.
     await browser!.navigate(`${hostedBase}/`);
     visited.push('/ (signed out)');
-    const page = await settle(/proves the bug existed/, '/ signed out');
-    expect(page).toMatch(/install on github/i);
+    const page = await settle(/fixes the bug and proves the fix/, '/ signed out');
+    // ONE door on a surface that has accounts. This asserted `install on github`, which was
+    // the old primary call to action — and it sat beside a secondary `Sign in`, for two
+    // steps that are sequential rather than alternative. Installing first returns you to
+    // this very page with no session; the way in is signing in, which the old copy admitted
+    // in as many words while keeping install as the primary button.
+    expect(page).toMatch(/continue with github/i);
+    expect(page).not.toMatch(/install on github/i);
   });
 });

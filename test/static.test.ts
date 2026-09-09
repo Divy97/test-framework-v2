@@ -207,7 +207,7 @@ describe('the front end never writes markup it did not build', () => {
     // there is no `location`, which is the build, and this is what says so.
     const html = built();
     if (html === null) return void expect(why).toBe('SKIP');
-    expect(html).toContain('proves the bug existed');
+    expect(html).toContain('fixes the bug and proves the fix');
     expect(html).toContain('Install on GitHub');
     // And the shell around it, which is what makes it a page rather than a fragment.
     expect(html).toContain('<title>');

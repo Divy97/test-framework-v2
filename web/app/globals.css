@@ -377,6 +377,14 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .lede b{color:var(--ink);font-weight:600}
 .band{padding:4.5rem 2rem;border-bottom:1px solid var(--rule)}
 .band:last-of-type{border-bottom:0}
+/*
+ * FIVE SLABS OF EQUAL WEIGHT was most of why this page read flat: every section had the
+ * same padding, the same hairline and the same mono eyebrow, so nothing told a reader
+ * which one mattered. The band immediately after the hero holds the deliverable — the
+ * pull request you actually receive — and it gets the tinted ground and the extra air.
+ * One emphasis, spent once; a second would cancel it.
+ */
+.band.lead{background:var(--panel);padding-top:5rem;padding-bottom:5rem}
 /* An `h2` wearing the eyebrow's clothes. It was a `<p>`, which left the eight `h3`s
  * inside the steps and cards following `h1.display` with nothing between them — the whole
  * section structure of the only public page absent from a heading list. */
@@ -390,6 +398,25 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .specimen-body{padding:1.5rem 1.2rem}
 .verdict{font-family:var(--mono);font-size:.8125rem;line-height:2}
 .verdict .n{color:var(--muted);display:inline-block;min-width:3.6rem}
+
+/*
+ * The five sections of the pull request, as a document rather than a bullet list.
+ *
+ * Serif, because these are section TITLES somebody wrote and prose explaining them — the
+ * type rule at the top of this file splits on who is speaking, and the mono `.verdict`
+ * beside it is machine output. Rendering both the same would erase the one distinction
+ * the whole product is built on.
+ *
+ * The counter is `decimal` and not `decimal-leading-zero` like `.step`: these are the
+ * parts of one document in order, not stages of a process, and matching the steps would
+ * imply a fifth thing happens after the fourth.
+ */
+.doc{margin:0;padding:0;list-style:none;counter-reset:doc;display:grid;gap:.9rem}
+.doc li{counter-increment:doc;display:grid;grid-template-columns:1.6rem 1fr;gap:.9rem;
+  color:var(--muted);font-size:1rem;line-height:1.5}
+.doc li::before{content:counter(doc) ".";font-family:var(--mono);font-size:.75rem;
+  color:var(--muted);padding-top:.28rem}
+.doc b{color:var(--ink);font-weight:600}
 .steps{display:grid;gap:0;counter-reset:step;max-width:56rem}
 .step{display:grid;grid-template-columns:3.2rem 1fr;gap:1.2rem;padding:1.5rem 0;
   border-top:1px solid var(--rule)}

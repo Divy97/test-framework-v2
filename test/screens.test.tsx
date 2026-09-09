@@ -363,6 +363,21 @@ describe('the landing page argues without manufacturing proof', () => {
     expect(render(<Landing installUrl="https://x.invalid" signIn />)).toContain('/auth/github');
   });
 
+  test('the headline claims the fix, not only the reproduction', () => {
+    // It said "Open an issue. Get back a pull request that proves the bug existed" — which
+    // describes a third of what a run does, and the least useful third. Reproducing is the
+    // PRECONDITION; the deliverable is a fix, and the reason to trust it is that the same
+    // run proves it. Leading with the proof and omitting the fix read as a verification
+    // tool for bugs somebody else would go and solve.
+    const html = render(<Landing installUrl="https://x.invalid" signIn />);
+    expect(html).toMatch(/fixes the bug/i);
+    // The refusal is the differentiator and belongs above the fold, not in a card five
+    // sections down.
+    expect(html).toMatch(/cannot reproduce your bug, it opens nothing/i);
+    // And it does not open by saying what it is not.
+    expect(html).not.toMatch(/Not a coding agent/i);
+  });
+
   test('ONE call to action, because install and sign-in are a sequence not a choice', () => {
     // This page offered both at once, `Install on GitHub` primary and `Sign in` secondary.
     // They are not alternatives: both are required, and every order dead-ends — install
@@ -389,7 +404,7 @@ describe('the landing page argues without manufacturing proof', () => {
     // crawler, a link preview or a reader with JavaScript disabled ever receives. A hook
     // here would make it an empty shell for all three.
     const html = render(<Landing installUrl="https://x.invalid" signIn />);
-    expect(html).toContain('proves the bug existed');
+    expect(html).toContain('fixes the bug and proves the fix');
     expect(html).toContain('Continue with GitHub');
   });
 });
