@@ -208,6 +208,12 @@ describe('the front end never writes markup it did not build', () => {
     const html = built();
     if (html === null) return void expect(why).toBe('SKIP');
     expect(html).toContain('fixes the bug and proves the fix');
+    // THE META DESCRIPTION TOO, which is the sentence a link preview and a search result
+    // show — so for most people it is the first thing they read. It kept the old headline
+    // for a full milestone after the headline was corrected, because it lives in the
+    // document metadata rather than in the component whose copy the screen tests assert.
+    expect(html).toMatch(/name="description"[^>]*fixes the bug and proves the fix/);
+    expect(html).not.toContain('proves the bug existed');
     expect(html).toContain('Install on GitHub');
     // And the shell around it, which is what makes it a page rather than a fragment.
     expect(html).toContain('<title>');
