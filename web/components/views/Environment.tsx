@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { send, type Me, type RepoDetail } from '../../lib/api';
 import { Said, When } from '../bits';
+import { review } from '../../lib/review';
 
 /**
  * A skeleton that is valid JSON, because the alternative is a trap.
@@ -31,6 +32,81 @@ const SKELETON = JSON.stringify({ install: '', migrate: '', seed: '', services: 
  * one into a file this milestone deletes would have been work done twice. So the product
  * asked people to use a terminal to configure the thing they had just installed.
  */
+/**
+ * What the recipe will actually do, as an ordered list rather than as JSON.
+ *
+ * Rendered from the TEXT being edited, not from the stored recipe, so it tracks the
+ * textarea keystroke by keystroke — the point is to see what you are about to approve,
+ * and a review of the last thing that happened to parse is a review of the wrong thing.
+ */
+function Review({ text }: { text: string }) {
+  const read = review(text);
+
+  if ('error' in read) {
+    return (
+      <div className="nothing">
+        <p>{read.error}</p>
+        <p className="muted small">
+          Nothing can be reviewed until it parses. Fix it below and this fills in as you type.
+        </p>
+      </div>
+    );
+  }
+
+  const runs = read.steps.filter((step) => step.command !== null);
+
+  return (
+    <section className="review" aria-label="What this recipe will run">
+      <h2>What will run, in order</h2>
+      {runs.length === 0 ? (
+        // A recipe of empty strings PARSES, and it is the trap `parseRecipe` and the
+        // skeleton comment both warn about: a run against it boots nothing and reports a
+        // bug that was never shown. Said here, where somebody is about to approve one.
+        <p className="warn-line">
+          <b>This recipe runs nothing.</b> Every command is empty, so a run would boot no
+          project and report that it could not reproduce your bug — which would be a fact
+          about this recipe, not about the bug.
+        </p>
+      ) : null}
+      {read.risks > 0 ? (
+        <p className="warn-line">
+          <b>
+            {read.risks} thing{read.risks === 1 ? '' : 's'} below {read.risks === 1 ? 'is' : 'are'} worth
+            reading twice.
+          </b>{' '}
+          Marked on the command {read.risks === 1 ? 'it' : 'they'} appear{read.risks === 1 ? 's' : ''} in.
+        </p>
+      ) : null}
+      <ol className="steps-run">
+        {read.steps.map((step, n) => (
+          <li key={`${step.phase}-${step.label}-${n}`} className={step.command === null ? 'step-empty' : undefined}>
+            <span className="tag">{step.label}</span>
+            <span className="body">
+              {step.command === null ? (
+                <span className="muted">nothing — this phase is skipped</span>
+              ) : (
+                <code>{step.command}</code>
+              )}
+              {step.detail ? <span className="meta">{step.detail}</span> : null}
+              {step.command === null ? null : <span className="meta">{step.note}</span>}
+              {step.risks.map((risk) => (
+                <span className="risk" key={risk.found}>
+                  {/* The word, not only the colour and the glyph. */}
+                  <span className="mark" aria-hidden="true">
+                    !
+                  </span>
+                  <span className="sr">Worth reading twice: </span>
+                  <code>{risk.found}</code> {risk.says}
+                </span>
+              ))}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 export function Environment({
   repo,
   detail,
@@ -42,6 +118,9 @@ export function Environment({
   me: Me | null;
   onChanged: () => void;
 }) {
+  const [asking, setAsking] = useState(false);
+  const [asked, setAsked] = useState<{ ok: boolean; text: string } | null>(null);
+
   // What fills the box, in priority order. An approved recipe always wins — it is the one
   // actually in force, and a draft beside it is a stale second opinion nobody asked for.
   const initial = detail.recipe
@@ -58,6 +137,17 @@ export function Environment({
   // a person mid-edit whose textarea is replaced by a refetch has lost their work to a
   // background poll.
   useEffect(() => setText(initial), [repo]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Whether the text in the box parses at all, which decides whether the JSON editor
+  // starts open: when it does not parse, that editor is the only place the problem can be
+  // fixed, and collapsing it would strand the reader behind a summary they cannot act on.
+  const parsed = (() => {
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      return null;
+    }
+  })();
 
   const approve = () => {
     let parsed: unknown;
@@ -113,18 +203,53 @@ export function Environment({
           can act on differently. */}
       {!detail.recipe && !isDraft ? (
         <div className="panel">
-          <h2>No proposal has arrived — the box is yours to fill.</h2>
+          {/* A BUTTON, because until 10n there was none (10n).
+              This panel told a reader that drafting exists, that it happens somewhere else,
+              and that an empty box might mean no machine was free — while offering no way
+              to ask for one. Installing the App queued drafting for EVERY repository it
+              could see instead, which spent the operator's key on repositories nobody had
+              opened and left the one somebody cared about waiting behind them.
+              Asking is the instruction; installing was only permission. */}
+          <h2>Nothing has been proposed for this repository yet.</h2>
           <p>
-            Drafting reads your project and proposes a recipe for you to review. It runs where
-            the containers run, so this service queues it and a machine picks it up — which
-            means an empty box either has no machine free yet, or means a drafting session ran
-            and had nothing it was willing to propose.
+            Drafting explores your project in a container — installs it, boots it, looks at
+            it — and proposes the commands a run should use. It takes a couple of minutes,
+            spends your model key, and produces a proposal you review before anything uses
+            it. Nothing runs against {repo} until you approve.
           </p>
-          <p className="muted small">
-            Either way you are not waiting on it: write the commands that install, boot and
-            test your project and approve them, and a proposal that arrives later will not
-            overwrite what you approved.
+          <p className="calls">
+            <button
+              type="button"
+              disabled={asking || me?.modelKey === null}
+              onClick={() => {
+                setAsking(true);
+                void send('POST', `/api/repos/${encodeURIComponent(repo)}/draft`).then((answer) => {
+                  setAsking(false);
+                  setAsked(
+                    answer.ok
+                      ? { ok: true, text: 'Asked. A machine will pick this up — reload in a minute or two.' }
+                      : { ok: false, text: answer.error ?? 'that failed' },
+                  );
+                  if (answer.ok) onChanged();
+                });
+              }}
+            >
+              {asking ? 'Asking…' : 'Propose a recipe'}
+            </button>
           </p>
+          <Said said={asked} />
+          {me?.modelKey === null ? (
+            <p className="muted small">
+              Drafting spends the model key of whoever asks for it, and this account has not
+              stored one. <a href="/settings">Store a key</a> and this button becomes live.
+            </p>
+          ) : (
+            <p className="muted small">
+              You do not have to wait for it. Write the commands that install, boot and test
+              your project and approve them — a proposal that arrives later will not overwrite
+              what you approved.
+            </p>
+          )}
         </div>
       ) : null}
 
@@ -157,26 +282,43 @@ export function Environment({
         </p>
       </div>
 
-      <div className="field">
-        <label htmlFor="recipe">The recipe, as JSON</label>
-        <textarea
-          id="recipe"
-          rows={20}
-          spellCheck={false}
-          value={text}
-          onChange={(event) => setText(event.target.value)}
-          aria-describedby="recipe-hint"
-        />
-        <p className="hint" id="recipe-hint">
-          <code>install</code>, <code>migrate</code>, <code>seed</code> and <code>test</code>{' '}
-          are single commands and each may be left empty; <code>services</code> is a list of
-          long-lived processes, each with a lowercase <code>name</code>, a <code>command</code>{' '}
-          that stays in the foreground, a <code>port</code>, and optionally a{' '}
-          <code>healthcheck</code> URL the engine polls until it answers. <code>test</code> is
-          your project&rsquo;s own suite — it is the regression arm, not the reproduction,
-          which the agent writes.
-        </p>
-      </div>
+      {/* WHAT WILL RUN, before the JSON (10n).
+          The warning above has said for four milestones that these commands execute
+          verbatim with a registry reachable and that the reader is the control. What sat
+          under it was a twenty-row textarea of raw JSON — the most consequential control
+          in the product, presented as a config file. To review it you had to hold the
+          schema in your head, find the commands among the ports and the env, and know
+          which of them the engine treats as a verdict. Most people read two lines and
+          press the button, which makes the control decorative, and a decorative control is
+          worse than none because the page claims it happened. */}
+      <Review text={text} />
+
+      <details className="as-json" open={parsed === null}>
+        {/* OPEN when the text does not parse, because then this is the only place the
+            problem can be fixed and hiding it would strand the reader behind a summary
+            that says "not valid JSON yet" and nothing they can act on. */}
+        <summary>Edit as JSON</summary>
+        <div className="field">
+          <label htmlFor="recipe">The recipe, as JSON</label>
+          <textarea
+            id="recipe"
+            rows={20}
+            spellCheck={false}
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            aria-describedby="recipe-hint"
+          />
+          <p className="hint" id="recipe-hint">
+            <code>install</code>, <code>migrate</code>, <code>seed</code> and <code>test</code>{' '}
+            are single commands and each may be left empty; <code>services</code> is a list of
+            long-lived processes, each with a lowercase <code>name</code>, a <code>command</code>{' '}
+            that stays in the foreground, a <code>port</code>, and optionally a{' '}
+            <code>healthcheck</code> URL the engine polls until it answers. <code>test</code> is
+            your project&rsquo;s own suite — it is the regression arm, not the reproduction,
+            which the agent writes.
+          </p>
+        </div>
+      </details>
       <button type="button" onClick={approve} disabled={busy}>
         {busy ? 'Storing…' : detail.recipe ? 'Approve this recipe' : 'Approve and store'}
       </button>

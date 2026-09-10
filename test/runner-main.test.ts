@@ -48,10 +48,14 @@ const bills: { usage?: unknown[]; compute?: unknown[] }[] = [];
 const stored: (Record<string, string> | null)[] = [null];
 const findings: { proof?: unknown; draft?: unknown }[] = [];
 const billed: ({ provider: string; key: string } | null)[] = [null];
+const notes: string[] = [];
 const io: DaemonIo = {
   append: async () => {},
   token: async () => 'an-installation-token',
   cost: async (spent) => void bills.push(spent),
+  // Collected rather than dropped: what a job says about producing nothing is the thing
+  // the onboarding screen renders, so a test asserting silence has to be able to see it.
+  note: (text) => void notes.push(text),
   // `null` by default: the shape every test in this file was written under, which is a
   // deployment that does not inject. A test that wants values pushes them.
   secrets: async () => stored.at(-1) ?? null,

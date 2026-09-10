@@ -34,7 +34,7 @@ import { readRun, type Db } from './store.js';
 import { sameOrigin, type Route } from './sse.js';
 import type { Session } from './auth.js';
 import { forgetRun, tombstoneFor } from './forget.js';
-import { enqueueJob, listRunners, openJobFor, pairRunner, revokeRunner } from './plane.js';
+import { enqueueJob, listRunners, openJobFor, pairRunner, repoActivity, revokeRunner } from './plane.js';
 
 /**
  * WHERE the engine runs, which changes what this surface may promise.
@@ -107,6 +107,22 @@ export function dashboardRoutes(options: {
    * two containers have finished.
    */
   onApproved?: (repo: string) => void;
+  /**
+   * Called when a person asks for a recipe to be PROPOSED for one repository (10n).
+   *
+   * The same shape and the same reasoning as `onApproved`: drafting needs a clone, a
+   * token, a model key and the images, none of which belong to the surface that answers
+   * HTTP. `serve.ts` passes its own `draftForRepo`, which does the work in-process
+   * because a laptop has Docker; the plane passes a function that queues a `draft` job
+   * for a worker.
+   *
+   * `by` is the GitHub id of whoever pressed it, and `null` only on a surface with no
+   * accounts — `serve.ts`, one operator on 127.0.0.1, where the key spent is theirs
+   * however the work was asked for. Everywhere there ARE accounts it is a real id, and
+   * that is the whole reason this route exists: the key drafting used to spend belonged to
+   * the operator rather than to anybody who had asked for the work.
+   */
+  onDraftRequested?: (repo: string, by: number | null) => void;
   /**
    * Where the engine runs, which decides what these pages may promise — see `Mode`.
    *
@@ -688,6 +704,44 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     //
     // BEFORE the catch-all below, whose `(.+)` would otherwise swallow `…/recipe` and
     // answer a repository named `acme/widgets/recipe` does not exist.
+    // ASK FOR A PROPOSAL (10n). Installing the App grants permission to read a
+    // repository; it is not an instruction to explore it. This is the instruction, and a
+    // person gives it for one repository at a time.
+    //
+    // Authorized exactly like the recipe write beside it — the origin check at the top of
+    // this function, then GitHub asked whether this person may see this repository. It
+    // starts a container that clones their code and spends a model key, so it is a write
+    // in every sense that matters even though it stores nothing itself.
+    //
+    // BEFORE the catch-all, whose `(.+)` would otherwise answer that a repository named
+    // `acme/widgets/draft` does not exist.
+    const draftRoute = /^\/api\/repos\/(.+)\/draft$/.exec(path);
+    if (method === 'POST' && draftRoute) {
+      const repo = decodeURIComponent(draftRoute[1]!);
+      const who = await visible(headers);
+      if (who === 'anonymous') return anonymous(path);
+      // `null` is the LOCAL surface — one operator, bound to loopback, no accounts — and
+      // refusing it here would have taken drafting away from the deployment that has had
+      // it working since M6b. There is nobody to bill because there is nobody else: the
+      // key is the operator's either way. Where accounts exist, `who` is a session and the
+      // check below is the real one.
+      if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
+      if (!(await loadInstallation(client, repo))) return json({ error: 'not connected' }, 404);
+      if (!options.onDraftRequested) {
+        return json({ error: 'this deployment cannot draft — no worker and no containers' }, 501);
+      }
+      // An APPROVED recipe wins outright, exactly as `/api/repos/:repo` decides for the
+      // box itself: proposing an alternative to the commands already in force is a second
+      // opinion nobody asked for, and approving it would silently replace them.
+      if ((await loadRecipe(client, repo)) !== null) {
+        return json({ error: 'this repository already has an approved recipe' }, 409);
+      }
+      options.onDraftRequested(repo, who === null ? null : who.session.githubId);
+      // 202: the work has been accepted and has not happened. The page polls the
+      // repository for a draft, the same way Start polls for a run's first event.
+      return json({ drafting: repo }, 202);
+    }
+
     const recipeRoute = /^\/api\/repos\/(.+)\/recipe$/.exec(path);
     if (recipeRoute && (method === 'PUT' || method === 'GET')) {
       const repo = decodeURIComponent(recipeRoute[1]!);
@@ -748,12 +802,15 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       if (who !== null && !who.repos.has(repo)) return json({ error: 'not connected' }, 404);
       const installation = await loadInstallation(client, repo);
       if (!installation) return json({ error: 'not connected' }, 404);
-      const [recipe, stored, draft, names, runs] = await Promise.all([
+      const [recipe, stored, draft, names, runs, activity] = await Promise.all([
         loadRecipe(client, repo),
         loadStored(client, repo),
         loadDraft(client, repo),
         listRepoSecretNames(client, repo),
         listRuns(client, repo),
+        // The drafting and proving work, which has no log and no projection and was
+        // therefore invisible to the screen waiting on it (10n).
+        repoActivity(client, repo),
       ]);
       return json({
         repo,
@@ -770,6 +827,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
         draft: draft?.draft ?? null,
         secrets: { names, enabled: secretsEnabled() },
         runs,
+        activity,
       });
     }
 

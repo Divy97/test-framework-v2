@@ -377,6 +377,14 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .lede b{color:var(--ink);font-weight:600}
 .band{padding:4.5rem 2rem;border-bottom:1px solid var(--rule)}
 .band:last-of-type{border-bottom:0}
+/*
+ * FIVE SLABS OF EQUAL WEIGHT was most of why this page read flat: every section had the
+ * same padding, the same hairline and the same mono eyebrow, so nothing told a reader
+ * which one mattered. The band immediately after the hero holds the deliverable — the
+ * pull request you actually receive — and it gets the tinted ground and the extra air.
+ * One emphasis, spent once; a second would cancel it.
+ */
+.band.lead{background:var(--panel);padding-top:5rem;padding-bottom:5rem}
 /* An `h2` wearing the eyebrow's clothes. It was a `<p>`, which left the eight `h3`s
  * inside the steps and cards following `h1.display` with nothing between them — the whole
  * section structure of the only public page absent from a heading list. */
@@ -390,6 +398,25 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .specimen-body{padding:1.5rem 1.2rem}
 .verdict{font-family:var(--mono);font-size:.8125rem;line-height:2}
 .verdict .n{color:var(--muted);display:inline-block;min-width:3.6rem}
+
+/*
+ * The five sections of the pull request, as a document rather than a bullet list.
+ *
+ * Serif, because these are section TITLES somebody wrote and prose explaining them — the
+ * type rule at the top of this file splits on who is speaking, and the mono `.verdict`
+ * beside it is machine output. Rendering both the same would erase the one distinction
+ * the whole product is built on.
+ *
+ * The counter is `decimal` and not `decimal-leading-zero` like `.step`: these are the
+ * parts of one document in order, not stages of a process, and matching the steps would
+ * imply a fifth thing happens after the fourth.
+ */
+.doc{margin:0;padding:0;list-style:none;counter-reset:doc;display:grid;gap:.9rem}
+.doc li{counter-increment:doc;display:grid;grid-template-columns:1.6rem 1fr;gap:.9rem;
+  color:var(--muted);font-size:1rem;line-height:1.5}
+.doc li::before{content:counter(doc) ".";font-family:var(--mono);font-size:.75rem;
+  color:var(--muted);padding-top:.28rem}
+.doc b{color:var(--ink);font-weight:600}
 .steps{display:grid;gap:0;counter-reset:step;max-width:56rem}
 .step{display:grid;grid-template-columns:3.2rem 1fr;gap:1.2rem;padding:1.5rem 0;
   border-top:1px solid var(--rule)}
@@ -403,6 +430,104 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .card{background:var(--paper);padding:1.6rem 1.5rem}
 .card h3{margin:0 0 .5rem;font-size:1.1rem;font-weight:500;letter-spacing:-.01em}
 .card p{margin:0;color:var(--muted);font-size:.97rem}
+/*
+ * THE RECIPE, AS WHAT IT WILL DO (10n).
+ *
+ * Replaces reading raw JSON in a textarea as the primary way to review commands the
+ * engine executes verbatim. Mono for every command, because a command is a machine fact
+ * and this sheet splits the type on who is speaking; serif for the sentence explaining
+ * when it runs, because that is us talking.
+ *
+ * A skipped phase stays in the list rather than being dropped. The ORDER is the thing a
+ * reader could not see in the JSON, and a list with gaps in it does not show an order.
+ */
+.review{margin:0 0 1.5rem;max-width:60rem}
+.review h2{margin:0 0 .9rem}
+.steps-run{list-style:none;margin:0;padding:0;display:grid;gap:1px;
+  background:var(--rule);border:1px solid var(--rule)}
+.steps-run li{background:var(--paper);display:grid;grid-template-columns:7rem 1fr;
+  gap:1rem;padding:.9rem 1.1rem;align-items:baseline}
+.steps-run .tag{font-family:var(--mono);font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--muted);padding-top:.15rem;overflow-wrap:anywhere}
+.steps-run .body{display:block;min-width:0}
+/* Long commands wrap rather than scrolling the page sideways — a command you cannot read
+ * to the end of is a command you cannot review. */
+.steps-run code{display:block;font-family:var(--mono);font-size:.86rem;line-height:1.5;
+  white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink)}
+.steps-run .meta{display:block;color:var(--muted);font-size:.9rem;line-height:1.45;margin-top:.3rem}
+/* A phase that does nothing recedes. It is still listed, because the order matters. */
+.steps-run .step-empty .tag,.steps-run .step-empty .body{opacity:.72}
+/* THE FLAG. The only thing on this page that could ever stop a bad approval, so it gets
+ * the warn treatment — and the bar for showing one is high on purpose, because a screen
+ * that flags something in every recipe teaches the reader to click past the flags. */
+.steps-run .risk{display:grid;grid-template-columns:1.1rem 1fr;gap:.45rem;margin-top:.55rem;
+  padding:.5rem .7rem;background:var(--warn-bg);border-left:3px solid var(--warn-line);
+  border-radius:0 4px 4px 0;color:var(--warn-fg);font-size:.9rem;line-height:1.45}
+.steps-run .risk .mark{font-family:var(--mono);font-weight:700;text-align:center}
+.steps-run .risk code{display:inline;font-size:.85rem;color:var(--warn-fg);background:none;padding:0}
+.warn-line{background:var(--warn-bg);border-left:3px solid var(--warn-line);
+  border-radius:0 4px 4px 0;padding:.7rem 1rem;margin:0 0 1rem;color:var(--warn-fg);
+  font-size:.95rem;line-height:1.5;max-width:60rem}
+/* The JSON, kept and demoted: a draft usually needs a fix, so this is an escape hatch
+ * rather than a thing to remove. */
+.as-json{margin:0 0 1.5rem;max-width:60rem}
+.as-json > summary{font-family:var(--mono);font-size:.72rem;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--muted);cursor:pointer;padding:.4rem 0}
+.as-json > summary:hover{color:var(--ink)}
+
+@media (max-width:640px){
+  .steps-run li{grid-template-columns:1fr;gap:.35rem}
+}
+
+/*
+ * A PROMPT, not a warning (10n).
+ *
+ * The model-key ask on the repository list. It uses the warn tokens because it IS the
+ * thing standing between the reader and anything working — but it stops nothing and must
+ * not read like an error, so it gets the ground and the rule and none of the alarm.
+ */
+.notice{background:var(--warn-bg);border:1px solid var(--warn-line);border-left-width:3px;
+  border-radius:6px;padding:1rem 1.2rem;margin:0 0 1.5rem;max-width:56rem;color:var(--warn-fg)}
+.notice p{margin:0}
+.notice p + p{margin-top:.9rem}
+.notice .calls{margin:.9rem 0 0}
+
+/*
+ * THE CHECKLIST (10n) — where you are, and the one thing to do next.
+ *
+ * Deliberately quiet. It sits above the tabs on every repository page, including the ones
+ * where every step is done, so a loud treatment would shout at a reader who has nothing
+ * left to do. Structure carries it: a hairline box, mono glyphs in a fixed gutter so the
+ * titles align, and colour spent only on the two states that are not neutral.
+ *
+ * `--panel` ground rather than a border alone, because it has to read as one object when
+ * six lines of it sit above a tablist that also has hairlines.
+ */
+.checklist{background:var(--panel);border:1px solid var(--rule);border-radius:8px;
+  padding:1.25rem 1.4rem;margin:0 0 2rem;max-width:56rem}
+.checklist ol{list-style:none;margin:0;padding:0;display:grid;gap:.7rem}
+.checklist li{display:grid;grid-template-columns:1.4rem 1fr;gap:.7rem;align-items:baseline}
+.checklist .mark{font-family:var(--mono);font-size:.85rem;color:var(--muted);text-align:center}
+.checklist .what{display:block}
+.checklist .what b{font-weight:500}
+/* The reason, the elapsed time, or the worker's own words about a failure. */
+.checklist .why{display:block;color:var(--muted);font-size:.92rem;line-height:1.45;margin-top:.15rem;
+  /* A `note` can carry a provider's error with a URL in it and no spaces to break on. */
+  overflow-wrap:anywhere}
+/* A step nobody is being asked to do yet recedes, and is NOT hidden: the value of the
+ * list is that the whole path is visible, including the parts not reached. */
+.checklist .step-later > .what b{color:var(--muted);font-weight:400}
+.checklist .step-done .mark{color:var(--ok)}
+.checklist .step-now > .what b{color:var(--ink);font-weight:600}
+.checklist .step-now .mark{color:var(--ink)}
+.checklist .step-failed .mark{color:var(--bad)}
+.checklist .step-failed > .what b{color:var(--bad)}
+.checklist .step-waiting .mark{color:var(--pending)}
+.checklist .calls{margin:1.25rem 0 0}
+
+/* `.sr` — the visually-hidden helper every state above relies on — is already defined
+ * further down this sheet, and a second copy is a second thing to keep in step. */
+
 footer.foot{padding:2.5rem 2rem 4rem;border-top:1px solid var(--rule)}
 footer.foot > div{max-width:74rem;margin:0 auto;display:flex;gap:1.5rem;
   flex-wrap:wrap;align-items:baseline;justify-content:space-between}

@@ -43,10 +43,13 @@ const job = (over: Partial<DaemonJob> = {}): DaemonJob => ({
 });
 
 /** A typed fake — never a cast, for the reason `runner-main.test.ts` records at length. */
-const fakeIo = (over: Partial<DaemonIo> = {}): DaemonIo & { findings: unknown[] } => {
+const fakeIo = (over: Partial<DaemonIo> = {}): DaemonIo & { findings: unknown[]; notes: string[] } => {
   const findings: unknown[] = [];
+  const notes: string[] = [];
   return {
     findings,
+    notes,
+    note: (text: string) => void notes.push(text),
     append: async () => {},
     token: async () => 'an-installation-token',
     cost: async () => {},
@@ -56,7 +59,13 @@ const fakeIo = (over: Partial<DaemonIo> = {}): DaemonIo & { findings: unknown[] 
     // which is what a webhook-era job and the local product both do.
     modelKey: async () => null,
     ...over,
-  } as DaemonIo & { findings: unknown[] };
+  };
+  // NO CAST, which is what the comment above this function has claimed since it was
+  // written. It ended in `as DaemonIo & { findings: unknown[] }`, and a cast is why
+  // `io.note` could be added to `DaemonIo` — and CALLED by the draft path this file
+  // tests — while every fake here silently lacked it. A missing member is a runtime
+  // `is not a function`, thrown inside the thing under test, which reads as a bug in the
+  // code rather than in the fixture.
 };
 
 describe('the three kinds are a closed set, and the database agrees', () => {
@@ -99,6 +108,37 @@ describe('a worker does the thing its job says', () => {
     expect(io.findings).toEqual([{ draft: { install: 'npm ci', services: [] } }]);
   });
 
+  it('and SAYS it proposed something, because the branch that worked said nothing', async () => {
+    // The first drafting session that ever succeeded in production wrote a real recipe for
+    // `Divy97/portfolio-v2` — its port, its install command, four required secrets — and
+    // left `took` and `0 event(s), 0 artifact(s)` in the log with nothing in between.
+    // Indistinguishable from the silent FAILURE fixed earlier the same day, and for the
+    // same reason: nobody wrote a line for the branch that worked.
+    const said: string[] = [];
+    const log = console.log;
+    console.log = (...parts: unknown[]) => void said.push(parts.map(String).join(' '));
+    try {
+      await engineExecute(CONFIG, undefined, undefined, {
+        clone: async () => {},
+        draft: async () =>
+          ({
+            ok: true,
+            draft: { install: 'npm ci', services: [], required: ['TOKEN'] },
+            usage: { turns: 12, input_tokens: 40_000, output_tokens: 900 },
+          }) as never,
+      })(job({ kind: 'draft', recipe: null }), fakeIo());
+    } finally {
+      console.log = log;
+    }
+
+    const all = said.join('\n');
+    expect(all).toContain('proposed a recipe for a human to approve');
+    // The SHAPE, and what it cost — enough to know the session ended with something in it.
+    expect(all).toContain('3 field(s)');
+    expect(all).toContain('12 turn(s)');
+    expect(all).toContain('40000 in / 900 out');
+  });
+
   it('a drafting session that proposed nothing stores nothing', async () => {
     // An ordinary outcome — the agent explored and had nothing it was willing to propose —
     // and an empty draft would put a box in front of a human saying an agent filled it in.
@@ -118,6 +158,14 @@ describe('a worker does the thing its job says', () => {
     })(job({ kind: 'draft', recipe: null }), io);
 
     expect(io.findings).toEqual([]);
+    // AND SAYS WHY, on the job row, which is where the onboarding screen reads it (10n).
+    // Storing nothing was already right; storing nothing SILENTLY left a reader unable to
+    // tell "no machine free yet" from "your model key is out of budget" from "this
+    // repository has no commits". All three were the same empty box, and they call for
+    // three different actions. The reason existed the whole time, in the worker's stdout.
+    expect(io.notes).toHaveLength(1);
+    expect(io.notes[0]).toContain('No recipe was proposed');
+    expect(io.notes[0]).toContain('it could not find a test command');
   });
 
   it('a prove job for a repository whose recipe was withdrawn does nothing, quietly', async () => {

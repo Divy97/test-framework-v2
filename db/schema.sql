@@ -298,6 +298,24 @@ create table if not exists jobs (
 -- within a round trip of claiming (`run.ts`, before the clone), so `heard_at is null` at
 -- the two-minute mark means nobody ever came for this run.
 alter table jobs add column if not exists heard_at timestamptz;
+-- WHY A JOB PRODUCED NOTHING, in the words the worker used (10n).
+--
+-- A `draft` job that proposes no recipe, or a `prove` job that cannot build, leaves the
+-- box on the onboarding screen empty. Until this column the screen could not tell a
+-- reader WHICH empty it was: no machine free yet, a session that explored and declined,
+-- an out-of-budget model key, or a repository with no commits. All four looked identical,
+-- and the difference is the whole question — the first means wait, the second means write
+-- it yourself, the third means go and fix your key.
+--
+-- The reason existed the whole time. It was in the worker's stdout, which is a place the
+-- person who pressed the button cannot see. This is the same account, in the row whose
+-- absence of a result it explains.
+--
+-- Prose and nullable on purpose: it is testimony (ADR-0006), no verdict rests on it, and
+-- most jobs finish with nothing to say. Bounded where it is written, because part of it
+-- comes from an agent-driven path.
+alter table jobs add column if not exists note text;
+
 
 -- A CEILING ON RE-DISPATCH. A job whose runner dies on every attempt would otherwise be
 -- handed out every two minutes forever, each one paying for a clone and a token mint.

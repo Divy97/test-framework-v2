@@ -2,8 +2,9 @@
 
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Me, RepoDetail } from '../../lib/api';
-import { useJson } from '../../lib/hooks';
+import { useJson, useTabTitle } from '../../lib/hooks';
 import { Failed, Loading, Tabs, When } from '../bits';
+import { Checklist, isWaiting, steps } from '../Checklist';
 import { Environment } from './Environment';
 import { Runners } from './Runners';
 import { Start } from './Start';
@@ -23,6 +24,10 @@ type Tab = 'start' | 'environment' | 'runners';
 export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: (to: string) => void }) {
   const detail = useJson<RepoDetail>(`/api/repos/${encodeURIComponent(repo)}`);
   const [tab, setTab] = useState<Tab>('start');
+  // Whether the tab on screen was ASKED for — by a link with a fragment, or by clicking.
+  // Without this the default below would keep dragging a reader back to Environment every
+  // time the detail refetched, overriding the tab they had just chosen.
+  const asked = useRef(false);
 
   // BEFORE THE PAINT. Read in an ordinary effect, `/repos/x#environment` rendered the Start
   // tab first — mounting it and firing its `GET …/issues` — and then switched. A layout
@@ -31,15 +36,56 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
   useBeforePaint(() => {
     const fromHash = () => {
       const hash = window.location.hash.replace('#', '');
-      setTab(hash === 'environment' || hash === 'runners' ? hash : 'start');
+      const named = hash === 'environment' || hash === 'runners' || hash === 'start';
+      asked.current = named;
+      setTab(named ? (hash as Tab) : 'start');
     };
     fromHash();
     window.addEventListener('hashchange', fromHash);
     return () => window.removeEventListener('hashchange', fromHash);
   }, [repo]);
 
+  // LAND WHERE THE WORK IS (10n). `start` was the default for every repository, including
+  // one with no approved recipe — so the first thing a person saw after connecting a
+  // repository was the Start tab, which is the one thing they cannot do yet, while the
+  // recipe waiting for their approval sat behind a tab they had no reason to open. The
+  // status line said "not onboarded yet" in small grey print and named no next step.
+  //
+  // Only when nobody asked for a tab, and only until they do.
+  const onboarded = detail.data?.onboarded;
+  useEffect(() => {
+    if (!asked.current && onboarded === false) setTab('environment');
+  }, [onboarded]);
+
+  // WAITING IS NOT THE READER'S JOB (10n). Drafting takes a couple of minutes and proving
+  // about half one, and both used to end with "reload in a minute or two" — an instruction
+  // to poll a server by hand about a job that server can see. Two blind waits in a
+  // fifteen-step flow, and the worst moment in the product.
+  //
+  // Five seconds while something is in flight, and NOTHING otherwise: this is a page
+  // people leave open. `tick` re-renders so the elapsed time on the waiting step counts up
+  // rather than freezing at whatever it said when the last answer arrived.
+  const [tick, setTick] = useState(() => Date.now());
+  const current = detail.data === null ? [] : steps(repo, detail.data, me, tick);
+  const waiting = isWaiting(current);
+  // AND IN THE TAB (10n), because nobody watches a browser tab for two and a half minutes.
+  // They switch away, and the one thing they wanted to know becomes the one thing they
+  // cannot see — so the title carries it, and says so afterwards if it finished while
+  // they were gone.
+  useTabTitle(waiting, current.find((step) => step.state === 'waiting')?.title ?? null, repo);
+  const reload = detail.reload;
+  useEffect(() => {
+    if (!waiting) return;
+    const timer = setInterval(() => {
+      setTick(Date.now());
+      reload();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [waiting, reload]);
+
   const tabs = useRef<HTMLDivElement>(null);
   const choose = (next: Tab) => {
+    asked.current = true;
     setTab(next);
     // A tab changed from somewhere OTHER than the tablist — the "Write its recipe" link in
     // Start's blocker — unmounts the thing that was just activated, and focus falls to
@@ -104,6 +150,18 @@ export function Repository({ repo, me, go }: { repo: string; me: Me | null; go: 
           </span>
         )}
       </p>
+
+      {/* ABOVE THE TABS, because "what should I do" is not one of three views of this
+          repository — it is the question a reader arrives with, and the tabs are how they
+          act on the answer. `onGo` moves them to the tab that holds the action, so the
+          one call to action on this page is never a dead end. */}
+      <Checklist
+        repo={repo}
+        detail={data}
+        me={me}
+        now={tick}
+        onGo={(id) => choose(id === 'secrets' || id === 'draft' || id === 'approve' ? 'environment' : 'start')}
+      />
 
       <div ref={tabs}>
       <Tabs<Tab>

@@ -4,6 +4,7 @@ import { useMemo, useState } from 'react';
 import { isOver, send, type Issue, type Me, type RepoDetail } from '../../lib/api';
 import { useJson } from '../../lib/hooks';
 import { Failed, Loading, Said, When } from '../bits';
+import { missingNames } from '../../lib/required';
 
 /**
  * Pick an issue. Press Start.
@@ -38,6 +39,7 @@ export function Start({
   const open = detail.runs.find((run) => !isOver(run.status, run.ended_at));
   // Every reason Start cannot happen, in the order the API checks them, so the sentence a
   // person reads here is the sentence they would have got back.
+  const missing = missingNames(detail.recipe, detail.secrets.names);
   const blocker =
     !me?.github
       ? { text: 'This deployment has no GitHub App, so it cannot read issues or start a run.', fix: null }
@@ -51,12 +53,26 @@ export function Start({
               text: 'A run spends the model key of whoever starts it, and this account has not stored one.',
               fix: { label: 'Store a key', to: '/settings' },
             }
-          : open
+          : // MISSING SECRETS (10n), and this list is why the omission mattered. The comment
+            // above it says every reason a run can be refused is answered BEFORE the
+            // button, in the words the API would use — and this was the one that was not.
+            // The recipe NAMES what it needs, nothing compared that to what was stored,
+            // and `missingRequired` in `src/run.ts` stopped the run correctly: after the
+            // person had chosen an issue, pressed Start, and waited. A blocked run whose
+            // cause was on screen the whole time.
+            missing.length > 0
             ? {
-                text: `A run for ${repo}#${open.issue_number} is already under way. One at a time per repository.`,
-                fix: { label: 'Watch it', to: `/runs/${open.run_id}` },
+                text:
+                  `The recipe for ${repo} requires ${missing.join(', ')}, which ${missing.length === 1 ? 'is' : 'are'} not ` +
+                  `stored. A run would stop before booting your project rather than report a bug it could not see.`,
+                fix: { label: missing.length === 1 ? 'Store it' : 'Store them', to: '#environment' },
               }
-            : null;
+            : open
+              ? {
+                  text: `A run for ${repo}#${open.issue_number} is already under way. One at a time per repository.`,
+                  fix: { label: 'Watch it', to: `/runs/${open.run_id}` },
+                }
+              : null;
 
   const shown = useMemo(() => {
     const rows = issues.data ?? [];

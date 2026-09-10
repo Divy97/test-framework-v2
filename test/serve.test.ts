@@ -417,12 +417,26 @@ describe('a signed issue becomes a run', () => {
   });
 });
 
-describe('drafting a recipe for a freshly-installed, un-onboarded repository (M6b)', () => {
+describe('drafting a recipe when a person asks for one (M6b, retriggered in 10n)', () => {
+  // INSTALLING NO LONGER DRAFTS. These tests delivered an `installation` webhook, because
+  // that is what used to start a drafting session — one per repository the delivery named,
+  // which on a real account meant 176 agent sessions from one checkbox, billed to the
+  // operator, for repositories nobody had opened. Installing is permission; asking is the
+  // instruction. What they assert is unchanged and still worth asserting: the clone, the
+  // agent, the store, and the two failure paths.
   const installedPayload = (repo = 'o/r') => ({
     action: 'created',
     installation: { id: 987654, account: { login: 'o' } },
     repositories: [{ full_name: repo }],
   });
+
+  /** Ask for a proposal the way the Environment panel's button does. */
+  const askForDraft = (port: number, repo = 'o/r') =>
+    fetch(`http://127.0.0.1:${port}/api/repos/${encodeURIComponent(repo)}/draft`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      redirect: 'manual',
+    });
 
   const EMPTY_USAGE = {
     turns: 0,
@@ -463,6 +477,11 @@ describe('drafting a recipe for a freshly-installed, un-onboarded repository (M6
 
     await deliver(service.webhookPort, installedPayload(), { event: 'installation' });
     await service.drain();
+    // Nothing yet: the install only made the repository known.
+    expect(cloned, 'installing drafted something').toEqual([]);
+
+    expect((await askForDraft(service.eventsPort)).status).toBe(202);
+    await service.drain();
 
     expect(cloned).toEqual([{ repo: 'o/r', installationId: 987654, into: cloned[0]!.into }]);
     expect(drafted).toHaveLength(1);
@@ -493,6 +512,14 @@ describe('drafting a recipe for a freshly-installed, un-onboarded repository (M6
     await deliver(service.webhookPort, installedPayload(), { event: 'installation' });
     await service.drain();
 
+    // ASKED FOR, and refused. Asserting on the install alone would now pass on a surface
+    // that cannot draft at all — installing starts nothing for any repository since 10n.
+    // The rule under test is that an APPROVED recipe wins: proposing an alternative to the
+    // commands already in force is a second opinion nobody asked for, and this is where
+    // that is enforced.
+    expect((await askForDraft(service.eventsPort)).status).toBe(409);
+    await service.drain();
+
     expect(cloned).toEqual([]);
     expect(drafted).toEqual([]);
   });
@@ -514,6 +541,8 @@ describe('drafting a recipe for a freshly-installed, un-onboarded repository (M6
     services.push(service);
 
     await deliver(service.webhookPort, installedPayload(), { event: 'installation' });
+    await service.drain();
+    expect((await askForDraft(service.eventsPort)).status).toBe(202);
     await service.drain();
 
     // The installation is still recorded — a drafting failure is not an installation
@@ -541,6 +570,8 @@ describe('drafting a recipe for a freshly-installed, un-onboarded repository (M6
     services.push(service);
 
     await deliver(service.webhookPort, installedPayload(), { event: 'installation' });
+    await service.drain();
+    expect((await askForDraft(service.eventsPort)).status).toBe(202);
     await service.drain();
 
     expect(lines.join('\n')).toContain('the drafting agent never ran');

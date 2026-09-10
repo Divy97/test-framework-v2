@@ -151,6 +151,12 @@ const fixtureClient = (): Db => {
     if (sql.includes('from recipe_drafts where repo = $1')) {
       return [];
     }
+    // The drafting and proving work for a repository (10n). Nothing here has any, which is
+    // the state that matters: the checklist's job on this fixture is to say what to do
+    // next, not to report a job in flight.
+    if (sql.includes('from jobs')) {
+      return [];
+    }
     if (sql.includes('from run_projection where run_id = $1')) {
       return params[0] === DEMO_RUN_ID ? [RUN_ROW] : [];
     }
@@ -465,7 +471,14 @@ describe.sequential('the dashboard, driven in a real browser', () => {
 
   test('the evidence page shows base red, fix green, the tier and every ground', async () => {
     if (skipped('the evidence page')) return;
-    const page = await visit(`/runs/${DEMO_RUN_ID}`, /the reproduction arm/i);
+    // TWO REQUESTS, and this waited for one. `visit` settles on the Evidence section,
+    // which comes from `/evidence`; the timeline below it is built from a SEPARATE
+    // `/events` read, and the assertions further down were being made before that read had
+    // landed. It failed on `the run was requested` in CI and locally, at 19ms — fast
+    // enough that the second request had not answered — while the live-run test asserting
+    // the identical string passed, because that one waits for it.
+    await visit(`/runs/${DEMO_RUN_ID}`, /the reproduction arm/i);
+    const page = await settle(/the run was requested/i, 'the finished run\u2019s timeline');
 
     // The verdict, from the fold rather than from the row.
     expect(page).toMatch(/tier 1/i);
@@ -520,6 +533,60 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     // The approval warning, on the screen that stores commands the engine runs verbatim.
     expect(panel).toMatch(/Read this before you approve/i);
     expect(panel).toContain('STRIPE_KEY');
+  });
+
+  test('a repository with no approved recipe opens on the tab where the work is', async () => {
+    if (skipped('the unonboarded default')) return;
+    // `start` was the default for EVERY repository, so the first thing somebody saw after
+    // connecting one was the Start tab — the one action they cannot take yet — while the
+    // recipe awaiting their approval sat behind a tab they had no reason to open. The
+    // status line said "not onboarded yet" in small grey print and named no next step.
+    const page = await visit(`/repos/${UNONBOARDED}`, /you are the control/i);
+    // The Environment panel, not Start's issue picker.
+    expect(page).toMatch(/Read this before you approve/i);
+    // And the fragment agrees, so the tab on screen is the tab the URL names — reloading
+    // or sharing it lands in the same place.
+    expect(page).not.toMatch(/Pick the issue to work on/i);
+
+    // The control: an ONBOARDED repository is untouched and still opens on Start.
+    expect(await visit('/repos/acme/widgets', /start a run/i)).toMatch(/Pick the issue to work on|no GitHub App/i);
+  });
+
+  test('the checklist tells a reader where they are and what to do next', async () => {
+    if (skipped('the checklist')) return;
+    // The whole point of 10n, driven for real: `steps()` has unit tests, and this asserts
+    // the thing they cannot — that it is mounted, on the page, above the tabs, on a
+    // repository that has not been onboarded.
+    const page = await visit(`/repos/${UNONBOARDED}`, /you are the control/i);
+
+    // The path, visible in full including the parts not reached — that is the value of a
+    // checklist over a single "next step" line.
+    expect(page).toMatch(/approve the recipe/i);
+    expect(page).toMatch(/start a run on an issue/i);
+    // Exactly one step is the next action, and the words say so rather than only a colour.
+    expect(page.match(/do this next/gi) ?? []).toHaveLength(1);
+    // This fixture has no draft, no recipe and no activity, so getting one proposed is it.
+    expect(page).toMatch(/get a recipe proposed/i);
+  });
+
+  test('approving shows the commands that will run, not a wall of JSON', async () => {
+    if (skipped('the recipe review')) return;
+    await browser!.navigate(`${base}/repos/acme/widgets`);
+    visited.push('/repos/acme/widgets (review)');
+    await settle(/start a run/i, '/repos/acme/widgets');
+    const panel = await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
+
+    // The commands, in the order the engine runs them, which is the thing the JSON could
+    // not show — object keys have no order and `services` sits between phases.
+    expect(panel).toMatch(/what will run, in order/i);
+    expect(panel).toContain('npm ci');
+    expect(panel).toContain('npm test');
+    // And what each one is for, in particular the one the engine treats as evidence.
+    expect(panel).toMatch(/your own suite/i);
+    // The JSON is collapsed, not gone: a draft usually needs a fix.
+    expect(panel).toMatch(/edit as json/i);
+    // Collapsed means its content is not rendered, which is the whole point of demoting it.
+    expect(panel).not.toMatch(/are single commands and each may be left empty/i);
   });
 
   test('the run register renders, and links to the run', async () => {
@@ -643,6 +710,14 @@ describe.sequential('the floor, in the browser that renders it', () => {
     visited.push('/repos/acme/widgets');
     await settle(/start a run/i, '/repos/acme/widgets');
     await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
+    // EXPANDED FIRST, since 10n. The recipe is reviewed as a list of the commands it will
+    // run, and the JSON editor is an escape hatch inside a `<details>` — so its label is
+    // hidden with its control until the disclosure is open, which is what a disclosure is
+    // for. `browser.text()` reads RENDERED text and returns nothing for a collapsed one,
+    // so the floor has to open it: the property is "every input has a label pointing at
+    // it", not "every label is on screen at once".
+    await browser!.click('.as-json > summary');
+    await settle(/the recipe, as json/i, 'the JSON editor');
     // The three the screen has: the recipe, and the two halves of storing a secret. Each is
     // asserted by its label's `for`, which only resolves if the `id` is really there.
     for (const [id, label] of [
@@ -866,7 +941,13 @@ describe.sequential('a stranger on a surface with accounts', () => {
     // visitor is not in one.
     await browser!.navigate(`${hostedBase}/`);
     visited.push('/ (signed out)');
-    const page = await settle(/proves the bug existed/, '/ signed out');
-    expect(page).toMatch(/install on github/i);
+    const page = await settle(/fixes the bug and proves the fix/, '/ signed out');
+    // ONE door on a surface that has accounts. This asserted `install on github`, which was
+    // the old primary call to action — and it sat beside a secondary `Sign in`, for two
+    // steps that are sequential rather than alternative. Installing first returns you to
+    // this very page with no session; the way in is signing in, which the old copy admitted
+    // in as many words while keeping install as the primary button.
+    expect(page).toMatch(/continue with github/i);
+    expect(page).not.toMatch(/install on github/i);
   });
 });

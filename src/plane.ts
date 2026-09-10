@@ -461,9 +461,71 @@ export async function jobFacts(
 }
 
 /** The job is over, however it ended. Bookkeeping only — never authorization. */
-export async function finishJob(client: Db, runId: string): Promise<void> {
-  await client.query('update jobs set finished_at = now() where run_id = $1', [runId]);
+/**
+ * What the onboarding screen needs to know about work it cannot see (10n).
+ *
+ * A `draft` or `prove` job lives entirely outside the log — no events, no projection —
+ * so the screen that is waiting on one had no way to ask whether it was queued, running,
+ * or finished having produced nothing. It said "an empty box either has no machine free
+ * yet, or means a drafting session ran and had nothing it was willing to propose" and
+ * asked the reader to guess which. Then it asked them to reload.
+ *
+ * Newest first and bounded: this answers "what is happening to my repository right now",
+ * not "everything that ever happened to it".
+ */
+export type RepoActivity = {
+  kind: JobKind;
+  queuedAt: string;
+  dispatchedAt: string | null;
+  finishedAt: string | null;
+  /** Why it produced nothing, in the worker's own words. Testimony (ADR-0006). */
+  note: string | null;
+};
+
+export async function repoActivity(client: Db, repo: string, limit = 6): Promise<RepoActivity[]> {
+  const { rows } = await client.query(
+    `select kind, queued_at, dispatched_at, finished_at, note
+       from jobs
+      where repo = $1 and kind = any($2::text[])
+      order by queued_at desc
+      limit $3`,
+    // `run` is deliberately absent: a run has a log, a projection and a page of its own,
+    // and `listRuns` already answers for it. What is missing is the work that has none.
+    [repo, ['draft', 'prove'], limit],
+  );
+  return rows.map((row) => ({
+    kind: row.kind as JobKind,
+    queuedAt: iso(row.queued_at),
+    dispatchedAt: row.dispatched_at === null ? null : iso(row.dispatched_at),
+    finishedAt: row.finished_at === null ? null : iso(row.finished_at),
+    note: (row.note as string | null) ?? null,
+  }));
 }
+
+/** Dates cross this boundary as strings, because the client reading them is a browser. */
+const iso = (at: unknown): string => (at instanceof Date ? at.toISOString() : String(at));
+
+export async function finishJob(client: Db, runId: string, note?: string | null): Promise<void> {
+  // The note is written only when there IS one, so a retry that says nothing cannot erase
+  // the account of why the first attempt produced nothing.
+  await client.query(
+    note === undefined || note === null
+      ? 'update jobs set finished_at = now() where run_id = $1'
+      : 'update jobs set finished_at = now(), note = $2 where run_id = $1',
+    note === undefined || note === null ? [runId] : [runId, note.slice(0, MAX_NOTE_CHARS)],
+  );
+}
+
+/**
+ * How much of a worker's explanation is kept.
+ *
+ * Enough for a sentence and a provider's error — the real one that made this column
+ * necessary was `HTTP 403 — {"error":{"message":"Key limit exceeded (total limit). Manage
+ * it using https://openrouter.ai/…"}}`, and truncating before the URL would have kept the
+ * half that says something is wrong and dropped the half that says what to do. Bounded at
+ * all because part of this string comes from an agent-driven path.
+ */
+const MAX_NOTE_CHARS = 2000;
 
 /**
  * What a runner is refused for, said in the words the caller should return.

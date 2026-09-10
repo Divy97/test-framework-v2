@@ -327,6 +327,9 @@ async function onboardingJob(
     // indistinguishable from a job that never ran.
     if (!outcome.ok) {
       console.log(`${job.repo}: drafting produced nothing — ${outcome.reason}`);
+      // AND ON THE ROW, so the onboarding screen can say it. The log line above has been
+      // here since 8f and is read by nobody who is waiting for the box to fill in.
+      io.note(`No recipe was proposed. ${outcome.reason}`);
       // The transcript too, bounded. It is testimony and no verdict rests on it (ADR-0006),
       // and it is the only account of what the agent was doing for those 37 seconds — which
       // is the whole question when a session proposes nothing.
@@ -343,6 +346,27 @@ async function onboardingJob(
       return;
     }
     await io.finding({ draft: outcome.draft });
+    // AND SAYS SO. This line did not exist, which made a SUCCESSFUL drafting session the
+    // quietest thing the worker does: the first one that ever worked — a real recipe for
+    // `Divy97/portfolio-v2`, naming its port and four required secrets — left `took` and
+    // `0 event(s), 0 artifact(s)` in the log and nothing in between. Indistinguishable
+    // from the silent failure fixed four commits ago, and for the same reason: the branch
+    // that worked was the branch nobody wrote a line for.
+    //
+    // The shape of the proposal, not the proposal itself. A recipe is commands this
+    // engine will execute verbatim once a human approves them, and the log is not where
+    // anybody should read them — the screen that asks for approval is (ADR-0013). What
+    // belongs here is enough to know a session ended with something in it, and what it
+    // cost to get.
+    const shape = outcome.draft !== null && typeof outcome.draft === 'object' ? Object.keys(outcome.draft) : [];
+    console.log(
+      `${job.repo}: proposed a recipe for a human to approve — ${shape.length} field(s)` +
+        `${shape.length === 0 ? '' : ` (${shape.slice(0, 8).join(', ')})`}`,
+    );
+    console.log(
+      `${job.repo}: spent ${outcome.usage?.turns ?? 0} turn(s), ` +
+        `${outcome.usage?.input_tokens ?? 0} in / ${outcome.usage?.output_tokens ?? 0} out`,
+    );
   } finally {
     await rm(workspace, { recursive: true, force: true }).catch(() => {});
   }

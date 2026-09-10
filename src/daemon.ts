@@ -53,6 +53,25 @@ export type DaemonIo = {
    */
   cost: (spent: { usage?: unknown[]; compute?: unknown[] }) => Promise<void>;
   /**
+   * Say why this job produced nothing (10n).
+   *
+   * The one member here that is not a request. It records a sentence locally and the
+   * daemon sends it with `POST /runner/runs/:id/finished`, so it lands on the job row
+   * rather than in a second place that could disagree with it.
+   *
+   * It exists because a `draft` job that proposes nothing and a `prove` job that cannot
+   * build both leave an empty box on somebody's onboarding screen, and the screen could
+   * not tell which empty it was: no machine free, a session that declined, an
+   * out-of-budget key, or a repository with no commits. All four looked the same, and the
+   * difference decides whether the reader waits, writes the recipe themselves, or goes and
+   * fixes their key. The answer already existed — in this process's stdout, where they
+   * cannot see it.
+   *
+   * Testimony, not evidence (ADR-0006): prose, no verdict rests on it, and the last call
+   * wins.
+   */
+  note: (text: string) => void;
+  /**
    * The stored credentials this run's repository has, or `null` (10l, ADR-0017).
    *
    * `null` and `{}` are DIFFERENT and the difference decides whether a run happens.
@@ -303,8 +322,16 @@ export async function runDaemon(options: {
 
       log(`${job.repo}: took ${job.runId}`);
       const shipped: RunEvent[] = [];
+      // WHY THIS JOB PRODUCED NOTHING, if it produces nothing (10n). Recorded locally and
+      // sent with the finish below, so it reaches the row whose empty result it explains —
+      // and therefore the screen. It used to exist only in this process's stdout, which is
+      // not somewhere the person who pressed the button can look.
+      let note: string | null = null;
       try {
         await options.execute(job, {
+          note: (text) => {
+            note = text;
+          },
           append: async (event) => {
             await append(job!.runId, event);
             shipped.push(event);
@@ -385,6 +412,9 @@ export async function runDaemon(options: {
         // delivery is somebody else's bug report, and a runner that exits on the first
         // bad run is a runner nobody can leave running.
         log(`${job.runId}: ended badly — ${String(error)}`);
+        // Only if nothing more specific was said. A job that explained itself and THEN
+        // threw is better described by its own words than by the exception.
+        note ??= `the run ended badly — ${String((error as Error).message ?? error)}`;
       }
 
       const sent = await upload(job.runId, refsIn(shipped));
@@ -392,9 +422,13 @@ export async function runDaemon(options: {
 
       // Finished whatever happened. A job left dispatched is a job no other runner will
       // ever take and no operator will ever see complete.
-      await call(`${base}/runner/runs/${job.runId}/finished`, { method: 'POST', headers: auth }).catch(
-        (error: unknown) => log(`${job!.runId}: could not mark it finished — ${String(error)}`),
-      );
+      await call(`${base}/runner/runs/${job.runId}/finished`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/json' },
+        // No body when there is nothing to say, which is most jobs — and what every worker
+        // before this sent, so the route still accepts one that posts none.
+        ...(note === null ? {} : { body: JSON.stringify({ note }) }),
+      }).catch((error: unknown) => log(`${job!.runId}: could not mark it finished — ${String(error)}`));
 
       if (options.once) break;
     }
