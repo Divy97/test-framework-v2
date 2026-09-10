@@ -85,6 +85,46 @@ export const installUrl = (env: NodeJS.ProcessEnv = process.env): string =>
     ? `https://github.com/apps/${env.GITHUB_APP_SLUG}/installations/new`
     : 'https://github.com/settings/apps/new';
 
+/**
+ * What to do about a key a provider would not accept.
+ *
+ * Every branch is an ACTION, because the alternative — repeating that the key was refused
+ * — is what this replaced. A person who has just pasted a key and been told "openrouter
+ * refused this key" knows only what they can already see.
+ *
+ * Keyed on the status rather than on the provider's prose: the prose is theirs to change
+ * without telling us, and `401` has meant the same thing for thirty years.
+ */
+const advice = (provider: string, status: number | undefined, detail: string): string => {
+  const over = /limit|quota|credit|balance|insufficient/i.test(detail);
+  if (status === 401) {
+    return (
+      `${provider} did not recognise this key, so it has not been saved. ` +
+      (provider === 'openrouter'
+        ? 'Check you pasted the whole thing — an OpenRouter key starts with `sk-or-`.'
+        : 'Check you pasted the whole thing, and that it is an API key rather than an OAuth token.')
+    );
+  }
+  if (status === 403 && over) {
+    // The failure that cost most of a day: a key that is valid, funded once, and spent.
+    return (
+      `This key is over its spend limit, so it has not been saved. Raise the cap or add ` +
+      `credit and store it again — a drafting run is tens of turns, so it needs real headroom.`
+    );
+  }
+  if (status === 403) return `${provider} refused this key, so it has not been saved. It may be revoked or restricted.`;
+  if (status === 404) {
+    return (
+      `${provider} accepted the key but does not offer this engine's model to it, so it has ` +
+      `not been saved. That is usually a key scoped to particular models.`
+    );
+  }
+  if (status === 429) return `${provider} is rate-limiting this key, so it has not been saved. Try again in a minute.`;
+  // No status at all means the request never got an answer — unreachable, DNS, a timeout.
+  if (status === undefined) return `${provider} could not be reached to check this key, so it has not been saved.`;
+  return `${provider} refused this key, so it has not been saved.`;
+};
+
 export function dashboardRoutes(options: {
   client: Db;
   /** Injected so a test can drive the surface without a GitHub App registered. */
@@ -96,7 +136,7 @@ export function dashboardRoutes(options: {
    * provider, and a test that drives this route must not need an account to do it. The
    * default is `checkModelKey`, so a deployment that says nothing still asks.
    */
-  checkKey?: (provider: string, key: string) => Promise<{ ok: boolean; detail: string }>;
+  checkKey?: (provider: string, key: string) => Promise<{ ok: boolean; detail: string; status?: number }>;
   /**
    * Called after a recipe is stored, to prove the repository actually runs (8f).
    *
@@ -594,9 +634,15 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       if (!checked.ok) {
         return json(
           {
-            error: `${provider} refused this key, so it has not been saved`,
-            // The provider's own words, verbatim. They name which of expired, revoked, out
-            // of credit, or not entitled to this model it was, and ours would be a guess.
+            // WHAT TO DO, then what was said. This used to be `${provider} refused this
+            // key` followed by the provider's response — and the response arrived as its
+            // raw JSON envelope, so a person storing a key read
+            //   openrouter refused this key … — HTTP 401 —
+            //   {"error":{"message":"Missing Authentication header","code":401}}
+            // which tells somebody who mistyped a key nothing they can act on. The status
+            // says which refusal it is, and the refusals call for different actions.
+            error: advice(provider, checked.status, checked.detail),
+            // Still included, and now the provider's sentence rather than its punctuation.
             detail: checked.detail,
           },
           400,
