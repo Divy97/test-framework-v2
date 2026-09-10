@@ -334,7 +334,7 @@ export async function checkModelKey(
   provider: string,
   key: string,
   options: { model?: string; baseURL?: string } = {},
-): Promise<{ ok: boolean; detail: string }> {
+): Promise<{ ok: boolean; detail: string; status?: number }> {
   if (providerName(provider) === 'openrouter') {
     // The model the WORKER will reach for, not one of our choosing: a key that works on a
     // cheap model and is not entitled to the configured one is still a key that cannot do

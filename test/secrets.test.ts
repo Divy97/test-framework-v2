@@ -159,7 +159,7 @@ const surface = (
   options: {
     client?: Db;
     installations?: number[];
-    checkKey?: (provider: string, key: string) => Promise<{ ok: boolean; detail: string }>;
+    checkKey?: (provider: string, key: string) => Promise<{ ok: boolean; detail: string; status?: number }>;
   } = {},
 ) =>
   dashboardRoutes({
@@ -260,6 +260,48 @@ describe('the secrets routes answer with names and never with values', () => {
     // filed under a name nothing reads is a credential held for nothing.
     const wrong = await call(surface(), 'PUT', '/api/settings/model-key', JSON.stringify({ provider: 'acme', key: 'k' }));
     expect(wrong?.status).toBe(400);
+  });
+
+  test('a refused key is told what to DO about it, per refusal', async () => {
+    // This route answered `openrouter refused this key` and then relayed the provider's
+    // response — which arrived as its raw JSON envelope, so somebody who had just mistyped
+    // a key read
+    //   openrouter refused this key … — HTTP 401 — {"error":{"message":"Missing
+    //   Authentication header","code":401}}
+    // on a settings page. It tells them nothing they can act on and nothing they cannot
+    // already see. Every branch below is an ACTION, and the statuses call for different
+    // ones.
+    const at = async (status: number | undefined, detail: string) => {
+      const response = await call(
+        surface({ checkKey: async () => ({ ok: false, detail, status }) }),
+        'PUT',
+        '/api/settings/model-key',
+        JSON.stringify({ provider: 'openrouter', key: 'k' }),
+      );
+      expect(response?.status).toBe(400);
+      return (JSON.parse(String(response?.body)) as { error: string }).error;
+    };
+
+    // A mistyped or truncated key — the commonest way this fails, and the one the old
+    // message served worst.
+    expect(await at(401, 'Missing Authentication header')).toMatch(/pasted the whole thing/);
+    expect(await at(401, 'Missing Authentication header')).toContain('sk-or-');
+    // A key that is valid, was funded once, and is spent. The failure that cost most of a
+    // day, so it says how much headroom a session needs.
+    expect(await at(403, 'Key limit exceeded (total limit)')).toMatch(/over its spend limit/);
+    expect(await at(403, 'Key limit exceeded (total limit)')).toMatch(/tens of turns/);
+    // Refused for some other reason.
+    expect(await at(403, 'forbidden')).toMatch(/revoked or restricted/);
+    expect(await at(404, 'no endpoints found')).toMatch(/does not offer/);
+    expect(await at(429, 'slow down')).toMatch(/rate-limiting/);
+    // No status at all is a request that never got an answer, which is not the key's fault
+    // and must not be described as if it were.
+    expect(await at(undefined, 'fetch failed')).toMatch(/could not be reached/);
+    // Every one of them says the key was not saved, because that is the fact a person needs
+    // before they navigate away believing it was.
+    for (const status of [401, 403, 404, 429, undefined]) {
+      expect(await at(status, 'whatever'), `status ${status}`).toMatch(/not been saved/);
+    }
   });
 
   test('a key the provider refuses is not stored, and the refusal is quoted', async () => {

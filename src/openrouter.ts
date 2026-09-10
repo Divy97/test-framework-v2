@@ -112,11 +112,42 @@ export const openAiTools = () =>
  *
  * Cheap: one turn, a handful of tokens, and it runs before the prompt is spent.
  */
+/**
+ * The sentence a provider put inside its error, or the raw text if it is not in there.
+ *
+ * OpenRouter answers `{"error":{"message":"…","code":401}}`; other OpenAI-shaped services
+ * answer `{"error":{"message":…}}` or `{"message":…}` or `{"detail":…}`. All of them wrap
+ * one useful sentence in punctuation nobody needs to read.
+ *
+ * Never throws and never returns nothing useful: an unparseable body is returned as text,
+ * because a bare status code is what made this necessary in the first place.
+ */
+export const said = (body: string): string => {
+  const text = body.trim();
+  if (text === '') return '';
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    const error = parsed.error;
+    const inner =
+      error !== null && typeof error === 'object' ? (error as Record<string, unknown>).message : undefined;
+    for (const candidate of [inner, parsed.message, parsed.detail, error]) {
+      if (typeof candidate === 'string' && candidate.trim() !== '') return candidate.trim();
+    }
+    return text;
+  } catch {
+    // HTML from a proxy, a plain string, an empty object. Bounded and handed back as-is.
+    return text;
+  }
+};
+
 export async function probeToolCalling(options: {
   apiKey: string;
   model: string;
   baseURL?: string;
-}): Promise<{ ok: boolean; detail: string }> {
+  // `status` is the HTTP code when there was one, so a caller can say something useful
+  // about WHICH refusal this was — "check you pasted the whole key" for a 401 is different
+  // advice from "raise the spend cap" for a 403, and both beat repeating the provider.
+}): Promise<{ ok: boolean; detail: string; status?: number }> {
   try {
     const response = await fetch(`${options.baseURL ?? OPENROUTER_BASE}/chat/completions`, {
       method: 'POST',
@@ -147,12 +178,19 @@ export async function probeToolCalling(options: {
       }),
     });
     if (!response.ok) {
-      // The body, not just the status — the same fix as the loop's. `HTTP 403` on its own
-      // sent a real diagnosis in the wrong direction for an afternoon; the sentence that
-      // said `Key limit exceeded (total limit)`, and the URL that raises it, was in the
-      // body this used to throw away.
-      const detail = (await response.text()).slice(0, 500).trim();
-      return { ok: false, detail: `HTTP ${response.status}${detail === '' ? '' : ` — ${detail}`}` };
+      // The provider's WORDS, not its envelope. `HTTP 403` on its own sent a real
+      // diagnosis in the wrong direction for an afternoon, so this started including the
+      // body — and then shipped the body raw, which put
+      //   {"error":{"message":"Missing Authentication header","code":401}}
+      // on a settings page in front of somebody storing a key. The useful half is the
+      // three words inside it. `said()` digs them out, and falls back to the raw text
+      // when a provider answers with something that is not that shape.
+      const detail = said((await response.text()).slice(0, 800));
+      return {
+        ok: false,
+        status: response.status,
+        detail: `HTTP ${response.status}${detail === '' ? '' : ` — ${detail}`}`,
+      };
     }
     const body = (await response.json()) as ChatResponse;
     // Before reading the answer, check the answer is one. A rejected request must never

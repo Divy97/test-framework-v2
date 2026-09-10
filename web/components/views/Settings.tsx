@@ -55,10 +55,14 @@ export function Settings({ me, onChanged }: { me: Me | null; onChanged: () => vo
       <h2 ref={heading} tabIndex={-1}>
         Your model key
       </h2>
+      {/* AN INSTRUCTION, not an essay (10n). This read: "a failure about our configuration
+          wearing the shape of a finding about your bug is the one thing that answer exists
+          to prevent". That sentence is defensible in an ADR and unreadable on a form —
+          somebody here has one job, which is to paste a key, and the page should tell them
+          what it is for and get out of the way. */}
       <p className="hero">
-        A run spends the key of whoever starts it. Without one, Start is refused before any
-        machine is created — a failure about our configuration wearing the shape of a finding
-        about your bug is the one thing that answer exists to prevent.
+        Drafting a recipe and starting a run both spend your key. Store one and this account
+        can use the product; without one, nothing here starts.
       </p>
 
       <p>
@@ -77,43 +81,54 @@ export function Settings({ me, onChanged }: { me: Me | null; onChanged: () => vo
             No key is stored.
           </span>
         )}{' '}
+        {/* `AES-256-GCM` was in this sentence. It is true, and it is the wrong fact for a
+            person checking whether they have a key: what they need to know is that it is
+            encrypted, that nothing can read it back, and that storing another replaces it. */}
         <span className="muted">
-          Sealed with AES-256-GCM. No page and no route can show it to you again — storing a
-          new one replaces it.
+          Stored encrypted. Nothing can show it to you again, and storing another replaces it.
         </span>
       </p>
 
-      <div className="row">
-        <div className="field">
-          <label htmlFor="provider">Provider</label>
-          <select id="provider" value={provider} onChange={(event) => setProvider(event.target.value)}>
-            {PROVIDERS.map((one) => (
-              <option key={one} value={one}>
-                {one}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="field">
-          <label htmlFor="model-key">Key</label>
-          <input
-            id="model-key"
-            type="password"
-            value={key}
-            onChange={(event) => setKey(event.target.value)}
-            autoComplete="off"
-            aria-describedby="model-key-hint"
-            placeholder={provider === 'openrouter' ? 'sk-or-v1-…' : 'sk-ant-…'}
-          />
-          <p className="hint" id="model-key-hint">
-            It is spent by the worker, on your runs, and never leaves it — the sandbox that
-            runs an agent holds neither this key nor your GitHub token. We check it against{' '}
-            {provider} before saving, which costs a few tokens on the key itself. A key with
-            a spend limit needs enough headroom for a whole session: a drafting run is tens
-            of turns, not one.
-          </p>
-        </div>
+      {/* STACKED, not a row (10n). `.row` is `align-items: flex-end`, so putting a narrow
+          select beside a wide input whose hint runs to four lines pushed the select to the
+          bottom of that hint — the PROVIDER label ended up floating halfway down the page,
+          level with the middle of somebody else's paragraph. It read as a broken layout,
+          because it was one. Two fields with different heights do not belong on one row. */}
+      <div className="field">
+        <label htmlFor="provider">Provider</label>
+        <select id="provider" value={provider} onChange={(event) => setProvider(event.target.value)}>
+          {PROVIDERS.map((one) => (
+            <option key={one} value={one}>
+              {one}
+            </option>
+          ))}
+        </select>
       </div>
+      <div className="field">
+        <label htmlFor="model-key">Key</label>
+        <input
+          id="model-key"
+          type="password"
+          value={key}
+          onChange={(event) => setKey(event.target.value)}
+          autoComplete="off"
+          aria-describedby="model-key-hint"
+          placeholder={provider === 'openrouter' ? 'sk-or-v1-…' : 'sk-ant-…'}
+        />
+        <p className="hint" id="model-key-hint">
+          We check it against {provider} before saving, which spends a few tokens on the key
+          itself. A key with a spend limit needs headroom for a whole session — a drafting run
+          is tens of turns.
+        </p>
+      </div>
+
+      {/* The security fact, on its own and after the form rather than buried in a hint
+          nobody reads while typing. It is the reassurance somebody wants BEFORE pasting a
+          credential, and it was the fourth sentence of a four-sentence paragraph. */}
+      <p className="muted small">
+        The key is spent by the worker, on your runs, and never leaves it: the sandbox that runs
+        an agent holds neither this key nor your GitHub token.
+      </p>
       <div className="row">
         <button
           type="button"

@@ -9,7 +9,7 @@
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { effortLevel, providerName, runAgentLoop } from '../src/loop.js';
-import { DEFAULT_OPENROUTER_MODEL, openAiTools, probeToolCalling, runOpenRouterLoop } from '../src/openrouter.js';
+import { DEFAULT_OPENROUTER_MODEL, openAiTools, probeToolCalling, runOpenRouterLoop, said } from '../src/openrouter.js';
 import { TOOL_SCHEMAS } from '../src/tools.js';
 import { type FakeModel, fakeChat, fnCall } from './fixtures/model.js';
 import { draftRecipe } from '../src/orchestrate.js';
@@ -417,6 +417,29 @@ describe('the probe refuses a model that cannot drive the tools', () => {
     // refused key is which of expired, revoked, out of credit, or not entitled to this
     // model it was, and only the provider knows.
     expect(outcome.detail).toContain('Key limit exceeded');
+    // The WORDS, not the envelope. Including the body raw put
+    //   {"error":{"message":"Missing Authentication header","code":401}}
+    // on a settings page in front of somebody storing a key.
+    expect(outcome.detail).not.toContain('{');
+    expect(outcome.detail).not.toContain('"message"');
+    // And the status, so a caller can say which refusal this was — "check you pasted the
+    // whole key" for a 401 is different advice from "raise the spend cap" for a 403.
+    expect(outcome.status).toBe(403);
+  });
+
+  it('digs the sentence out of whatever shape a provider wraps it in', () => {
+    // Every one of these is a real shape from an OpenAI-compatible service, and all of
+    // them wrap one useful sentence in punctuation nobody needs to read.
+    expect(said('{"error":{"message":"Missing Authentication header","code":401}}')).toBe('Missing Authentication header');
+    expect(said('{"error":"invalid_api_key"}')).toBe('invalid_api_key');
+    expect(said('{"message":"quota exceeded"}')).toBe('quota exceeded');
+    expect(said('{"detail":"Not authenticated"}')).toBe('Not authenticated');
+    // Not that shape at all: handed back as text, because a bare status code is what made
+    // this necessary in the first place.
+    expect(said('<html>502 Bad Gateway</html>')).toBe('<html>502 Bad Gateway</html>');
+    expect(said('  ')).toBe('');
+    // A body that parses but says nothing useful is better shown than swallowed.
+    expect(said('{"ok":false}')).toBe('{"ok":false}');
   });
 
   it('fails when the endpoint is unreachable instead of throwing', async () => {
