@@ -94,13 +94,13 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
   // 2 — A PROPOSAL. Three outcomes and they used to look identical: nothing asked for
   // yet, a session in flight, and a session that finished having proposed nothing.
   if (detail.recipe) {
-    out.push({ id: 'draft', title: 'A recipe was proposed', state: 'done' });
+    out.push({ id: 'draft', title: 'We know how to run your project', state: 'done' });
   } else if (detail.draft) {
-    out.push({ id: 'draft', title: 'A recipe has been proposed for you to review', state: 'done' });
+    out.push({ id: 'draft', title: 'Commands proposed, waiting for you to check them', state: 'done' });
   } else if (running(draft)) {
     out.push({
       id: 'draft',
-      title: 'Drafting a recipe',
+      title: 'Working out how to run your project',
       state: 'waiting',
       detail:
         draft!.dispatchedAt === null
@@ -108,13 +108,13 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
           : `Running for ${since(draft!.dispatchedAt, now)} — it explores your project, which takes a couple of minutes.`,
     });
   } else if (draft?.note) {
-    out.push({ id: 'draft', title: 'Drafting produced nothing', state: 'failed', detail: draft.note });
+    out.push({ id: 'draft', title: 'Could not work out how to run it', state: 'failed', detail: draft.note });
   } else {
     out.push({
       id: 'draft',
-      title: 'Get a recipe proposed',
+      title: 'Work out how to run your project',
       state: 'now',
-      detail: 'An agent explores your project and proposes the commands a run should use. You review them before anything uses them.',
+      detail: 'An agent reads your project and proposes the commands that install, start and test it. You check them before anything runs.',
     });
   }
 
@@ -122,12 +122,12 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
   // (ADR-0013) and the only step here nothing can do on your behalf.
   out.push(
     detail.recipe
-      ? { id: 'approve', title: 'You approved the recipe', state: 'done' }
+      ? { id: 'approve', title: 'You checked the commands', state: 'done' }
       : {
           id: 'approve',
-          title: 'Approve the recipe',
+          title: 'Check the commands and use them',
           state: 'later',
-          detail: 'These are commands the engine will execute verbatim. Nothing runs until you say so.',
+          detail: 'They run verbatim, in a container of your own. Nothing runs until you say so.',
         },
   );
 
@@ -135,11 +135,11 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
   // a person actually has after approving, and which used to have a permanent "reload in
   // a minute" in front of it.
   if (!detail.recipe) {
-    out.push({ id: 'prove', title: 'Check the environment builds', state: 'later' });
+    out.push({ id: 'prove', title: 'Check your project builds', state: 'later' });
   } else if (running(prove)) {
     out.push({
       id: 'prove',
-      title: 'Checking the environment builds',
+      title: 'Checking your project builds',
       state: 'waiting',
       detail:
         prove!.dispatchedAt === null
@@ -147,13 +147,13 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
           : `Running for ${since(prove!.dispatchedAt, now)} — it builds your project and runs its own tests once.`,
     });
   } else if (detail.proof) {
-    out.push({ id: 'prove', title: 'The environment builds and your suite ran', state: 'done' });
+    out.push({ id: 'prove', title: 'Your project builds and its tests ran', state: 'done' });
   } else if (prove?.note) {
-    out.push({ id: 'prove', title: 'The environment check produced nothing', state: 'failed', detail: prove.note });
+    out.push({ id: 'prove', title: 'The build check produced nothing', state: 'failed', detail: prove.note });
   } else {
     out.push({
       id: 'prove',
-      title: 'The environment has not been checked',
+      title: 'Your project has not been build-checked',
       state: 'done',
       detail: 'Not required. A run will find out either way; checking first is how you find out sooner.',
     });
@@ -165,12 +165,12 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
   if (detail.recipe?.required?.length) {
     out.push(
       missing.length === 0
-        ? { id: 'secrets', title: 'Every value the recipe requires is stored', state: 'done' }
+        ? { id: 'secrets', title: 'Every value your project needs is stored', state: 'done' }
         : {
             id: 'secrets',
-            title: `Store ${missing.length} value${missing.length === 1 ? '' : 's'} the recipe requires`,
+            title: `Store ${missing.length} value${missing.length === 1 ? '' : 's'} your project needs`,
             state: 'now',
-            detail: `${missing.join(', ')} — a run cannot boot your project without ${missing.length === 1 ? 'it' : 'them'}, and will stop before it tries.`,
+            detail: `${missing.join(', ')} — your project cannot start without ${missing.length === 1 ? 'it' : 'them'}, so a run stops before it tries.`,
           },
     );
   }

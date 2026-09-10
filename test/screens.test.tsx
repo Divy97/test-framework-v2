@@ -534,7 +534,9 @@ describe('the environment screen says what approving did', () => {
 
   test('names when the recipe in force took force', () => {
     const html = render(<Environment repo="acme/widgets" detail={detail()} me={me} onChanged={() => {}} />);
-    expect(html).toContain('In force');
+    // "In force" is our phrase and nobody else's — a first-time reader has to translate
+    // it. The FACT is unchanged: when these commands started being used.
+    expect(html).toMatch(/in use since/i);
     // The moving part: a second approval writes a new timestamp, so the screen changes even
     // when the recipe does not. Rendered as the machine-readable value here because the
     // human phrasing is computed against `Date.now()` in an effect — which is itself the
@@ -574,7 +576,9 @@ describe('the environment screen says what approving did', () => {
         onChanged={() => {}}
       />,
     );
-    expect(drafted).toMatch(/pre-filled by an agent, not by a person/);
+    // Same fact, plainer — see the note on the other assertion of this above.
+    expect(drafted).toMatch(/agent proposed these/i);
+    expect(drafted).toMatch(/nobody has reviewed them/i);
     expect(drafted).toContain('pip install -e .');
 
     // Both present: the recipe in force is the one actually in force, and a draft beside it
@@ -1120,7 +1124,9 @@ describe('an empty recipe box says why it is empty', () => {
     const html = bare('plane');
     expect(html).not.toMatch(/there is no drafting yet/);
     expect(html).not.toMatch(/holds no model key and runs nothing itself/);
-    expect(html).toMatch(/Nothing has been proposed/);
+    // The state is unchanged and the words are the reader's: this step now ASKS the
+    // question the step exists to answer, rather than reporting the absence of an answer.
+    expect(html).toMatch(/How should we run your project/i);
   });
 
   test('it offers a way to ASK, which is the whole thing it used to be missing', () => {
@@ -1130,7 +1136,9 @@ describe('an empty recipe box says why it is empty', () => {
     // the one somebody cared about queued behind them. Permission is not an instruction;
     // this button is the instruction.
     const html = bare('plane');
-    expect(html).toMatch(/Propose a recipe/);
+    // `recipe` is our word for it. A first-time reader is being asked whether we may work
+    // out how to run their project, which is what the button now says.
+    expect(html).toMatch(/Work it out for me/i);
     // And it says what pressing it costs, because it starts a container and spends a key.
     expect(html).toMatch(/spends your model key/);
     expect(html).toMatch(/couple of minutes/);
@@ -1145,14 +1153,14 @@ describe('an empty recipe box says why it is empty', () => {
     // possible outcome is a failure the page could have predicted.
     const html = bare('plane');
     expect(html).toMatch(/disabled/);
-    expect(html).toMatch(/has not\s+stored one/);
+    expect(html).toMatch(/which this account has not stored/i);
     expect(html).toContain('/settings');
   });
 
   test('the same panel on a laptop, because the answer no longer depends on the surface', () => {
     // It was gated on `mode === 'plane'`, so a local operator with an empty box was told
     // nothing at all. Both deployments now draft; only the machine differs.
-    expect(bare('local')).toMatch(/Nothing has been proposed/);
+    expect(bare('local')).toMatch(/How should we run your project/i);
   });
 });
 

@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { send, type Me, type RepoDetail } from '../../lib/api';
 import { Said, When } from '../bits';
+import { since } from '../Checklist';
+import { missingNames } from '../../lib/required';
 import { review } from '../../lib/review';
 
 /**
@@ -107,6 +109,83 @@ function Review({ text }: { text: string }) {
   );
 }
 
+/**
+ * The commands as JSON, and the button that stores them.
+ *
+ * One component because three stages can store commands — writing them by hand, using a
+ * proposal, changing them later — and three near-identical copies of a textarea and a
+ * submit is how the same screen ends up with three subtly different affordances. The
+ * label differs because the ACT differs: using somebody's proposal is not the same
+ * decision as saving an edit to commands already in use.
+ */
+function Editor({
+  text,
+  setText,
+  parsed,
+  onApprove,
+  busy,
+  said,
+  label,
+}: {
+  text: string;
+  setText: (to: string) => void;
+  parsed: unknown;
+  onApprove: () => void;
+  busy: boolean;
+  said: { ok: boolean; text: string } | null;
+  label: string;
+}) {
+  return (
+    <>
+      {/* ADR-0013, BESIDE THE CONTROL THAT AUTHORISES IT.
+          This was a two-paragraph panel rendered on every state of the screen, including
+          states with no commands to authorise — which is both why the page was long and
+          why the warning had stopped being read. It is not decoration: `verbatim`, the
+          reachable package registry, the absence of any sandbox around them, and who the
+          control is are the four facts a person is agreeing to, and cutting any of them to
+          save words would be trading somebody else's safety for my page length.
+          So it lives HERE, in the component that stores commands — which means it appears
+          wherever storing is possible, by construction rather than by remembering. Same
+          four facts, thirty words instead of ninety. */}
+      <p className="authorises">
+        Every run executes these <b>verbatim</b>, in a container of your own, with a package
+        registry reachable. Nothing sandboxes them from that sandbox — <b>you are the
+        control</b>.
+      </p>
+      <details className="as-json" open={parsed === null}>
+        {/* OPEN when the text does not parse, because then this is the only place the
+            problem can be fixed and hiding it would strand the reader behind a summary
+            that says "not valid JSON yet" and nothing they can act on. */}
+        <summary>Edit as JSON</summary>
+        <div className="field">
+          <label htmlFor="recipe">The commands, as JSON</label>
+          <textarea
+            id="recipe"
+            rows={18}
+            spellCheck={false}
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            aria-describedby="recipe-hint"
+          />
+          <p className="hint" id="recipe-hint">
+            <code>install</code>, <code>migrate</code>, <code>seed</code> and <code>test</code>{' '}
+            are single commands, each optional. <code>services</code> lists anything that has
+            to stay running, each with a <code>name</code>, a <code>command</code>, a{' '}
+            <code>port</code>, and optionally a <code>healthcheck</code> URL we poll until it
+            answers. <code>test</code> is your project&rsquo;s own test command.
+          </p>
+        </div>
+      </details>
+      <p className="calls">
+        <button type="button" className="primary" onClick={onApprove} disabled={busy}>
+          {busy ? 'Saving…' : label}
+        </button>
+      </p>
+      <Said said={said} />
+    </>
+  );
+}
+
 export function Environment({
   repo,
   detail,
@@ -173,53 +252,50 @@ export function Environment({
     );
   };
 
+  const missing = missingNames(detail.recipe, detail.secrets.names);
+  const working = detail.activity.find((one) => one.kind === 'draft' && one.finishedAt === null) ?? null;
+  const failed = detail.activity.find((one) => one.kind === 'draft' && one.note !== null) ?? null;
+
+  /*
+   * ONE STEP, ONE ACTION (10n).
+   *
+   * This screen was a single scroll carrying FOUR submit buttons — start a run, ask for a
+   * proposal, approve the commands, store a secret — and every explanatory paragraph the
+   * feature had ever needed, all visible at once regardless of which of them applied. A
+   * first-time reader met about nine hundred words and had to work out which of four
+   * things they were supposed to do, in a vocabulary they had never seen: recipe, caveats,
+   * in force, blocked run, reproduction.
+   *
+   * The information was right and the architecture was wrong: it was organised around what
+   * this product STORES rather than around what a person is doing. The checklist above
+   * already knows which step they are on, so this renders that step and nothing else.
+   * Everything cut is behind a disclosure on the step it belongs to, not deleted — the
+   * reader who wants the whole picture is one click away, and the reader who wants to get
+   * going is not reading nine hundred words first.
+   */
+  const stage: 'propose' | 'working' | 'review' | 'values' | 'ready' = detail.recipe
+    ? missing.length > 0
+      ? 'values'
+      : 'ready'
+    : working
+      ? 'working'
+      : detail.draft
+        ? 'review'
+        : 'propose';
+
   return (
     <>
-      <p className="hero">
-        Every repository boots differently and nothing in a repository reliably says how, so
-        this is asked once and replayed forever. It is stored on our side, keyed by
-        repository — never as a pull request against your code.
-      </p>
-
-      {detail.recipe ? <Proof proof={detail.proof} /> : null}
-
-      {isDraft ? (
-        <div className="warning">
-          <h2>This box is pre-filled by an agent, not by a person.</h2>
-          <p>
-            It explored this repository and proposed what follows — nobody here has reviewed
-            it. Treat it as a first draft, not a recommendation: check every command, every
-            port and every service name against what you actually know about this project
-            before you approve anything below.
-          </p>
-        </div>
-      ) : null}
-
-      {/* NOTHING YET, rather than nothing ever — 10h changed which of those is true.
-          This said "on a hosted plane there is no drafting yet" and it was correct: the
-          plane holds no model key and starts no containers, so installing the App drafted
-          nothing. It now QUEUES the work and a worker does it, so the honest state of an
-          empty box is "no proposal has arrived", and that has two possible causes a reader
-          can act on differently. */}
-      {!detail.recipe && !isDraft ? (
-        <div className="panel">
-          {/* A BUTTON, because until 10n there was none (10n).
-              This panel told a reader that drafting exists, that it happens somewhere else,
-              and that an empty box might mean no machine was free — while offering no way
-              to ask for one. Installing the App queued drafting for EVERY repository it
-              could see instead, which spent the operator's key on repositories nobody had
-              opened and left the one somebody cared about waiting behind them.
-              Asking is the instruction; installing was only permission. */}
-          <h2>Nothing has been proposed for this repository yet.</h2>
-          <p>
-            Drafting explores your project in a container — installs it, boots it, looks at
-            it — and proposes the commands a run should use. It takes a couple of minutes,
-            spends your model key, and produces a proposal you review before anything uses
-            it. Nothing runs against {repo} until you approve.
+      {stage === 'propose' ? (
+        <section className="stage">
+          <h2>How should we run your project?</h2>
+          <p className="lede-sm">
+            To test a bug we have to boot your project the way you do — install it, start it,
+            run its tests. Tell us those commands once and every run reuses them.
           </p>
           <p className="calls">
             <button
               type="button"
+              className="primary"
               disabled={asking || me?.modelKey === null}
               onClick={() => {
                 setAsking(true);
@@ -227,122 +303,150 @@ export function Environment({
                   setAsking(false);
                   setAsked(
                     answer.ok
-                      ? { ok: true, text: 'Asked. A machine will pick this up — reload in a minute or two.' }
+                      ? { ok: true, text: 'On its way. This page will keep itself up to date.' }
                       : { ok: false, text: answer.error ?? 'that failed' },
                   );
                   if (answer.ok) onChanged();
                 });
               }}
             >
-              {asking ? 'Asking…' : 'Propose a recipe'}
+              {asking ? 'Asking…' : 'Work it out for me'}
             </button>
           </p>
           <Said said={asked} />
           {me?.modelKey === null ? (
             <p className="muted small">
-              Drafting spends the model key of whoever asks for it, and this account has not
-              stored one. <a href="/settings">Store a key</a> and this button becomes live.
+              {/* The COST in both branches. It was only on the branch where the button
+                  works, so somebody without a key was told to go and store one without
+                  being told what pressing the button afterwards would spend. */}
+              This reads your code with a model: a couple of minutes, about 13¢, and it spends
+              your model key — which this account has not stored.{' '}
+              <a href="/settings">Store a key</a> to use it.
             </p>
           ) : (
             <p className="muted small">
-              You do not have to wait for it. Write the commands that install, boot and test
-              your project and approve them — a proposal that arrives later will not overwrite
-              what you approved.
+              An agent explores your project and proposes the commands. Takes a couple of
+              minutes, costs about 13¢, and you review everything before it is used.
             </p>
           )}
-        </div>
+          <details className="quiet">
+            <summary>Or write them yourself</summary>
+            <Editor
+              text={text}
+              setText={setText}
+              parsed={parsed}
+              onApprove={approve}
+              busy={busy}
+              said={said}
+              label="Use these commands"
+            />
+          </details>
+        </section>
       ) : null}
 
-      {detail.approvedAt ? (
-        <p className="in-force">
-          <span className="pass">
-            <span className="mark" aria-hidden="true">
-              ✓
-            </span>
-            In force
-          </span>{' '}
-          since <When iso={detail.approvedAt} /> — this is what every run against {repo} will
-          execute.
-        </p>
-      ) : null}
-
-      <div className="warning refusal">
-        <h2>Read this before you approve.</h2>
-        <p>
-          Every run against this repository will execute these commands <b>verbatim</b>, in
-          the agent sandbox, with a package registry reachable. Nothing sandboxes them from
-          that sandbox — <b>you are the control</b>.
-        </p>
-        <p>
-          {isDraft
-            ? 'An agent drafted this. It is testimony, not a finding: we validate its shape and nothing about what it does.'
-            : 'Whoever wrote this box is the only review it has had: we validate its shape and nothing about what it does.'}{' '}
-          A service answering its healthcheck is the only thing here the engine will ever
-          treat as evidence.
-        </p>
-      </div>
-
-      {/* WHAT WILL RUN, before the JSON (10n).
-          The warning above has said for four milestones that these commands execute
-          verbatim with a registry reachable and that the reader is the control. What sat
-          under it was a twenty-row textarea of raw JSON — the most consequential control
-          in the product, presented as a config file. To review it you had to hold the
-          schema in your head, find the commands among the ports and the env, and know
-          which of them the engine treats as a verdict. Most people read two lines and
-          press the button, which makes the control decorative, and a decorative control is
-          worse than none because the page claims it happened. */}
-      <Review text={text} />
-
-      <details className="as-json" open={parsed === null}>
-        {/* OPEN when the text does not parse, because then this is the only place the
-            problem can be fixed and hiding it would strand the reader behind a summary
-            that says "not valid JSON yet" and nothing they can act on. */}
-        <summary>Edit as JSON</summary>
-        <div className="field">
-          <label htmlFor="recipe">The recipe, as JSON</label>
-          <textarea
-            id="recipe"
-            rows={20}
-            spellCheck={false}
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            aria-describedby="recipe-hint"
-          />
-          <p className="hint" id="recipe-hint">
-            <code>install</code>, <code>migrate</code>, <code>seed</code> and <code>test</code>{' '}
-            are single commands and each may be left empty; <code>services</code> is a list of
-            long-lived processes, each with a lowercase <code>name</code>, a <code>command</code>{' '}
-            that stays in the foreground, a <code>port</code>, and optionally a{' '}
-            <code>healthcheck</code> URL the engine polls until it answers. <code>test</code> is
-            your project&rsquo;s own suite — it is the regression arm, not the reproduction,
-            which the agent writes.
+      {stage === 'working' ? (
+        <section className="stage">
+          <h2>Working out how to run your project</h2>
+          <p className="lede-sm">
+            An agent is reading your code, installing it and starting it up. About two
+            minutes.
           </p>
-        </div>
-      </details>
-      <button type="button" onClick={approve} disabled={busy}>
-        {busy ? 'Storing…' : detail.recipe ? 'Approve this recipe' : 'Approve and store'}
-      </button>
-      <Said said={said} />
+          <p className="waiting-for">
+            {working!.dispatchedAt === null
+              ? `Queued ${since(working!.queuedAt)} ago, waiting for a machine.`
+              : `Running for ${since(working!.dispatchedAt)}.`}
+          </p>
+          <p className="muted small">
+            You can leave this page. The browser tab will tell you when it is done.
+          </p>
+        </section>
+      ) : null}
 
-      <h2>Environment variables: configuration here, secrets below</h2>
-      <p>
-        A recipe carries its own configuration in an <code>env</code> field — a port, a{' '}
-        <code>DATABASE_URL</code> pointing at a database one of the services above starts,{' '}
-        <code>NODE_ENV</code>. Those are values that are worthless outside the sandbox, and
-        every command in the recipe runs with them.
-      </p>
-      <p>
-        A value that <em>authenticates to something outside the sandbox</em> is a different
-        thing, and it never goes in the recipe. Name it in <code>required</code> instead: the
-        name is public, the value is not, and a run that cannot find one stops before any
-        container starts and says which name it was missing — a <code>blocked</code> run,
-        which is not a finding about anybody&rsquo;s bug and does not pretend to be one.
-      </p>
+      {stage === 'review' ? (
+        <section className="stage">
+          <h2>Check these commands, then use them</h2>
+          <p className="lede-sm">
+            An agent proposed these by exploring your project — nobody has reviewed them yet.
+            We will run them <b>exactly as written</b>, in a container of your own. Nothing has
+            run so far.
+          </p>
+          {failed?.note ? <p className="muted small">Last attempt: {failed.note}</p> : null}
+          <Review text={text} />
+          <Editor
+            text={text}
+            setText={setText}
+            parsed={parsed}
+            onApprove={approve}
+            busy={busy}
+            said={said}
+            label="Use these commands"
+          />
+        </section>
+      ) : null}
 
+      {stage === 'values' ? (
+        <section className="stage">
+          <h2>
+            {missing.length} value{missing.length === 1 ? '' : 's'} your project needs
+          </h2>
+          <p className="lede-sm">
+            Your commands say this project cannot start without{' '}
+            {missing.map((name, n) => (
+              <span key={name}>
+                {n > 0 ? ', ' : ''}
+                <code>{name}</code>
+              </span>
+            ))}
+            . Add {missing.length === 1 ? 'it' : 'them'} and runs can begin; without{' '}
+            {missing.length === 1 ? 'it' : 'them'} a run stops before it starts rather than
+            report a bug it could not see.
+          </p>
+          <Secrets repo={repo} detail={detail} onChanged={onChanged} suggest={missing[0]} />
+        </section>
+      ) : null}
+
+      {stage === 'ready' ? (
+        <section className="stage">
+          <h2>Ready to test bugs on {repo}</h2>
+          <p className="lede-sm">
+            We know how to run this project, and we checked that it builds. Pick an issue on
+            the <b>Start a run</b> tab.
+          </p>
+          {/* WHEN, because a second approval writes a new timestamp and the screen has to
+              change even when the commands do not. This read "In force since …", which is
+              our word for it and nobody else's. */}
+          {detail.approvedAt ? (
+            <p className="muted small">
+              These commands have been in use since <When iso={detail.approvedAt} />.
+            </p>
+          ) : null}
+          <details className="quiet">
+            <summary>The commands we will run</summary>
+            <Review text={text} />
+            <Editor
+              text={text}
+              setText={setText}
+              parsed={parsed}
+              onApprove={approve}
+              busy={busy}
+              said={said}
+              label="Save changes"
+            />
+          </details>
+          <details className="quiet">
+            <summary>What we checked, and what we could not</summary>
+            <Proof proof={detail.proof} />
+          </details>
+          <details className="quiet">
+            <summary>Values this project runs with</summary>
       <Secrets repo={repo} detail={detail} onChanged={onChanged} />
+          </details>
+        </section>
+      ) : null}
     </>
   );
 }
+
 
 const safely = (draft: unknown): string => {
   // `draft` arrived as `unknown` off an agent's own words and never through validation, so
@@ -478,10 +582,26 @@ function Proof({ proof }: { proof: unknown }) {
  * control that implied one would be the first step towards writing the route that does.
  * Replacing a value means storing it again.
  */
-function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail; onChanged: () => void }) {
+function Secrets({
+  repo,
+  detail,
+  onChanged,
+  // The name the step is asking for, so the reader is not retyping something the screen
+  // already knows. `required` names it; leaving the field blank made them copy it across
+  // from a sentence two lines up.
+  suggest,
+}: {
+  repo: string;
+  detail: RepoDetail;
+  onChanged: () => void;
+  suggest?: string;
+}) {
   const [deleting, setDeleting] = useState<string | null>(null);
   const heading = useRef<HTMLHeadingElement>(null);
-  const [name, setName] = useState('');
+  // Pre-filled with the name the step is asking for. It was blank, so somebody being told
+  // "this project cannot start without SPOTIFY_CLIENT_ID" had to copy that name out of a
+  // sentence two lines above into a field directly below it.
+  const [name, setName] = useState(suggest ?? '');
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [said, setSaid] = useState<{ ok: boolean; text: string } | null>(null);
@@ -549,6 +669,30 @@ function Secrets({ repo, detail, onChanged }: { repo: string; detail: RepoDetail
       ) : (
         <p className="muted">Nothing is stored for {repo} yet.</p>
       )}
+
+      {/* WHERE A PORT GOES AND WHERE A PASSWORD GOES (10j), kept and demoted.
+          This was two paragraphs on the main scroll, above a form most readers had no
+          reason to use yet. It is real teaching — somebody who puts a database password in
+          `env` has put a credential in the commands, and somebody who puts a port in
+          `required` has made their project un-runnable until they type a 3000 into a
+          secrets form — so it is behind a disclosure on the step that asks for values,
+          rather than in front of everybody who visits the page. */}
+      <details className="quiet">
+        <summary>Which of these goes where?</summary>
+        <p>
+          Environment variables: configuration here, secrets below. A port, or a{' '}
+          <code>DATABASE_URL</code> pointing at a database your own commands start, is
+          configuration — it is worthless outside the sandbox, so it belongs in the{' '}
+          <code>env</code> field of the commands themselves.
+        </p>
+        <p>
+          A value that authenticates to something <i>outside</i> the sandbox is a secret and
+          never goes in the commands. Name it in <code>required</code> instead: the name is
+          public, the value is not, and a run that cannot find one stops before any container
+          starts and says which name was missing — a <code>blocked</code> run, which is not a
+          finding about anybody&rsquo;s bug and does not pretend to be one.
+        </p>
+      </details>
 
       {detail.secrets.enabled ? (
         <>

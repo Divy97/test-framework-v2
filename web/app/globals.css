@@ -431,6 +431,60 @@ h1.display{font-size:clamp(2.5rem,1.6rem + 3.6vw,4.6rem);line-height:1.03;
 .card h3{margin:0 0 .5rem;font-size:1.1rem;font-weight:500;letter-spacing:-.01em}
 .card p{margin:0;color:var(--muted);font-size:.97rem}
 /*
+ * ONE STEP AT A TIME (10n).
+ *
+ * The onboarding screen was one scroll carrying four submit buttons and every explanatory
+ * paragraph the feature had ever needed, all visible at once regardless of which applied.
+ * A first-time reader met about nine hundred words and had to work out which of four
+ * things they were meant to do. It was organised around what this product stores rather
+ * than around what a person is doing.
+ *
+ * A stage is one question, one answer, one control. The measurements do the work: a
+ * heading that is allowed to be a heading, prose capped near 62ch so it reads as a
+ * sentence rather than a wall, and air above the action so the eye lands on it.
+ */
+.stage{max-width:62rem;padding:.5rem 0 1rem}
+.stage > h2{margin:0 0 .6rem;font-size:1.55rem;font-weight:500;letter-spacing:-.015em;
+  text-wrap:balance}
+/* The one paragraph a stage is allowed. Larger than body on purpose — it is the sentence
+ * that says what this step is, and everything else on the step is subordinate to it. */
+.lede-sm{font-size:1.06rem;line-height:1.55;max-width:62ch;margin:0 0 1.4rem;color:var(--ink)}
+.stage .calls{margin:1.5rem 0 0}
+/* What a machine is doing, counted. Mono because the number is a machine fact, and it
+ * updates every five seconds while a reader watches it. */
+.waiting-for{font-family:var(--mono);font-size:.82rem;letter-spacing:.02em;
+  color:var(--pending);margin:0 0 1rem}
+
+/* PRIMARY vs the rest. Every button on this surface was `--ink` on `--paper`, so a stage
+ * with a submit and a disclosure trigger offered two things of identical weight. The
+ * default stays as it was — this only says which one is the answer to the question the
+ * heading asked. */
+button.primary{padding:.8rem 1.7rem;font-size:.8rem}
+button.primary:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+
+/* A disclosure that is genuinely secondary: everything cut from the scroll above lives
+ * behind one of these, on the step it belongs to. Not deleted — one click away. */
+details.quiet{margin:1.75rem 0 0;border-top:1px solid var(--rule);padding-top:.9rem;
+  max-width:62rem}
+details.quiet > summary{font-family:var(--mono);font-size:.7rem;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--muted);cursor:pointer;padding:.35rem 0;
+  /* 150ms, and colour only: a disclosure opening is a state change, and animating the
+   * height of content whose size nobody knows is how a page janks. */
+  transition:color 150ms cubic-bezier(.22,1,.36,1)}
+details.quiet > summary:hover{color:var(--ink)}
+details.quiet > summary:focus-visible{outline:2px solid var(--control);outline-offset:2px}
+details.quiet[open] > summary{color:var(--ink);margin-bottom:.5rem}
+
+@media (prefers-reduced-motion:reduce){
+  details.quiet > summary{transition:none}
+}
+
+@media (max-width:640px){
+  .stage > h2{font-size:1.35rem}
+  .lede-sm{font-size:1rem}
+}
+
+/*
  * THE RECIPE, AS WHAT IT WILL DO (10n).
  *
  * Replaces reading raw JSON in a textarea as the primary way to review commands the
