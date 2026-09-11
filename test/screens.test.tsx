@@ -42,7 +42,7 @@ import type {
 import { EVENT_TYPES as CLIENT_EVENT_TYPES, tabTitle } from '../web/lib/hooks';
 import { Checklist, isWaiting, steps } from '../web/components/Checklist';
 import { missingNames } from '../web/lib/required';
-import { review } from '../web/lib/review';
+import { doesNothing, review } from '../web/lib/review';
 import { missingRequired } from '../src/recipe.js';
 import { Chrome } from '../web/components/Chrome';
 import { Start } from '../web/components/views/Start';
@@ -1568,5 +1568,103 @@ describe('the tab carries the wait', () => {
     expect(tabTitle({ waiting: true, settledWhileAway: true, label: 'Checking the environment builds', base: 'acme/widgets' })).toContain(
       'Checking the environment builds',
     );
+  });
+});
+
+// ── a recipe that runs nothing is not ready (10n) ────────────────────────────
+//
+// Found on a real repository. `Divy97/linkedIn-agents` was onboarded with `{"services":[]}`
+// — the skeleton, approved twenty-one seconds before the agent's proposal landed — and the
+// screen said "Ready to test bugs on Divy97/linkedIn-agents". A run against it boots no
+// project and reports that it could not reproduce the bug, which is a fact about the
+// commands and not about the bug.
+//
+// `parseRecipe` permits it deliberately: a project with no dependencies and no suite is a
+// real thing. So nothing upstream refuses it and saying so is the only defence — and the
+// one place that said so, `Review`, sits behind a disclosure on exactly that step.
+
+describe('commands that do nothing are not a finished repository', () => {
+  const me: Me = {
+    accounts: true, signedIn: true, login: 'd', mode: 'plane', installUrl: 'https://x.invalid',
+    modelKey: { provider: 'openrouter' }, secrets: { enabled: true }, github: true, forgetting: true,
+  };
+  const withRecipe = (recipe: unknown, over: Partial<RepoDetail> = {}): RepoDetail => ({
+    repo: 'acme/widgets', account: 'acme', connectedAt: '2026-08-01T00:00:00.000Z',
+    onboarded: true, recipe: recipe as RepoDetail['recipe'], approvedAt: '2026-09-10T07:28:20.630Z',
+    proof: { state: 'ready_with_caveats' }, draft: null,
+    secrets: { names: [], enabled: true }, runs: [], activity: [],
+    ...over,
+  });
+
+  test('the exact recipe that was approved on a real repository', () => {
+    // `{"services":[]}` — no install, no migrate, no seed, no test, no services.
+    expect(doesNothing({ services: [] })).toBe(true);
+    // And the near-misses, because the rule has to be the one `review()` already holds.
+    expect(doesNothing({ install: '', services: [], test: '' })).toBe(true);
+    expect(doesNothing({ install: '   ', services: [] })).toBe(true);
+    expect(doesNothing({ install: 'npm ci', services: [] })).toBe(false);
+    expect(doesNothing({ services: [{ name: 'web', command: 'npm start', port: 3000 }] })).toBe(false);
+    // A service with no command runs nothing either.
+    expect(doesNothing({ services: [{ name: 'web', command: '', port: 3000 }] })).toBe(true);
+    // Not a recipe at all is not this failure, and must not be reported as one.
+    expect(doesNothing(null)).toBe(false);
+  });
+
+  test('the checklist refuses to tick steps it has not earned', () => {
+    const list = steps('acme/widgets', withRecipe({ services: [] }), me);
+    const at = (id: string) => list.find((step) => step.id === id)!;
+    expect(at('draft').state).toBe('failed');
+    expect(at('draft').title).toMatch(/run nothing/i);
+    // And nothing downstream claims to be done on the back of it.
+    expect(at('approve').state).not.toBe('done');
+    expect(at('prove').state).toBe('later');
+    // The control: real commands earn the ticks.
+    const real = steps('acme/widgets', withRecipe({ install: 'npm ci', services: [], test: 'npm test' }), me);
+    expect(real.find((step) => step.id === 'draft')!.state).toBe('done');
+    expect(real.find((step) => step.id === 'approve')!.state).toBe('done');
+  });
+
+  test('the screen says so, instead of calling it ready', () => {
+    const html = render(
+      <Environment repo="acme/widgets" detail={withRecipe({ services: [] })} me={me} onChanged={() => {}} />,
+    );
+    expect(html).toMatch(/these commands run nothing/i);
+    expect(html).toMatch(/could not reproduce your bug/i);
+    // The claim it used to make.
+    expect(html).not.toMatch(/ready to test bugs/i);
+  });
+
+  test('and offers the proposal that arrived after the approval', () => {
+    // The other half of what happened: the agent's real proposal landed 21 seconds after
+    // the skeleton was approved, and an approved recipe wins outright — so two services,
+    // their healthchecks and three required values sat unreachable behind commands that
+    // boot nothing.
+    const draft = {
+      install: 'cd backend && npm install',
+      services: [{ name: 'backend', command: 'npx serverless offline', port: 3001 }],
+      required: ['OPENAI_API_KEY'],
+    };
+    const html = render(
+      <Environment repo="acme/widgets" detail={withRecipe({ services: [] }, { draft })} me={me} onChanged={() => {}} />,
+    );
+    expect(html).toMatch(/an agent has since proposed/i);
+    // Loaded into the box, so it can be read and used rather than described.
+    expect(html).toContain('cd backend &amp;&amp; npm install');
+    expect(html).toContain('Use these commands');
+  });
+
+  test('a recipe that DOES something still wins over a draft beside it', () => {
+    // The rule this narrows and must not break: an approved recipe is the one in force,
+    // and a draft next to it is a stale second opinion nobody asked for.
+    const html = render(
+      <Environment
+        repo="acme/widgets"
+        detail={withRecipe({ install: 'npm ci', services: [], test: 'npm test' }, { draft: { install: 'pip install -e .', services: [] } })}
+        me={me}
+        onChanged={() => {}}
+      />,
+    );
+    expect(html).toContain('npm ci');
+    expect(html).not.toContain('pip install -e .');
   });
 });

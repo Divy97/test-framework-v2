@@ -380,6 +380,12 @@ beforeAll(async () => {
 afterAll(async () => {
   if (client) {
     await client.query('delete from repo_secrets where repo = $1', [REPO]).catch(() => {});
+    // THE INSTALLATION ROW TOO. `recordInstallation` writes one for this file's throwaway
+    // `secrets-test/<uuid>` repository and nothing here removed it, so every run of this
+    // suite left one behind — 37 of them had accumulated in the production database by the
+    // time anybody counted, because `.env` points there. The leak is one line; the reason
+    // it survived is that the row is invisible to every assertion in this file.
+    await client.query('delete from installations where repo = $1', [REPO]).catch(() => {});
     await client.query('delete from user_model_keys where github_id = $1', [GITHUB_ID]).catch(() => {});
     await client.query('delete from jobs where run_id = any($1)', [madeRuns]).catch(() => {});
     await client.query('delete from runners where id = any($1)', [madeRunners]).catch(() => {});

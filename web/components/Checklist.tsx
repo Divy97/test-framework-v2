@@ -24,6 +24,7 @@
  */
 import type { Me, RepoActivity, RepoDetail } from '../lib/api';
 import { missingNames } from '../lib/required';
+import { doesNothing } from '../lib/review';
 
 export type StepState = 'done' | 'now' | 'waiting' | 'failed' | 'later';
 
@@ -72,6 +73,10 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
   const draft = latest(detail.activity, 'draft');
   const prove = latest(detail.activity, 'prove');
   const missing = missingNames(detail.recipe, detail.secrets.names);
+  // Whether what was approved actually does anything. A recipe of empty strings parses,
+  // stores, and proves "ready with caveats" — and every step here read `done` off the
+  // recipe merely existing.
+  const nothing = doesNothing(detail.recipe);
 
   const out: Step[] = [];
 
@@ -93,7 +98,20 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
 
   // 2 — A PROPOSAL. Three outcomes and they used to look identical: nothing asked for
   // yet, a session in flight, and a session that finished having proposed nothing.
-  if (detail.recipe) {
+  if (detail.recipe && nothing) {
+    // APPROVED, AND IT RUNS NOTHING (10n). Every step below this used to read `done` off
+    // the mere existence of a recipe, so a stored `{"services":[]}` produced a checklist
+    // of ticks ending in "Ready to test bugs" — for commands that boot no project. The
+    // tick is the strongest claim this component makes and it was the easiest to earn.
+    out.push({
+      id: 'draft',
+      title: 'The approved commands run nothing',
+      state: 'failed',
+      detail: detail.draft
+        ? 'They install nothing and test nothing, so a run would report it could not reproduce your bug. An agent has proposed real ones — check them and use them.'
+        : 'They install nothing and test nothing, so a run would report it could not reproduce your bug rather than tell you anything about it.',
+    });
+  } else if (detail.recipe) {
     out.push({ id: 'draft', title: 'We know how to run your project', state: 'done' });
   } else if (detail.draft) {
     out.push({ id: 'draft', title: 'Commands proposed, waiting for you to check them', state: 'done' });
@@ -121,7 +139,7 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
   // 3 — APPROVAL, which is the human control this whole product is built around
   // (ADR-0013) and the only step here nothing can do on your behalf.
   out.push(
-    detail.recipe
+    detail.recipe && !nothing
       ? { id: 'approve', title: 'You checked the commands', state: 'done' }
       : {
           id: 'approve',
@@ -134,7 +152,7 @@ export function steps(repo: string, detail: RepoDetail, me: Me | null, now = Dat
   // 4 — PROOF. Answers "will a run here be able to say anything", which is the question
   // a person actually has after approving, and which used to have a permanent "reload in
   // a minute" in front of it.
-  if (!detail.recipe) {
+  if (!detail.recipe || nothing) {
     out.push({ id: 'prove', title: 'Check your project builds', state: 'later' });
   } else if (running(prove)) {
     out.push({

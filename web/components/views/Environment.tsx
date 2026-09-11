@@ -5,7 +5,7 @@ import { send, type Me, type RepoDetail } from '../../lib/api';
 import { Said, When } from '../bits';
 import { since } from '../Checklist';
 import { missingNames } from '../../lib/required';
-import { review } from '../../lib/review';
+import { doesNothing, review } from '../../lib/review';
 
 /**
  * A skeleton that is valid JSON, because the alternative is a trap.
@@ -202,11 +202,20 @@ export function Environment({
 
   // What fills the box, in priority order. An approved recipe always wins — it is the one
   // actually in force, and a draft beside it is a stale second opinion nobody asked for.
-  const initial = detail.recipe
-    ? JSON.stringify(detail.recipe, null, 2)
-    : detail.draft
-      ? safely(detail.draft)
-      : SKELETON;
+  // An approved recipe wins — EXCEPT one that runs nothing, which is the one case where
+  // the thing in force is worse than the proposal beside it. On `Divy97/linkedIn-agents`
+  // the skeleton was approved twenty-one seconds before the agent's proposal landed, and
+  // the proposal — two services, healthchecks, three required values — then sat
+  // unreachable behind a recipe that boots no project at all.
+  const empty = doesNothing(detail.recipe);
+  const initial =
+    detail.recipe && !empty
+      ? JSON.stringify(detail.recipe, null, 2)
+      : detail.draft
+        ? safely(detail.draft)
+        : detail.recipe
+          ? JSON.stringify(detail.recipe, null, 2)
+          : SKELETON;
   const isDraft = !detail.recipe && detail.draft !== null;
 
   const [text, setText] = useState(initial);
@@ -273,10 +282,17 @@ export function Environment({
    * reader who wants the whole picture is one click away, and the reader who wants to get
    * going is not reading nine hundred words first.
    */
-  const stage: 'propose' | 'working' | 'review' | 'values' | 'ready' = detail.recipe
-    ? missing.length > 0
-      ? 'values'
-      : 'ready'
+  const stage: 'propose' | 'working' | 'review' | 'values' | 'ready' | 'empty' = detail.recipe
+    ? // A RECIPE THAT RUNS NOTHING IS NOT READY (10n). This asked only whether a recipe
+      // existed and whether values were missing, so a stored `{"services":[]}` reached the
+      // last step and the screen said "Ready to test bugs" about commands that boot no
+      // project. `Review` says so in as many words — and on that step `Review` is behind a
+      // disclosure, so the warning was hidden exactly where it mattered most.
+      empty
+      ? 'empty'
+      : missing.length > 0
+        ? 'values'
+        : 'ready'
     : working
       ? 'working'
       : detail.draft
@@ -380,6 +396,32 @@ export function Environment({
             busy={busy}
             said={said}
             label="Use these commands"
+          />
+        </section>
+      ) : null}
+
+      {stage === 'empty' ? (
+        <section className="stage">
+          <h2>These commands run nothing</h2>
+          <p className="lede-sm">
+            {repo} is onboarded, but what was approved installs nothing, starts nothing and
+            tests nothing. A run would boot no project and report that it could not reproduce
+            your bug — which would be a fact about these commands, not about the bug.
+          </p>
+          {detail.draft ? (
+            <p className="lede-sm">
+              An agent has since proposed the commands below. Check them and use them.
+            </p>
+          ) : null}
+          <Review text={text} />
+          <Editor
+            text={text}
+            setText={setText}
+            parsed={parsed}
+            onApprove={approve}
+            busy={busy}
+            said={said}
+            label={detail.draft ? 'Use these commands' : 'Save changes'}
           />
         </section>
       ) : null}

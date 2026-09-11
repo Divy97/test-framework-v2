@@ -162,3 +162,25 @@ export function review(text: string): { steps: ReviewStep[]; risks: number } | {
 
   return { steps, risks: steps.reduce((count, step) => count + step.risks.length, 0) };
 }
+
+/**
+ * Does this recipe actually run anything?
+ *
+ * A recipe of empty strings PARSES, stores, and proves "ready with caveats" — and a run
+ * against it boots no project and reports that it could not reproduce the bug, which is a
+ * fact about the recipe and not about the bug. `parseRecipe` permits it deliberately (a
+ * project with no dependencies and no suite is a real thing), so nothing upstream refuses
+ * it and the only defence is saying so.
+ *
+ * It happened on a real repository: the skeleton was approved twenty-one seconds before
+ * the agent's proposal landed, and the screen then called the result "ready to test bugs".
+ *
+ * Reuses `review()` rather than re-deriving emptiness, because "a command that counts" is
+ * exactly the rule that function already holds — `''` is absent, a service needs a command,
+ * and every caller has to agree on that or the warning fires on the wrong recipes.
+ */
+export const doesNothing = (recipe: unknown): boolean => {
+  if (recipe === null || recipe === undefined) return false;
+  const read = review(JSON.stringify(recipe));
+  return 'error' in read ? false : read.steps.every((step) => step.command === null);
+};
